@@ -1,0 +1,61 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orka-workspace-fake
+rules:
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspaces]
+    verbs: [get, list, watch]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders/status, executionworkspacepools/status, executionworkspaces/status]
+    verbs: [get, patch, update]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders]
+    resourceNames: [fake]
+    verbs: [provider-status]
+  - apiGroups: [fake.workspace.orka.ai]
+    resources: [fakeproviderconfigs, fakepoolparameters]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orka-workspace-fake
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orka-workspace-fake
+subjects:
+  - kind: ServiceAccount
+    name: orka-workspace-fake
+    namespace: orka-workspace-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orka-workspace-fake-leader
+  namespace: orka-workspace-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orka-workspace-fake-leader
+  namespace: orka-workspace-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orka-workspace-fake-leader
+subjects:
+  - kind: ServiceAccount
+    name: orka-workspace-fake
+    namespace: orka-workspace-system

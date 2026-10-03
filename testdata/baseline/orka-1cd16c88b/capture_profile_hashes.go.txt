@@ -1,0 +1,169 @@
+// Run this program with go run -mod=readonly from an unchanged Orka checkout at
+// 1cd16c88b43410e0ea46463f8a39b473d8e5250e. Copy it to a temporary .go file first.
+// The resolved input structs and ordering match resolvedClassProfileHash in
+// internal/controller/execution_workspace_class_controller.go at that commit.
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"slices"
+	"time"
+
+	acpv1 "github.com/orka-agents/orka/api/acp.workspace/v1alpha1"
+	fakev1 "github.com/orka-agents/orka/api/fake.workspace/v1alpha1"
+	workspacev1 "github.com/orka-agents/orka/api/workspace/v1alpha1"
+	"github.com/orka-agents/orka/pkg/workspaceprovider"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+)
+
+type fixture struct {
+	Name           string                                 `json:"name"`
+	Class          workspacev1.ExecutionWorkspaceClass    `json:"class"`
+	Provider       workspacev1.ExecutionWorkspaceProvider `json:"provider"`
+	ProviderConfig any                                    `json:"providerConfig"`
+	Pool           *workspacev1.ExecutionWorkspacePool    `json:"pool,omitempty"`
+	Parameters     any                                    `json:"parameters"`
+	Resolved       []json.RawMessage                      `json:"resolved"`
+	Hash           string                                 `json:"hash"`
+}
+
+func main() {
+	cases := []struct {
+		name       string
+		backend    acpv1.RuntimeProviderBackend
+		profile    acpv1.RuntimeWorkspaceProfileSpec
+		pooled     bool
+		suspension bool
+	}{
+		{name: "fake-direct"},
+		{name: "fake-pool", pooled: true},
+		{name: "agent-sandbox-default", backend: acpv1.RuntimeProviderBackendAgentSandbox},
+		{name: "agent-sandbox-durable", backend: acpv1.RuntimeProviderBackendAgentSandbox, suspension: true,
+			profile: acpv1.RuntimeWorkspaceProfileSpec{AgentSandbox: &acpv1.AgentSandboxProfileSpec{Suspend: &acpv1.AgentSandboxSuspendPolicy{
+				Mode:   acpv1.SubstrateSuspendModeDataOnly,
+				Volume: acpv1.AgentSandboxDurableVolume{Capacity: "1Gi"},
+			}}}},
+		{name: "substrate-default", backend: acpv1.RuntimeProviderBackendSubstrate,
+			profile: acpv1.RuntimeWorkspaceProfileSpec{Substrate: &acpv1.SubstrateProfileSpec{
+				TemplateRef: acpv1.SubstrateTemplateReference{Name: "runtime"},
+			}}},
+		{name: "substrate-data-only", backend: acpv1.RuntimeProviderBackendSubstrate, suspension: true,
+			profile: acpv1.RuntimeWorkspaceProfileSpec{Substrate: &acpv1.SubstrateProfileSpec{
+				TemplateRef: acpv1.SubstrateTemplateReference{Name: "runtime", Namespace: "infrastructure"},
+				Suspend:     &acpv1.SubstrateSuspendPolicy{Mode: acpv1.SubstrateSuspendModeDataOnly},
+			}}},
+	}
+	var fixtures []fixture
+	for _, c := range cases {
+		provider := workspacev1.ExecutionWorkspaceProvider{
+			ObjectMeta: metav1.ObjectMeta{Name: c.name, UID: types.UID(c.name + "-provider-uid"), Generation: 1},
+			Spec: workspacev1.ExecutionWorkspaceProviderSpec{
+				ControllerName:    "fake.workspace.orka.ai/v1",
+				ParametersRef:     workspacev1.TypedObjectReference{Group: "fake.workspace.orka.ai", Kind: "FakeProviderConfig", Name: "default"},
+				LifecycleState:    workspacev1.ExecutionWorkspaceProviderActive,
+				RequiredContracts: []string{workspacev1.ContractVersionV1},
+			},
+		}
+		class := workspacev1.ExecutionWorkspaceClass{
+			ObjectMeta: metav1.ObjectMeta{Name: c.name, Namespace: "workspaces", UID: types.UID(c.name + "-class-uid"), Generation: 1},
+			Spec: workspacev1.ExecutionWorkspaceClassSpec{
+				ProviderRef:        &workspacev1.ClusterObjectReference{Name: provider.Name},
+				ParametersRef:      &workspacev1.TypedObjectReference{Group: "fake.workspace.orka.ai", Kind: "FakePoolParameters", Name: "profile"},
+				Mode:               workspacev1.ExecutionWorkspaceModeInteractive,
+				RequiredFeatures:   []workspacev1.ExecutionWorkspaceFeature{workspacev1.WorkspaceFeatureTLS, workspacev1.WorkspaceFeatureExec},
+				AllowedReuseScopes: []workspacev1.WorkspaceReuseScope{workspacev1.WorkspaceReuseScopeSession, workspacev1.WorkspaceReuseScopeNone},
+				Lifecycle: workspacev1.ExecutionWorkspaceLifecycle{
+					DefaultOnDetach: workspacev1.WorkspaceOnDetachDelete,
+					AllowedOnDetach: []workspacev1.WorkspaceOnDetach{workspacev1.WorkspaceOnDetachDelete},
+					DetachTimeout:   metav1.Duration{Duration: 2 * time.Minute},
+					DeletionPolicy: workspacev1.ExecutionWorkspaceDeletionPolicy{
+						ProviderResources: workspacev1.WorkspaceDeletionActionDelete,
+						PersistentVolumes: workspacev1.WorkspaceDeletionActionDelete,
+						Checkpoints:       workspacev1.WorkspaceDeletionActionDelete,
+					},
+				},
+			},
+		}
+		meta := metav1.ObjectMeta{Name: "profile", Namespace: "workspaces", UID: types.UID(c.name + "-parameters-uid"), Generation: 7}
+		configMeta := metav1.ObjectMeta{Name: "default", UID: types.UID(c.name + "-config-uid"), Generation: 1}
+		var parameters any = &fakev1.FakePoolParameters{
+			TypeMeta: metav1.TypeMeta{APIVersion: fakev1.GroupVersion.String(), Kind: "FakePoolParameters"}, ObjectMeta: meta,
+		}
+		var config any = &fakev1.FakeProviderConfig{
+			TypeMeta: metav1.TypeMeta{APIVersion: fakev1.GroupVersion.String(), Kind: "FakeProviderConfig"}, ObjectMeta: configMeta,
+		}
+		if c.backend != "" {
+			provider.Spec.ControllerName = "acp.workspace.orka.ai/runtime-pool"
+			provider.Spec.ParametersRef = workspacev1.TypedObjectReference{Group: acpv1.GroupVersion.Group, Kind: "RuntimeProviderConfig", Name: "default"}
+			class.Spec.ParametersRef = &workspacev1.TypedObjectReference{Group: acpv1.GroupVersion.Group, Kind: "RuntimeWorkspaceProfile", Name: "profile"}
+			parameters = &acpv1.RuntimeWorkspaceProfile{TypeMeta: metav1.TypeMeta{APIVersion: acpv1.GroupVersion.String(), Kind: "RuntimeWorkspaceProfile"}, ObjectMeta: meta, Spec: c.profile}
+			config = &acpv1.RuntimeProviderConfig{TypeMeta: metav1.TypeMeta{APIVersion: acpv1.GroupVersion.String(), Kind: "RuntimeProviderConfig"}, ObjectMeta: configMeta, Spec: acpv1.RuntimeProviderConfigSpec{Backend: c.backend}}
+		}
+		if c.suspension {
+			class.Spec.Lifecycle.DefaultOnDetach = workspacev1.WorkspaceOnDetachSuspend
+			class.Spec.Lifecycle.AllowedOnDetach = []workspacev1.WorkspaceOnDetach{workspacev1.WorkspaceOnDetachSuspend, workspacev1.WorkspaceOnDetachDelete}
+			class.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: 24 * time.Hour}
+		}
+		var pool *workspacev1.ExecutionWorkspacePool
+		if c.pooled {
+			pool = &workspacev1.ExecutionWorkspacePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "workspaces", UID: "pool-uid", Generation: 2},
+				Spec: workspacev1.ExecutionWorkspacePoolSpec{
+					ProviderRef: *class.Spec.ProviderRef, ParametersRef: *class.Spec.ParametersRef,
+					Capacity: workspacev1.ExecutionWorkspacePoolCapacity{MinReady: 1, MaxSize: 5},
+				},
+			}
+			class.Spec.ProviderRef, class.Spec.ParametersRef = nil, nil
+			class.Spec.PoolRef = &corev1.LocalObjectReference{Name: pool.Name}
+		}
+		requiredContracts := append([]string(nil), provider.Spec.RequiredContracts...)
+		slices.Sort(requiredContracts)
+		identity := struct {
+			UID               types.UID                        `json:"uid"`
+			ControllerName    string                           `json:"controllerName"`
+			ParametersRef     workspacev1.TypedObjectReference `json:"parametersRef"`
+			RequiredContracts []string                         `json:"requiredContracts"`
+		}{provider.UID, provider.Spec.ControllerName, provider.Spec.ParametersRef, requiredContracts}
+		object, err := runtime.DefaultUnstructuredConverter.ToUnstructured(parameters)
+		must(err)
+		var resolved any
+		if pool == nil {
+			resolved = struct {
+				APIVersion string    `json:"apiVersion"`
+				Kind       string    `json:"kind"`
+				UID        types.UID `json:"uid"`
+				Generation int64     `json:"generation"`
+				Spec       any       `json:"spec,omitempty"`
+			}{object["apiVersion"].(string), object["kind"].(string), meta.UID, meta.Generation, object["spec"]}
+		} else {
+			resolved = struct {
+				UID           types.UID                          `json:"uid"`
+				ProviderRef   workspacev1.ClusterObjectReference `json:"providerRef"`
+				ParametersRef workspacev1.TypedObjectReference   `json:"parametersRef"`
+				ParameterUID  types.UID                          `json:"parameterUID"`
+				Generation    int64                              `json:"parameterGeneration"`
+				Spec          any                                `json:"parameterSpec,omitempty"`
+			}{pool.UID, pool.Spec.ProviderRef, pool.Spec.ParametersRef, meta.UID, meta.Generation, object["spec"]}
+		}
+		hash, err := workspaceprovider.ClassProfileHash(class.Spec, identity, resolved)
+		must(err)
+		fixtures = append(fixtures, fixture{c.name, class, provider, config, pool, parameters, []json.RawMessage{raw(identity), raw(resolved)}, hash})
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	must(encoder.Encode(struct {
+		Baseline string    `json:"baseline"`
+		Fixtures []fixture `json:"fixtures"`
+	}{"1cd16c88b43410e0ea46463f8a39b473d8e5250e", fixtures}))
+}
+
+func raw(value any) json.RawMessage { data, err := json.Marshal(value); must(err); return data }
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
