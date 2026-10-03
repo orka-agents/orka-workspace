@@ -21,7 +21,7 @@ const (
 )
 
 // ConnectionData is the public, credential-bearing data stored in the Secret
-// referenced by ExecutionWorkspace status.connectionRef. It must never be
+// referenced by ExecutionWorkspace status.connectionSecretRef. It must never be
 // copied into status, logs, or events.
 type ConnectionData struct {
 	Endpoint      string
