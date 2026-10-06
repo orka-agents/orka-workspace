@@ -6,7 +6,7 @@ set -Eeuo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 cd "${repo_root}"
-kindctl="${KINDCTL_BIN:-/Users/sozercan/projects/kindctl/bin/kindctl}"
+kindctl="${KINDCTL_BIN:-kindctl}"
 cluster_tag=external-workspace
 mode="${1:-provider}"
 artifact_dir="${ORKA_E2E_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/orka-workspace-e2e.XXXXXX")}"
@@ -23,7 +23,7 @@ k() { "${kindctl}" kubectl --tag "${cluster_tag}" "$@"; }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
 case "${mode}" in provider|prepare-runtime|core) ;; *) fail "Usage: $0 [provider|prepare-runtime|core]" ;; esac
-[[ -x "${kindctl}" ]] || fail "kindctl executable is unavailable: ${kindctl}"
+command -v "${kindctl}" >/dev/null 2>&1 || fail "kindctl executable is unavailable: ${kindctl}. Install kindctl on PATH or set KINDCTL_BIN."
 for required in go docker python3 rsync; do
   command -v "${required}" >/dev/null || fail "Required command unavailable: ${required}"
 done

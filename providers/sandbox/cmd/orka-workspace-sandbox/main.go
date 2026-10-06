@@ -9,6 +9,7 @@ import (
 	provider "github.com/orka-agents/orka-workspace/providers/sandbox"
 	sandboxv1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	nativev1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -37,7 +38,7 @@ func main() {
 
 func run(leaderElection bool, leaderNamespace string) error {
 	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, storagev1.AddToScheme, workspacev1alpha1.AddToScheme, sandboxv1alpha1.AddToScheme, nativev1beta1.AddToScheme, extv1beta1.AddToScheme} {
+	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, storagev1.AddToScheme, workspacev1alpha1.AddToScheme, sandboxv1alpha1.AddToScheme, nativev1beta1.AddToScheme, extv1beta1.AddToScheme} {
 		if err := register(scheme); err != nil {
 			return err
 		}

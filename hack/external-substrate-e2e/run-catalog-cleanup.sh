@@ -69,6 +69,6 @@ kubectl -n "${runner_namespace}" wait --for=condition=complete "job/${job_name}"
 }
 kubectl -n "${runner_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
 kubectl wait --for=delete "namespace/${namespace}" --timeout=2m
-kubectl delete clusterrolebinding "${job_name}" "${namespace}"
-kubectl delete clusterrole "${job_name}" "${namespace}"
+kubectl delete clusterrolebinding "${job_name}" "${namespace}" --ignore-not-found
+kubectl delete clusterrole "${job_name}" "${namespace}" --ignore-not-found
 printf 'Exact catalog and namespace finalization verified: %s\n' "${run_dir}/catalog.log"

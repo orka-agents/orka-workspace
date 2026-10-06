@@ -27,7 +27,8 @@ def arguments():
     parser.add_argument("--old-crd", required=True, type=pathlib.Path, help="saved pre-pruning RuntimePool CRD")
     parser.add_argument("--build-proof", type=pathlib.Path, help="public build provenance for the supplied image")
     parser.add_argument("--artifact-dir", type=pathlib.Path)
-    parser.add_argument("--kindctl", default=os.environ.get("KINDCTL_BIN", "/Users/sozercan/projects/kindctl/bin/kindctl"))
+    parser.add_argument("--kindctl", default=os.environ.get("KINDCTL_BIN") or "kindctl",
+                        help="kindctl executable; defaults to KINDCTL_BIN or kindctl on PATH")
     parser.add_argument("--fixture-deployment", default="external-workspace-core")
     parser.add_argument("--fixture-namespace", default="orka-system")
     parser.add_argument("--timeout", type=int, default=180)

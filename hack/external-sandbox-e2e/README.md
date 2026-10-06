@@ -5,6 +5,8 @@ the existing kindctl `external-workspace` cluster, upstream agent-sandbox
 v1.0.3, the external Sandbox provider, and the cluster's dynamically provisioned
 `standard` StorageClass with Delete reclaim policy. It preserves the shared
 ownership policy, fake provider, and concurrent Orka RuntimeSession proof.
+The script uses `kindctl` from `PATH` by default; set
+`KINDCTL_BIN=/path/to/kindctl` to choose another executable.
 
 The fixture creates a credential-free HTTP listener with one writable durable
 mount. It writes data, authorizes exact DataOnly suspension, independently

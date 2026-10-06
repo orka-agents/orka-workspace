@@ -77,7 +77,6 @@ func TestPersistedWorkloadSurvivesPruningAndRejectsMutation(t *testing.T) {
 					{Name: "azure", VolumeSource: corev1.VolumeSource{AzureDisk: &corev1.AzureDiskVolumeSource{DiskName: "disk", DataDiskURI: "uri"}}},
 					{Name: "iscsi", VolumeSource: corev1.VolumeSource{ISCSI: &corev1.ISCSIVolumeSource{TargetPortal: "portal", IQN: "iqn"}}},
 					{Name: "rbd", VolumeSource: corev1.VolumeSource{RBD: &corev1.RBDVolumeSource{CephMonitors: []string{"monitor"}, RBDImage: "image"}}},
-					{Name: "scaleio", VolumeSource: corev1.VolumeSource{ScaleIO: &corev1.ScaleIOVolumeSource{Gateway: "gateway", System: "system", SecretRef: &corev1.LocalObjectReference{Name: "name"}}}},
 				}}}},
 	}
 	request.Revision, _ = WorkloadRevision(*request)

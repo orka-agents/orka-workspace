@@ -90,8 +90,10 @@ type WorkloadCheckpointReference struct {
 // storage, isolation, networking and public bootstrap configuration. It must
 // never refer to Orka's private bootstrap or runtime credential Secrets.
 type RuntimeWorkload struct {
-	// NetworkPolicy carries the admitted network rules. The provider applies
-	// these to the exact workload placement before reporting startup readiness.
+	// NetworkPolicy carries the admitted network permission envelope. Before
+	// reporting startup readiness, the provider ensures required isolation
+	// directions are applied and no selecting policy grants permissions outside
+	// these rules.
 	// +optional
 	NetworkPolicy *networkingv1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
 	// BootstrapPort is the public one-time listener port on the reported instance.
@@ -202,12 +204,8 @@ func (r WorkloadRequest) Validate() error {
 	if err := r.Key.Validate(); err != nil {
 		return err
 	}
-	parts := strings.Split(r.Image, "@sha256:")
-	if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
-		return fmt.Errorf("workload image must be pinned by SHA-256 digest")
-	}
-	if _, err := hex.DecodeString(parts[1]); err != nil {
-		return fmt.Errorf("invalid image digest: %w", err)
+	if err := validatePinnedImage(r.Image); err != nil {
+		return err
 	}
 	if r.ParametersRef != nil && (r.ParametersRef.Group == "" || r.ParametersRef.Kind == "" || r.ParametersRef.Name == "") {
 		return fmt.Errorf("parameter reference requires group, kind and name")
@@ -245,6 +243,17 @@ func validDigest(value string) bool {
 	return err == nil
 }
 
+func validatePinnedImage(image string) error {
+	parts := strings.Split(image, "@sha256:")
+	if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
+		return fmt.Errorf("workload image must be pinned by SHA-256 digest")
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return fmt.Errorf("invalid image digest: %w", err)
+	}
+	return nil
+}
+
 func (r WorkloadRequest) validateRuntime() error {
 	runtime := r.Runtime
 	if runtime.BootstrapPort < 1 || runtime.BootstrapPort > 65535 {
@@ -259,6 +268,9 @@ func (r WorkloadRequest) validateRuntime() error {
 	}
 	found := false
 	for _, container := range append(append([]corev1.Container(nil), pod.InitContainers...), pod.Containers...) {
+		if err := validatePinnedImage(container.Image); err != nil {
+			return fmt.Errorf("runtime container %q: %w", container.Name, err)
+		}
 		if len(container.EnvFrom) != 0 {
 			return fmt.Errorf("runtime environment sources must be resolved before allocation")
 		}
@@ -282,8 +294,8 @@ func (r WorkloadRequest) validateRuntime() error {
 		return fmt.Errorf("runtime container is missing from the template")
 	}
 	for _, volume := range pod.Volumes {
-		if volume.Secret != nil || volume.ConfigMap != nil {
-			return fmt.Errorf("runtime cannot mount credential Secrets or mutable configuration before bootstrap")
+		if volumeUsesSecret(volume.VolumeSource) || volume.ConfigMap != nil {
+			return fmt.Errorf("runtime cannot reference credential Secrets or mutable configuration before bootstrap")
 		}
 		if volume.Projected != nil {
 			for _, source := range volume.Projected.Sources {
@@ -294,6 +306,19 @@ func (r WorkloadRequest) validateRuntime() error {
 		}
 	}
 	return nil
+}
+
+func volumeUsesSecret(volume corev1.VolumeSource) bool {
+	return volume.Secret != nil ||
+		(volume.ISCSI != nil && volume.ISCSI.SecretRef != nil) ||
+		(volume.RBD != nil && volume.RBD.SecretRef != nil) ||
+		(volume.FlexVolume != nil && volume.FlexVolume.SecretRef != nil) ||
+		(volume.Cinder != nil && volume.Cinder.SecretRef != nil) ||
+		(volume.CephFS != nil && volume.CephFS.SecretRef != nil) ||
+		(volume.AzureFile != nil && volume.AzureFile.SecretName != "") ||
+		(volume.ScaleIO != nil && volume.ScaleIO.SecretRef != nil) ||
+		(volume.StorageOS != nil && volume.StorageOS.SecretRef != nil) ||
+		(volume.CSI != nil && volume.CSI.NodePublishSecretRef != nil)
 }
 
 // InstanceIdentity is the full fence for one physical incarnation. AllocationID
@@ -423,6 +448,9 @@ func ValidateStartup(request WorkloadRequest, observed AllocationObservation) er
 	u, err := url.Parse(evidence.Endpoint)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("startup endpoint must be an HTTP(S) URL without credentials, query or fragment")
+	}
+	if request.Runtime != nil && evidence.Pod == nil && evidence.Process == nil {
+		return fmt.Errorf("runtime startup requires an exact Pod or native process identity")
 	}
 	if evidence.Pod != nil && (evidence.Pod.Namespace == "" || evidence.Pod.Name == "" || evidence.Pod.UID == "") {
 		return fmt.Errorf("startup Pod reference requires namespace, name and UID")

@@ -13,6 +13,7 @@ import (
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,7 +46,7 @@ func (c *uidClient) Create(ctx context.Context, object client.Object, options ..
 func fixture(t *testing.T, persistent bool) (client.Client, workspaceprovider.WorkloadRequest) {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, storagev1.AddToScheme, workspacev1alpha1.AddToScheme, profilev1alpha1.AddToScheme, sandboxv1beta1.AddToScheme, extv1beta1.AddToScheme} {
+	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, storagev1.AddToScheme, workspacev1alpha1.AddToScheme, profilev1alpha1.AddToScheme, sandboxv1beta1.AddToScheme, extv1beta1.AddToScheme} {
 		if err := register(scheme); err != nil {
 			t.Fatal(err)
 		}

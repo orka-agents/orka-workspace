@@ -86,6 +86,6 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
 PY
 kubectl delete --raw "/api/v1/namespaces/${namespace}" -f "${run_dir}/delete-options.json" >/dev/null
 kubectl wait --for=delete "namespace/${namespace}" --timeout=2m
-kubectl delete clusterrolebinding "${job_name}" "${namespace}"
-kubectl delete clusterrole "${job_name}" "${namespace}"
+kubectl delete clusterrolebinding "${job_name}" "${namespace}" --ignore-not-found
+kubectl delete clusterrole "${job_name}" "${namespace}" --ignore-not-found
 printf 'Verified failed-run cleanup report: %s\n' "${run_dir}/report.json"

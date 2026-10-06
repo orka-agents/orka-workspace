@@ -14,7 +14,7 @@ import (
 func ValidateEndpoints(endpoints []workspacev1alpha1.ExecutionWorkspaceEndpoint) error {
 	for _, endpoint := range endpoints {
 		parsed, err := url.Parse(strings.TrimSpace(endpoint.URL))
-		if err != nil || parsed.Host == "" {
+		if err != nil || parsed.Hostname() == "" {
 			return fmt.Errorf("workspace endpoint %q is invalid", endpoint.Name)
 		}
 		switch parsed.Scheme {

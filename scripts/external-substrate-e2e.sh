@@ -3,7 +3,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
-kindctl="${KINDCTL_BIN:-/Users/sozercan/projects/kindctl/bin/kindctl}"
+kindctl="${KINDCTL_BIN:-kindctl}"
+command -v "${kindctl}" >/dev/null 2>&1 || {
+  printf 'kindctl executable is unavailable: %s. Install kindctl on PATH or set KINDCTL_BIN.\n' "${kindctl}" >&2
+  exit 1
+}
 tag=external-substrate
 upstream=https://github.com/agent-substrate/substrate.git
 pin=fa6d949685a6318940a9a0195c867c864009b820

@@ -5,7 +5,11 @@ set -Eeuo pipefail
 # The existing fake provider/core proof and shared ownership policy remain intact.
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
-kindctl="${KINDCTL_BIN:-/Users/sozercan/projects/kindctl/bin/kindctl}"
+kindctl="${KINDCTL_BIN:-kindctl}"
+command -v "${kindctl}" >/dev/null 2>&1 || {
+  printf 'kindctl executable is unavailable: %s. Install kindctl on PATH or set KINDCTL_BIN.\n' "${kindctl}" >&2
+  exit 1
+}
 cluster_tag=external-workspace
 artifact_dir="${ORKA_SANDBOX_E2E_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/orka-sandbox-e2e.XXXXXX")}"
 mkdir -p "${artifact_dir}"

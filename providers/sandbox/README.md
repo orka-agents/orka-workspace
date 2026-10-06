@@ -25,6 +25,18 @@ readiness reports the exact Pod and its bootstrap endpoint without waiting for
 runtime admission. Stop, suspension, and deletion require core's matching
 sequence and instance retirement authorization.
 
+Core owns and installs the admitted NetworkPolicies before publishing a workload.
+Sandbox keeps upstream network-policy management `Unmanaged` and preserves the
+admitted runtime namespace and labels. When a workload supplies `NetworkPolicy`,
+the provider verifies the combined rules of every selecting policy before native
+allocation or resume and before each startup-ready observation. It requires the
+admitted isolation directions, rejects permissions outside the admitted envelope,
+and repeats verification against the realized Pod's upstream labels. Missing,
+terminating, or unreadable policies fail closed. The provider needs read-only
+NetworkPolicy list permission; it does not create or delete Core's policies.
+Host-networked runtimes with admitted policies are unsupported. The cluster's
+network plugin must enforce Kubernetes NetworkPolicies.
+
 The provider advertises ACP runtime allocation and data-only suspension. Every
 allocation gets an isolated zero-replica warm pool, template, and claim. It does
 not advertise pooled capacity, exec, files, independent checkpoints, TLS, or

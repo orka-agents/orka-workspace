@@ -8,6 +8,8 @@ scripts/external-workspace-e2e.sh provider
 
 The script creates or reuses this repository's `kindctl` cluster with tag
 `external-workspace`. Every cluster command uses that tag and a scoped kubeconfig.
+Scripts use `kindctl` from `PATH` by default. Set `KINDCTL_BIN=/path/to/kindctl`
+to choose another executable; the upgrade proof also accepts `--kindctl`.
 It preserves the cluster, frozen build source, images, and JSON proof report.
 It does not alter the global kubeconfig or delete existing clusters.
 

@@ -59,6 +59,13 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		if err := d.admitted(ctx, request); err != nil {
 			return err
 		}
+		namespace := request.Runtime.Template.Namespace
+		if namespace == "" {
+			namespace = request.Key.Namespace
+		}
+		if err := d.verifyNetworkPolicies(ctx, request.Runtime, namespace, request.Runtime.Template.Labels); err != nil {
+			return err
+		}
 		if record == nil {
 			if err := d.proveNoAllocation(ctx, request.Key); err != nil {
 				return err
@@ -268,6 +275,9 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (wo
 		return workspaceprovider.AllocationObservation{}, err
 	}
 	if err := d.attestPod(ctx, record, sb, pod); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
+	}
+	if err := d.verifyNetworkPolicies(ctx, record.Request.Runtime, pod.Namespace, pod.Labels); err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
 	if record.Pod == nil || pod.DeletionTimestamp != nil || net.ParseIP(pod.Status.PodIP) == nil || pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {

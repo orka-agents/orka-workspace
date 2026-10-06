@@ -38,9 +38,9 @@ failures only; native operations and identity mismatches are never replayed.
 
 ## Run
 
-Run every command from this repository. Set `KINDCTL_BIN` to your kindctl
-executable and `SUBSTRATE_SOURCE_DIR` to a clean native checkout if they differ
-from the script's defaults.
+Run every command from this repository. Scripts use `kindctl` from `PATH` by
+default; set `KINDCTL_BIN=/path/to/kindctl` to choose another executable. Set
+`SUBSTRATE_SOURCE_DIR` to a clean native checkout if it differs from the default.
 
 ```sh
 git clone --filter=blob:none --no-checkout https://github.com/agent-substrate/substrate.git /tmp/orka-external-substrate-native-pin-fa6d949685a6318940a9a0195c867c864009b820
@@ -70,8 +70,8 @@ and `report.json`. The latest namespace is recorded in
 `bin/external-substrate-proof-namespace`. For inspection, use:
 
 ```sh
-"$KINDCTL_BIN" kubectl --tag external-substrate get nodes -o wide
-"$KINDCTL_BIN" kubectl --tag external-substrate -n "$(cat bin/external-substrate-proof-namespace)" get pods,workerpools,executionworkspaces,executionworkspacecheckpoints
+"${KINDCTL_BIN:-kindctl}" kubectl --tag external-substrate get nodes -o wide
+"${KINDCTL_BIN:-kindctl}" kubectl --tag external-substrate -n "$(cat bin/external-substrate-proof-namespace)" get pods,workerpools,executionworkspaces,executionworkspacecheckpoints
 ```
 
 Failed Jobs are not retried. Their scoped resources remain available for exact
