@@ -119,7 +119,26 @@ type ExecutionWorkspaceCoreAdmission struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.service) || self.mode == 'Service'",message="service ports are only valid for Service workspaces"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Service' || has(self.service)",message="Service workspaces require service configuration"
 // +kubebuilder:validation:XValidation:rule="self.mode != 'Interactive' || !has(self.service)",message="Interactive workspaces cannot request service ports"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.workload) || has(self.workload)",message="workload cannot be removed"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.workload) || !has(self.workload) || self.workload.sequence == 1",message="first workload must use sequence one"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.workload) || !has(self.workload) || (self.workload.sequence == oldSelf.workload.sequence ? self.workload == oldSelf.workload : (self.workload.sequence == oldSelf.workload.sequence + 1 && has(self.workload.previousInstance) && self.workload.previousInstance.requestRevision == oldSelf.workload.revision))",message="workload is immutable within a sequence; replacement must fence its predecessor"
+// +kubebuilder:validation:XValidation:rule="!has(self.workload) || self.workload.key.providerUID == self.providerBinding.uid",message="workload must bind this provider installation"
+// +kubebuilder:validation:XValidation:rule="!has(self.workload) || !has(self.workload.runtime) || (self.workload.runtime.classBinding.name == self.classBinding.name && self.workload.runtime.classBinding.uid == self.classBinding.uid && self.workload.runtime.classBinding.generation == self.classBinding.generation && has(self.workload.runtime.classBinding.profileHash) && self.workload.runtime.classBinding.profileHash == self.classBinding.profileHash)",message="runtime workload must bind this class revision"
+// +kubebuilder:validation:XValidation:rule="!has(self.retirement) || (has(self.workload) && self.retirement.sequence == self.workload.sequence && self.retirement.identity.requestRevision == self.workload.revision)",message="retirement must bind the current workload request"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.retirement) || (has(self.workload) && has(oldSelf.workload) && self.workload.sequence > oldSelf.workload.sequence) || (has(self.retirement) && self.retirement.sequence == oldSelf.retirement.sequence && self.retirement.identity == oldSelf.retirement.identity && (self.retirement.action == oldSelf.retirement.action || self.retirement.action == 'Delete'))",message="retirement cannot be withdrawn or change its instance; only deletion may supersede it"
 type ExecutionWorkspaceSpec struct {
+	// Retirement authorizes provider mutation after core has drained the exact
+	// runtime. A provider observes desiredState immediately but waits for this
+	// authorization before physical stop, suspension or deletion.
+	// +optional
+	Retirement *WorkloadRetirement `json:"retirement,omitempty"`
+
+	// Workload is public runtime intent written by core after workspace admission.
+	// It is immutable within each sequence. Only a terminated predecessor can be
+	// replaced; suspended resume also requires verified provider-owned data lineage.
+	// +optional
+	Workload *WorkloadRequest `json:"workload,omitempty"`
+
 	// Mode is copied from the class.
 	Mode ExecutionWorkspaceMode `json:"mode"`
 
@@ -237,6 +256,11 @@ type ExecutionWorkspaceDisposition struct {
 // ExecutionWorkspaceStatus defines adapter-observed state. Exactly one provider adapter owns this status;
 // Orka core projects it into Task and Tool status rather than allowing adapters to write those resources.
 type ExecutionWorkspaceStatus struct {
+	// Allocation reports the exact instance materialized for spec.workload.
+	// This infrastructure evidence never grants runtime admission by itself.
+	// +optional
+	Allocation *AllocationObservation `json:"allocation,omitempty"`
+
 	// ObservedGeneration is the most recent spec generation observed by the adapter.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

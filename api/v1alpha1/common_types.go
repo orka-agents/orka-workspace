@@ -85,6 +85,7 @@ type ObjectIdentityReference struct {
 type ExecutionWorkspaceFeature string
 
 const (
+	WorkspaceFeatureACPRuntime   ExecutionWorkspaceFeature = "acp.runtime.v2"
 	WorkspaceFeatureExec         ExecutionWorkspaceFeature = "exec"
 	WorkspaceFeatureFiles        ExecutionWorkspaceFeature = "files"
 	WorkspaceFeatureReset        ExecutionWorkspaceFeature = "reset"

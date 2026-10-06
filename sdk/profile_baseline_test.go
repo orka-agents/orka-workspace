@@ -2,6 +2,7 @@ package workspaceprovider
 
 import (
 	"encoding/json"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,5 +48,24 @@ func TestClassProfileHashMatchesOrkaBaseline(t *testing.T) {
 				t.Fatalf("ClassProfileHash = %s, want baseline %s", got, fixture.Hash)
 			}
 		})
+	}
+}
+
+func TestParametersProfileHashPinsAPISpecOnly(t *testing.T) {
+	parameters := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "fixture.workspace.orka.ai/v1alpha1", "kind": "Profile", "metadata": map[string]any{"name": "profile", "uid": "one"}, "spec": map[string]any{"capacity": "1Gi"}}}
+	original, err := ParametersProfileHash(parameters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters.Object["status"] = map[string]any{"ready": true}
+	parameters.SetResourceVersion("2")
+	same, err := ParametersProfileHash(parameters)
+	if err != nil || same != original {
+		t.Fatal("observed metadata changed parameter content binding")
+	}
+	parameters.Object["spec"].(map[string]any)["capacity"] = "2Gi"
+	changed, err := ParametersProfileHash(parameters)
+	if err != nil || changed == original {
+		t.Fatal("parameter content drift did not change binding")
 	}
 }

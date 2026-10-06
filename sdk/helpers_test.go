@@ -13,10 +13,10 @@ import (
 
 func TestControllerNamePredicate(t *testing.T) {
 	t.Parallel()
-	predicate := ControllerNamePredicate("fake.workspace.orka.ai/v1")
+	predicate := ControllerNamePredicate("fake.workspace.orka.ai")
 	matching := &workspacev1alpha1.ExecutionWorkspaceProvider{
 		Spec: workspacev1alpha1.ExecutionWorkspaceProviderSpec{
-			ControllerName: "fake.workspace.orka.ai/v1",
+			ControllerName: "fake.workspace.orka.ai",
 		},
 	}
 	other := matching.DeepCopy()

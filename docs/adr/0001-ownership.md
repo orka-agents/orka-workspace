@@ -20,6 +20,7 @@ Cluster-scoped. The operator registers one adapter installation.
 
 | Field or entry | Sole writer | Rule |
 | --- | --- | --- |
+| `spec.serviceAccountRef.{namespace,name}` | Operator | Immutable adapter principal for registration-scoped provider-status authorization |
 | `spec.controllerName` | Operator | Immutable controller identity |
 | `spec.parametersRef.{group,kind,name}` | Operator | Immutable, resolves to a cluster-scoped kind |
 | `spec.requiredContracts` | Operator | Immutable exact contract identifiers |
@@ -91,6 +92,9 @@ Namespaced and controller-created. The immutable provider binding selects one ow
 | `spec.desiredState` | Orka core | Ready, Suspended, Deleted, or Quarantined intent |
 | `spec.attachmentEpoch` | Orka core | Monotonic attachment counter |
 | `spec.attachment.taskRef`, `epoch`, `tokenSHA256`, `tokenSecretRef`, `expiresAt` | Orka core | Exclusive attachment intent; token bytes stay in a Secret |
+| `spec.workload` | Orka core | Immutable within each numbered execution; replacement fences the terminated predecessor |
+| `spec.retirement` | Orka core | Exact-instance physical retirement authorization after core drain and settlement |
+| `status.allocation` | Selected provider | Exact workload sequence, physical instance, startup and retained-data evidence |
 | `spec.service.ports[].{name,port,protocol}` | Orka core | Requested service endpoints |
 | `status.observedGeneration`, `status.state`, `status.externalID` | Selected provider | Exact observed request and allocation, sanitized |
 | `status.attachedEpoch` | Selected provider | Acknowledges enforcement, not merely receipt |

@@ -8,7 +8,9 @@ package v1alpha1
 
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-// ExecutionWorkspaceProviderLifecycleState controls whether a provider accepts new allocations.
+// ExecutionWorkspaceProviderLifecycleState controls new identity and continuation admission.
+// Active permits both. Draining permits existing bound workspaces, including cold
+// resume, but rejects new identities. Disabled permits cleanup only.
 // +kubebuilder:validation:Enum=Active;Draining;Disabled
 type ExecutionWorkspaceProviderLifecycleState string
 
@@ -30,7 +32,14 @@ type ExecutionWorkspaceProviderUsagePolicy struct {
 // +kubebuilder:validation:XValidation:rule="self.controllerName == oldSelf.controllerName",message="controllerName is immutable"
 // +kubebuilder:validation:XValidation:rule="self.parametersRef == oldSelf.parametersRef",message="parametersRef is immutable"
 // +kubebuilder:validation:XValidation:rule="self.requiredContracts == oldSelf.requiredContracts",message="requiredContracts is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.serviceAccountRef) == has(oldSelf.serviceAccountRef) && (!has(self.serviceAccountRef) || self.serviceAccountRef == oldSelf.serviceAccountRef)",message="serviceAccountRef is immutable"
 type ExecutionWorkspaceProviderSpec struct {
+	// ServiceAccountRef identifies the installed adapter for core's provider-status
+	// authorization check. External runtime dispatch requires this reference.
+	// Legacy installations may omit it only while retiring existing resources.
+	// +optional
+	ServiceAccountRef *ProviderServiceAccountReference `json:"serviceAccountRef,omitempty"`
+
 	// ControllerName is the globally unique adapter controller identity.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
@@ -51,6 +60,17 @@ type ExecutionWorkspaceProviderSpec struct {
 	// UsagePolicy constrains which namespaces may resolve classes to this provider.
 	// +optional
 	UsagePolicy *ExecutionWorkspaceProviderUsagePolicy `json:"usagePolicy,omitempty"`
+}
+
+// ProviderServiceAccountReference names the operator-approved adapter identity.
+// The binding granting provider-status remains the source of write authority.
+type ProviderServiceAccountReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Namespace string `json:"namespace"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
 }
 
 // ExecutionWorkspaceAdapterStatus reports the adapter build serving a provider.

@@ -27,11 +27,12 @@ func (noOp) DeleteAllocation(context.Context, workspaceprovider.AllocationKey, w
 
 func TestRejectsProviderThatDoesNothing(t *testing.T) {
 	request := workspaceprovider.WorkloadRequest{
-		Key:   workspaceprovider.AllocationKey{Namespace: "test", Name: "test", WorkspaceUID: "workspace", ProviderUID: "provider"},
-		Image: "registry.example/fixture@sha256:" + strings.Repeat("a", 64),
+		Sequence: 1,
+		Key:      workspaceprovider.AllocationKey{Namespace: "test", Name: "test", WorkspaceUID: "workspace", ProviderUID: "provider"},
+		Image:    "registry.example/fixture@sha256:" + strings.Repeat("a", 64),
 	}
 	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
-	if err := conformance.Check(context.Background(), func() workspaceprovider.Lifecycle { return noOp{} }, request); err == nil {
+	if err := conformance.Check(context.Background(), func() workspaceprovider.Lifecycle { return noOp{} }, request); err == nil || !strings.Contains(err.Error(), "no allocation/instance identity") {
 		t.Fatal("a provider that does nothing passed lifecycle conformance")
 	}
 }
