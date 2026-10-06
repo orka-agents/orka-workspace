@@ -112,6 +112,22 @@ func TestRuntimeRequestPinsEveryMaterializedContainerImage(t *testing.T) {
 	}
 }
 
+func TestRuntimeRequestRejectsEphemeralContainers(t *testing.T) {
+	for _, image := range []string{"registry.example/debug:latest", "registry.example/debug@sha256:" + strings.Repeat("c", 64)} {
+		request := validationRuntimeRequest(t)
+		request.Runtime.Template.Spec.EphemeralContainers = []corev1.EphemeralContainer{{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "debug", Image: image},
+		}}
+		setValidationRevision(t, &request)
+		if err := request.Validate(); err == nil || !strings.Contains(err.Error(), "ephemeral containers") {
+			t.Fatalf("accepted an unsupported runtime ephemeral container: %v", err)
+		}
+		if revision, err := WorkloadRevision(request); err != nil || revision != request.Revision {
+			t.Fatalf("validation mutated the frozen request: revision=%q err=%v", revision, err)
+		}
+	}
+}
+
 func TestRuntimeStartupRequiresExactMaterializationIdentity(t *testing.T) {
 	request := validationRuntimeRequest(t)
 	identity := InstanceIdentity{AllocationID: "allocation", InstanceID: "instance", RequestRevision: request.Revision}

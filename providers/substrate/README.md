@@ -36,9 +36,14 @@ allocation and instance labels, so each worker is confined from creation.
 The provider pins an active, empty, single-Actor worker and its exact Pod UID
 before native Resume. It refuses missing or foreign birth labels and never
 patches labels onto an already executing worker. Observe rechecks the pool spec,
-policy, labels, and recorded worker identity. Runtime Pod ingress rules do not
-apply to worker management. Native worker and router ingress remain
-operator-owned: firewall management traffic to authorized ateapi/atenet callers
+policy, labels, and recorded worker identity. The admitted policy must explicitly
+select Egress alone. Required ingress isolation, ingress rules, and inactive
+egress rules are rejected before allocation, including Kubernetes defaults that
+require ingress isolation. Namespace-relative Pod peers are qualified with the
+frozen runtime namespace when copied to the worker namespace; a missing runtime
+namespace rejects such peers. Explicit namespace selectors remain unchanged.
+Native worker and router ingress remain operator-owned: firewall management
+traffic to authorized ateapi/atenet callers
 and permit Orka's runtime routes. Worker ingress policies should select inherited
 operator Pod template labels, since each private pool has a fresh name.
 Operators must avoid additional policies that widen admitted worker egress and
@@ -50,11 +55,26 @@ Orka supplies the immutable public supervisor request. The provider compiles it
 into an immutable ActorTemplate with explicit gVisor isolation and a native
 SystemInfo identity projection, resolves downward identity fields, and adapts the
 listen address to the native router's port 80. The pinned root overlay requires
-a permission repair before the requested command starts. Container mounts must
-be admitted ephemeral storage or the dedicated durable workspace directory.
-The provider advertises ACP allocation, verified data-only suspension,
-`checkpoint.data`, and `restore.cold`. Pooled capacity, MCP Service workloads,
-exec, files, TLS actor endpoints, and full-memory restore remain unsupported.
+a permission repair before the requested command starts. An explicit working
+directory is passed as a literal argument to that initialization wrapper and
+selected before the exact command and arguments execute. The pinned backend has
+no ephemeral-volume primitive. Kubernetes `emptyDir` declarations and mounts are
+rejected even without a quota, as is a required read-only root filesystem.
+The dedicated durable workspace directory remains supported through the DataOnly
+profile. CPU and memory requests require matching admitted limits at least as
+large; native scheduling reserves those full limits.
+Resources with requests but no limits, unsupported resource names, and requests
+exceeding the limit fail before compute is created.
+
+The provider advertises ACP allocation, `runtime.native-process`, verified
+data-only suspension, `checkpoint.data`, and `restore.cold`. Pooled capacity, MCP
+Service workloads, exec, files, TLS actor endpoints, and full-memory restore remain
+unsupported.
+The `runtime.native-process` capability lets Core publish intent for a fresh
+writable container filesystem with no Kubernetes scratch mounts and require exact
+process startup evidence. Core freezes this choice before workload admission;
+Pod-backed providers keep their own scratch-volume layout. Existing admitted
+requests are never rewritten.
 
 A workspace-owned ConfigMap persists bounded creation and retirement intent,
 random never-reused Actor names, native UIDs, immutable template digests, exact

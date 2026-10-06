@@ -49,23 +49,26 @@ type storageIdentity struct {
 }
 
 type journalRecord struct {
-	Version         string                                              `json:"version"`
-	Request         workspaceprovider.WorkloadRequest                   `json:"request"`
-	Observation     workspaceprovider.AllocationObservation             `json:"observation"`
-	Operation       string                                              `json:"operation"`
-	Namespace       string                                              `json:"namespace"`
-	Anchor          objectReference                                     `json:"anchor"`
-	Template        objectReference                                     `json:"template"`
-	WarmPool        objectReference                                     `json:"warmPool"`
-	Claim           objectReference                                     `json:"claim"`
-	Sandbox         objectReference                                     `json:"sandbox"`
-	Pod             *workspaceprovider.PodReference                     `json:"pod,omitempty"`
-	PreviousPod     *workspaceprovider.PodReference                     `json:"previousPod,omitempty"`
-	Volume          *profilev1alpha1.SandboxDurableVolume               `json:"volume,omitempty"`
-	StorageClassUID types.UID                                           `json:"storageClassUID,omitempty"`
-	Storage         *storageIdentity                                    `json:"storage,omitempty"`
-	ResumePrepared  bool                                                `json:"resumePrepared,omitempty"`
-	DeletionPolicy  *workspacev1alpha1.ExecutionWorkspaceDeletionPolicy `json:"deletionPolicy,omitempty"`
+	Version              string                                              `json:"version"`
+	Request              workspaceprovider.WorkloadRequest                   `json:"request"`
+	Observation          workspaceprovider.AllocationObservation             `json:"observation"`
+	Operation            string                                              `json:"operation"`
+	Namespace            string                                              `json:"namespace"`
+	Anchor               objectReference                                     `json:"anchor"`
+	Template             objectReference                                     `json:"template"`
+	WarmPool             objectReference                                     `json:"warmPool"`
+	Claim                objectReference                                     `json:"claim"`
+	Sandbox              objectReference                                     `json:"sandbox"`
+	Pod                  *workspaceprovider.PodReference                     `json:"pod,omitempty"`
+	PreviousPod          *workspaceprovider.PodReference                     `json:"previousPod,omitempty"`
+	Volume               *profilev1alpha1.SandboxDurableVolume               `json:"volume,omitempty"`
+	StorageClassUID      types.UID                                           `json:"storageClassUID,omitempty"`
+	Storage              *storageIdentity                                    `json:"storage,omitempty"`
+	RetentionResolved    bool                                                `json:"retentionResolved,omitempty"`
+	MaxSuspended         *int32                                              `json:"maxSuspended,omitempty"`
+	RetentionReservation *retentionReservation                               `json:"retentionReservation,omitempty"`
+	ResumePrepared       bool                                                `json:"resumePrepared,omitempty"`
+	DeletionPolicy       *workspacev1alpha1.ExecutionWorkspaceDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // Lifecycle uses an uncached client. Every native mutation follows durable CAS
@@ -125,6 +128,12 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 	}
 	if err := record.Request.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("invalid journal request: %w", err)
+	}
+	if record.MaxSuspended != nil && *record.MaxSuspended < 0 {
+		return nil, nil, workspaceprovider.ErrStaleIdentity
+	}
+	if reservation := record.RetentionReservation; reservation != nil && (record.MaxSuspended == nil || reservation.LedgerUID == "" || reservation.Sequence <= 0 || reservation.Sequence > record.Request.Sequence) {
+		return nil, nil, workspaceprovider.ErrStaleIdentity
 	}
 	return cm, &record, nil
 }

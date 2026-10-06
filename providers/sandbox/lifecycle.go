@@ -96,6 +96,11 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				return err
 			}
 		} else if request.Sequence != record.Request.Sequence {
+			if record.Volume != nil {
+				if err := d.resolveRetention(ctx, record); err != nil {
+					return err
+				}
+			}
 			if record.Volume != nil && (record.Operation != "suspend" || record.Storage == nil) {
 				return fmt.Errorf("persistent Sandbox replacement requires exact retained data from suspension")
 			}
@@ -138,6 +143,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				}
 				record = fresh
 			} else {
+				if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {
+					return err
+				}
 				sb, err := d.sandbox(ctx, record)
 				if err != nil {
 					return err
@@ -219,7 +227,13 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 			return err
 		}
 		record.Observation = observed
-		return d.save(ctx, cm, record)
+		if err := d.save(ctx, cm, record); err != nil {
+			return err
+		}
+		if observed.State == workspaceprovider.AllocationReady {
+			return d.releaseSuspended(ctx, cm, record)
+		}
+		return nil
 	})
 	return observed, err
 }
@@ -293,12 +307,20 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (wo
 }
 
 func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.AllocationKey) (workspaceprovider.AllocationObservation, error) {
-	_, record, err := d.read(ctx, key)
+	cm, record, err := d.read(ctx, key)
 	if err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
 	if record.Operation == "ensure" {
 		return d.observeReady(ctx, record)
+	}
+	if record.Operation == "suspend" {
+		if err := d.resolveRetention(ctx, record); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
+		if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
 	}
 	return record.Observation, nil
 }
@@ -338,6 +360,9 @@ func (d *Lifecycle) resume(ctx context.Context, cm *corev1.ConfigMap, record *jo
 	}
 	if record.ResumePrepared && sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
 		return attestBlueprint(record, sb)
+	}
+	if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {
+		return err
 	}
 	if err := d.confirmSuspended(ctx, record, sb); err != nil {
 		return err

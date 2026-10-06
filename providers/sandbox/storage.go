@@ -21,36 +21,71 @@ import (
 const durableVolumeName = "orka-workspace"
 const durableMountPath = "/durable/orka-workspace"
 
-func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) error {
+func (d *Lifecycle) profile(ctx context.Context, record *journalRecord) (*profilev1alpha1.SandboxWorkspaceProfile, error) {
 	ref := record.Request.ParametersRef
 	if ref == nil {
-		return nil
+		return nil, nil
 	}
 	if ref.Group != profilev1alpha1.GroupVersion.Group || ref.Kind != "SandboxWorkspaceProfile" {
-		return fmt.Errorf("Sandbox requires SandboxWorkspaceProfile parameters")
+		return nil, fmt.Errorf("Sandbox requires SandboxWorkspaceProfile parameters")
 	}
 	raw := &unstructured.Unstructured{}
 	raw.SetGroupVersionKind(profilev1alpha1.GroupVersion.WithKind("SandboxWorkspaceProfile"))
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Request.Key.Namespace, Name: ref.Name}, raw); err != nil {
-		return err
+		return nil, err
 	}
 	profile := &profilev1alpha1.SandboxWorkspaceProfile{}
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw.Object, profile); err != nil {
-		return err
+		return nil, err
 	}
 	binding := record.Request.ParametersBinding
 	if profile.UID != binding.UID || profile.Generation != binding.Generation || profile.DeletionTimestamp != nil {
-		return workspaceprovider.ErrStaleIdentity
+		return nil, workspaceprovider.ErrStaleIdentity
 	}
 	hash, err := workspaceprovider.ParametersProfileHash(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if hash != binding.ProfileHash {
-		return fmt.Errorf("Sandbox profile hash changed: %w", workspaceprovider.ErrStaleIdentity)
+		return nil, fmt.Errorf("Sandbox profile hash changed: %w", workspaceprovider.ErrStaleIdentity)
 	}
 	if err := profile.Validate(); err != nil {
+		return nil, err
+	}
+	return profile, nil
+}
+
+func freezeRetention(record *journalRecord, profile *profilev1alpha1.SandboxWorkspaceProfile) {
+	record.RetentionResolved = true
+	record.MaxSuspended = nil
+	if profile != nil && profile.Spec.Retention != nil && profile.Spec.Retention.MaxSuspendedWorkspaces != nil {
+		limit := *profile.Spec.Retention.MaxSuspendedWorkspaces
+		record.MaxSuspended = &limit
+	}
+}
+
+// Older journals omitted retention. Re-resolve only their pinned immutable
+// profile before the first suspension; already reserved journals remain frozen.
+func (d *Lifecycle) resolveRetention(ctx context.Context, record *journalRecord) error {
+	if record.RetentionResolved {
+		return nil
+	}
+	profile, err := d.profile(ctx, record)
+	if err != nil {
 		return err
+	}
+	freezeRetention(record, profile)
+	return nil
+}
+
+func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) error {
+	profile, err := d.profile(ctx, record)
+	if err != nil {
+		return err
+	}
+	freezeRetention(record, profile)
+	if profile == nil {
+		return nil
 	}
 	if profile.Spec.Suspend == nil {
 		return nil

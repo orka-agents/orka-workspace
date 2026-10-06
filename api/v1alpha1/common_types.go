@@ -85,16 +85,19 @@ type ObjectIdentityReference struct {
 type ExecutionWorkspaceFeature string
 
 const (
-	WorkspaceFeatureACPRuntime   ExecutionWorkspaceFeature = "acp.runtime.v2"
-	WorkspaceFeatureExec         ExecutionWorkspaceFeature = "exec"
-	WorkspaceFeatureFiles        ExecutionWorkspaceFeature = "files"
-	WorkspaceFeatureReset        ExecutionWorkspaceFeature = "reset"
-	WorkspaceFeatureSuspend      ExecutionWorkspaceFeature = "suspend"
-	WorkspaceFeatureCheckpoint   ExecutionWorkspaceFeature = "checkpoint.data"
-	WorkspaceFeatureRestore      ExecutionWorkspaceFeature = "restore.cold"
-	WorkspaceFeatureServicePorts ExecutionWorkspaceFeature = "service-ports"
-	WorkspaceFeaturePools        ExecutionWorkspaceFeature = "pools"
-	WorkspaceFeatureTLS          ExecutionWorkspaceFeature = "tls"
+	WorkspaceFeatureACPRuntime ExecutionWorkspaceFeature = "acp.runtime.v2"
+	// WorkspaceFeatureNativeProcess declares process startup evidence and a fresh writable
+	// container filesystem. Kubernetes scratch mounts are not part of this intent.
+	WorkspaceFeatureNativeProcess ExecutionWorkspaceFeature = "runtime.native-process"
+	WorkspaceFeatureExec          ExecutionWorkspaceFeature = "exec"
+	WorkspaceFeatureFiles         ExecutionWorkspaceFeature = "files"
+	WorkspaceFeatureReset         ExecutionWorkspaceFeature = "reset"
+	WorkspaceFeatureSuspend       ExecutionWorkspaceFeature = "suspend"
+	WorkspaceFeatureCheckpoint    ExecutionWorkspaceFeature = "checkpoint.data"
+	WorkspaceFeatureRestore       ExecutionWorkspaceFeature = "restore.cold"
+	WorkspaceFeatureServicePorts  ExecutionWorkspaceFeature = "service-ports"
+	WorkspaceFeaturePools         ExecutionWorkspaceFeature = "pools"
+	WorkspaceFeatureTLS           ExecutionWorkspaceFeature = "tls"
 )
 
 // ExecutionWorkspaceMode distinguishes task-attached workspaces from persistent service workspaces.

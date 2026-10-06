@@ -45,6 +45,21 @@ at `/durable/orka-workspace`; core must include that mount and environment in
 the admitted template. A suspend-capable class must use session reuse and bounded
 retention. PVC storage must be dynamically provisioned with Delete reclaim policy.
 
+`retention.maxSuspendedWorkspaces` is a count bound for each class UID and
+workspace namespace, including suspension still in progress. Sharing a profile
+does not share a class's count. A bounded class-owned ConfigMap reserves exact
+journal, allocation, and sequence identities with Kubernetes resource-version
+updates before native suspension; a zero cap rejects suspension. Resume frees
+the slot once the new runtime is observed Ready, while preserving its PVC.
+All-Delete cleanup frees it after exact native and storage deletion completes.
+Unreadable, missing, or changed occupied reservations fail closed.
+
+Journals created before retention was recorded re-resolve their pinned immutable
+profile before suspension. An already suspended capped journal without a
+reservation blocks new suspensions in that class and namespace and cannot resume
+or republish retained lineage. Stop and exact all-Delete cleanup remain available
+to drain that older occupancy; no reservation or storage identity is guessed.
+
 A workspace-owned ConfigMap stores bounded intent and exact native UIDs. A
 protected workspace annotation requires that journal before native effects.
 The runtime namespace has a separate ownership anchor, so runtime Pods may live

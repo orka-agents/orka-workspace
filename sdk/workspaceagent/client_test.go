@@ -26,6 +26,35 @@ func TestNewClientRejectsInsecureTransportByDefault(t *testing.T) {
 	}
 }
 
+func TestNewClientRequiresHostnameAndValidPort(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		endpoint string
+		valid    bool
+	}{
+		{endpoint: "https://:443"},
+		{endpoint: "http://:80"},
+		{endpoint: "https://[]:443"},
+		{endpoint: "https://workspace-agent.example:"},
+		{endpoint: "https://workspace-agent.example:0"},
+		{endpoint: "https://workspace-agent.example:65536"},
+		{endpoint: "https://workspace-agent.example:999999999999999999999"},
+		{endpoint: "https://workspace-agent.example", valid: true},
+		{endpoint: "https://workspace-agent.example:443", valid: true},
+		{endpoint: "http://workspace-agent.example:1", valid: true},
+		{endpoint: "https://192.0.2.1:65535", valid: true},
+		{endpoint: "https://[2001:db8::1]", valid: true},
+		{endpoint: "https://[2001:db8::1]:443", valid: true},
+	} {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			_, err := NewClient(ClientConfig{Endpoint: tc.endpoint, AllowInsecure: true})
+			if (err == nil) != tc.valid {
+				t.Fatalf("NewClient(%q) = %v, want valid %v", tc.endpoint, err, tc.valid)
+			}
+		})
+	}
+}
+
 func TestClientValidatesTLSWithConfiguredCA(t *testing.T) {
 	t.Parallel()
 

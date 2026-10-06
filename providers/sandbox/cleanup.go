@@ -43,6 +43,16 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		if observed.State == workspaceprovider.AllocationDeleted {
 			return nil
 		}
+		if suspend {
+			if err := d.resolveRetention(ctx, record); err != nil {
+				return err
+			}
+			if record.Operation == "suspend" {
+				if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {
+					return err
+				}
+			}
+		}
 		if observed.State == workspaceprovider.AllocationStopped {
 			if suspend && observed.RetainedData == nil {
 				return workspaceprovider.ErrRequestConflict
@@ -111,6 +121,11 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 				if err != nil {
 					return err
 				}
+			}
+		}
+		if suspend {
+			if err := d.reserveSuspended(ctx, cm, record); err != nil {
+				return err
 			}
 		}
 		record.Operation = operation
@@ -287,7 +302,7 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 			if record.DeletionPolicy == nil || *record.DeletionPolicy != policy {
 				return workspaceprovider.ErrRequestConflict
 			}
-			return nil
+			return d.releaseSuspended(ctx, cm, record)
 		}
 		if observed.State != workspaceprovider.AllocationStopped {
 			return workspaceprovider.ErrInstanceRunning
@@ -381,7 +396,7 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 			return err
 		}
 		observed = record.Observation
-		return nil
+		return d.releaseSuspended(ctx, cm, record)
 	})
 	return observed, err
 }

@@ -52,3 +52,21 @@ func TestConnectionDataRejectsMissingVersionOrControlAuth(t *testing.T) {
 		t.Fatal("missing control auth passed")
 	}
 }
+
+func TestConnectionDataRejectsMalformedEndpointAuthority(t *testing.T) {
+	for _, endpoint := range []string{"https://:443", "https://[]:443", "https://workspace-agent.example:", "https://workspace-agent.example:0", "https://workspace-agent.example:65536"} {
+		t.Run(endpoint, func(t *testing.T) {
+			if _, err := EncodeConnectionData(ConnectionData{Endpoint: endpoint, ControlAuth: "test-control"}); err == nil {
+				t.Fatal("encoded connection data with malformed endpoint authority")
+			}
+			values := map[string][]byte{
+				ConnectionDataVersionKey:     []byte(ConnectionDataVersion),
+				ConnectionDataEndpointKey:    []byte(endpoint),
+				ConnectionDataControlAuthKey: []byte("test-control"),
+			}
+			if _, err := ParseConnectionData(values); err == nil {
+				t.Fatal("parsed connection data with malformed endpoint authority")
+			}
+		})
+	}
+}

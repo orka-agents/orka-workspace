@@ -3,6 +3,7 @@ package substrate
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 
@@ -32,8 +33,11 @@ func validateRequest(request sdk.WorkloadRequest) error {
 	if request.Runtime.NetworkPolicy == nil {
 		return fmt.Errorf("native runtime requires admitted network rules")
 	}
+	if err := validateNativeNetworkPolicy(request.Runtime); err != nil {
+		return err
+	}
 	for _, feature := range request.Runtime.RequiredFeatures {
-		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore {
+		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore {
 			return fmt.Errorf("native runtime feature %s is unsupported", feature)
 		}
 	}
@@ -112,13 +116,22 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
 	for _, volume := range record.Request.Runtime.Template.Spec.Volumes {
-		if volume.EmptyDir != nil && volume.EmptyDir.SizeLimit != nil && !volume.EmptyDir.SizeLimit.IsZero() {
-			return nil, fmt.Errorf("native emptyDir quota for %s is unsupported", volume.Name)
+		if volume.EmptyDir != nil {
+			if volume.EmptyDir.SizeLimit != nil && !volume.EmptyDir.SizeLimit.IsZero() {
+				return nil, fmt.Errorf("native emptyDir quota for %s is unsupported", volume.Name)
+			}
+			return nil, fmt.Errorf("native emptyDir volume %s is unsupported", volume.Name)
 		}
 	}
 	container := record.Request.Runtime.Template.Spec.Containers[0]
+	if container.SecurityContext != nil && container.SecurityContext.ReadOnlyRootFilesystem != nil && *container.SecurityContext.ReadOnlyRootFilesystem {
+		return nil, fmt.Errorf("native read-only root filesystem is unsupported")
+	}
 	if len(container.Command) == 0 {
 		return nil, fmt.Errorf("native supervisor requires an explicit command")
+	}
+	if container.WorkingDir != "" && (!path.IsAbs(container.WorkingDir) || strings.ContainsRune(container.WorkingDir, 0)) {
+		return nil, fmt.Errorf("native working directory must be an absolute path")
 	}
 	args := []string{`chmod 0755 /; exec "$@"`, "orka-substrate-init"}
 	args = append(args, container.Command...)
@@ -176,15 +189,37 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		if mount.Name == durableVolumeName && record.SuspendEnabled {
 			continue
 		}
-		if mount.ReadOnly || mount.SubPath != "" || mount.SubPathExpr != "" || !slices.ContainsFunc(record.Request.Runtime.Template.Spec.Volumes, func(v corev1.Volume) bool { return v.Name == mount.Name && v.EmptyDir != nil }) {
-			return nil, fmt.Errorf("native mount %s is not supported", mount.Name)
-		}
+		return nil, fmt.Errorf("native mount %s is not supported", mount.Name)
+	}
+	if container.WorkingDir != "" {
+		// The native DTO fixes cwd to /. Pass the admitted directory as data,
+		// then change cwd before exec without interpreting shell metacharacters.
+		compiled.Args[0] = strings.TrimSuffix(compiled.Args[0], `exec "$@"`) + `cd "$1" || exit "$?"; shift; exec "$@"`
+		compiled.Args = slices.Insert(compiled.Args, 2, container.WorkingDir)
 	}
 	compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: identityVolumeName, MountPath: identityMountPath})
 	return compiled, nil
 }
 
 func compileResources(requirements corev1.ResourceRequirements) (*pb.Resources, error) {
+	for name, quantity := range requirements.Requests {
+		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {
+			return nil, fmt.Errorf("native resource request %s is unsupported", name)
+		}
+		if quantity.Sign() < 0 {
+			return nil, fmt.Errorf("native resource request must not be negative")
+		}
+		if quantity.IsZero() {
+			continue
+		}
+		limit, bounded := requirements.Limits[name]
+		// The native scheduler reserves the full Actor limit. This covers a
+		// smaller request without inventing an unadmitted maximum for request-
+		// only resources, which the pinned backend cannot represent.
+		if !bounded || limit.Cmp(quantity) < 0 {
+			return nil, fmt.Errorf("native resource request %s requires an admitted limit at least as large", name)
+		}
+	}
 	var resources *pb.Resources
 	for name, quantity := range requirements.Limits {
 		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -150,11 +151,46 @@ func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *jo
 	return d.verifyRuntimePool(ctx, record)
 }
 
+func validateNativeNetworkPolicy(runtime *sdk.RuntimeWorkload) error {
+	policy := runtime.NetworkPolicy
+	// Kubernetes defaults omitted policyTypes to Ingress, adding Egress when
+	// egress rules are present. Worker management ingress is operator-owned.
+	ingress := len(policy.PolicyTypes) == 0 || slices.Contains(policy.PolicyTypes, networkingv1.PolicyTypeIngress)
+	egress := slices.Contains(policy.PolicyTypes, networkingv1.PolicyTypeEgress) || len(policy.PolicyTypes) == 0 && len(policy.Egress) != 0
+	if !egress && len(policy.Egress) != 0 {
+		return fmt.Errorf("native network policy cannot activate inactive egress rules")
+	}
+	if ingress || len(policy.Ingress) != 0 {
+		return fmt.Errorf("native runtime ingress policy is unsupported")
+	}
+	if !egress || len(policy.PolicyTypes) != 1 {
+		return fmt.Errorf("native network policy requires only effective Egress")
+	}
+	for _, rule := range policy.Egress {
+		for _, peer := range rule.To {
+			if peer.PodSelector != nil && peer.NamespaceSelector == nil && runtime.Template.Namespace == "" {
+				return fmt.Errorf("native namespace-relative egress requires a frozen runtime namespace")
+			}
+		}
+	}
+	return nil
+}
+
 func nativeNetworkPolicy(record *journalRecord) networkingv1.NetworkPolicySpec {
 	desired := *record.Request.Runtime.NetworkPolicy.DeepCopy()
 	desired.PodSelector = metav1.LabelSelector{MatchLabels: workerLabels(record)}
 	desired.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
 	desired.Ingress = nil
+	for i := range desired.Egress {
+		for j := range desired.Egress[i].To {
+			peer := &desired.Egress[i].To[j]
+			if peer.PodSelector != nil && peer.NamespaceSelector == nil {
+				// A Pod-only peer is relative to the runtime namespace, while this
+				// policy lives with the infrastructure worker in another namespace.
+				peer.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{corev1.LabelMetadataName: record.Request.Runtime.Template.Namespace}}
+			}
+		}
+	}
 	return desired
 }
 

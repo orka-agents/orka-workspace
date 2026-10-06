@@ -84,7 +84,7 @@ func (e *Error) Unwrap() error {
 func NewClient(config ClientConfig) (*Client, error) {
 	rawEndpoint := strings.TrimSpace(config.Endpoint)
 	parsed, err := url.Parse(rawEndpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" || strings.HasSuffix(parsed.Host, ":") {
 		return nil, &Error{Reason: ErrorReasonInvalidEndpoint, Message: "invalid workspace-agent endpoint"}
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -95,6 +95,12 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	if parsed.Scheme != schemeHTTPS && parsed.Scheme != schemeHTTP {
 		return nil, &Error{Reason: ErrorReasonInvalidEndpoint, Message: "workspace-agent endpoint must use http or https"}
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return nil, &Error{Reason: ErrorReasonInvalidEndpoint, Message: "workspace-agent endpoint port must be between 1 and 65535"}
+		}
 	}
 	if parsed.Scheme != schemeHTTPS && !config.AllowInsecure {
 		return nil, &Error{Reason: ErrorReasonInvalidEndpoint, Message: "insecure workspace-agent transport is disabled"}

@@ -28,3 +28,24 @@ func TestValidateEndpointsRequiresHostname(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateEndpointsRequiresUniqueNames(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		endpoints []workspacev1alpha1.ExecutionWorkspaceEndpoint
+		valid     bool
+	}{
+		{name: "empty list", valid: true},
+		{name: "empty name", endpoints: []workspacev1alpha1.ExecutionWorkspaceEndpoint{{URL: "https://runtime.example"}}},
+		{name: "duplicate name", endpoints: []workspacev1alpha1.ExecutionWorkspaceEndpoint{{Name: "runtime", URL: "https://runtime.example"}, {Name: "runtime", URL: "https://other.example"}}},
+		{name: "distinct names", endpoints: []workspacev1alpha1.ExecutionWorkspaceEndpoint{{Name: "runtime", URL: "https://runtime.example"}, {Name: "metrics", URL: "https://metrics.example"}}, valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateEndpoints(tc.endpoints)
+			if (err == nil) != tc.valid {
+				t.Fatalf("ValidateEndpoints() = %v, want valid %v", err, tc.valid)
+			}
+		})
+	}
+}

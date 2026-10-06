@@ -106,7 +106,9 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		workspace := &api.ExecutionWorkspace{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: checkpoint.Namespace, Name: checkpoint.Spec.WorkspaceRef.Name}, workspace); err != nil {
 			if apierrors.IsNotFound(err) && !controllerutil.ContainsFinalizer(checkpoint, checkpointFinalizer) {
-				return ctrl.Result{}, nil
+				// Without a source or export record, ownership is not established.
+				// Retry a possible cache miss without claiming status or finalizers.
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 			}
 			return r.phase(ctx, checkpoint, "Pending", "SourceUnavailable", "the pinned source workspace is unavailable")
 		}
@@ -246,11 +248,11 @@ func (r *CheckpointReconciler) reconcileCatalog(ctx context.Context, d *Lifecycl
 	}
 	provider := &api.ExecutionWorkspaceProvider{}
 	if err := r.Get(ctx, types.NamespacedName{Name: artifact.ProviderBinding.Name}, provider); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if provider.UID == artifact.ProviderBinding.UID && provider.Spec.ControllerName != ControllerName {
+	// Keep the exact registration through retained-data cleanup. A missing or
+	// replaced registration cannot establish this controller's catalog ownership.
+	if provider.UID != artifact.ProviderBinding.UID || provider.Spec.ControllerName != ControllerName {
 		return ctrl.Result{}, nil
 	}
 	for owner, active := range artifact.Owners {

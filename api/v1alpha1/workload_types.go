@@ -263,6 +263,9 @@ func (r WorkloadRequest) validateRuntime() error {
 		return fmt.Errorf("runtime requires immutable pool/class bindings and orka.harness.v2")
 	}
 	pod := runtime.Template.Spec
+	if len(pod.EphemeralContainers) != 0 {
+		return fmt.Errorf("runtime templates cannot contain ephemeral containers")
+	}
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		return fmt.Errorf("runtime must explicitly disable ServiceAccount token mounting")
 	}
