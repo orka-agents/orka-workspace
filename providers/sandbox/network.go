@@ -43,6 +43,10 @@ func (d *Lifecycle) verifyNetworkPolicies(ctx context.Context, runtime *workspac
 		return fmt.Errorf("read runtime NetworkPolicies: %w", err)
 	}
 	requireIngress, requireEgress := policyDirections(admitted)
+	// A direction not isolated by the admitted policy is unrestricted, rather
+	// than denied by its empty rule list. Extra policies in that direction can
+	// only preserve or narrow the admitted permissions. Check additive grants
+	// against the rule envelope only for directions admission isolates.
 	ingressIsolated, egressIsolated := false, false
 	for _, policy := range policies.Items {
 		selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)

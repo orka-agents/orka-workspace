@@ -158,6 +158,61 @@ func TestNetworkPolicyDefaultsAndAdditiveRules(t *testing.T) {
 	}
 }
 
+func TestUnisolatedNetworkDirectionAllowsAdditionalRestrictions(t *testing.T) {
+	for _, required := range []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress} {
+		for _, permission := range []string{"deny all", "allow all", "specific CIDR"} {
+			t.Run(string(required)+"/"+permission, func(t *testing.T) {
+				c, request := fixture(t, false)
+				admitted := denyNetwork()
+				admitted.PolicyTypes = []networkingv1.PolicyType{required}
+				request = networkRequest(t, c, request, admitted)
+				createPolicy(t, c, request.Runtime.Template.Namespace, "core-policy", admitted)
+				extra := denyNetwork()
+				if required == networkingv1.PolicyTypeIngress {
+					extra.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
+					if permission != "deny all" {
+						extra.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
+						if permission == "specific CIDR" {
+							extra.Egress[0].To = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"}}}
+						}
+					}
+				} else {
+					extra.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}
+					if permission != "deny all" {
+						extra.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+						if permission == "specific CIDR" {
+							extra.Ingress[0].From = []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"}}}
+						}
+					}
+				}
+				createPolicy(t, c, request.Runtime.Template.Namespace, "additional-isolation", extra)
+				first := ready(t, c, request)
+				pod := &corev1.Pod{}
+				if err := c.Get(t.Context(), types.NamespacedName{Namespace: first.Startup.Pod.Namespace, Name: first.Startup.Pod.Name}, pod); err != nil {
+					t.Fatal(err)
+				}
+				// Upstream labels can select another restriction after allocation.
+				extra.PodSelector = metav1.LabelSelector{MatchLabels: map[string]string{sandboxv1beta1.SandboxTemplateRefHashLabel: pod.Labels[sandboxv1beta1.SandboxTemplateRefHashLabel]}}
+				createPolicy(t, c, pod.Namespace, "realized-pod-isolation", extra)
+				if observed, err := New(c).Observe(t.Context(), request.Key); err != nil || observed.Startup == nil || observed.Identity != first.Identity {
+					t.Fatalf("additional restriction exceeded an unrestricted direction: %+v, %v", observed, err)
+				}
+				// The required direction's empty envelope still forbids grants.
+				violation := *admitted.DeepCopy()
+				if required == networkingv1.PolicyTypeIngress {
+					violation.Ingress = []networkingv1.NetworkPolicyIngressRule{{}}
+				} else {
+					violation.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
+				}
+				createPolicy(t, c, pod.Namespace, "unadmitted-required-direction", violation)
+				if observed, err := New(c).Observe(t.Context(), request.Key); err == nil || observed.Startup != nil {
+					t.Fatalf("required direction's permission envelope was bypassed: %+v, %v", observed, err)
+				}
+			})
+		}
+	}
+}
+
 func TestRealizedPodNetworkPolicyDriftWithdrawsStartup(t *testing.T) {
 	for _, drift := range []string{"deleted policy", "upstream label selects ingress", "upstream label selects egress"} {
 		t.Run(drift, func(t *testing.T) {

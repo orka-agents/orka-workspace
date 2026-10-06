@@ -68,7 +68,8 @@ kubectl -n "${runner_namespace}" wait --for=condition=complete "job/${job_name}"
   exit 1
 }
 kubectl -n "${runner_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
-kubectl wait --for=delete "namespace/${namespace}" --timeout=2m
-kubectl delete clusterrolebinding "${job_name}" "${namespace}" --ignore-not-found
-kubectl delete clusterrole "${job_name}" "${namespace}" --ignore-not-found
-printf 'Exact catalog and namespace finalization verified: %s\n' "${run_dir}/catalog.log"
+# Catalog collection does not prove all native resources are gone. Namespace
+# deletion and its existing proof RBAC remain owned by the full cleanup caller.
+kubectl delete clusterrolebinding "${job_name}" --ignore-not-found
+kubectl delete clusterrole "${job_name}" --ignore-not-found
+printf 'Exact catalog finalization verified; namespace deletion remains caller-owned: %s\n' "${run_dir}/catalog.log"
