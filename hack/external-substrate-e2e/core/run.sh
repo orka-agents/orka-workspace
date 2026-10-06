@@ -32,7 +32,10 @@ test "${ORKA_CORE_BUILD_RELEASED:-}" = 1
 core_source="${ORKA_CORE_SOURCE:-${PWD}/../orka.workspace-external-providers}"
 test -f "${core_source}/cmd/orka-acp-runtime/main.go"
 test -f "${core_source}/cmd/main.go"
-test "$(kubectl get deployments -A -l app=external-substrate-core -o json | jq '.items | length')" = 0
+if test "$(kubectl get deployments -A -o json | jq '[.items[] | select(.metadata.name == "external-substrate-core" or .metadata.labels.app == "external-substrate-core")] | length')" != 0; then
+  printf 'Existing native Core proof deployment requires explicit review before another run.\n' >&2
+  exit 1
+fi
 if kubectl -n orka-workspace-system get deployment/orka-workspace-substrate >/dev/null 2>&1; then
   printf 'Existing native provider deployment requires explicit review before another run.\n' >&2
   exit 1
