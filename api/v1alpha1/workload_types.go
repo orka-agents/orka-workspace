@@ -469,11 +469,19 @@ func ValidateStartup(request WorkloadRequest, observed AllocationObservation) er
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("startup endpoint must be an HTTP(S) URL without credentials, query or fragment")
 	}
-	if port := u.Port(); port != "" {
-		number, err := strconv.Atoi(port)
+	port := 80
+	if u.Scheme == "https" {
+		port = 443
+	}
+	if explicit := u.Port(); explicit != "" {
+		number, err := strconv.Atoi(explicit)
 		if err != nil || number < 1 || number > 65535 {
 			return fmt.Errorf("startup endpoint port must be between 1 and 65535")
 		}
+		port = number
+	}
+	if request.Runtime != nil && int(request.Runtime.BootstrapPort) != port {
+		return fmt.Errorf("startup endpoint port differs from the admitted bootstrap port")
 	}
 	if request.Runtime != nil && evidence.Pod == nil && evidence.Process == nil {
 		return fmt.Errorf("runtime startup requires an exact Pod or native process identity")

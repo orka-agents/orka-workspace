@@ -260,6 +260,20 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		if err != nil {
 			return err
 		}
+		if err := d.verifyRuntimeServiceAccount(ctx, request); err != nil {
+			observed = workspaceprovider.AllocationObservation{}
+			return err
+		}
+		if request.Runtime != nil {
+			namespace := request.Runtime.Template.Namespace
+			if namespace == "" {
+				namespace = request.Key.Namespace
+			}
+			if err := d.verifyNetworkPolicies(ctx, request.Runtime, namespace, request.Runtime.Template.Labels); err != nil {
+				observed = workspaceprovider.AllocationObservation{}
+				return err
+			}
+		}
 		if record == nil {
 			if request.Sequence != 1 {
 				return workspaceprovider.ErrRequestConflict

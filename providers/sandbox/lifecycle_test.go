@@ -92,7 +92,7 @@ func fixture(t *testing.T, persistent bool) (client.Client, workspaceprovider.Wo
 	}
 	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
-	for _, object := range []client.Object{provider, workspace} {
+	for _, object := range []client.Object{provider, workspace, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: request.Runtime.Template.Namespace, Name: "default"}}} {
 		if err := c.Create(t.Context(), object); err != nil {
 			t.Fatal(err)
 		}

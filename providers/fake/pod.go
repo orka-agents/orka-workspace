@@ -21,6 +21,9 @@ const podInstanceLabel = "fake.workspace.orka.ai/instance"
 const podRequestAnnotation = "fake.workspace.orka.ai/request-revision"
 
 func validatePodRequest(request workspaceprovider.WorkloadRequest) error {
+	if err := validatePodFeatures(request); err != nil {
+		return err
+	}
 	if request.Runtime == nil {
 		return nil
 	}
@@ -46,6 +49,23 @@ func validatePodRequest(request workspaceprovider.WorkloadRequest) error {
 		}
 		if !found {
 			return fmt.Errorf("runtime bootstrap port is not declared by the supervisor container")
+		}
+	}
+	return nil
+}
+
+func validatePodFeatures(request workspaceprovider.WorkloadRequest) error {
+	if request.RestoreFrom != nil {
+		return fmt.Errorf("fake provider does not support checkpoint import")
+	}
+	if request.Runtime == nil {
+		return nil
+	}
+	for _, feature := range request.Runtime.RequiredFeatures {
+		switch feature {
+		case workspacev1alpha1.WorkspaceFeatureACPRuntime, workspacev1alpha1.WorkspaceFeaturePools:
+		default:
+			return fmt.Errorf("fake Pod runtime does not support required feature %q", feature)
 		}
 	}
 	return nil
@@ -143,11 +163,14 @@ func (d *Lifecycle) ensurePod(ctx context.Context, cm *corev1.ConfigMap, record 
 		if record.CreateIssued {
 			return pendingObservation(record), fmt.Errorf("runtime Pod creation is unresolved; absence cannot authorize replay: %w", workspaceprovider.ErrStaleIdentity)
 		}
+		pod = desiredPod(record)
+		if err := d.verifyNetworkPolicies(ctx, record.Request.Runtime, record.Pod.Namespace, pod.Labels); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
 		record.CreateIssued = true
 		if err := d.save(ctx, cm, record); err != nil {
 			return workspaceprovider.AllocationObservation{}, err
 		}
-		pod = desiredPod(record)
 		if err := d.client.Create(ctx, pod); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return pendingObservation(record), nil
@@ -189,6 +212,9 @@ func pendingObservation(record *journalRecord) workspaceprovider.AllocationObser
 	return observed
 }
 func (d *Lifecycle) observePod(ctx context.Context, record *journalRecord) (workspaceprovider.AllocationObservation, error) {
+	if err := validatePodFeatures(record.Request); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
+	}
 	pod, err := d.pod(ctx, record)
 	if apierrors.IsNotFound(err) {
 		return pendingObservation(record), nil
@@ -198,6 +224,9 @@ func (d *Lifecycle) observePod(ctx context.Context, record *journalRecord) (work
 	}
 	if record.Pod.UID == "" || pod.DeletionTimestamp != nil || net.ParseIP(pod.Status.PodIP) == nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 		return pendingObservation(record), nil
+	}
+	if err := d.verifyNetworkPolicies(ctx, record.Request.Runtime, record.Pod.Namespace, pod.Labels); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
 	}
 	observed := record.Observation
 	observed.State = workspaceprovider.AllocationReady
@@ -245,11 +274,12 @@ func normalizePodSpec(spec *corev1.PodSpec) {
 		spec.SchedulerName = corev1.DefaultSchedulerName
 	}
 	if spec.ServiceAccountName == "" {
-		spec.ServiceAccountName = "default"
+		spec.ServiceAccountName = spec.DeprecatedServiceAccount
+		if spec.ServiceAccountName == "" {
+			spec.ServiceAccountName = "default"
+		}
 	}
-	if spec.DeprecatedServiceAccount == "" {
-		spec.DeprecatedServiceAccount = spec.ServiceAccountName
-	}
+	spec.DeprecatedServiceAccount = spec.ServiceAccountName
 	if spec.TerminationGracePeriodSeconds == nil {
 		value := int64(30)
 		spec.TerminationGracePeriodSeconds = &value

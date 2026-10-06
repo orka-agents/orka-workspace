@@ -41,6 +41,9 @@ rules:
     resources: [sandboxes]
     verbs: [get, update, delete]
   - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get]
+  - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
 ---

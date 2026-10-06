@@ -102,11 +102,14 @@ func normalizePodSpec(spec corev1.PodSpec) corev1.PodSpec {
 		*result.EnableServiceLinks = corev1.DefaultEnableServiceLinks
 	}
 	if result.ServiceAccountName == "" {
-		result.ServiceAccountName = "default"
+		result.ServiceAccountName = result.DeprecatedServiceAccount
+		if result.ServiceAccountName == "" {
+			result.ServiceAccountName = "default"
+		}
 	}
-	// The core API's internal-to-v1 conversion mirrors the effective service
-	// account into this deprecated alias on Pods. Embedded PodSpecs in CRDs do
-	// not receive that conversion, so compare the canonical field once here.
+	// Pod defaulting gives the canonical field precedence over the deprecated
+	// alias, then ServiceAccount admission defaults an omitted account. Embedded
+	// PodSpecs in CRDs do not receive these passes.
 	result.DeprecatedServiceAccount = result.ServiceAccountName
 	for i := range result.InitContainers {
 		normalizeContainer(&result.InitContainers[i])

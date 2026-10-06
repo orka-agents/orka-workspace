@@ -59,6 +59,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		if err := d.admitted(ctx, request); err != nil {
 			return err
 		}
+		if err := d.verifyRuntimeServiceAccount(ctx, request); err != nil {
+			return err
+		}
 		namespace := request.Runtime.Template.Namespace
 		if namespace == "" {
 			namespace = request.Key.Namespace

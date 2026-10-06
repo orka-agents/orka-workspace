@@ -210,7 +210,9 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 			}
 		}
 		pending = operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
-		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(ready), Reason: conditionReason(ready, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(ready, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
+		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
+		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
+		setLifecycleMilestoneConditions(current, observed, missing, operationErr)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
 	if err != nil {
@@ -223,6 +225,33 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{RequeueAfter: fakeProviderHeartbeatPeriod}, nil
+}
+
+// Provisioned records a durable allocation milestone, independently of startup
+// readiness. Finalized covers provider cleanup; core verifies its credentials
+// and retains sole ownership of the workspace finalizer.
+func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorkspace, observed workspaceprovider.AllocationObservation, missing bool, operationErr error) {
+	provisioned := !missing && observed.Identity.Valid() &&
+		(observed.State == workspaceprovider.AllocationPending || observed.State == workspaceprovider.AllocationReady || observed.State == workspaceprovider.AllocationStopped)
+	provisionedStatus := conditionStatus(provisioned)
+	provisionedMessage := chooseMessage(provisioned, "durable provider allocation is recorded; startup readiness is independent", "provider allocation is absent or fully deleted")
+	if operationErr != nil || (observed.State == workspaceprovider.AllocationDeleted &&
+		workspaceprovider.ValidateDeletedDisposition(observed.Disposition, workspace.Spec.Lifecycle.DeletionPolicy) != nil) {
+		// An unavailable observation cannot establish physical absence.
+		provisionedStatus = metav1.ConditionUnknown
+		provisionedMessage = "provider allocation could not be verified; the last instance fence is preserved"
+	}
+	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: provisionedStatus, Reason: conditionReason(provisionedStatus == metav1.ConditionTrue, string(workspacev1alpha1.ReasonProgressing)), Message: provisionedMessage, ObservedGeneration: workspace.Generation})
+	finalized := operationErr == nil && workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateDeleted &&
+		workspaceprovider.ValidateDeletedDisposition(workspace.Status.Disposition, workspace.Spec.Lifecycle.DeletionPolicy) == nil
+	finalizedReason := conditionReason(finalized, string(workspacev1alpha1.ReasonProgressing))
+	finalizedMessage := chooseMessage(finalized, "provider-owned cleanup is complete; core finalization remains independent", "provider cleanup is pending or has not been requested")
+	deleteRequested := !workspace.DeletionTimestamp.IsZero() || workspace.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
+	if (operationErr != nil && deleteRequested) || (workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateDeleted && !finalized) {
+		finalizedReason = string(workspacev1alpha1.ReasonCleanupFailed)
+		finalizedMessage = "provider cleanup could not be verified"
+	}
+	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceFinalized), Status: conditionStatus(finalized), Reason: finalizedReason, Message: finalizedMessage, ObservedGeneration: workspace.Generation})
 }
 
 func workspaceHasCoreAdmission(workspace *workspacev1alpha1.ExecutionWorkspace) bool {

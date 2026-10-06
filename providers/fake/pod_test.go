@@ -80,6 +80,9 @@ func runtimeFixture(t *testing.T) (*podClient, workspaceprovider.WorkloadRequest
 		Protocol:     "orka.harness.v2", ContainerName: "supervisor", BootstrapPort: 8080,
 		Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: request.Key.Namespace, Labels: map[string]string{"fixture": "supervisor"}}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: &disabled, Containers: []corev1.Container{{Name: "supervisor", Image: request.Image, Command: request.Command, Args: request.Args, Resources: request.Resources, Ports: []corev1.ContainerPort{{ContainerPort: 8080}}}}}},
 	}
+	if err := c.Create(t.Context(), &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: request.Runtime.Template.Namespace, Name: "default"}}); err != nil {
+		t.Fatal(err)
+	}
 	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
 	if err := publishRequest(t.Context(), c, request); err != nil {
 		t.Fatal(err)

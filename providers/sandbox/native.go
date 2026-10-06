@@ -6,6 +6,7 @@ import (
 	"maps"
 	"reflect"
 
+	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -22,6 +23,9 @@ func validateRequest(request workspaceprovider.WorkloadRequest) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
+	if err := validateRequiredFeatures(request); err != nil {
+		return err
+	}
 	if request.Runtime == nil || request.Runtime.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		return fmt.Errorf("Sandbox requires an admitted runtime with restartPolicy Never")
 	}
@@ -34,6 +38,23 @@ func validateRequest(request workspaceprovider.WorkloadRequest) error {
 		}
 	}
 	return validateRuntimeVolumes(request.Runtime)
+}
+
+func validateRequiredFeatures(request workspaceprovider.WorkloadRequest) error {
+	if request.RestoreFrom != nil {
+		return fmt.Errorf("Sandbox does not support checkpoint import")
+	}
+	if request.Runtime == nil {
+		return nil
+	}
+	for _, feature := range request.Runtime.RequiredFeatures {
+		switch feature {
+		case workspacev1alpha1.WorkspaceFeatureACPRuntime, workspacev1alpha1.WorkspaceFeatureSuspend:
+		default:
+			return fmt.Errorf("Sandbox does not support required feature %q", feature)
+		}
+	}
+	return nil
 }
 
 // Only Pod-local scratch and metadata projections retire with the exact Pod.
@@ -252,6 +273,9 @@ func (d *Lifecycle) sandbox(ctx context.Context, record *journalRecord) (*sandbo
 
 func (d *Lifecycle) readSandbox(ctx context.Context, record *journalRecord, validateSpec bool) (*sandboxv1beta1.Sandbox, error) {
 	if validateSpec {
+		if err := validateRequiredFeatures(record.Request); err != nil {
+			return nil, err
+		}
 		if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
 			return nil, err
 		}

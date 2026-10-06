@@ -26,6 +26,12 @@ rules:
     resources: [pods]
     verbs: [get, create, delete]
   - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [get]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list]
+  - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
 ---
