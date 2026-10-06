@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 
+	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
@@ -20,6 +21,47 @@ import (
 
 const durableVolumeName = "orka-workspace"
 const durableMountPath = "/durable/orka-workspace"
+
+func validateDeletionPolicy(policy workspacev1alpha1.ExecutionWorkspaceDeletionPolicy) error {
+	if policy.PersistentVolumes != workspacev1alpha1.WorkspaceDeletionActionDelete || policy.Checkpoints != workspacev1alpha1.WorkspaceDeletionActionDelete || policy.ProviderResources != workspacev1alpha1.WorkspaceDeletionActionDelete {
+		return fmt.Errorf("Sandbox supports only all-Delete dispositions")
+	}
+	return nil
+}
+
+func (d *Lifecycle) validateWorkspaceLifecycle(ctx context.Context, record *journalRecord, suspend bool) error {
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	key := record.Request.Key
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: key.Name}, workspace); err != nil {
+		return err
+	}
+	if workspace.UID != key.WorkspaceUID || workspace.Spec.ProviderBinding.UID != key.ProviderUID || workspace.Spec.ClassBinding != record.Request.Runtime.ClassBinding {
+		return workspaceprovider.ErrStaleIdentity
+	}
+	lifecycle := workspace.Spec.Lifecycle
+	if err := validateDeletionPolicy(lifecycle.DeletionPolicy); err != nil {
+		return err
+	}
+	if !suspend {
+		return nil
+	}
+	if workspace.Spec.Mode != workspacev1alpha1.ExecutionWorkspaceModeInteractive || workspace.Spec.SessionRef == nil || workspace.Spec.SessionRef.Name == "" || workspace.Spec.SessionRef.UID == "" || !slices.Contains(lifecycle.AllowedOnDetach, workspacev1alpha1.WorkspaceOnDetachSuspend) {
+		return fmt.Errorf("Sandbox suspension requires interactive session reuse and allowed Suspend")
+	}
+	if lifecycle.IdleTimeout != nil && lifecycle.IdleTimeout.Duration <= 0 || lifecycle.MaxLifetime != nil && lifecycle.MaxLifetime.Duration <= 0 {
+		return fmt.Errorf("Sandbox suspension expiry must be positive")
+	}
+	if lifecycle.IdleTimeout == nil && lifecycle.MaxLifetime == nil {
+		return fmt.Errorf("Sandbox suspension requires a positive retention expiry")
+	}
+	if lifecycle.IdleTimeout != nil && lifecycle.MaxLifetime != nil && lifecycle.MaxLifetime.Duration < lifecycle.IdleTimeout.Duration {
+		return fmt.Errorf("Sandbox maxLifetime must be at least idleTimeout")
+	}
+	if record.MaxSuspended != nil && lifecycle.MaxLifetime == nil {
+		return fmt.Errorf("suspended count cap requires a positive maxLifetime")
+	}
+	return nil
+}
 
 func (d *Lifecycle) profile(ctx context.Context, record *journalRecord) (*profilev1alpha1.SandboxWorkspaceProfile, error) {
 	ref := record.Request.ParametersRef
@@ -90,6 +132,9 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	if profile.Spec.Suspend == nil {
 		return nil
 	}
+	if err := d.validateWorkspaceLifecycle(ctx, record, true); err != nil {
+		return err
+	}
 	volume, err := profile.Spec.Suspend.ResolveVolume()
 	if err != nil {
 		return err
@@ -139,15 +184,19 @@ func (d *Lifecycle) verifyStorageClass(ctx context.Context, record *journalRecor
 	return nil
 }
 
-func volumeTemplate(record *journalRecord) sandboxv1beta1.PersistentVolumeClaimTemplate {
+func volumeTemplate(record *journalRecord) (sandboxv1beta1.PersistentVolumeClaimTemplate, error) {
 	volume := record.Volume
+	capacity, err := resource.ParseQuantity(volume.Capacity)
+	if err != nil || capacity.Sign() <= 0 {
+		return sandboxv1beta1.PersistentVolumeClaimTemplate{}, fmt.Errorf("durable workspace capacity %q must be a positive storage quantity", volume.Capacity)
+	}
 	modes := make([]corev1.PersistentVolumeAccessMode, len(volume.AccessModes))
 	for i, mode := range volume.AccessModes {
 		modes[i] = corev1.PersistentVolumeAccessMode(mode)
 	}
-	result := sandboxv1beta1.PersistentVolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &volume.StorageClassName, AccessModes: modes, Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(volume.Capacity)}}}}
+	result := sandboxv1beta1.PersistentVolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &volume.StorageClassName, AccessModes: modes, Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: capacity}}}}
 	result.Name = durableVolumeName
-	return result
+	return result, nil
 }
 
 func (d *Lifecycle) verifyStorage(ctx context.Context, record *journalRecord, sb *sandboxv1beta1.Sandbox) (*storageIdentity, error) {
@@ -161,7 +210,11 @@ func (d *Lifecycle) verifyStorage(ctx context.Context, record *journalRecord, sb
 	if pvc.UID == "" || !metav1.IsControlledBy(pvc, sb) || pvc.DeletionTimestamp != nil {
 		return nil, fmt.Errorf("durable PVC ownership or lifetime changed: %w", workspaceprovider.ErrStaleIdentity)
 	}
-	expected := volumeTemplate(record).Spec
+	template, err := volumeTemplate(record)
+	if err != nil {
+		return nil, err
+	}
+	expected := template.Spec
 	actual := *pvc.Spec.DeepCopy()
 	actual.VolumeName = ""
 	if actual.VolumeMode != nil && *actual.VolumeMode == corev1.PersistentVolumeFilesystem {

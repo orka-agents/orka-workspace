@@ -44,6 +44,12 @@ memory restore. `SandboxWorkspaceProfile` enables the durable workspace layout
 at `/durable/orka-workspace`; core must include that mount and environment in
 the admitted template. A suspend-capable class must use session reuse and bounded
 retention. PVC storage must be dynamically provisioned with Delete reclaim policy.
+Sandbox checks the concrete workspace's Interactive mode, exact SessionRef,
+allowed Suspend action, and positive idleTimeout or maxLifetime before enabling
+its suspension profile. A count cap also requires positive maxLifetime. This
+profile therefore requires a Session-reused concrete workspace even when its
+class also lists None reuse. All allocation requires all-Delete dispositions;
+Retain is unsupported and is rejected before native resources are created.
 
 `retention.maxSuspendedWorkspaces` is a count bound for each class UID and
 workspace namespace, including suspension still in progress. Sharing a profile

@@ -84,6 +84,7 @@ func TestReconcileUsesLifecycleAndAllowsRevocationAndDeletionWhenAdmissionIsStal
 	workspace.Spec.Workload = &request
 	workspace.Spec.Lifecycle.DeletionPolicy = deletionPolicy()
 	workspace.Spec.Attachment = &workspacev1alpha1.ExecutionWorkspaceAttachment{Epoch: 1}
+	workspace.Spec.AttachmentEpoch = 1
 	if err := c.Update(t.Context(), workspace); err != nil {
 		t.Fatal(err)
 	}

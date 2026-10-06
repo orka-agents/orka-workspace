@@ -60,12 +60,16 @@ func desiredWarmPool(record *journalRecord) *extv1beta1.SandboxWarmPool {
 	return &extv1beta1.SandboxWarmPool{ObjectMeta: nativeMetadata(record, record.WarmPool.Name), Spec: extv1beta1.SandboxWarmPoolSpec{Replicas: new(int32), TemplateRef: extv1beta1.SandboxTemplateRef{Name: record.Template.Name}}}
 }
 
-func desiredClaim(record *journalRecord) *extv1beta1.SandboxClaim {
+func desiredClaim(record *journalRecord) (*extv1beta1.SandboxClaim, error) {
 	claim := &extv1beta1.SandboxClaim{ObjectMeta: nativeMetadata(record, record.Claim.Name), Spec: extv1beta1.SandboxClaimSpec{WarmPoolRef: extv1beta1.SandboxWarmPoolRef{Name: record.WarmPool.Name}}}
 	if record.Volume != nil {
-		claim.Spec.VolumeClaimTemplates = []sandboxv1beta1.PersistentVolumeClaimTemplate{volumeTemplate(record)}
+		volume, err := volumeTemplate(record)
+		if err != nil {
+			return nil, err
+		}
+		claim.Spec.VolumeClaimTemplates = []sandboxv1beta1.PersistentVolumeClaimTemplate{volume}
 	}
-	return claim
+	return claim, nil
 }
 
 func nativeOwned(object client.Object, record *journalRecord, ref objectReference) bool {
@@ -197,7 +201,10 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		}
 	}
 	claim := &extv1beta1.SandboxClaim{}
-	expectedClaim := desiredClaim(record)
+	expectedClaim, err := desiredClaim(record)
+	if err != nil {
+		return err
+	}
 	if err := d.ensureObject(ctx, cm, record, &record.Claim, claim, expectedClaim); err != nil {
 		return err
 	}
@@ -219,8 +226,17 @@ func (d *Lifecycle) readSandbox(ctx context.Context, record *journalRecord, vali
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Namespace, Name: record.Claim.Name}, claim); err != nil {
 		return nil, err
 	}
-	if !nativeOwned(claim, record, record.Claim) || (validateSpec && !apiequality.Semantic.DeepEqual(claim.Spec, desiredClaim(record).Spec)) {
+	if !nativeOwned(claim, record, record.Claim) {
 		return nil, workspaceprovider.ErrStaleIdentity
+	}
+	if validateSpec {
+		expected, err := desiredClaim(record)
+		if err != nil {
+			return nil, err
+		}
+		if !apiequality.Semantic.DeepEqual(claim.Spec, expected.Spec) {
+			return nil, workspaceprovider.ErrStaleIdentity
+		}
 	}
 	if claim.Status.SandboxStatus.Name != "" && claim.Status.SandboxStatus.Name != record.Claim.Name {
 		return nil, fmt.Errorf("claim selected an unexpected Sandbox")

@@ -121,6 +121,29 @@ spec:
     message: workspace intent requires core admit; configuration requires operator configure
     reason: Forbidden
   - expression: >-
+      variables.resource != 'executionworkspaces' || !has(object.spec.attachment) ||
+      (oldObject != null && has(oldObject.spec.attachment) &&
+       object.spec.attachment == oldObject.spec.attachment &&
+       has(object.spec.attachmentEpoch) == has(oldObject.spec.attachmentEpoch) &&
+       (!has(object.spec.attachmentEpoch) || object.spec.attachmentEpoch == oldObject.spec.attachmentEpoch)) ||
+      (has(object.spec.attachment.epoch) && has(object.spec.attachmentEpoch) &&
+       object.spec.attachment.epoch > 0 && object.spec.attachment.epoch == object.spec.attachmentEpoch)
+    message: changed attachment intent must match the positive attachmentEpoch counter
+  - expression: >-
+      variables.resource != 'executionworkspaces' || !has(object.spec.attachment) || oldObject == null ||
+      (has(oldObject.spec.attachment) && object.spec.attachment == oldObject.spec.attachment) ||
+      (has(object.spec.attachment.epoch) &&
+       (!has(oldObject.spec.attachmentEpoch) || object.spec.attachment.epoch > oldObject.spec.attachmentEpoch) &&
+       (!has(oldObject.spec.attachment) || object.spec.attachment.epoch > oldObject.spec.attachment.epoch))
+    message: a new attachment intent must advance the previous attachment high-water mark
+  - expression: >-
+      variables.resource != 'executionworkspaces' || oldObject == null || !has(oldObject.spec.attachment) ||
+      (has(object.spec.attachment) && object.spec.attachment == oldObject.spec.attachment &&
+       has(object.spec.attachmentEpoch) == has(oldObject.spec.attachmentEpoch) &&
+       (!has(object.spec.attachmentEpoch) || object.spec.attachmentEpoch == oldObject.spec.attachmentEpoch)) ||
+      (has(object.spec.attachmentEpoch) && object.spec.attachmentEpoch >= oldObject.spec.attachment.epoch)
+    message: clearing attachment intent must preserve its epoch high-water mark
+  - expression: >-
       (size(variables.newStatus.filter(k, k != 'conditions')) == size(variables.oldStatus.filter(k, k != 'conditions')) &&
        variables.newStatus.filter(k, k != 'conditions').all(k, k in variables.oldStatus && variables.newStatus[k] == variables.oldStatus[k])) ||
       (variables.resource == 'executionworkspaceclasses' ? variables.core : variables.provider)

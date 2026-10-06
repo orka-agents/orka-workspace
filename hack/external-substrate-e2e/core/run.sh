@@ -14,6 +14,11 @@ node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memo
 [[ "${node_memory}" =~ ^([0-9]+)Ki$ ]] && (( BASH_REMATCH[1] >= 8 * 1024 * 1024 ))
 kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router -o json |
   jq -e 'all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
+# The isolated fixture enables direct egress explicitly. Refuse a backend still
+# routing runtime traffic through its privileged egress gateway. kind proves
+# policy identity and ordering; packet enforcement needs a compatible CNI.
+kubectl -n ate-system get deployment ate-api-server -o json |
+  jq -e '[.spec.template.spec.containers[] | select(.name == "ate-api-server") | .args[] | select(startswith("--egress-gateway-address="))] == ["--egress-gateway-address="]' >/dev/null
 registry=orka-external-substrate-registry
 test "$(docker inspect -f '{{index .Config.Labels "orka.workspace.e2e"}}' "${registry}")" = external-substrate
 registry_ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "${registry}")"

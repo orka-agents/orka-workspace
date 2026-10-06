@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
@@ -39,8 +40,25 @@ func (d *Lifecycle) reserveSuspended(ctx context.Context, record *journalRecord)
 				return err
 			}
 			for _, object := range journals.Items {
+				raw, hasRecord := object.Data[journalDataKey]
+				if !hasRecord && !strings.HasPrefix(object.Name, "substrate-workspace-") && !strings.HasPrefix(object.Name, "substrate-history-") {
+					continue // Ownership anchors and quota ledgers are not journals.
+				}
+				if len(raw) == 0 || len(raw) > MaxJournalBytes {
+					return fmt.Errorf("cannot account for native journal %q: invalid record size", object.Name)
+				}
 				var existing journalRecord
-				if json.Unmarshal([]byte(object.Data[journalDataKey]), &existing) == nil && existing.Version == journalVersion && existing.Request.Runtime != nil && existing.Request.Runtime.ClassBinding.UID == record.Request.Runtime.ClassBinding.UID && existing.Operation == "suspend" && existing.Observation.State != sdk.AllocationDeleted {
+				if err := json.Unmarshal([]byte(raw), &existing); err != nil {
+					return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
+				}
+				if existing.Version != journalVersion {
+					return fmt.Errorf("cannot account for native journal %q: unsupported journal version %q", object.Name, existing.Version)
+				}
+				_, verified, err := d.readAt(ctx, existing.Request.Key, client.ObjectKeyFromObject(&object))
+				if err != nil {
+					return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
+				}
+				if verified.Request.Runtime.ClassBinding.UID == record.Request.Runtime.ClassBinding.UID && verified.Operation == "suspend" && verified.Observation.State != sdk.AllocationDeleted {
 					return fmt.Errorf("suspended occupancy journal is missing while retained lifecycle evidence remains")
 				}
 			}

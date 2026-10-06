@@ -47,6 +47,9 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 			if err := d.resolveRetention(ctx, record); err != nil {
 				return err
 			}
+			if err := d.validateWorkspaceLifecycle(ctx, record, true); err != nil {
+				return err
+			}
 			if record.Operation == "suspend" {
 				if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {
 					return err
@@ -282,8 +285,8 @@ func deletedDisposition(hasVolume bool) *workspacev1alpha1.ExecutionWorkspaceDis
 }
 
 func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, policy workspacev1alpha1.ExecutionWorkspaceDeletionPolicy) (workspaceprovider.AllocationObservation, error) {
-	if policy.PersistentVolumes != workspacev1alpha1.WorkspaceDeletionActionDelete || policy.Checkpoints != workspacev1alpha1.WorkspaceDeletionActionDelete || policy.ProviderResources != workspacev1alpha1.WorkspaceDeletionActionDelete {
-		return workspaceprovider.AllocationObservation{}, fmt.Errorf("Sandbox supports only all-Delete dispositions")
+	if err := validateDeletionPolicy(policy); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
 	}
 	var observed workspaceprovider.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {

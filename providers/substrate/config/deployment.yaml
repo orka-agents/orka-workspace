@@ -38,7 +38,7 @@ spec:
             - --native-api-endpoint=api.ate-system.svc:443
             - --native-ca-file=/native-control/ca.crt
             - --native-token-file=/native-control/token
-            - --native-direct-egress=true
+            - --native-direct-egress=false
             - --actor-dns-suffix=actors.resources.substrate.ate.dev
           volumeMounts:
             - name: native-control

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"strings"
 	"testing"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	"github.com/orka-agents/orka-workspace/conformance"
@@ -55,12 +56,17 @@ func fixture(t *testing.T, persistent bool) (client.Client, workspaceprovider.Wo
 	hash := "sha256:" + strings.Repeat("1", 64)
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", UID: "provider", Generation: 1}, Spec: workspacev1alpha1.ExecutionWorkspaceProviderSpec{ControllerName: ControllerName, LifecycleState: workspacev1alpha1.ExecutionWorkspaceProviderActive}}
 	workspace := &workspacev1alpha1.ExecutionWorkspace{ObjectMeta: metav1.ObjectMeta{Namespace: "tasks", Name: "workspace", UID: "workspace", Generation: 1}, Spec: workspacev1alpha1.ExecutionWorkspaceSpec{ClassBinding: workspacev1alpha1.ImmutableObjectBinding{Name: "class", UID: "class", Generation: 1, ProfileHash: hash}, ProviderBinding: workspacev1alpha1.ImmutableObjectBinding{Name: provider.Name, UID: provider.UID, Generation: 1, ProfileHash: hash}, DesiredState: workspacev1alpha1.ExecutionWorkspaceDesiredReady}}
+	workspace.Spec.Mode = workspacev1alpha1.ExecutionWorkspaceModeInteractive
+	workspace.Spec.Lifecycle = workspacev1alpha1.ExecutionWorkspaceLifecycle{DefaultOnDetach: workspacev1alpha1.WorkspaceOnDetachDelete, AllowedOnDetach: []workspacev1alpha1.WorkspaceOnDetach{workspacev1alpha1.WorkspaceOnDetachDelete}, DetachTimeout: metav1.Duration{Duration: time.Minute}, DeletionPolicy: workspacev1alpha1.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspacev1alpha1.WorkspaceDeletionActionDelete, PersistentVolumes: workspacev1alpha1.WorkspaceDeletionActionDelete, Checkpoints: workspacev1alpha1.WorkspaceDeletionActionDelete}}
 	workspace.Spec.CoreAdmission = &workspacev1alpha1.ExecutionWorkspaceCoreAdmission{AdmittedGeneration: 1, ClassBinding: workspace.Spec.ClassBinding, ProviderBinding: workspace.Spec.ProviderBinding}
 	workspace.Status.Conditions = []metav1.Condition{{Type: string(workspacev1alpha1.ConditionWorkspaceAdmitted), Status: metav1.ConditionTrue, Reason: string(workspacev1alpha1.ReasonReady), ObservedGeneration: 1}}
 	image := "example.invalid/runtime@sha256:" + strings.Repeat("2", 64)
 	automount := false
 	request := workspaceprovider.WorkloadRequest{Sequence: 1, Key: workspaceprovider.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Runtime: &workspaceprovider.RuntimeWorkload{BootstrapPort: 8080, Protocol: "orka.harness.v2", ContainerName: "supervisor", PoolBinding: workspacev1alpha1.ImmutableObjectBinding{Name: "pool", UID: "pool", Generation: 1, ProfileHash: hash}, ClassBinding: workspace.Spec.ClassBinding, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtimes", Labels: map[string]string{"orka.ai/pool": "pool"}}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: &automount, Containers: []corev1.Container{{Name: "supervisor", Image: image}}}}}}
 	if persistent {
+		workspace.Spec.SessionRef = &workspacev1alpha1.ObjectIdentityReference{Name: "session", UID: "session-uid"}
+		workspace.Spec.Lifecycle.AllowedOnDetach = append(workspace.Spec.Lifecycle.AllowedOnDetach, workspacev1alpha1.WorkspaceOnDetachSuspend)
+		workspace.Spec.Lifecycle.MaxLifetime = &metav1.Duration{Duration: time.Hour}
 		profile := &profilev1alpha1.SandboxWorkspaceProfile{TypeMeta: metav1.TypeMeta{APIVersion: profilev1alpha1.GroupVersion.String(), Kind: "SandboxWorkspaceProfile"}, ObjectMeta: metav1.ObjectMeta{Namespace: workspace.Namespace, Name: "data", UID: "profile", Generation: 1}, Spec: profilev1alpha1.SandboxWorkspaceProfileSpec{Suspend: &profilev1alpha1.SandboxSuspendPolicy{Mode: profilev1alpha1.SandboxSuspendModeDataOnly, Volume: profilev1alpha1.SandboxDurableVolume{StorageClassName: "dynamic", Capacity: "1Gi"}}}}
 		if err := c.Create(t.Context(), profile); err != nil {
 			t.Fatal(err)

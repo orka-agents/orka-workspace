@@ -19,10 +19,11 @@ import (
 // labels. Check their combined permissions before allocation and again against
 // the realized Pod, whose upstream labels may select additional policies.
 func (d *Lifecycle) verifyNetworkPolicies(ctx context.Context, runtime *workspaceprovider.RuntimeWorkload, namespace string, podLabels map[string]string) error {
-	admitted := runtime.NetworkPolicy
-	if admitted == nil {
+	if runtime.NetworkPolicy == nil {
 		return nil
 	}
+	normalized := workspaceprovider.NormalizedNetworkPolicySpec(*runtime.NetworkPolicy)
+	admitted := &normalized
 	for _, direction := range admitted.PolicyTypes {
 		if direction != networkingv1.PolicyTypeIngress && direction != networkingv1.PolicyTypeEgress {
 			return fmt.Errorf("admitted network policy has unsupported direction %q", direction)
@@ -59,18 +60,19 @@ func (d *Lifecycle) verifyNetworkPolicies(ctx context.Context, runtime *workspac
 		if policy.DeletionTimestamp != nil {
 			return fmt.Errorf("runtime NetworkPolicy %q is being deleted", policy.Name)
 		}
-		isolatesIngress, isolatesEgress := policyDirections(&policy.Spec)
+		actual := workspaceprovider.NormalizedNetworkPolicySpec(policy.Spec)
+		isolatesIngress, isolatesEgress := policyDirections(&actual)
 		ingressIsolated = ingressIsolated || isolatesIngress
 		egressIsolated = egressIsolated || isolatesEgress
 		if requireIngress && isolatesIngress {
-			for _, rule := range policy.Spec.Ingress {
+			for _, rule := range actual.Ingress {
 				if !containsRule(admitted.Ingress, rule) {
 					return fmt.Errorf("runtime labels select unadmitted ingress permissions in NetworkPolicy %q", policy.Name)
 				}
 			}
 		}
 		if requireEgress && isolatesEgress {
-			for _, rule := range policy.Spec.Egress {
+			for _, rule := range actual.Egress {
 				if !containsRule(admitted.Egress, rule) {
 					return fmt.Errorf("runtime labels select unadmitted egress permissions in NetworkPolicy %q", policy.Name)
 				}

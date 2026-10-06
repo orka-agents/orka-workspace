@@ -25,7 +25,7 @@ func TestNativeWorkingDirectoryPreservesLiteralCommandAndArguments(t *testing.T)
 	container := &request.Runtime.Template.Spec.Containers[0]
 	container.WorkingDir = workingDir
 	container.Command = []string{"/bin/sh", "-c", `printf '%s\n' "$PWD"; printf '%s\n' "$@"`, "working-directory-fixture"}
-	container.Args = []string{"literal argument", "$(touch injected)", "--option=value"}
+	container.Args = []string{"literal argument", "`touch injected`", "${literal_argument}", "--option=value"}
 	record, err := newRecord(request)
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,13 @@ func TestNativeProcessIntentPreservesDurableMountWithoutPodScratch(t *testing.T)
 	c, native, request := fixture(t, true)
 	request.Runtime.RequiredFeatures = []api.ExecutionWorkspaceFeature{api.WorkspaceFeatureACPRuntime, api.WorkspaceFeatureNativeProcess, api.WorkspaceFeatureSuspend}
 	container := &request.Runtime.Template.Spec.Containers[0]
-	container.SecurityContext = &corev1.SecurityContext{ReadOnlyRootFilesystem: new(false)}
+	zero := int64(0)
+	request.Runtime.Template.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: &zero, RunAsGroup: &zero}
+	container.SecurityContext = &corev1.SecurityContext{
+		RunAsUser: &zero, RunAsGroup: &zero, RunAsNonRoot: new(false),
+		Privileged: new(false), ReadOnlyRootFilesystem: new(false),
+		Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"CHOWN", "KILL", "SETGID", "SETUID"}},
+	}
 	container.Resources = corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m"), corev1.ResourceMemory: resource.MustParse("512Mi")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("4Gi")},
@@ -182,6 +188,10 @@ func TestNativeProcessIntentPreservesDurableMountWithoutPodScratch(t *testing.T)
 	}
 	if !durable || !identity || len(record.TemplateSpec.Containers[0].VolumeMounts) != 2 {
 		t.Fatal("native process intent lost exact durable or identity mounts")
+	}
+	capabilities := record.TemplateSpec.Containers[0].GetSecurityContext().GetCapabilities()
+	if len(capabilities.GetDrop()) != 1 || capabilities.GetDrop()[0] != "ALL" || strings.Join(capabilities.GetAdd(), ",") != "CHOWN,KILL,SETGID,SETUID" {
+		t.Fatal("native process intent changed admitted supervisor capabilities")
 	}
 	if revision, err := sdk.WorkloadRevision(request); err != nil || revision != request.Revision {
 		t.Fatal("provider rewrote the admitted native intent")

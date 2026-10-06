@@ -268,6 +268,9 @@ func TestCoreIntentAndRoutingCannotBeForged(t *testing.T) {
 			old := fixture("executionworkspaces")
 			updated := old.DeepCopy()
 			set(t, updated, tc.value, tc.fields...)
+			if tc.name == "attachment" {
+				set(t, updated, int64(1), "spec", "attachmentEpoch")
+			}
 			for _, identity := range []string{coreUser, providerUser, otherProviderUser, operatorUser, untrustedUser} {
 				if got := policy.allows(t, "executionworkspaces", identity, "", updated, old); got != (identity == coreUser) {
 					t.Errorf("%s allowed=%t", identity, got)

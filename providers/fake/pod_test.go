@@ -257,6 +257,102 @@ func TestPodMutationAndUIDReplacementAreRejected(t *testing.T) {
 		})
 	}
 }
+
+type priorityPodClient struct {
+	*podClient
+	admit func(*corev1.PodSpec)
+}
+
+func (c *priorityPodClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if pod, ok := object.(*corev1.Pod); ok {
+		c.admit(&pod.Spec)
+	}
+	return c.podClient.Create(ctx, object, options...)
+}
+
+func TestPodPriorityAdmissionPreservesExplicitTemplateFields(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*corev1.PodSpec)
+		admit     func(*corev1.PodSpec)
+		valid     bool
+	}{
+		{
+			name: "global default priority class", valid: true,
+			configure: func(*corev1.PodSpec) {},
+			admit: func(spec *corev1.PodSpec) {
+				spec.PriorityClassName = "global-default"
+				spec.Priority = new(int32(700))
+				spec.PreemptionPolicy = new(corev1.PreemptNever)
+			},
+		},
+		{
+			name: "named priority class", valid: true,
+			configure: func(spec *corev1.PodSpec) { spec.PriorityClassName = "workspace-priority" },
+			admit: func(spec *corev1.PodSpec) {
+				spec.Priority = new(int32(700))
+				spec.PreemptionPolicy = new(corev1.PreemptNever)
+			},
+		},
+		{
+			name: "explicit priority and preemption", valid: true,
+			configure: func(spec *corev1.PodSpec) {
+				spec.PriorityClassName = "workspace-priority"
+				spec.Priority = new(int32(700))
+				spec.PreemptionPolicy = new(corev1.PreemptNever)
+			},
+			admit: func(*corev1.PodSpec) {},
+		},
+		{
+			name:      "changed explicit priority",
+			configure: func(spec *corev1.PodSpec) { spec.Priority = new(int32(700)) },
+			admit:     func(spec *corev1.PodSpec) { spec.Priority = new(int32(701)) },
+		},
+		{
+			name:      "changed explicit preemption policy",
+			configure: func(spec *corev1.PodSpec) { spec.PreemptionPolicy = new(corev1.PreemptNever) },
+			admit:     func(spec *corev1.PodSpec) { spec.PreemptionPolicy = new(corev1.PreemptLowerPriority) },
+		},
+		{
+			name:      "changed explicit priority class",
+			configure: func(spec *corev1.PodSpec) { spec.PriorityClassName = "workspace-priority" },
+			admit:     func(spec *corev1.PodSpec) { spec.PriorityClassName = "foreign-priority" },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, request := runtimeFixture(t)
+			tc.configure(&request.Runtime.Template.Spec)
+			var err error
+			request.Revision, err = workspaceprovider.WorkloadRevision(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := publishRequest(t.Context(), base, request); err != nil {
+				t.Fatal(err)
+			}
+			c := &priorityPodClient{podClient: base, admit: tc.admit}
+			ready, err := New(c).EnsureAllocation(t.Context(), request)
+			if !tc.valid {
+				if err == nil {
+					t.Fatal("changed explicitly frozen scheduling field was accepted")
+				}
+				return
+			}
+			if err != nil || ready.State != workspaceprovider.AllocationReady || ready.Startup == nil || ready.Startup.Pod == nil {
+				t.Fatalf("admission-derived scheduling fields rejected: %v", err)
+			}
+			observed, err := New(c).Observe(t.Context(), request.Key)
+			if err != nil || observed.Identity != ready.Identity || observed.Startup == nil || *observed.Startup.Pod != *ready.Startup.Pod || c.creates != 1 {
+				t.Fatalf("scheduling normalization changed exact runtime identity: %v", err)
+			}
+			revision, err := workspaceprovider.WorkloadRevision(request)
+			if err != nil || revision != request.Revision {
+				t.Fatalf("scheduling normalization changed admitted request: %v", err)
+			}
+		})
+	}
+}
+
 func TestProviderOutageCannotProveTermination(t *testing.T) {
 	c, request := runtimeFixture(t)
 	ready, err := New(c).EnsureAllocation(t.Context(), request)
@@ -289,6 +385,7 @@ func TestAttachmentAcknowledgementDoesNotWaitForPodCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace.Spec.Attachment = &workspacev1alpha1.ExecutionWorkspaceAttachment{Epoch: 5}
+	workspace.Spec.AttachmentEpoch = 5
 	if err := c.Update(t.Context(), workspace); err != nil {
 		t.Fatal(err)
 	}
@@ -423,5 +520,19 @@ func TestMissingJournalBeforeStatusCannotRecreateOrClaimDeletion(t *testing.T) {
 	workspace = workspaceFor(t, c, request.Key)
 	if workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateDeleted || workspace.Status.Disposition != nil {
 		t.Fatal("lost journal manufactured termination")
+	}
+}
+
+func TestPodAdmissionInjectedImagePullSecretsAreRejected(t *testing.T) {
+	base, request := runtimeFixture(t)
+	c := &priorityPodClient{podClient: base, admit: func(spec *corev1.PodSpec) {
+		spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "admission-injected-credential"}}
+	}}
+	observed, err := New(c).EnsureAllocation(t.Context(), request)
+	if err == nil || observed.Startup != nil {
+		t.Fatalf("credential-bearing Pod was accepted: %v", err)
+	}
+	if c.creates != 1 {
+		t.Fatalf("Pod create attempts = %d", c.creates)
 	}
 }

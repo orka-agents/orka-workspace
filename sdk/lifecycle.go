@@ -66,6 +66,16 @@ type AttachmentController interface {
 	RevokeAttachment(context.Context, *workspacev1alpha1.ExecutionWorkspace, int64) error
 }
 
+// AttachmentEpochAcknowledgement returns the positive epoch that can be
+// acknowledged. Invalid persisted intent must not prevent revocation or cleanup.
+func AttachmentEpochAcknowledgement(workspace *workspacev1alpha1.ExecutionWorkspace) int64 {
+	if workspace == nil || workspace.Spec.Attachment == nil || workspace.Spec.Attachment.Epoch <= 0 ||
+		workspace.Spec.Attachment.Epoch != workspace.Spec.AttachmentEpoch {
+		return 0
+	}
+	return workspace.Spec.Attachment.Epoch
+}
+
 // SuspensionController is optional. It preserves verified durable data and must
 // confirm termination of the exact instance before publishing retained lineage.
 // EnsureAllocation consumes that lineage on a later numbered request, cold boots

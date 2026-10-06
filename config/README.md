@@ -4,6 +4,8 @@
 
 The standalone live proof passes on Kubernetes v1.37.0, including ownership denials and two-replica leader election. Other server versions are not certified. The bundle requires `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` and its CEL authorizer library. Tests also compile and evaluate the shipped policy with the Kubernetes `v0.37.0` API-server implementation.
 
+Attachment intent must match its positive monotonic counter. Changing a Task, credential, or expiry advances the epoch; revocation preserves the high-water mark. Unchanged legacy intent can still be revoked and deleted. Providers refuse positive acknowledgement of a stored counter mismatch, while Core clears it with the preserved high-water counter.
+
 Configure authorization before controllers begin reconciling:
 
 1. Bind the [core admission role](rbac/core-admission-role.yaml) to the Orka core ServiceAccount. It adds virtual `admit` permission; keep the controller's ordinary API permissions separately.

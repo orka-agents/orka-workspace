@@ -65,9 +65,6 @@ func podSpecsMatch(expected, actual corev1.PodSpec, injectedDurableClaimName str
 	expectedSpec.Priority, actualSpec.Priority = nil, nil
 	expectedSpec.PreemptionPolicy, actualSpec.PreemptionPolicy = nil, nil
 	expectedSpec.Overhead, actualSpec.Overhead = nil, nil
-	if len(expectedSpec.ImagePullSecrets) == 0 {
-		actualSpec.ImagePullSecrets = nil
-	}
 	if expectedSpec.PriorityClassName == "" {
 		actualSpec.PriorityClassName = ""
 	}
@@ -110,8 +107,37 @@ func normalizePodSpec(spec corev1.PodSpec) corev1.PodSpec {
 	for i := range result.Containers {
 		normalizeContainer(&result.Containers[i])
 	}
+	for i := range result.Volumes {
+		volume := &result.Volumes[i]
+		if volume.DownwardAPI != nil {
+			if volume.DownwardAPI.DefaultMode == nil {
+				mode := corev1.DownwardAPIVolumeSourceDefaultMode
+				volume.DownwardAPI.DefaultMode = &mode
+			}
+			normalizeDownwardAPIItems(volume.DownwardAPI.Items)
+		}
+		if volume.Projected != nil {
+			if volume.Projected.DefaultMode == nil {
+				mode := corev1.ProjectedVolumeSourceDefaultMode
+				volume.Projected.DefaultMode = &mode
+			}
+			for j := range volume.Projected.Sources {
+				if downwardAPI := volume.Projected.Sources[j].DownwardAPI; downwardAPI != nil {
+					normalizeDownwardAPIItems(downwardAPI.Items)
+				}
+			}
+		}
+	}
 	result.Tolerations = explicitTolerations(result.Tolerations)
 	return result
+}
+
+func normalizeDownwardAPIItems(items []corev1.DownwardAPIVolumeFile) {
+	for i := range items {
+		if fieldRef := items[i].FieldRef; fieldRef != nil && fieldRef.APIVersion == "" {
+			fieldRef.APIVersion = "v1"
+		}
+	}
 }
 
 func normalizeContainer(container *corev1.Container) {

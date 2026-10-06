@@ -107,6 +107,7 @@ func TestAttachmentAcknowledgementDoesNotWaitForRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace.Spec.Attachment = &workspacev1alpha1.ExecutionWorkspaceAttachment{Epoch: 7}
+	workspace.Spec.AttachmentEpoch = 7
 	if err := c.Update(t.Context(), workspace); err != nil {
 		t.Fatal(err)
 	}

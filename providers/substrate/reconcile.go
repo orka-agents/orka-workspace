@@ -28,6 +28,11 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		if provider.UID != current.Spec.ProviderBinding.UID || provider.Spec.ControllerName != ControllerName {
 			return nil
 		}
+		workload := current.Spec.Workload
+		var workloadErr error
+		if workload != nil {
+			workloadErr = workspaceprovider.ValidateWorkspaceWorkload(current)
+		}
 		deleted := !current.DeletionTimestamp.IsZero() || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
 		quarantined := current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined
 		revoking := workspaceNeedsAttachmentRevocation(current)
@@ -41,9 +46,11 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		// establish runtime demand; it must not depend on its own bootstrap work.
 		before := current.DeepCopy()
 		current.Status.AttachedEpoch = 0
-		if admitted && provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderDisabled && !deleted && !quarantined && current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady && current.Spec.Attachment != nil {
-			current.Status.AttachedEpoch = current.Spec.Attachment.Epoch
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+		if workloadErr == nil && admitted && provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderDisabled && !deleted && !quarantined && current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady && current.Spec.Attachment != nil {
+			current.Status.AttachedEpoch = workspaceprovider.AttachmentEpochAcknowledgement(current)
+			if current.Status.AttachedEpoch > 0 {
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+			}
 		}
 		attached := current.Status.AttachedEpoch > 0
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: conditionStatus(attached), Reason: conditionReason(attached, string(workspacev1alpha1.ReasonAttachmentRevoked)), Message: chooseMessage(attached, "attachment epoch acknowledged; runtime startup is independent", "no attachment epoch is active"), ObservedGeneration: current.Generation})
@@ -55,15 +62,30 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		before = current.DeepCopy()
 		driver := New(r.Client, r.Control, r.Config)
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
-		observed, err := driver.Observe(ctx, key)
-		if deleted || quarantined || current.Spec.Retirement != nil {
-			// Cleanup is authorized by the durable instance fence, even when an
-			// admission webhook changed the Pod so ordinary observation rejects it.
+		var observed workspaceprovider.AllocationObservation
+		err := workloadErr
+		if workloadErr == nil {
+			observed, err = driver.Observe(ctx, key)
+		}
+		if (workloadErr != nil && maintenance) || deleted || quarantined || current.Spec.Retirement != nil {
+			// Cleanup uses only this workspace's durable instance fence. A
+			// malformed launch intent cannot authorize a different workspace.
 			_, record, readErr := driver.read(ctx, key)
 			err = readErr
 			if record != nil {
-				observed = record.Observation
+				bound := current.DeepCopy()
+				bound.Spec.Workload = &record.Request
+				err = workspaceprovider.ValidateWorkspaceWorkload(bound)
+				if err == nil {
+					observed = record.Observation
+					if workloadErr != nil || workload == nil {
+						workload = &record.Request
+					}
+				}
 			}
+		}
+		if err == nil && observed.Key != key {
+			err = workspaceprovider.ErrStaleIdentity
 		}
 		missing := err == workspaceprovider.ErrNotFound
 		operationErr = nil
@@ -75,41 +97,51 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			case deleted || quarantined:
 				if missing {
 					operationErr = driver.proveNoAllocation(ctx, key)
-				} else if workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil {
+				} else if workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil {
 					observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
-					if operationErr == nil && deleted && observed.State == workspaceprovider.AllocationStopped && workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementDelete) == nil {
+					if operationErr == nil && deleted && observed.State == workspaceprovider.AllocationStopped && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementDelete) == nil {
 						observed, operationErr = driver.DeleteAllocation(ctx, key, observed.Identity, current.Spec.Lifecycle.DeletionPolicy)
 					}
 				}
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
-				if !missing && workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil {
+				if !missing && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil {
 					observed, operationErr = driver.SuspendInstance(ctx, key, observed.Identity)
 				}
-			case !missing && current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend && workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil:
+			case !missing && current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil:
 				observed, operationErr = driver.SuspendInstance(ctx, key, observed.Identity)
-			case !missing && current.Spec.Retirement != nil && workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil:
+			case !missing && current.Spec.Retirement != nil && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
-			case !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
+			case workloadErr == nil && !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
 				observed, operationErr = driver.EnsureAllocation(ctx, *current.Spec.Workload)
 				if operationErr == nil {
 					missing = false
 				}
 			}
 		}
+		if operationErr == nil && !missing && observed.Key != key {
+			operationErr = workspaceprovider.ErrStaleIdentity
+		}
+		if workloadErr != nil && observed.State == workspaceprovider.AllocationReady {
+			observed.State = workspaceprovider.AllocationPending
+			observed.Startup = nil
+		}
 		current.Status.ObservedGeneration = current.Generation
 		current.Status.ProviderBinding = &workspacev1alpha1.ExecutionWorkspaceProviderBindingStatus{ContractVersion: workspacev1alpha1.ContractVersionV1, AdapterVersion: AdapterVersion, BackendAPIVersion: "ateapi.v0.1.0"}
 		current.Status.Endpoints = nil
 		current.Status.ConnectionSecretRef = nil
 		current.Status.Disposition = nil
-		ready := operationErr == nil && !missing && observed.State == workspaceprovider.AllocationReady
+		ready := workloadErr == nil && operationErr == nil && !missing && observed.State == workspaceprovider.AllocationReady
 		if operationErr != nil {
 			// A read failure is not termination. Preserve the exact last fence while
 			// withdrawing its startup claim so core cannot keep admission open.
-			if current.Status.Allocation != nil {
+			if current.Status.Allocation != nil && current.Status.Allocation.Key == key {
 				observed = *current.Status.Allocation
 				observed.State = workspaceprovider.AllocationPending
 				observed.Startup = nil
 				current.Status.Allocation = &observed
+			} else {
+				current.Status.Allocation = nil
+				current.Status.ExternalID = ""
 			}
 			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
 			if attached {

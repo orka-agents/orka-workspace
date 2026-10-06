@@ -263,6 +263,9 @@ func (r WorkloadRequest) validateRuntime() error {
 		return fmt.Errorf("runtime requires immutable pool/class bindings and orka.harness.v2")
 	}
 	pod := runtime.Template.Spec
+	if len(pod.ImagePullSecrets) != 0 {
+		return fmt.Errorf("runtime cannot reference image-pull credential Secrets before bootstrap")
+	}
 	if len(pod.EphemeralContainers) != 0 {
 		return fmt.Errorf("runtime templates cannot contain ephemeral containers")
 	}

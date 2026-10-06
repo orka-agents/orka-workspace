@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -115,6 +117,9 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 }
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
+	if err := validateNativeScheduling(record.Request.Runtime.Template.Spec); err != nil {
+		return nil, err
+	}
 	for _, volume := range record.Request.Runtime.Template.Spec.Volumes {
 		if volume.EmptyDir != nil {
 			if volume.EmptyDir.SizeLimit != nil && !volume.EmptyDir.SizeLimit.IsZero() {
@@ -124,11 +129,19 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		}
 	}
 	container := record.Request.Runtime.Template.Spec.Containers[0]
-	if container.SecurityContext != nil && container.SecurityContext.ReadOnlyRootFilesystem != nil && *container.SecurityContext.ReadOnlyRootFilesystem {
-		return nil, fmt.Errorf("native read-only root filesystem is unsupported")
+	securityContext, err := compileSecurityContext(record.Request.Runtime.Template.Spec.SecurityContext, container.SecurityContext)
+	if err != nil {
+		return nil, err
 	}
 	if len(container.Command) == 0 {
 		return nil, fmt.Errorf("native supervisor requires an explicit command")
+	}
+	for _, values := range [][]string{container.Command, container.Args} {
+		for _, value := range values {
+			if hasKubernetesExpansion(value) {
+				return nil, fmt.Errorf("native command/argument expansion is unsupported")
+			}
+		}
 	}
 	if container.WorkingDir != "" && (!path.IsAbs(container.WorkingDir) || strings.ContainsRune(container.WorkingDir, 0)) {
 		return nil, fmt.Errorf("native working directory must be an absolute path")
@@ -136,9 +149,15 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 	args := []string{`chmod 0755 /; exec "$@"`, "orka-substrate-init"}
 	args = append(args, container.Command...)
 	args = append(args, container.Args...)
-	compiled := &pb.Container{Name: container.Name, Image: container.Image, Command: []string{"/bin/sh", "-ec"}, Args: args, Readyz: &pb.ContainerReadyz{HttpGet: &pb.HTTPGetAction{Path: "/v2/health", Port: 80}, TimeoutSeconds: 120}, SecurityContext: &pb.SecurityContext{Capabilities: &pb.Capabilities{Drop: []string{"ALL"}, Add: []string{"CHOWN", "KILL", "SETGID", "SETUID"}}}}
+	compiled := &pb.Container{Name: container.Name, Image: container.Image, Command: []string{"/bin/sh", "-ec"}, Args: args, Readyz: &pb.ContainerReadyz{HttpGet: &pb.HTTPGetAction{Path: "/v2/health", Port: 80}, TimeoutSeconds: 120}, SecurityContext: securityContext}
 	seen := map[string]bool{}
 	for _, env := range container.Env {
+		// The native DTO treats values literally. Kubernetes expands $(NAME)
+		// using earlier variables and reduces $$ escapes, so these expressions
+		// must be resolved before admission to this backend.
+		if hasKubernetesExpansion(env.Value) {
+			return nil, fmt.Errorf("native environment expansion for %s is unsupported", env.Name)
+		}
 		// Preserve the pinned native compiler's fixed ephemeral session/broker
 		// defaults. Actor identity uses SystemInfo, not a Kubernetes namespace.
 		if env.Name == "ORKA_ACP_SESSION_BASE_DIR" || env.Name == "ORKA_ACP_MCP_BROKER_URL" || env.Name == "ORKA_ACP_POD_NAMESPACE" {
@@ -200,6 +219,100 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 	compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: identityVolumeName, MountPath: identityMountPath})
 	return compiled, nil
 }
+
+func hasKubernetesExpansion(value string) bool {
+	return strings.Contains(value, "$(") || strings.Contains(value, "$$")
+}
+
+// Runtime Pod placement cannot be translated to the native Actor scheduler.
+// Its exact operator WorkerPool has a separately pinned scheduling contract.
+func validateNativeScheduling(pod corev1.PodSpec) error {
+	if len(pod.NodeSelector) != 0 || pod.NodeName != "" || pod.Affinity != nil || len(pod.Tolerations) != 0 || pod.SchedulerName != "" ||
+		pod.PriorityClassName != "" || pod.Priority != nil || pod.PreemptionPolicy != nil || pod.RuntimeClassName != nil ||
+		len(pod.Overhead) != 0 || len(pod.TopologySpreadConstraints) != 0 || len(pod.SchedulingGates) != 0 || pod.SchedulingGroup != nil ||
+		len(pod.ResourceClaims) != 0 || pod.Resources != nil || pod.OS != nil || len(pod.EvictionResponders) != 0 {
+		return fmt.Errorf("native runtime Pod scheduling constraints are unsupported")
+	}
+	for _, container := range pod.Containers {
+		if len(container.Resources.Claims) != 0 {
+			return fmt.Errorf("native runtime resource claims are unsupported")
+		}
+		for _, port := range container.Ports {
+			if port.HostPort != 0 || port.HostIP != "" {
+				return fmt.Errorf("native runtime host port placement is unsupported")
+			}
+		}
+	}
+	return nil
+}
+
+// The pinned OCI builder always starts as UID/GID 0 and exposes only capability
+// changes. Accept explicit constraints matching those defaults, and reject any
+// other supplied setting instead of silently discarding it.
+func compileSecurityContext(podContext *corev1.PodSecurityContext, containerContext *corev1.SecurityContext) (*pb.SecurityContext, error) {
+	validateIdentity := func(user, group *int64, nonRoot *bool) error {
+		if user != nil && *user != 0 || group != nil && *group != 0 || nonRoot != nil && *nonRoot {
+			return fmt.Errorf("native process requires UID/GID 0 and cannot require non-root")
+		}
+		return nil
+	}
+	if podContext != nil {
+		if err := validateIdentity(podContext.RunAsUser, podContext.RunAsGroup, podContext.RunAsNonRoot); err != nil {
+			return nil, err
+		}
+		remaining := podContext.DeepCopy()
+		remaining.RunAsUser, remaining.RunAsGroup, remaining.RunAsNonRoot = nil, nil, nil
+		if !reflect.DeepEqual(remaining, &corev1.PodSecurityContext{}) {
+			return nil, fmt.Errorf("native pod security context contains unsupported settings")
+		}
+	}
+	if containerContext == nil {
+		return nil, nil
+	}
+	if err := validateIdentity(containerContext.RunAsUser, containerContext.RunAsGroup, containerContext.RunAsNonRoot); err != nil {
+		return nil, err
+	}
+	if containerContext.Privileged != nil && *containerContext.Privileged {
+		return nil, fmt.Errorf("native privileged process is unsupported")
+	}
+	if containerContext.ReadOnlyRootFilesystem != nil && *containerContext.ReadOnlyRootFilesystem {
+		return nil, fmt.Errorf("native read-only root filesystem is unsupported")
+	}
+	remaining := containerContext.DeepCopy()
+	remaining.RunAsUser, remaining.RunAsGroup, remaining.RunAsNonRoot = nil, nil, nil
+	remaining.Privileged, remaining.ReadOnlyRootFilesystem, remaining.Capabilities = nil, nil, nil
+	if !reflect.DeepEqual(remaining, &corev1.SecurityContext{}) {
+		return nil, fmt.Errorf("native container security context contains unsupported settings")
+	}
+	if containerContext.Capabilities == nil {
+		return nil, nil
+	}
+	compiled := &pb.SecurityContext{Capabilities: &pb.Capabilities{}}
+	for _, list := range []struct {
+		values []corev1.Capability
+		target *[]string
+		drop   bool
+	}{
+		{values: containerContext.Capabilities.Add, target: &compiled.Capabilities.Add},
+		{values: containerContext.Capabilities.Drop, target: &compiled.Capabilities.Drop, drop: true},
+	} {
+		if len(list.values) > 64 {
+			return nil, fmt.Errorf("native capabilities exceed the upstream limit")
+		}
+		seen := map[string]bool{}
+		for _, capability := range list.values {
+			name := string(capability)
+			if name == "ALL" && !list.drop || len(name) > 63 || strings.HasPrefix(name, "CAP_") || !nativeCapabilityName.MatchString(name) || seen[name] {
+				return nil, fmt.Errorf("native capability %s is unsupported", name)
+			}
+			seen[name] = true
+			*list.target = append(*list.target, name)
+		}
+	}
+	return compiled, nil
+}
+
+var nativeCapabilityName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
 func compileResources(requirements corev1.ResourceRequirements) (*pb.Resources, error) {
 	for name, quantity := range requirements.Requests {

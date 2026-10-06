@@ -84,6 +84,17 @@ func (d *Lifecycle) pod(ctx context.Context, record *journalRecord) (*corev1.Pod
 	if expectedSpec.NodeName == "" {
 		actualSpec.NodeName = ""
 	}
+	// Priority admission derives these values from a requested or global
+	// default class. Explicit template fields remain part of the frozen intent.
+	if expectedSpec.Priority == nil {
+		actualSpec.Priority = nil
+	}
+	if expectedSpec.PreemptionPolicy == nil {
+		actualSpec.PreemptionPolicy = nil
+	}
+	if expectedSpec.PriorityClassName == "" {
+		actualSpec.PriorityClassName = ""
+	}
 	normalizePodSpec(&actualSpec)
 	normalizePodSpec(&expectedSpec)
 	if !apiequality.Semantic.DeepEqual(actualSpec, expectedSpec) {

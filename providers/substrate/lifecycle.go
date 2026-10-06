@@ -257,16 +257,17 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if record.Actor.UID != "" {
 			return fmt.Errorf("recorded native Actor disappeared; uncertain work is never replayed")
 		}
+		if record.Actor.CreateIssued {
+			return fmt.Errorf("native Actor creation was already issued without an observed lifetime; uncertain work is never replayed")
+		}
 		if record.InheritedCheckpoint != nil {
 			if err := d.verifyCheckpoint(ctx, record.InheritedCheckpoint); err != nil {
 				return err
 			}
 		}
-		if !record.Actor.CreateIssued {
-			record.Actor.CreateIssued = true
-			if err := d.save(ctx, cm, record); err != nil {
-				return err
-			}
+		record.Actor.CreateIssued = true
+		if err := d.save(ctx, cm, record); err != nil {
+			return err
 		}
 		create := &pb.Actor{Metadata: &pb.ResourceMetadata{Atespace: record.Atespace, Name: record.Actor.Name}, ActorTemplate: &pb.ObjectRef{Atespace: record.Atespace, Name: record.CreateTemplate.Name}}
 		if record.InheritedCheckpoint != nil {

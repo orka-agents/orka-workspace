@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -114,7 +115,7 @@ func (d *Lifecycle) ensureInfrastructure(ctx context.Context, cm *corev1.ConfigM
 	} else if err != nil {
 		return err
 	}
-	if policy.UID == "" || record.NetworkPolicy.UID != "" && record.NetworkPolicy.UID != string(policy.UID) || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !reflect.DeepEqual(policy.Spec, desired) {
+	if policy.UID == "" || record.NetworkPolicy.UID != "" && record.NetworkPolicy.UID != string(policy.UID) || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(policy.Spec), desired) {
 		return fmt.Errorf("native network policy differs from admitted rules")
 	}
 	if record.NetworkPolicy.UID == "" {
@@ -145,7 +146,7 @@ func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *jo
 		return err
 	}
 	desired := nativeNetworkPolicy(record)
-	if record.NetworkPolicy.UID == "" || string(policy.UID) != record.NetworkPolicy.UID || policy.DeletionTimestamp != nil || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !reflect.DeepEqual(policy.Spec, desired) {
+	if record.NetworkPolicy.UID == "" || string(policy.UID) != record.NetworkPolicy.UID || policy.DeletionTimestamp != nil || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(policy.Spec), desired) {
 		return fmt.Errorf("native network confinement identity or admitted rules changed")
 	}
 	return d.verifyRuntimePool(ctx, record)
@@ -191,7 +192,7 @@ func nativeNetworkPolicy(record *journalRecord) networkingv1.NetworkPolicySpec {
 			}
 		}
 	}
-	return desired
+	return sdk.NormalizedNetworkPolicySpec(desired)
 }
 
 func workerLabels(record *journalRecord) map[string]string {

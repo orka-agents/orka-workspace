@@ -110,10 +110,11 @@ for obj in provider_objects:
         container = spec["containers"][0]
         container["image"], container["imagePullPolicy"] = provider_image, "IfNotPresent"
         container["volumeMounts"] = mounts
-        container["args"] = [value for value in container["args"] if not value.startswith(("--native-ca-file=", "--native-token-file="))]
+        container["args"] = [value for value in container["args"] if not value.startswith(("--native-ca-file=", "--native-token-file=", "--native-direct-egress="))]
         container["args"] += ["--native-ca-file=/native/server/trust-bundle.pem",
                               "--native-cert-file=/native/client/credential-bundle.pem",
-                              "--native-key-file=/native/client/credential-bundle.pem"]
+                              "--native-key-file=/native/client/credential-bundle.pem",
+                              "--native-direct-egress=true"]
     objects.append(obj)
 
 json.dump({"apiVersion": "v1", "kind": "List", "items": objects}, sys.stdout, indent=2)

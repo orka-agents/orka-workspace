@@ -275,7 +275,8 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	providerBinding := workspace.ImmutableObjectBinding{Name: registration.Name, UID: registration.UID, Generation: registration.Generation}
 	p.w = &workspace.ExecutionWorkspace{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: map[string]string{workspace.ProviderControllerLabel: registration.Spec.ControllerName}}, Spec: workspace.ExecutionWorkspaceSpec{
 		Mode: workspace.ExecutionWorkspaceModeInteractive, ClassBinding: classBinding, ProviderBinding: providerBinding,
-		Slot: "default", DesiredState: workspace.ExecutionWorkspaceDesiredReady, Lifecycle: lifecycle,
+		SessionRef: &workspace.ObjectIdentityReference{Name: "proof-session-" + p.runID, UID: types.UID("proof-session-" + p.runID)},
+		Slot:       "default", DesiredState: workspace.ExecutionWorkspaceDesiredReady, Lifecycle: lifecycle,
 		CoreAdmission: &workspace.ExecutionWorkspaceCoreAdmission{ClassBinding: classBinding, ProviderBinding: providerBinding, AdmittedGeneration: 1}}}
 	if err := p.core.Create(ctx, p.w); err != nil {
 		return nil, err

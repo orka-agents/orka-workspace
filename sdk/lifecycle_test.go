@@ -78,6 +78,9 @@ func TestRuntimeRequestRejectsPreBootstrapCredentialAccess(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*corev1.PodSpec){
 		"automatic token": func(p *corev1.PodSpec) { p.AutomountServiceAccountToken = nil },
+		"image pull secret": func(p *corev1.PodSpec) {
+			p.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "credential"}}
+		},
 		"secret environment": func(p *corev1.PodSpec) {
 			p.Containers[0].Env = []corev1.EnvVar{{Name: "CREDENTIAL", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{}}}}
 		},

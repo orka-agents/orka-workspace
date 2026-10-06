@@ -129,6 +129,15 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 	if err := record.Request.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("invalid journal request: %w", err)
 	}
+	if record.Volume != nil {
+		volume, err := (&profilev1alpha1.SandboxSuspendPolicy{Mode: profilev1alpha1.SandboxSuspendModeDataOnly, Volume: *record.Volume}).ResolveVolume()
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid journal durable volume: %w", err)
+		}
+		if volume.StorageClassName == "" || record.StorageClassUID == "" || !reflect.DeepEqual(volume, *record.Volume) {
+			return nil, nil, fmt.Errorf("journal durable volume is not a normalized pinned volume: %w", workspaceprovider.ErrStaleIdentity)
+		}
+	}
 	if record.MaxSuspended != nil && *record.MaxSuspended < 0 {
 		return nil, nil, workspaceprovider.ErrStaleIdentity
 	}
@@ -208,6 +217,9 @@ func (d *Lifecycle) admitted(ctx context.Context, request workspaceprovider.Work
 		return workspaceprovider.ErrWorkspaceNotAdmitted
 	}
 	if err := workspaceprovider.ValidateWorkspaceWorkload(workspace); err != nil {
+		return err
+	}
+	if err := validateDeletionPolicy(workspace.Spec.Lifecycle.DeletionPolicy); err != nil {
 		return err
 	}
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}

@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -47,6 +48,45 @@ func createPolicy(t *testing.T, c client.Client, namespace, name string, spec ne
 		t.Fatal(err)
 	}
 	return policy
+}
+
+func TestNetworkPolicyPortProtocolDefaultsWithoutChangingIntent(t *testing.T) {
+	for _, direction := range []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress} {
+		t.Run(string(direction), func(t *testing.T) {
+			c, request := fixture(t, false)
+			admitted := denyNetwork()
+			port := networkingv1.NetworkPolicyPort{Port: new(intstr.FromInt32(443))}
+			if direction == networkingv1.PolicyTypeIngress {
+				admitted.Ingress = []networkingv1.NetworkPolicyIngressRule{{Ports: []networkingv1.NetworkPolicyPort{port}}}
+			} else {
+				admitted.Egress = []networkingv1.NetworkPolicyEgressRule{{Ports: []networkingv1.NetworkPolicyPort{port}}}
+			}
+			request = networkRequest(t, c, request, admitted)
+			actual := workspaceprovider.NormalizedNetworkPolicySpec(admitted)
+			policy := createPolicy(t, c, request.Runtime.Template.Namespace, "core-policy", actual)
+			ready(t, c, request)
+			if observed, err := New(c).Observe(t.Context(), request.Key); err != nil || observed.Startup == nil {
+				t.Fatalf("API-defaulted TCP policy rejected: %+v, %v", observed, err)
+			}
+			var frozen *corev1.Protocol
+			if direction == networkingv1.PolicyTypeIngress {
+				frozen = request.Runtime.NetworkPolicy.Ingress[0].Ports[0].Protocol
+				policy.Spec.Ingress[0].Ports[0].Protocol = new(corev1.ProtocolUDP)
+			} else {
+				frozen = request.Runtime.NetworkPolicy.Egress[0].Ports[0].Protocol
+				policy.Spec.Egress[0].Ports[0].Protocol = new(corev1.ProtocolUDP)
+			}
+			if revision, err := workspaceprovider.WorkloadRevision(request); frozen != nil || err != nil || revision != request.Revision {
+				t.Fatal("normalization rewrote the frozen workload")
+			}
+			if err := c.Update(t.Context(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if observed, err := New(c).Observe(t.Context(), request.Key); err == nil || observed.Startup != nil {
+				t.Fatalf("changed UDP permissions accepted: %+v, %v", observed, err)
+			}
+		})
+	}
 }
 
 func TestNetworkPolicyRequiredBeforeNativeAllocation(t *testing.T) {

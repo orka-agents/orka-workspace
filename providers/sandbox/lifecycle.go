@@ -66,6 +66,14 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		if err := d.verifyNetworkPolicies(ctx, request.Runtime, namespace, request.Runtime.Template.Labels); err != nil {
 			return err
 		}
+		if record != nil && record.Volume != nil {
+			if err := d.resolveRetention(ctx, record); err != nil {
+				return err
+			}
+			if err := d.validateWorkspaceLifecycle(ctx, record, true); err != nil {
+				return err
+			}
+		}
 		if record == nil {
 			if err := d.proveNoAllocation(ctx, request.Key); err != nil {
 				return err
@@ -96,11 +104,6 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				return err
 			}
 		} else if request.Sequence != record.Request.Sequence {
-			if record.Volume != nil {
-				if err := d.resolveRetention(ctx, record); err != nil {
-					return err
-				}
-			}
 			if record.Volume != nil && (record.Operation != "suspend" || record.Storage == nil) {
 				return fmt.Errorf("persistent Sandbox replacement requires exact retained data from suspension")
 			}
@@ -271,6 +274,9 @@ func (d *Lifecycle) attestPod(ctx context.Context, record *journalRecord, sb *sa
 }
 
 func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (workspaceprovider.AllocationObservation, error) {
+	if err := d.validateWorkspaceLifecycle(ctx, record, record.Volume != nil); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
+	}
 	sb, err := d.sandbox(ctx, record)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -316,6 +322,9 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 	}
 	if record.Operation == "suspend" {
 		if err := d.resolveRetention(ctx, record); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
+		if err := d.validateWorkspaceLifecycle(ctx, record, true); err != nil {
 			return workspaceprovider.AllocationObservation{}, err
 		}
 		if err := d.verifySuspendedReservation(ctx, cm, record); err != nil {

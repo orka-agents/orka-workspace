@@ -24,7 +24,10 @@ Use a digest-pinned provider image. Two replicas share a provider-specific leade
 Lease, and identity and journal reads bypass the manager cache.
 
 Configure native direct egress with ateapi's transparent egress gateway disabled
-before setting `--native-direct-egress=true`. Configure the Actor DNS suffix so
+and verify WorkerPool NetworkPolicy enforcement before explicitly setting
+`--native-direct-egress=true` in an installation overlay. The shipped Deployment
+keeps this acknowledgement false and cannot serve allocations until configured.
+Configure the Actor DNS suffix so
 `<actor>.<atespace>.<suffix>:80` reaches atenet-router directly from both provider
 and Orka. No core routing flag or provider-specific transport is required. The
 profile's infrastructure ActorTemplate must select exactly one operator-owned
@@ -65,6 +68,25 @@ profile. CPU and memory requests require matching admitted limits at least as
 large; native scheduling reserves those full limits.
 Resources with requests but no limits, unsupported resource names, and requests
 exceeding the limit fail before compute is created.
+Admitted Pod scheduling constraints, including node selection, affinity,
+tolerations, scheduler/runtime classes, priority, topology spread, scheduling
+gates/groups, resource claims, Pod resource budgets, and OS selection, are
+unsupported. Placement comes only from the exact operator WorkerPool and its
+frozen specification. Core omits its generated Pod node selector from new native
+intent before admission.
+Environment values, commands, and arguments must already be resolved literals.
+Kubernetes `$(NAME)` expansion and `$$` escaping are rejected before allocation
+rather than copied with different native meaning.
+
+The pinned native process starts as UID/GID 0 regardless of image `USER`.
+Explicit user/group constraints must match 0, and non-root or privileged execution
+requirements are rejected. Admitted capability add/drop lists are translated
+without adding capabilities; absent lists use the pinned backend defaults.
+Other supplied security settings, including privilege escalation, seccomp,
+AppArmor, SELinux, Windows options, proc mounts, filesystem groups, supplemental
+groups, and sysctls, fail before allocation. Core publishes explicit UID/GID 0
+and omits unsupported security settings from new native-process intent before
+admission.
 
 The provider advertises ACP allocation, `runtime.native-process`, verified
 data-only suspension, `checkpoint.data`, and `restore.cold`. Pooled capacity, MCP
@@ -125,6 +147,9 @@ challenge, and leaves credential rotation and authenticated admission to Orka.
 A lost boot or suspension response is recovered by observation; a possibly
 accepted mutation is never replayed. Explicit core Retirement.Suspend is honored
 also while desiredState remains Ready during epoch rotation.
+Actor creation intent is also journaled before its RPC. An issued create recovers
+only by observing the Actor; absence without a recorded UID blocks allocation
+and retirement rather than issuing another create.
 
 Deletion requires observed termination and Delete disposition for provider
 resources, checkpoints, and storage. Cleanup removes recorded Tags, immutable

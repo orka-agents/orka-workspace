@@ -13,7 +13,46 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+func TestNativeNetworkPolicyPortProtocolDefaultsWithoutChangingIntent(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request.Runtime.NetworkPolicy.Egress = []networkingv1.NetworkPolicyEgressRule{{Ports: []networkingv1.NetworkPolicyPort{{Port: new(intstr.FromInt32(443))}}}}
+	var err error
+	request.Revision, err = sdk.WorkloadRevision(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	ready(t, c, native, request)
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := &networkingv1.NetworkPolicy{}
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: record.Placement.Namespace, Name: record.NetworkPolicy.Name}, policy); err != nil {
+		t.Fatal(err)
+	}
+	if protocol := policy.Spec.Egress[0].Ports[0].Protocol; protocol == nil || *protocol != corev1.ProtocolTCP {
+		t.Fatal("created policy does not carry the Kubernetes TCP default")
+	}
+	if observed, err := driver(c, native).Observe(t.Context(), request.Key); err != nil || observed.Startup == nil {
+		t.Fatalf("defaulted TCP policy rejected: %+v, %v", observed, err)
+	}
+	if request.Runtime.NetworkPolicy.Egress[0].Ports[0].Protocol != nil || record.Request.Runtime.NetworkPolicy.Egress[0].Ports[0].Protocol != nil {
+		t.Fatal("normalization rewrote frozen intent")
+	}
+	policy.Spec.Egress[0].Ports[0].Protocol = new(corev1.ProtocolUDP)
+	if err := c.Update(t.Context(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := driver(c, native).Observe(t.Context(), request.Key); err == nil || observed.Startup != nil {
+		t.Fatalf("changed UDP permissions accepted: %+v, %v", observed, err)
+	}
+}
 
 func TestNativeRejectsUnsupportedNetworkPolicyBeforeEffects(t *testing.T) {
 	for _, test := range []struct {
