@@ -81,6 +81,7 @@ func TestReconcileUsesLifecycleAndAllowsRevocationAndDeletionWhenAdmissionIsStal
 	if err := c.Create(t.Context(), class); err != nil {
 		t.Fatal(err)
 	}
+	workspace.Spec.Workload = &request
 	workspace.Spec.Lifecycle.DeletionPolicy = deletionPolicy()
 	workspace.Spec.Attachment = &workspacev1alpha1.ExecutionWorkspaceAttachment{Epoch: 1}
 	if err := c.Update(t.Context(), workspace); err != nil {
@@ -112,6 +113,7 @@ func TestReconcileUsesLifecycleAndAllowsRevocationAndDeletionWhenAdmissionIsStal
 		t.Fatal("stale admission blocked revocation")
 	}
 	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
+	workspace.Spec.Retirement = &workspacev1alpha1.WorkloadRetirement{Sequence: request.Sequence, Identity: observed.Identity, Action: workspacev1alpha1.WorkloadRetirementDelete}
 	if err := c.Update(t.Context(), workspace); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,7 @@ func TestProviderPreservesCoreOwnedConditions(t *testing.T) {
 		t.Fatal(err)
 	}
 	conditions = provider.Status.Conditions
-	config := &fakev1alpha1.FakeProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: "fake"}}
+	config := &fakev1alpha1.FakeProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: "fake", UID: "config-uid"}}
 	if err := c.Create(t.Context(), config); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +180,7 @@ func TestProviderPreservesCoreOwnedConditions(t *testing.T) {
 			t.Fatal("provider rewrote core-owned conditions")
 		}
 		for _, feature := range provider.Status.SupportedFeatures {
-			if feature != workspacev1alpha1.WorkspaceFeaturePools {
+			if feature != workspacev1alpha1.WorkspaceFeaturePools && feature != workspacev1alpha1.WorkspaceFeatureACPRuntime {
 				t.Fatalf("unsupported capability advertised: %q", feature)
 			}
 		}

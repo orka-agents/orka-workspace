@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-workspace-proof
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: proof-core
+  namespace: external-workspace-proof
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: proof-untrusted
+  namespace: external-workspace-proof
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-workspace-proof-core
+rules:
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspaces, executionworkspacecheckpoints]
+    verbs: [get, list, create, update, patch, delete, admit, configure]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders/status, executionworkspaceclasses/status, executionworkspacepools/status, executionworkspaces/status, executionworkspacecheckpoints/status]
+    verbs: [get, update, patch]
+  - apiGroups: [fake.workspace.orka.ai]
+    resources: [fakepoolparameters]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-workspace-proof-core
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-workspace-proof-core
+subjects:
+  - kind: ServiceAccount
+    name: proof-core
+    namespace: external-workspace-proof
+---
+# Deliberately grant ordinary HTTP writes without the virtual ownership verbs.
+# A rejected request must reach admission rather than fail ordinary RBAC first.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-workspace-proof-untrusted
+rules:
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspaces, executionworkspacecheckpoints, executionworkspaceproviders/status, executionworkspaceclasses/status, executionworkspacepools/status, executionworkspaces/status, executionworkspacecheckpoints/status]
+    verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-workspace-proof-untrusted
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-workspace-proof-untrusted
+subjects:
+  - kind: ServiceAccount
+    name: proof-untrusted
+    namespace: external-workspace-proof

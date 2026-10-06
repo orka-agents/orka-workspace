@@ -1,0 +1,36 @@
+apiVersion: substrate.workspace.orka.ai/v1alpha1
+kind: SubstrateProviderConfig
+metadata:
+  name: substrate
+spec: {}
+---
+apiVersion: workspace.orka.ai/v1alpha1
+kind: ExecutionWorkspaceProvider
+metadata:
+  name: substrate
+spec:
+  controllerName: v1.substrate.workspace.orka.ai
+  serviceAccountRef:
+    namespace: orka-workspace-system
+    name: orka-workspace-substrate
+  lifecycleState: Active
+  requiredContracts:
+    - workspace.orka.ai/v1
+    - orka.workspace.lifecycle.v1
+  parametersRef:
+    group: substrate.workspace.orka.ai
+    kind: SubstrateProviderConfig
+    name: substrate
+
+---
+apiVersion: substrate.workspace.orka.ai/v1alpha1
+kind: SubstrateWorkspaceProfile
+metadata:
+  name: substrate-data
+  namespace: default
+spec:
+  templateRef:
+    name: workspace-infrastructure
+    namespace: default
+  suspend:
+    mode: DataOnly

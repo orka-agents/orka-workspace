@@ -1,0 +1,85 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orka-workspace-substrate
+rules:
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaces]
+    verbs: [patch]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspaces]
+    verbs: [get, list, watch]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders/status, executionworkspacepools/status, executionworkspaces/status]
+    verbs: [get, patch, update]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspacecheckpoints]
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspacecheckpoints/status]
+    verbs: [get, patch, update]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspacecheckpoints/finalizers]
+    verbs: [update]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceproviders]
+    resourceNames: [substrate]
+    verbs: [provider-status]
+  - apiGroups: [substrate.workspace.orka.ai]
+    resources: [substrateproviderconfigs, substrateworkspaceprofiles]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+  - apiGroups: [ate.dev]
+    resources: [workerpools]
+    verbs: [get, list, create, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orka-workspace-substrate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orka-workspace-substrate
+subjects:
+  - kind: ServiceAccount
+    name: orka-workspace-substrate
+    namespace: orka-workspace-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orka-workspace-substrate-leader
+  namespace: orka-workspace-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orka-workspace-substrate-leader
+  namespace: orka-workspace-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orka-workspace-substrate-leader
+subjects:
+  - kind: ServiceAccount
+    name: orka-workspace-substrate
+    namespace: orka-workspace-system

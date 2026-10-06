@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orka-workspace-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orka-workspace-sandbox
+  namespace: orka-workspace-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orka-workspace-sandbox
+  namespace: orka-workspace-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orka-workspace-sandbox
+  template:
+    metadata:
+      labels:
+        app: orka-workspace-sandbox
+    spec:
+      serviceAccountName: orka-workspace-sandbox
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provider
+          image: orka-workspace-sandbox:dev
+          args:
+            - --leader-elect=true
+            - --leader-election-namespace=orka-workspace-system
+          ports:
+            - containerPort: 8081
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

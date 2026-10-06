@@ -29,11 +29,13 @@ generate: controller-gen
 	"$(CONTROLLER_GEN)" object:headerFile=hack/boilerplate.go.txt paths=./api/...
 
 manifests: controller-gen
-	"$(CONTROLLER_GEN)" crd:allowDangerousTypes=true paths=./api/... output:crd:artifacts:config=config/crd/bases
+	"$(CONTROLLER_GEN)" crd:allowDangerousTypes=true,generateEmbeddedObjectMeta=true paths=./api/... output:crd:artifacts:config=config/crd/bases
 
 check-generated: controller-gen
 	bash scripts/check-generated.sh "$(CONTROLLER_GEN)"
 	bash providers/fake/check-generated.sh "$(CONTROLLER_GEN)"
+	bash scripts/check-provider-generated.sh "$(CONTROLLER_GEN)" sandbox
+	bash scripts/check-provider-generated.sh "$(CONTROLLER_GEN)" substrate
 
 check-boundaries:
 	python3 scripts/check-boundaries.py

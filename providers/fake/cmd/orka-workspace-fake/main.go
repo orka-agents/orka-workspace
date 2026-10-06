@@ -47,13 +47,24 @@ func run(conformanceMode, leaderElection bool, leaderNamespace string) error {
 	}
 	if conformanceMode {
 		ctx := context.Background()
-		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workspacev1alpha1.ExecutionWorkspace{}).Build()
-		request, err := provider.ConformanceFixture(ctx, c)
-		if err != nil {
-			return err
+		checks := []func(context.Context, func() workspaceprovider.Lifecycle, workspaceprovider.WorkloadRequest) error{
+			conformance.Check,
+			func(ctx context.Context, factory func() workspaceprovider.Lifecycle, request workspaceprovider.WorkloadRequest) error {
+				return conformance.CheckReplacement(ctx, factory, request, nil)
+			},
+			func(ctx context.Context, factory func() workspaceprovider.Lifecycle, request workspaceprovider.WorkloadRequest) error {
+				return conformance.CheckSuspension(ctx, factory, request, nil)
+			},
 		}
-		if err := conformance.Check(ctx, func() workspaceprovider.Lifecycle { return provider.New(c) }, request); err != nil {
-			return err
+		for _, check := range checks {
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workspacev1alpha1.ExecutionWorkspace{}).Build()
+			request, err := provider.ConformanceFixture(ctx, c)
+			if err != nil {
+				return err
+			}
+			if err := check(ctx, func() workspaceprovider.Lifecycle { return provider.New(c) }, request); err != nil {
+				return err
+			}
 		}
 		fmt.Println("fake fixture lifecycle conformance passed")
 		return nil

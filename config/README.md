@@ -1,8 +1,8 @@
 # Shared installation bundle
 
-`kubectl apply -k config` installs the five shared CRDs and the field-ownership admission policy. The platform owner installs this bundle once. Provider deployments install their own configuration kinds and RBAC, and do not uninstall the shared bundle.
+`kubectl apply --server-side -k config` installs the five shared CRDs and the field-ownership admission policy. Server-side apply avoids the client-side annotation size limit for the embedded Pod schema. The platform owner installs this bundle once. Provider deployments install their own configuration kinds and RBAC, and do not uninstall the shared bundle.
 
-This phase has not certified a Kubernetes server version. The bundle requires a server that serves `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` and its CEL authorizer library. Tests compile and evaluate the shipped policy with the Kubernetes `v0.37.0` API-server implementation. An actual cluster admission test and an exact supported server-version row remain Phase 2 gates. A successful local CEL test does not prove a running cluster has enabled the policy.
+The standalone live proof passes on Kubernetes v1.37.0, including ownership denials and two-replica leader election. Other server versions are not certified. The bundle requires `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` and its CEL authorizer library. Tests also compile and evaluate the shipped policy with the Kubernetes `v0.37.0` API-server implementation.
 
 Configure authorization before controllers begin reconciling:
 

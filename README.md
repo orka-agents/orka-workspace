@@ -2,7 +2,7 @@
 
 Shared Kubernetes workspace API, Go SDK, lifecycle conformance tests, and independently built provider controllers.
 
-This repository implements the shared foundation of [orka-workspace#1](https://github.com/orka-agents/orka-workspace/issues/1). The five `workspace.orka.ai/v1alpha1` CRDs are byte-identical to Orka commit `1cd16c88b43410e0ea46463f8a39b473d8e5250e`. The first provider is a persistent fake for lifecycle and controller tests. It does not run an ACP runtime.
+The shared `workspace.orka.ai/v1alpha1` API persists numbered, immutable workload requests and exact allocation evidence. Separate fake, Agent Sandbox, and Substrate controllers own compute and recovery journals. Orka owns authorization, credentials, authenticated runtime admission, and drain settlement.
 
 ## Build and check
 
@@ -16,12 +16,14 @@ This builds, vets, and race-tests both Go modules, regenerates the shared API in
 
 | Directory | Module and purpose |
 | --- | --- |
-| `api/v1alpha1` | Stored workspace types, with the original groups, kinds, scope, and schemas |
+| `api/v1alpha1` | Workspace types, immutable workloads, startup evidence, and checkpoint references |
 | `sdk` | Conditions, class hashes, identity, connection helpers, and the allocation lifecycle contract |
 | `sdk/workspaceagent` | Existing command/file protocol and client |
 | `conformance` | Required allocation, recovery, fencing, stop, and deletion behavior |
 | `config` | Shared CRDs, admission policies, and RBAC templates |
-| `providers/fake` | Separate module and binary, provider parameter CRDs, ConfigMap journal, and deployment example |
+| `providers/fake` | Pod materialization, persistent journal, separate binary and deployment |
+| `providers/sandbox` | Agent Sandbox allocation, exact Pod/PVC evidence, data-only suspension |
+| `providers/substrate` | Native ACP actor lifecycle, sealed bootstrap evidence, data-only capture |
 | `docs/adr` | Ownership, startup/retirement, configuration/trust, and compatibility decisions |
 
 The `sdk` import retains the Go package name `workspaceprovider` to keep consumer changes mechanical. `providers/go.mod` uses a local replacement for development; it is not part of the shared module's dependency graph.
@@ -36,9 +38,9 @@ Call `conformance.Check` with a fresh admitted fixture and a factory that reconn
 
 ## Integration status
 
-The shared schemas remain unchanged during extraction. The SDK's new workload and startup-evidence types are not yet fields on `ExecutionWorkspace`. A standalone provider cannot yet admit an Orka `RuntimeSession` through this boundary.
+Orka #572 is implemented on the integration branch. The generic RuntimePool path consumes provider evidence, independently verifies accessible Pods and storage, binds private credentials to the exact instance, and admits only an authenticated supervisor fence. See [installation and retirement](docs/external-providers.md) and [implementation status](docs/implementation-status.md) for validation results and remaining migration work.
 
-The next stage depends on [Orka #572](https://github.com/orka-agents/orka/issues/572). It adds the persisted handoff and generic RuntimePool integration before extracting Sandbox and Substrate. Fiberd remains gated on those providers and its upstream authentication, revocation, cleanup, image-launching, and pressure-parking requirements.
+Fiberd remains gated on upstream authentication, persisted revocation, explicit deletion, selected-image launching, and pressure-parking controls.
 
 The accepted migration choices are separate provider-owned config/profile kinds, in-place `v1alpha1` pool changes with an enforced upgrade gate, and continuation while a provider is `Draining` only for an existing workspace bound to the same session, slot, and provider. Cold resume counts as continuation. `Disabled` permits cleanup only. See the [configuration and trust ADR](docs/adr/0003-configuration-and-trust.md) and [compatibility ADR](docs/adr/0004-compatibility.md).
 

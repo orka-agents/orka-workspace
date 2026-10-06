@@ -228,3 +228,94 @@ func TestDeletedTombstoneRetainsOwnerAndPolicy(t *testing.T) {
 		t.Fatalf("changed deletion policy accepted: %v", err)
 	}
 }
+
+func TestSequenceAndOptionalSuspensionConformance(t *testing.T) {
+	for _, suspend := range []bool{false, true} {
+		t.Run(fmt.Sprint("suspend=", suspend), func(t *testing.T) {
+			c, request := fixture(t)
+			factory := func() workspaceprovider.Lifecycle { return New(c) }
+			var err error
+			if suspend {
+				err = conformance.CheckSuspension(t.Context(), factory, request, nil)
+			} else {
+				err = conformance.CheckReplacement(t.Context(), factory, request, nil)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
+	for _, write := range []int{1, 2} {
+		t.Run(fmt.Sprint(write), func(t *testing.T) {
+			c, request := fixture(t)
+			ready, err := New(c).EnsureAllocation(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(&faultClient{Client: c, failAt: write, commit: true}).SuspendInstance(t.Context(), request.Key, ready.Identity); err == nil {
+				t.Fatal("expected lost response")
+			}
+			pending, err := New(c).EnsureAllocation(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pending.State == workspaceprovider.AllocationReady || pending.Startup != nil {
+				t.Fatal("suspension intent retained startup readiness")
+			}
+			suspended, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if suspended.State != workspaceprovider.AllocationStopped || suspended.RetainedData == nil || suspended.RetainedData.SourceInstance != ready.Identity {
+				t.Fatal("suspension lost its exact retained lineage")
+			}
+		})
+	}
+}
+
+func TestInvalidSequenceTransitionsDoNotChangePredecessor(t *testing.T) {
+	for _, kind := range []string{"gap", "foreign-instance", "missing-lineage", "forged-lineage"} {
+		t.Run(kind, func(t *testing.T) {
+			c, request := fixture(t)
+			ready, err := New(c).EnsureAllocation(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stopped, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := request
+			next.Sequence = 2
+			next.PreviousInstance = &ready.Identity
+			lineage := *stopped.RetainedData
+			next.RetainedData = &lineage
+			switch kind {
+			case "gap":
+				next.Sequence = 3
+			case "foreign-instance":
+				foreign := ready.Identity
+				foreign.InstanceID = "foreign"
+				next.PreviousInstance = &foreign
+			case "missing-lineage":
+				next.RetainedData = nil
+			case "forged-lineage":
+				next.RetainedData.ID = "foreign"
+			}
+			next.Revision, _ = workspaceprovider.WorkloadRevision(next)
+			if _, err := New(c).EnsureAllocation(t.Context(), next); err == nil {
+				t.Fatal("invalid sequence was accepted")
+			}
+			current, err := New(c).Observe(t.Context(), request.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Identity != ready.Identity || current.Sequence != 1 || current.State != workspaceprovider.AllocationStopped {
+				t.Fatal("rejected request changed predecessor")
+			}
+		})
+	}
+}

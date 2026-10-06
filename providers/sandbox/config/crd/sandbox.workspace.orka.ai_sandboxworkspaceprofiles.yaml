@@ -1,0 +1,118 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: sandboxworkspaceprofiles.sandbox.workspace.orka.ai
+spec:
+  group: sandbox.workspace.orka.ai
+  names:
+    categories:
+    - orka
+    kind: SandboxWorkspaceProfile
+    listKind: SandboxWorkspaceProfileList
+    plural: sandboxworkspaceprofiles
+    singular: sandboxworkspaceprofile
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SandboxWorkspaceProfile is resolved in the ExecutionWorkspaceClass namespace
+          through its TypedObjectReference. It cannot supply a different namespace.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            default: {}
+            description: |-
+              Default an empty functional spec so later additions are also subject to
+              the immutable-spec transition rule.
+            properties:
+              retention:
+                description: |-
+                  RetentionPolicy limits suspended occupancy per class and namespace. The
+                  owning class must separately provide an expiry bound. A configured count cap
+                  requires maxLifetime because capacity contention can defer suspension.
+                properties:
+                  maxSuspendedWorkspaces:
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              suspend:
+                description: |-
+                  Suspend enables PVC-backed cold resume. Omission keeps suspension
+                  unsupported and leaves ordinary delete/recreate behavior unchanged.
+                properties:
+                  mode:
+                    description: SandboxSuspendMode identifies the only admitted cold-resume
+                      scope.
+                    enum:
+                    - DataOnly
+                    type: string
+                  volume:
+                    description: |-
+                      SandboxDurableVolume freezes the requested workspace PVC shape. The provider
+                      owns its mount path and verifies the realized PVC identity before bootstrap.
+                    properties:
+                      accessModes:
+                        default:
+                        - ReadWriteOnce
+                        description: |-
+                          AccessModes defaults to ReadWriteOnce when omitted or empty. Every mode
+                          must permit the runtime to write repository/workspace data.
+                        items:
+                          enum:
+                          - ReadWriteOnce
+                          - ReadWriteOncePod
+                          - ReadWriteMany
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: set
+                      capacity:
+                        description: Capacity is a positive Kubernetes storage quantity,
+                          for example 1Gi.
+                        minLength: 1
+                        type: string
+                      storageClassName:
+                        description: |-
+                          StorageClassName selects a class, or the cluster default when empty.
+                          Resolution must pin the live class UID and verify its deletion policy.
+                        type: string
+                    required:
+                    - capacity
+                    type: object
+                required:
+                - mode
+                - volume
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: SandboxWorkspaceProfile spec is immutable; create a new profile
+              rule: self == oldSelf
+        type: object
+    served: true
+    storage: true
+    subresources: {}

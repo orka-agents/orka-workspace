@@ -9,6 +9,6 @@ These records describe the extraction from Orka commit [`1cd16c88b43410e0ea46463
 | [0003](0003-configuration-and-trust.md) | Typed configuration, virtual verbs, and operation journals |
 | [0004](0004-compatibility.md) | Independent versions and supported combinations |
 
-Phase 1 builds the shared packages and fake provider. It preserves the stored workspace schemas. The external RuntimePool handoff, production provider extraction, migration, and cluster proof described here remain later work. [The provider inventory](../provider-inventory.md) identifies those boundaries.
+These records preserve the baseline decisions. See [implementation status](../implementation-status.md) for the completed workload handoff, separate providers, and live proofs, and [installation and retirement](../external-providers.md) for current deployment requirements. [The provider inventory](../provider-inventory.md) records the original extraction boundaries.
 
 [ADR 0005](0005-persisted-workload-sequences.md) records numbered runtime requests, retained lineage, and exact-instance retirement authorization.

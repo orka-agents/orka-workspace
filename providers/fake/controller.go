@@ -22,14 +22,14 @@ import (
 )
 
 const (
-	FakeWorkspaceControllerName = "fake.workspace.orka.ai/v1"
+	FakeWorkspaceControllerName = "fake.workspace.orka.ai"
 	fakeWorkspaceAdapterVersion = "0.1.0-dev"
 	fakeProviderConfigKind      = "FakeProviderConfig"
 	fakeProviderHeartbeatPeriod = 20 * time.Second
 )
 
-// FakeExecutionWorkspaceProviderReconciler is a status-only reference adapter
-// used by envtest and development. It owns only providers with the fake controllerName.
+// FakeExecutionWorkspaceProviderReconciler advertises the development Pod
+// provider. It owns only registrations with the fake controller name.
 type FakeExecutionWorkspaceProviderReconciler struct {
 	client.Client
 	Now func() time.Time
@@ -43,6 +43,7 @@ func (r *FakeExecutionWorkspaceProviderReconciler) Reconcile(ctx context.Context
 	if provider.Spec.ControllerName != FakeWorkspaceControllerName || !provider.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+	before := provider.DeepCopy()
 	configured, err := r.providerConfigAvailable(ctx, provider)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -57,15 +58,15 @@ func (r *FakeExecutionWorkspaceProviderReconciler) Reconcile(ctx context.Context
 	if r.Now != nil {
 		now = r.Now().UTC()
 	}
-	before := provider.DeepCopy()
 	provider.Status.ObservedGeneration = provider.Generation
 	provider.Status.Adapter = &workspacev1alpha1.ExecutionWorkspaceAdapterStatus{Version: fakeWorkspaceAdapterVersion}
-	provider.Status.Backend = &workspacev1alpha1.ExecutionWorkspaceBackendStatus{Version: "status-fixture-v1", APIVersions: []string{"fake.workspace.orka.ai/v1"}}
-	provider.Status.SupportedContracts = []string{workspacev1alpha1.ContractVersionV1}
-	// This adapter models status transitions only. It provides no executable runtime,
-	// network endpoint, TLS, files, reset or resume capability.
+	provider.Status.Backend = &workspacev1alpha1.ExecutionWorkspaceBackendStatus{Version: "kubernetes-pod-v1", APIVersions: []string{"fake.workspace.orka.ai/v1"}}
+	provider.Status.SupportedContracts = []string{workspacev1alpha1.ContractVersionV1, workspaceprovider.LifecycleContractV1}
+	// Pod mode materializes the admitted supervisor template. Runtime bootstrap
+	// and authenticated admission remain core-owned; data suspension is fixture-only.
 	provider.Status.SupportedFeatures = []workspacev1alpha1.ExecutionWorkspaceFeature{
 		workspacev1alpha1.WorkspaceFeaturePools,
+		workspacev1alpha1.WorkspaceFeatureACPRuntime,
 	}
 	heartbeat := metav1.NewTime(now)
 	provider.Status.LastHeartbeat = &heartbeat
@@ -107,7 +108,14 @@ func (r *FakeExecutionWorkspaceProviderReconciler) providerConfigAvailable(
 		}
 		return false, fmt.Errorf("get fake provider config %q: %w", ref.Name, err)
 	}
-	return config.GetNamespace() == "" && config.GetDeletionTimestamp() == nil, nil
+	if config.GetNamespace() != "" || config.GetDeletionTimestamp() != nil || config.GetUID() == "" {
+		return false, nil
+	}
+	if provider.Status.PinnedParametersUID != "" && provider.Status.PinnedParametersUID != string(config.GetUID()) {
+		return false, nil
+	}
+	provider.Status.PinnedParametersUID = string(config.GetUID())
+	return true, nil
 }
 
 func (r *FakeExecutionWorkspaceProviderReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -211,7 +219,7 @@ func (r *FakeExecutionWorkspacePoolReconciler) SetupWithManager(mgr ctrl.Manager
 }
 
 // FakeExecutionWorkspaceReconciler projects the durable fixture lifecycle into
-// shared status. It cannot launch a workload or admit an ACP runtime.
+// shared status and materializes admitted Pods. Core admits ACP runtimes.
 type FakeExecutionWorkspaceReconciler struct {
 	client.Client
 	APIReader  client.Reader

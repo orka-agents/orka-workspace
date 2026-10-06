@@ -3,6 +3,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -16,19 +17,21 @@ import (
 )
 
 // FixtureRequest is fixed public simulation input, never a launchable runtime
-// request. Shared schema v1 has no workload field; this remains a status fixture.
+// request for simulation-only conformance. Real controllers consume spec.workload.
 func FixtureRequest(workspace *workspacev1alpha1.ExecutionWorkspace) workspaceprovider.WorkloadRequest {
 	request := workspaceprovider.WorkloadRequest{
-		Key:   workspaceprovider.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: workspace.Spec.ProviderBinding.UID},
-		Image: "fixture.invalid/status-only@sha256:" + strings.Repeat("0", 64),
-		Args:  []string{string(workspace.Spec.ClassBinding.UID), workspace.Spec.ClassBinding.ProfileHash},
+		Sequence: 1,
+		Key:      workspaceprovider.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: workspace.Spec.ProviderBinding.UID},
+		Image:    "fixture.invalid/status-only@sha256:" + strings.Repeat("0", 64),
+		Args:     []string{string(workspace.Spec.ClassBinding.UID), workspace.Spec.ClassBinding.ProfileHash},
 	}
 	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
 	return request
 }
 
 func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, workspace *workspacev1alpha1.ExecutionWorkspace) (ctrl.Result, error) {
-	admissionPending := false
+	pending := false
+	var operationErr error
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		current := &workspacev1alpha1.ExecutionWorkspace{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
@@ -44,9 +47,10 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 		deleted := !current.DeletionTimestamp.IsZero() || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
 		quarantined := current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined
 		revoking := workspaceNeedsAttachmentRevocation(current)
-		maintenance := deleted || quarantined || revoking
-		if !maintenance && !workspaceCurrentlyAdmittedByCore(current) {
-			admissionPending = true
+		admitted := workspaceCurrentlyAdmittedByCore(current) && provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderDisabled
+		maintenance := deleted || quarantined || revoking || current.Spec.Retirement != nil || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || provider.Spec.LifecycleState == workspacev1alpha1.ExecutionWorkspaceProviderDisabled
+		if !maintenance && !admitted {
+			pending = true
 			return nil
 		}
 		if !maintenance {
@@ -55,77 +59,138 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				return err
 			}
 			if !withinCapacity {
-				admissionPending = true
+				pending = true
 				return nil
 			}
 		}
+		// Acknowledge the attachment before Pod startup. This signal lets core
+		// establish runtime demand; it must not depend on its own bootstrap work.
 		before := current.DeepCopy()
-		driver := New(r.Client)
-		request := FixtureRequest(current)
-		observed, err := driver.Observe(ctx, request.Key)
-		missing := err == workspaceprovider.ErrNotFound
-		if err != nil && !missing {
-			return err
+		current.Status.AttachedEpoch = 0
+		if admitted && !deleted && !quarantined && current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady && current.Spec.Attachment != nil {
+			current.Status.AttachedEpoch = current.Spec.Attachment.Epoch
+			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
 		}
-		if deleted || quarantined || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended {
-			if !missing {
-				observed, err = driver.StopInstance(ctx, request.Key, observed.Identity)
-				if err != nil {
-					return err
-				}
-				if deleted {
-					observed, err = driver.DeleteAllocation(ctx, request.Key, observed.Identity, current.Spec.Lifecycle.DeletionPolicy)
-					if err != nil {
-						return err
-					}
-				}
-			}
-		} else if !revoking {
-			observed, err = driver.EnsureAllocation(ctx, request)
-			if err != nil {
+		attached := current.Status.AttachedEpoch > 0
+		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: conditionStatus(attached), Reason: conditionReason(attached, string(workspacev1alpha1.ReasonAttachmentRevoked)), Message: chooseMessage(attached, "attachment epoch acknowledged; runtime startup is independent", "no attachment epoch is active"), ObservedGeneration: current.Generation})
+		if !reflect.DeepEqual(before.Status, current.Status) {
+			if err := r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 				return err
 			}
 		}
+		before = current.DeepCopy()
+		driver := New(r.Client)
+		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
+		observed, err := driver.Observe(ctx, key)
+		if deleted || quarantined {
+			// Cleanup is authorized by the durable instance fence, even when an
+			// admission webhook changed the Pod so ordinary observation rejects it.
+			_, record, readErr := driver.read(ctx, key)
+			err = readErr
+			if record != nil {
+				observed = record.Observation
+			}
+		}
+		missing := err == workspaceprovider.ErrNotFound
+		operationErr = nil
+		if err != nil && !missing {
+			operationErr = err
+		}
+		retirementPending := false
+		if operationErr == nil && !missing && (deleted || quarantined || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || current.Spec.Retirement != nil) {
+			action := workspacev1alpha1.WorkloadRetirementStop
+			if deleted {
+				action = workspacev1alpha1.WorkloadRetirementDelete
+			} else if current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || (!quarantined && current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend) {
+				action = workspacev1alpha1.WorkloadRetirementSuspend
+			}
+			if err := workspaceprovider.ValidateWorkloadRetirement(current.Spec.Workload, &observed, current.Spec.Retirement, action); err != nil {
+				retirementPending = true
+			}
+		}
+		if operationErr == nil && !retirementPending {
+			switch {
+			case deleted || quarantined:
+				if !missing {
+					observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
+					if operationErr == nil && deleted && observed.State == workspaceprovider.AllocationStopped {
+						observed, operationErr = driver.DeleteAllocation(ctx, key, observed.Identity, current.Spec.Lifecycle.DeletionPolicy)
+					}
+				}
+			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || (current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend):
+				if !missing {
+					observed, operationErr = driver.SuspendInstance(ctx, key, observed.Identity)
+				}
+			case current.Spec.Retirement != nil && !missing:
+				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
+			case !revoking && current.Spec.Workload != nil:
+				observed, operationErr = driver.EnsureAllocation(ctx, *current.Spec.Workload)
+				if operationErr == nil {
+					missing = false
+				}
+			}
+		}
 		current.Status.ObservedGeneration = current.Generation
-		current.Status.ExternalID = observed.Identity.AllocationID
 		current.Status.ProviderBinding = &workspacev1alpha1.ExecutionWorkspaceProviderBindingStatus{ContractVersion: workspacev1alpha1.ContractVersionV1, AdapterVersion: fakeWorkspaceAdapterVersion, BackendAPIVersion: "fake.workspace.orka.ai/v1"}
 		current.Status.Endpoints = nil
 		current.Status.ConnectionSecretRef = nil
-		current.Status.AttachedEpoch = 0
-		switch {
-		case deleted:
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleted
-			current.Status.Disposition = observed.Disposition
-			if missing {
-				current.Status.Disposition = fakeDeletedDisposition(current.Spec.Lifecycle.DeletionPolicy)
+		current.Status.Disposition = nil
+		ready := operationErr == nil && !retirementPending && !missing && observed.State == workspaceprovider.AllocationReady
+		if operationErr != nil {
+			// A read failure is not termination. Preserve the exact last fence while
+			// withdrawing its startup claim so core cannot keep admission open.
+			if current.Status.Allocation != nil {
+				observed = *current.Status.Allocation
+				observed.State = workspaceprovider.AllocationPending
+				observed.Startup = nil
+				current.Status.Allocation = &observed
 			}
-		case quarantined:
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateQuarantined
-		case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
-		case observed.State == workspaceprovider.AllocationReady:
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateReady
-			if !revoking && current.Spec.Attachment != nil {
-				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
-				current.Status.AttachedEpoch = current.Spec.Attachment.Epoch
-			}
-		case observed.State == workspaceprovider.AllocationStopped || observed.State == workspaceprovider.AllocationDeleted:
-			// The lifecycle deliberately cannot resurrect the same instance. Resume
-			// is not an advertised feature of this status-only fixture provider.
-			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
-		default:
 			current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
+			if attached {
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+			}
+		} else {
+			if !missing {
+				current.Status.Allocation = &observed
+				current.Status.ExternalID = observed.Identity.AllocationID
+			}
+			switch {
+			case deleted && (missing || observed.State == workspaceprovider.AllocationDeleted):
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleted
+				current.Status.Disposition = observed.Disposition
+				if missing {
+					current.Status.Disposition = fakeDeletedDisposition(current.Spec.Lifecycle.DeletionPolicy)
+				}
+			case deleted:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleting
+			case quarantined && (missing || observed.State == workspaceprovider.AllocationStopped || observed.State == workspaceprovider.AllocationDeleted):
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && observed.State == workspaceprovider.AllocationStopped && observed.RetainedData != nil:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
+			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspending
+			case attached:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
+			case ready:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateReady
+			default:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
+			}
 		}
-		ready := current.Status.State == workspacev1alpha1.ExecutionWorkspaceStateReady || current.Status.State == workspacev1alpha1.ExecutionWorkspaceStateAttached
-		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(ready), Reason: conditionReason(ready, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(ready, "fake fixture is ready; no runtime or data-plane endpoint is provided", "fake fixture is stopped or not allocated; stopped instances cannot resume"), ObservedGeneration: current.Generation})
-		attached := current.Status.AttachedEpoch > 0
-		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceAttached), Status: conditionStatus(attached), Reason: conditionReason(attached, string(workspacev1alpha1.ReasonAttachmentRevoked)), Message: chooseMessage(attached, "fixture attachment epoch is acknowledged", "no fixture attachment epoch is active"), ObservedGeneration: current.Generation})
+		pending = operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(ready), Reason: conditionReason(ready, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(ready, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
-	if admissionPending {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, err
+	if operationErr != nil {
+		return ctrl.Result{}, operationErr
+	}
+	if pending {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	return ctrl.Result{RequeueAfter: fakeProviderHeartbeatPeriod}, nil
 }
 
 func workspaceHasCoreAdmission(workspace *workspacev1alpha1.ExecutionWorkspace) bool {
@@ -183,7 +248,7 @@ func chooseMessage(ok bool, success, failure string) string {
 func ConformanceFixture(ctx context.Context, c client.Client) (workspaceprovider.WorkloadRequest, error) {
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{ObjectMeta: metav1.ObjectMeta{Name: "fake", UID: "conformance-provider"}, Spec: workspacev1alpha1.ExecutionWorkspaceProviderSpec{ControllerName: FakeWorkspaceControllerName, LifecycleState: workspacev1alpha1.ExecutionWorkspaceProviderActive}}
 	workspace := &workspacev1alpha1.ExecutionWorkspace{ObjectMeta: metav1.ObjectMeta{Namespace: "conformance", Name: "fixture", UID: "conformance-workspace", Generation: 1}}
-	workspace.Spec.ClassBinding = workspacev1alpha1.ImmutableObjectBinding{Name: "fixture", UID: "conformance-class", Generation: 1, ProfileHash: "fixture"}
+	workspace.Spec.ClassBinding = workspacev1alpha1.ImmutableObjectBinding{Name: "fixture", UID: "conformance-class", Generation: 1, ProfileHash: "sha256:" + strings.Repeat("a", 64)}
 	workspace.Spec.ProviderBinding = workspacev1alpha1.ImmutableObjectBinding{Name: provider.Name, UID: provider.UID, Generation: 1}
 	workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredReady
 	workspace.Spec.CoreAdmission = &workspacev1alpha1.ExecutionWorkspaceCoreAdmission{ClassBinding: workspace.Spec.ClassBinding, ProviderBinding: workspace.Spec.ProviderBinding, AdmittedGeneration: workspace.Generation}

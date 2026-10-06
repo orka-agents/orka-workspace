@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orka-workspace-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orka-workspace-substrate
+  namespace: orka-workspace-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orka-workspace-substrate
+  namespace: orka-workspace-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orka-workspace-substrate
+  template:
+    metadata:
+      labels:
+        app: orka-workspace-substrate
+    spec:
+      serviceAccountName: orka-workspace-substrate
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provider
+          image: orka-workspace-substrate:dev
+          args:
+            - --leader-elect=true
+            - --leader-election-namespace=orka-workspace-system
+            - --native-api-endpoint=api.ate-system.svc:443
+            - --native-ca-file=/native-control/ca.crt
+            - --native-token-file=/native-control/token
+            - --native-direct-egress=true
+            - --actor-dns-suffix=actors.resources.substrate.ate.dev
+          volumeMounts:
+            - name: native-control
+              mountPath: /native-control
+              readOnly: true
+          ports:
+            - containerPort: 8081
+              name: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: native-control
+          secret:
+            secretName: substrate-native-control
