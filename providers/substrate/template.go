@@ -111,6 +111,11 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 }
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
+	for _, volume := range record.Request.Runtime.Template.Spec.Volumes {
+		if volume.EmptyDir != nil && volume.EmptyDir.SizeLimit != nil && !volume.EmptyDir.SizeLimit.IsZero() {
+			return nil, fmt.Errorf("native emptyDir quota for %s is unsupported", volume.Name)
+		}
+	}
 	container := record.Request.Runtime.Template.Spec.Containers[0]
 	if len(container.Command) == 0 {
 		return nil, fmt.Errorf("native supervisor requires an explicit command")
