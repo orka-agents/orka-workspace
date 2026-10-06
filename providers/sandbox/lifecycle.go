@@ -238,6 +238,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		}
 		return nil
 	})
+	if err != nil {
+		return workspaceprovider.AllocationObservation{}, err
+	}
 	return observed, err
 }
 
@@ -316,6 +319,11 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 	cm, record, err := d.read(ctx, key)
 	if err != nil {
 		return workspaceprovider.AllocationObservation{}, err
+	}
+	if record.Observation.State == workspaceprovider.AllocationDeleted {
+		if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
 	}
 	if record.Operation == "ensure" {
 		return d.observeReady(ctx, record)

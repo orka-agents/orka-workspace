@@ -25,6 +25,13 @@ readiness reports the exact Pod and its bootstrap endpoint without waiting for
 runtime admission. Stop, suspension, and deletion require core's matching
 sequence and instance retirement authorization.
 
+Admitted storage is limited to EmptyDir, DownwardAPI and projected DownwardAPI
+sources, plus the provider-injected durable workspace volume. HostPath,
+pre-existing PVCs, NFS, CSI and other unmanaged sources are rejected before
+allocation. Older allocations with those sources can stop their exact compute,
+but deletion preserves the stopped journal and reports that external storage
+requires operator settlement.
+
 Core owns and installs the admitted NetworkPolicies before publishing a workload.
 Sandbox keeps upstream network-policy management `Unmanaged` and preserves the
 admitted runtime namespace and labels. When a workload supplies `NetworkPolicy`,
@@ -34,6 +41,10 @@ admitted isolation directions, rejects permissions outside the admitted envelope
 and repeats verification against the realized Pod's upstream labels. Missing,
 terminating, or unreadable policies fail closed. The provider needs read-only
 NetworkPolicy list permission; it does not create or delete Core's policies.
+Peer and port-list subsets, numeric port-range narrowing and wildcard narrowing
+are accepted when contained within an admitted rule. Selector and IP-block
+implication remains conservative. Startup also checks the live template's exact
+network-management and claim/environment-injection policies.
 Host-networked runtimes with admitted policies are unsupported. The cluster's
 network plugin must enforce Kubernetes NetworkPolicies.
 

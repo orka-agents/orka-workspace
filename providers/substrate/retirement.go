@@ -425,8 +425,12 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record)})
 		return err
 	}
-	if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED {
+	state := actor.GetStatus().GetState()
+	if state == pb.ActorState_ACTOR_STATE_SUSPENDING {
 		return nil
+	}
+	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
+		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
 	}
 	snapshot := actor.GetStatus().GetExternalSnapshot()
 	hash := snapshotDigest(snapshot)

@@ -81,6 +81,21 @@ Native active deadlines are unsupported and rejected before allocation. The
 sealed-bootstrap nonce must be present once as a nonempty literal before any
 compute is created.
 
+Bootstrap and declared container ports must use TCP 80. A supplied
+`ORKA_ACP_LISTEN_ADDRESS` must be literal `:80`. Kubernetes probes, lifecycle
+hooks, termination grace periods, custom DNS or host namespaces, Pod identity
+settings, readiness gates, service-link injection and container stream/restart
+controls are unsupported. Digest images use the native cache, so omitted or
+`IfNotPresent` image pull policy is supported; `Always` and `Never` are rejected.
+DataOnly accepts only the single writable durable mount at
+`/durable/orka-workspace`; other volume sources and additional mounts are rejected.
+An omitted template namespace resolves downward identity to the request namespace.
+
+Native sessions use supervisor defaults and SystemInfo identity. Pod namespace,
+session-directory and configured Core MCP broker environment overrides are
+rejected. Core omits these overrides, Kubernetes health/shutdown fields, and
+declares port 80 before hashing fresh native intent.
+
 The pinned native process starts as UID/GID 0 regardless of image `USER`.
 Explicit user/group constraints must match 0, and non-root or privileged execution
 requirements are rejected. Admitted capability add/drop lists are translated
@@ -111,6 +126,9 @@ admission and block cleanup. Previous numbered request tombstones remain until
 workspace finalization. Native resources in worker namespaces use an exact
 namespace-local ownership anchor, which is removed after its network policy.
 Journals remain until core finalizes the workspace.
+An issued suspension is never replayed because of a transport error. Known native
+`SUSPENDING` progress stays pending; a still-running or failed Actor reports an
+unresolved outcome until exact snapshot evidence or authorized retirement settles it.
 
 Infrastructure readiness reports the native Actor identity, exact worker Pod,
 request sequence, and public sealed-bootstrap challenge hash. The provider

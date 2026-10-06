@@ -33,6 +33,35 @@ func validateRequest(request workspaceprovider.WorkloadRequest) error {
 			return fmt.Errorf("runtime template carries provider-owned label %q", key)
 		}
 	}
+	return validateRuntimeVolumes(request.Runtime)
+}
+
+// Only Pod-local scratch and metadata projections retire with the exact Pod.
+// Durable storage is injected separately by the provider and has pinned PVC/PV
+// cleanup evidence; arbitrary storage references cannot satisfy that contract.
+func validateRuntimeVolumes(runtime *workspaceprovider.RuntimeWorkload) error {
+	if runtime == nil {
+		return fmt.Errorf("Sandbox storage lifecycle requires an admitted runtime")
+	}
+	for _, volume := range runtime.Template.Spec.Volumes {
+		if volume.Name == durableVolumeName {
+			return fmt.Errorf("durable workspace PVC is injected by the SandboxClaim")
+		}
+		source := volume.VolumeSource
+		supported := source.EmptyDir != nil && reflect.DeepEqual(source, corev1.VolumeSource{EmptyDir: source.EmptyDir}) ||
+			source.DownwardAPI != nil && reflect.DeepEqual(source, corev1.VolumeSource{DownwardAPI: source.DownwardAPI})
+		if source.Projected != nil && reflect.DeepEqual(source, corev1.VolumeSource{Projected: source.Projected}) {
+			supported = len(source.Projected.Sources) > 0
+			for _, projection := range source.Projected.Sources {
+				if projection.DownwardAPI == nil || !reflect.DeepEqual(projection, corev1.VolumeProjection{DownwardAPI: projection.DownwardAPI}) {
+					supported = false
+				}
+			}
+		}
+		if !supported {
+			return fmt.Errorf("Sandbox cannot own storage lifecycle for volume %q: only EmptyDir and DownwardAPI metadata volumes are supported", volume.Name)
+		}
+	}
 	return nil
 }
 
@@ -222,6 +251,22 @@ func (d *Lifecycle) sandbox(ctx context.Context, record *journalRecord) (*sandbo
 }
 
 func (d *Lifecycle) readSandbox(ctx context.Context, record *journalRecord, validateSpec bool) (*sandboxv1beta1.Sandbox, error) {
+	if validateSpec {
+		if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
+			return nil, err
+		}
+		template := &extv1beta1.SandboxTemplate{}
+		if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Namespace, Name: record.Template.Name}, template); err != nil {
+			return nil, err
+		}
+		if !nativeOwned(template, record, record.Template) || template.DeletionTimestamp != nil {
+			return nil, workspaceprovider.ErrStaleIdentity
+		}
+		expected := desiredTemplate(record).Spec
+		if template.Spec.NetworkPolicyManagement != expected.NetworkPolicyManagement || template.Spec.EnvVarsInjectionPolicy != expected.EnvVarsInjectionPolicy || template.Spec.VolumeClaimTemplatesPolicy != expected.VolumeClaimTemplatesPolicy {
+			return nil, fmt.Errorf("SandboxTemplate behavior policies differ from the admitted template")
+		}
+	}
 	claim := &extv1beta1.SandboxClaim{}
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Namespace, Name: record.Claim.Name}, claim); err != nil {
 		return nil, err

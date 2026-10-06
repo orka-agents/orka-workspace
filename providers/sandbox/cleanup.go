@@ -39,10 +39,14 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		if err := d.requireJournal(ctx, cm, record); err != nil {
 			return err
 		}
-		observed = record.Observation
-		if observed.State == workspaceprovider.AllocationDeleted {
+		if record.Observation.State == workspaceprovider.AllocationDeleted {
+			if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
+				return err
+			}
+			observed = record.Observation
 			return nil
 		}
+		observed = record.Observation
 		if suspend {
 			if err := d.resolveRetention(ctx, record); err != nil {
 				return err
@@ -300,13 +304,17 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 		if err := d.requireJournal(ctx, cm, record); err != nil {
 			return err
 		}
-		observed = record.Observation
-		if observed.State == workspaceprovider.AllocationDeleted {
+		if record.Observation.State == workspaceprovider.AllocationDeleted {
+			if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
+				return err
+			}
+			observed = record.Observation
 			if record.DeletionPolicy == nil || *record.DeletionPolicy != policy {
 				return workspaceprovider.ErrRequestConflict
 			}
 			return d.releaseSuspended(ctx, cm, record)
 		}
+		observed = record.Observation
 		if observed.State != workspaceprovider.AllocationStopped {
 			return workspaceprovider.ErrInstanceRunning
 		}
@@ -391,6 +399,9 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 			if err != nil || !gone {
 				return err
 			}
+		}
+		if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {
+			return fmt.Errorf("Sandbox compute cleanup completed, but unmanaged storage prevents data disposition: %w", err)
 		}
 		record.Observation.State = workspaceprovider.AllocationDeleted
 		record.Observation.RetainedData = nil

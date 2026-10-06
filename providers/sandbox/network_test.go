@@ -89,6 +89,104 @@ func TestNetworkPolicyPortProtocolDefaultsWithoutChangingIntent(t *testing.T) {
 	}
 }
 
+func TestSelectingNetworkRuleSubsetsFitAdmittedEnvelope(t *testing.T) {
+	peer := func(role string) networkingv1.NetworkPolicyPeer {
+		return networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"role": role}}}
+	}
+	port := func(number int32) networkingv1.NetworkPolicyPort {
+		return networkingv1.NetworkPolicyPort{Port: new(intstr.FromInt32(number))}
+	}
+	for _, direction := range []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress} {
+		for _, test := range []struct {
+			name    string
+			allowed bool
+		}{
+			{"peer and port subset", true},
+			{"reordered lists", true},
+			{"numeric range subset", true},
+			{"narrower than all peers and ports", true},
+			{"narrower than all TCP ports", true},
+			{"unadmitted peer", false},
+			{"all peers broader", false},
+			{"all ports broader", false},
+			{"changed protocol", false},
+			{"numeric range broader", false},
+			{"cross grant between rules", false},
+		} {
+			t.Run(string(direction)+"/"+test.name, func(t *testing.T) {
+				c, request := fixture(t, false)
+				admitted := denyNetwork()
+				allowedPeers := []networkingv1.NetworkPolicyPeer{peer("a"), peer("b")}
+				allowedPorts := []networkingv1.NetworkPolicyPort{port(443), port(8443)}
+				actualPeers := []networkingv1.NetworkPolicyPeer{peer("a")}
+				actualPorts := []networkingv1.NetworkPolicyPort{port(443)}
+				switch test.name {
+				case "reordered lists":
+					actualPeers = []networkingv1.NetworkPolicyPeer{peer("b"), peer("a")}
+					actualPorts = []networkingv1.NetworkPolicyPort{port(8443), port(443)}
+				case "numeric range subset", "numeric range broader":
+					allowedPorts = []networkingv1.NetworkPolicyPort{port(400)}
+					allowedPorts[0].EndPort = new(int32(500))
+					actualPorts = []networkingv1.NetworkPolicyPort{port(450)}
+					actualPorts[0].EndPort = new(int32(460))
+					if test.name == "numeric range broader" {
+						actualPorts[0].EndPort = new(int32(550))
+					}
+				case "narrower than all peers and ports":
+					allowedPeers, allowedPorts = nil, nil
+				case "narrower than all TCP ports":
+					allowedPorts = []networkingv1.NetworkPolicyPort{{}}
+				case "unadmitted peer":
+					actualPeers = []networkingv1.NetworkPolicyPeer{peer("c")}
+				case "all peers broader":
+					actualPeers = nil
+				case "all ports broader":
+					actualPorts = nil
+				case "changed protocol":
+					actualPorts[0].Protocol = new(corev1.ProtocolUDP)
+				case "cross grant between rules":
+					allowedPeers = []networkingv1.NetworkPolicyPeer{peer("a")}
+					allowedPorts = []networkingv1.NetworkPolicyPort{port(443)}
+					actualPeers = []networkingv1.NetworkPolicyPeer{peer("a"), peer("b")}
+					actualPorts = []networkingv1.NetworkPolicyPort{port(443), port(80)}
+				}
+				if direction == networkingv1.PolicyTypeIngress {
+					admitted.Ingress = []networkingv1.NetworkPolicyIngressRule{{From: allowedPeers, Ports: allowedPorts}}
+					if test.name == "cross grant between rules" {
+						admitted.Ingress = append(admitted.Ingress, networkingv1.NetworkPolicyIngressRule{From: []networkingv1.NetworkPolicyPeer{peer("b")}, Ports: []networkingv1.NetworkPolicyPort{port(80)}})
+					}
+				} else {
+					admitted.Egress = []networkingv1.NetworkPolicyEgressRule{{To: allowedPeers, Ports: allowedPorts}}
+					if test.name == "cross grant between rules" {
+						admitted.Egress = append(admitted.Egress, networkingv1.NetworkPolicyEgressRule{To: []networkingv1.NetworkPolicyPeer{peer("b")}, Ports: []networkingv1.NetworkPolicyPort{port(80)}})
+					}
+				}
+				request = networkRequest(t, c, request, admitted)
+				createPolicy(t, c, request.Runtime.Template.Namespace, "core-policy", admitted)
+				extra := denyNetwork()
+				extra.PolicyTypes = []networkingv1.PolicyType{direction}
+				if direction == networkingv1.PolicyTypeIngress {
+					extra.Ingress = []networkingv1.NetworkPolicyIngressRule{{From: actualPeers, Ports: actualPorts}}
+				} else {
+					extra.Egress = []networkingv1.NetworkPolicyEgressRule{{To: actualPeers, Ports: actualPorts}}
+				}
+				createPolicy(t, c, request.Runtime.Template.Namespace, "additional-policy", extra)
+				if !test.allowed {
+					if observed, err := New(c).EnsureAllocation(t.Context(), request); err == nil || observed.Startup != nil {
+						t.Fatalf("broader selecting permissions were admitted: %+v, %v", observed, err)
+					}
+					requireNoSandboxAllocation(t, c, request)
+					return
+				}
+				first := ready(t, c, request)
+				if observed, err := New(c).Observe(t.Context(), request.Key); err != nil || observed.Startup == nil || observed.Identity != first.Identity {
+					t.Fatalf("safe rule subset withdrew startup: %+v, %v", observed, err)
+				}
+			})
+		}
+	}
+}
+
 func TestNetworkPolicyRequiredBeforeNativeAllocation(t *testing.T) {
 	for _, failure := range []string{"missing", "wrong namespace", "wrong selector", "admitted selector mismatch", "unknown policy type", "unadmitted ingress", "unadmitted egress", "missing egress isolation", "terminating", "host network"} {
 		t.Run(failure, func(t *testing.T) {

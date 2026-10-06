@@ -118,12 +118,19 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 }
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
+	if record.Request.Runtime.BootstrapPort != 80 {
+		return nil, fmt.Errorf("native runtime requires bootstrap port 80")
+	}
 	if record.Request.Runtime.Template.Spec.ActiveDeadlineSeconds != nil {
 		return nil, fmt.Errorf("native runtime active deadline is unsupported")
 	}
 	if err := validateNativeScheduling(record.Request.Runtime.Template.Spec); err != nil {
 		return nil, err
 	}
+	if err := validateNativePodRuntime(record.Request.Runtime.Template.Spec); err != nil {
+		return nil, err
+	}
+	seenVolume := false
 	for _, volume := range record.Request.Runtime.Template.Spec.Volumes {
 		if volume.EmptyDir != nil {
 			if volume.EmptyDir.SizeLimit != nil && !volume.EmptyDir.SizeLimit.IsZero() {
@@ -131,8 +138,15 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 			}
 			return nil, fmt.Errorf("native emptyDir volume %s is unsupported", volume.Name)
 		}
+		if volume.Name != durableVolumeName || !record.SuspendEnabled || seenVolume || !reflect.DeepEqual(volume.VolumeSource, corev1.VolumeSource{}) {
+			return nil, fmt.Errorf("native runtime volume %s is unsupported", volume.Name)
+		}
+		seenVolume = true
 	}
 	container := record.Request.Runtime.Template.Spec.Containers[0]
+	if err := validateNativeContainerRuntime(container); err != nil {
+		return nil, err
+	}
 	if _, err := nativeBootstrapNonce(container.Env); err != nil {
 		return nil, err
 	}
@@ -165,10 +179,13 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		if hasKubernetesExpansion(env.Value) {
 			return nil, fmt.Errorf("native environment expansion for %s is unsupported", env.Name)
 		}
-		// Preserve the pinned native compiler's fixed ephemeral session/broker
-		// defaults. Actor identity uses SystemInfo, not a Kubernetes namespace.
+		// Native sessions use the supervisor defaults, and Actor identity uses
+		// SystemInfo. These Pod/Core overrides cannot be silently discarded.
 		if env.Name == "ORKA_ACP_SESSION_BASE_DIR" || env.Name == "ORKA_ACP_MCP_BROKER_URL" || env.Name == "ORKA_ACP_POD_NAMESPACE" {
-			continue
+			return nil, fmt.Errorf("native runtime environment %s is unsupported", env.Name)
+		}
+		if env.Name == "ORKA_ACP_LISTEN_ADDRESS" && (env.Value != ":80" || env.ValueFrom != nil) {
+			return nil, fmt.Errorf("native runtime listener must be literal :80")
 		}
 		if env.Name == "" || seen[env.Name] || len(env.Name) > 256 || len(env.Value) > 32768 {
 			return nil, fmt.Errorf("native environment is invalid")
@@ -176,8 +193,13 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		seen[env.Name] = true
 		value := env.Value
 		if env.ValueFrom != nil {
-			if env.ValueFrom.FieldRef == nil {
+			remaining := env.ValueFrom.DeepCopy()
+			remaining.FieldRef = nil
+			if env.Value != "" || env.ValueFrom.FieldRef == nil || !reflect.DeepEqual(remaining, &corev1.EnvVarSource{}) {
 				return nil, fmt.Errorf("native environment must be literal or an admitted identity field")
+			}
+			if env.ValueFrom.FieldRef.APIVersion != "" && env.ValueFrom.FieldRef.APIVersion != "v1" {
+				return nil, fmt.Errorf("native downward field API version is unsupported")
 			}
 			switch env.ValueFrom.FieldRef.FieldPath {
 			case "metadata.uid":
@@ -186,12 +208,12 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 				value = record.Actor.Name
 			case "metadata.namespace":
 				value = record.Request.Runtime.Template.Namespace
+				if value == "" {
+					value = record.Request.Key.Namespace
+				}
 			default:
 				return nil, fmt.Errorf("native downward field is unsupported")
 			}
-		}
-		if env.Name == "ORKA_ACP_LISTEN_ADDRESS" {
-			value = ":80"
 		}
 		compiled.Env = append(compiled.Env, &pb.EnvVar{Name: env.Name, Value: value})
 	}
@@ -203,9 +225,7 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 			return e.Name == "ORKA_ACP_DURABLE_WORKSPACE_DIR" && e.Value == durableMountPath
 		}) || !slices.ContainsFunc(compiled.Env, func(e *pb.EnvVar) bool {
 			return e.Name == "ORKA_ACP_DURABLE_WORKSPACE_KEY" && e.Value == "shared"
-		}) || !slices.ContainsFunc(container.VolumeMounts, func(m corev1.VolumeMount) bool {
-			return m.Name == durableVolumeName && m.MountPath == durableMountPath && !m.ReadOnly && m.SubPath == "" && m.SubPathExpr == ""
-		}) {
+		}) || len(container.VolumeMounts) != 1 || !reflect.DeepEqual(container.VolumeMounts[0], corev1.VolumeMount{Name: durableVolumeName, MountPath: durableMountPath}) {
 			return nil, fmt.Errorf("data-only native profile requires admitted durable workspace mount and environment")
 		}
 		compiled.Args[0] = `chmod 0755 /; chmod 0711 /durable /durable/orka-workspace; exec "$@"`
@@ -246,6 +266,38 @@ func nativeBootstrapNonce(env []corev1.EnvVar) (string, error) {
 		return "", fmt.Errorf("native bootstrap nonce must be a unique nonempty literal")
 	}
 	return nonce, nil
+}
+
+func validateNativePodRuntime(pod corev1.PodSpec) error {
+	if pod.TerminationGracePeriodSeconds != nil || pod.DNSPolicy != "" || pod.DNSConfig != nil ||
+		pod.ServiceAccountName != "" || pod.DeprecatedServiceAccount != "" ||
+		pod.HostNetwork || pod.HostPID || pod.HostIPC || pod.ShareProcessNamespace != nil && *pod.ShareProcessNamespace ||
+		pod.Hostname != "" || pod.Subdomain != "" || len(pod.HostAliases) != 0 || pod.HostnameOverride != nil ||
+		pod.SetHostnameAsFQDN != nil && *pod.SetHostnameAsFQDN || pod.HostUsers != nil && !*pod.HostUsers ||
+		len(pod.ReadinessGates) != 0 || pod.EnableServiceLinks != nil && *pod.EnableServiceLinks {
+		return fmt.Errorf("native runtime Pod settings are unsupported")
+	}
+	return nil
+}
+
+func validateNativeContainerRuntime(container corev1.Container) error {
+	if container.StartupProbe != nil || container.ReadinessProbe != nil || container.LivenessProbe != nil {
+		return fmt.Errorf("native runtime Kubernetes probes are unsupported")
+	}
+	if container.Lifecycle != nil || container.Stdin || container.StdinOnce || container.TTY ||
+		len(container.ResizePolicy) != 0 || container.RestartPolicy != nil || len(container.RestartPolicyRules) != 0 ||
+		len(container.VolumeDevices) != 0 || container.TerminationMessagePath != "" || container.TerminationMessagePolicy != "" {
+		return fmt.Errorf("native runtime container settings are unsupported")
+	}
+	if container.ImagePullPolicy != "" && container.ImagePullPolicy != corev1.PullIfNotPresent {
+		return fmt.Errorf("native runtime image pull policy is unsupported")
+	}
+	for _, port := range container.Ports {
+		if port.ContainerPort != 80 || port.Protocol != "" && port.Protocol != corev1.ProtocolTCP {
+			return fmt.Errorf("native runtime container ports must use TCP 80")
+		}
+	}
+	return nil
 }
 
 // Runtime Pod placement cannot be translated to the native Actor scheduler.
