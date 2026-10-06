@@ -52,8 +52,9 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 		deleted := !current.DeletionTimestamp.IsZero() || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
 		quarantined := current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredQuarantined
 		revoking := workspaceNeedsAttachmentRevocation(current)
-		admitted := workspaceCurrentlyAdmittedByCore(current) && provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderDisabled
-		maintenance := deleted || quarantined || revoking || current.Spec.Retirement != nil || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || provider.Spec.LifecycleState == workspacev1alpha1.ExecutionWorkspaceProviderDisabled
+		disabled := provider.Spec.LifecycleState == workspacev1alpha1.ExecutionWorkspaceProviderDisabled
+		admitted := workspaceCurrentlyAdmittedByCore(current) && !disabled
+		maintenance := deleted || quarantined || revoking || current.Spec.Retirement != nil || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || disabled
 		if !maintenance && !admitted {
 			pending = true
 			return nil
@@ -145,7 +146,7 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				}
 			case current.Spec.Retirement != nil && !missing:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
-			case workloadErr == nil && !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
+			case !disabled && workloadErr == nil && !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
 				observed, operationErr = driver.EnsureAllocation(ctx, *current.Spec.Workload)
 				if operationErr == nil {
 					missing = false
@@ -155,7 +156,7 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 		if operationErr == nil && !missing && observed.Key != key {
 			operationErr = workspaceprovider.ErrStaleIdentity
 		}
-		if workloadErr != nil && observed.State == workspaceprovider.AllocationReady {
+		if (workloadErr != nil || disabled) && observed.State == workspaceprovider.AllocationReady {
 			observed.State = workspaceprovider.AllocationPending
 			observed.Startup = nil
 		}
@@ -209,7 +210,7 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
 			}
 		}
-		pending = operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+		pending = !disabled && operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
 		setLifecycleMilestoneConditions(current, observed, missing, operationErr)
