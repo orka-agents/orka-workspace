@@ -24,6 +24,9 @@ func validatePodRequest(request workspaceprovider.WorkloadRequest) error {
 	if request.Runtime == nil {
 		return nil
 	}
+	if err := validatePodStorage(request); err != nil {
+		return err
+	}
 	runtime := request.Runtime
 	if runtime.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		return fmt.Errorf("fake runtime requires restartPolicy Never; another process needs a new workload sequence")
@@ -47,6 +50,30 @@ func validatePodRequest(request workspaceprovider.WorkloadRequest) error {
 	}
 	return nil
 }
+
+func validatePodStorage(request workspaceprovider.WorkloadRequest) error {
+	if request.Runtime == nil {
+		return nil
+	}
+	for _, volume := range request.Runtime.Template.Spec.Volumes {
+		source := volume.VolumeSource
+		switch {
+		case source.EmptyDir != nil:
+			source.EmptyDir = nil
+		case source.DownwardAPI != nil:
+			source.DownwardAPI = nil
+		case source.Projected != nil:
+			source.Projected = nil
+		default:
+			return fmt.Errorf("fake runtime volume %q requires an unsupported storage lifecycle", volume.Name)
+		}
+		if !reflect.DeepEqual(source, corev1.VolumeSource{}) {
+			return fmt.Errorf("fake runtime volume %q requires an unsupported storage lifecycle", volume.Name)
+		}
+	}
+	return nil
+}
+
 func desiredPod(record *journalRecord) *corev1.Pod {
 	template := record.Request.Runtime.Template
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: record.Pod.Namespace, Name: record.Pod.Name, Labels: map[string]string{}, Annotations: map[string]string{}}, Spec: *template.Spec.DeepCopy()}

@@ -187,8 +187,9 @@ enforcement. Sandbox filesystem persistence and installed native Substrate
 Data export/import passed separate backend tests. Those fixtures construct core
 admission and do not claim real-core credential bootstrap or RuntimeSession execution.
 
-The Sandbox fixture runs with `scripts/external-sandbox-e2e.sh`. The native
-fixture uses an isolated cluster with the backend's required certificate feature
+The Sandbox fixture runs with `scripts/external-sandbox-e2e.sh` and requires the
+paired Core checkout's upstream installer. See [the installer path and override](../hack/external-sandbox-e2e/README.md).
+The native fixture uses an isolated cluster with the backend's required certificate feature
 gates; see [its setup and proof](../hack/external-substrate-e2e/README.md).
 The additional `scripts/external-substrate-core-e2e.sh proof` runs an actual Task
 through deployed Core and native provider controllers. It proves authenticated

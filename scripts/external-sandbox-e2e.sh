@@ -10,6 +10,12 @@ command -v "${kindctl}" >/dev/null 2>&1 || {
   printf 'kindctl executable is unavailable: %s. Install kindctl on PATH or set KINDCTL_BIN.\n' "${kindctl}" >&2
   exit 1
 }
+# The upstream installer is supplied by the paired Core checkout.
+installer="${ORKA_AGENT_SANDBOX_INSTALLER:-${repo_root}/../orka.workspace-external-providers/hack/demos/cluster/install-agent-sandbox.sh}"
+if [[ ! -f "${installer}" ]]; then
+  printf 'Agent Sandbox installer not found: %s. Set ORKA_AGENT_SANDBOX_INSTALLER to the absolute path of Core hack/demos/cluster/install-agent-sandbox.sh. See hack/external-sandbox-e2e/README.md.\n' "${installer}" >&2
+  exit 1
+fi
 cluster_tag=external-workspace
 artifact_dir="${ORKA_SANDBOX_E2E_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/orka-sandbox-e2e.XXXXXX")}"
 mkdir -p "${artifact_dir}"
@@ -31,8 +37,6 @@ assert sc.get('provisioner') not in ('', None, 'kubernetes.io/no-provisioner'), 
 PY
 
 # Reuse the canonical pinned upstream installer without changing Orka flags.
-installer="${ORKA_AGENT_SANDBOX_INSTALLER:-${repo_root}/../orka.workspace-external-providers/hack/demos/cluster/install-agent-sandbox.sh}"
-test -f "${installer}"
 "${kindctl}" exec --tag "${cluster_tag}" -- env AGENTIC=0 ORKA_AGENT_SANDBOX_VERSION=v1.0.3 \
   ORKA_CONTROLLER_DEPLOYMENT=external-sandbox-no-core DEMO_NAMESPACE=external-sandbox-proof bash "${installer}"
 k rollout status deployment/agent-sandbox-controller -n agent-sandbox-system --timeout=180s

@@ -307,6 +307,10 @@ func (httpChallengeGetter) Get(ctx context.Context, endpoint string) (bootstrapC
 	return challenge, nil
 }
 func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor *pb.Actor) (string, error) {
+	nonce, err := nativeBootstrapNonce(record.Request.Runtime.Template.Spec.Containers[0].Env)
+	if err != nil {
+		return "", err
+	}
 	getter := d.challengeClient
 	if getter == nil {
 		getter = httpChallengeGetter{}
@@ -315,12 +319,6 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor 
 	closed := errors.Is(err, errChallengeClosed) && record.ChallengeSHA256 != ""
 	if err != nil && !closed {
 		return "", err
-	}
-	nonce := ""
-	for _, env := range record.TemplateSpec.GetContainers()[0].GetEnv() {
-		if env.Name == "ORKA_ACP_CREDENTIAL_BOOTSTRAP_NONCE" {
-			nonce = env.Value
-		}
 	}
 	key, keyErr := base64.RawURLEncoding.DecodeString(challenge.PublicKey)
 	boot, bootErr := base64.RawURLEncoding.DecodeString(challenge.BootNonce)

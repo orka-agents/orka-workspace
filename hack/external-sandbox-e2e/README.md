@@ -8,6 +8,19 @@ ownership policy, fake provider, and concurrent Orka RuntimeSession proof.
 The script uses `kindctl` from `PATH` by default; set
 `KINDCTL_BIN=/path/to/kindctl` to choose another executable.
 
+The proof also requires the paired Orka Core checkout's
+`hack/demos/cluster/install-agent-sandbox.sh`; that installer is not bundled here.
+By default it reads the adjacent `../orka.workspace-external-providers` checkout.
+For a different checkout location, supply its installer explicitly:
+
+```sh
+ORKA_AGENT_SANDBOX_INSTALLER=/absolute/path/to/orka/hack/demos/cluster/install-agent-sandbox.sh \
+  bash scripts/external-sandbox-e2e.sh
+```
+
+The proof sets `ORKA_AGENT_SANDBOX_VERSION=v1.0.3` and `AGENTIC=0` when invoking
+the installer. A missing installer fails before contacting the cluster.
+
 The fixture creates a credential-free HTTP listener with one writable durable
 mount. It writes data, authorizes exact DataOnly suspension, independently
 observes the first Pod's absence, cold resumes with a new Pod UID and rotated

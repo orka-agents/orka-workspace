@@ -58,13 +58,20 @@ func podSpecsMatch(expected, actual corev1.PodSpec, injectedDurableClaimName str
 	// its mount rather than by claim identity. Any other unexpected volume
 	// still fails the match.
 	actualSpec.Volumes = stripInjectedDurableWorkspaceVolume(expectedSpec.Volumes, actualSpec.Volumes, injectedDurableClaimName)
+	actualSpec.Tolerations = stripDefaultTolerationInjection(expectedSpec.Tolerations, actualSpec.Tolerations)
 
 	// These fields are derived from cluster scheduling/admission state rather
 	// than from the provider-visible Sandbox template.
 	expectedSpec.NodeName, actualSpec.NodeName = "", ""
-	expectedSpec.Priority, actualSpec.Priority = nil, nil
-	expectedSpec.PreemptionPolicy, actualSpec.PreemptionPolicy = nil, nil
 	expectedSpec.Overhead, actualSpec.Overhead = nil, nil
+	// Priority admission fills omitted values from the requested or global
+	// default class. Explicit values remain part of the frozen template.
+	if expectedSpec.Priority == nil {
+		actualSpec.Priority = nil
+	}
+	if expectedSpec.PreemptionPolicy == nil {
+		actualSpec.PreemptionPolicy = nil
+	}
 	if expectedSpec.PriorityClassName == "" {
 		actualSpec.PriorityClassName = ""
 	}
@@ -128,7 +135,9 @@ func normalizePodSpec(spec corev1.PodSpec) corev1.PodSpec {
 			}
 		}
 	}
-	result.Tolerations = explicitTolerations(result.Tolerations)
+	if len(result.Tolerations) == 0 {
+		result.Tolerations = nil
+	}
 	return result
 }
 
@@ -166,13 +175,25 @@ func normalizeContainer(container *corev1.Container) {
 	}
 }
 
-func explicitTolerations(tolerations []corev1.Toleration) []corev1.Toleration {
-	result := make([]corev1.Toleration, 0, len(tolerations))
-	for i := range tolerations {
-		toleration := tolerations[i]
+func stripDefaultTolerationInjection(expected, actual []corev1.Toleration) []corev1.Toleration {
+	var result []corev1.Toleration
+	for _, toleration := range actual {
 		if toleration.Operator == corev1.TolerationOpExists && toleration.Effect == corev1.TaintEffectNoExecute &&
+			toleration.Value == "" && toleration.TolerationSeconds != nil && *toleration.TolerationSeconds == 300 &&
 			(toleration.Key == corev1.TaintNodeNotReady || toleration.Key == corev1.TaintNodeUnreachable) {
-			continue
+			// DefaultTolerationSeconds only injects a taint's default when no
+			// declared toleration has that key (or all keys) and NoExecute (or
+			// all effects). A frozen toleration must remain compared exactly.
+			declared := false
+			for _, frozen := range expected {
+				if (frozen.Key == toleration.Key || frozen.Key == "") && (frozen.Effect == corev1.TaintEffectNoExecute || frozen.Effect == "") {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				continue
+			}
 		}
 		result = append(result, toleration)
 	}

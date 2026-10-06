@@ -77,6 +77,9 @@ intent before admission.
 Environment values, commands, and arguments must already be resolved literals.
 Kubernetes `$(NAME)` expansion and `$$` escaping are rejected before allocation
 rather than copied with different native meaning.
+Native active deadlines are unsupported and rejected before allocation. The
+sealed-bootstrap nonce must be present once as a nonempty literal before any
+compute is created.
 
 The pinned native process starts as UID/GID 0 regardless of image `USER`.
 Explicit user/group constraints must match 0, and non-root or privileged execution

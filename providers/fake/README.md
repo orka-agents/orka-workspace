@@ -12,6 +12,13 @@ spec against the admitted template with Kubernetes defaults accounted for.
 Startup evidence includes that exact Pod and its IP endpoint. It does not wait
 for Pod Ready, since the supervisor may require core bootstrap first.
 
+Pod mode supports only `EmptyDir`, `DownwardAPI`, and credential-free `Projected`
+volumes. It rejects persistent storage, including PVCs and generic ephemeral
+claims, before recording allocation intent. The adapter has no persistent-storage
+lifecycle contract. Legacy persistent-storage Pods can still be stopped by exact
+UID, but deletion returns an error and preserves the stopped journal for operator
+storage remediation. The adapter cannot confirm deletion of storage it did not manage.
+
 A missing Pod withdraws readiness. It cannot be recreated within the same
 sequence. The controller waits for core's exact-instance `spec.retirement` authorization before stopping. Stop deletes only the recorded UID and waits to observe its absence.
 Unresolved create outcomes and API outages cannot prove termination. Core must

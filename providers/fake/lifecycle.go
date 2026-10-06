@@ -306,6 +306,11 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 	if err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
+	if record.Observation.State == workspaceprovider.AllocationDeleted {
+		if err := validatePodStorage(record.Request); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
+	}
 	if record.Request.Runtime != nil && record.Operation == "ensure" {
 		return d.observePod(ctx, record)
 	}
@@ -332,6 +337,13 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 		}
 		if record.Observation.Identity != identity {
 			return workspaceprovider.ErrStaleIdentity
+		}
+		// Existing persistent-storage Pods can still be stopped by exact UID, but fake
+		// cannot confirm storage deletion or replay a legacy deletion claim.
+		if operation == "delete" || record.Observation.State == workspaceprovider.AllocationDeleted {
+			if err := validatePodStorage(record.Request); err != nil {
+				return err
+			}
 		}
 		if operation == "suspend" && record.Request.Runtime != nil {
 			return fmt.Errorf("fake Pod workloads do not implement data suspension")

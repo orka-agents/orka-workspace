@@ -24,6 +24,7 @@ const durableVolumeName = "orka-workspace"
 const durableMountPath = "/durable/orka-workspace"
 const identityVolumeName = "orka-substrate-identity"
 const identityMountPath = "/run/orka-substrate-identity"
+const bootstrapNonceEnv = "ORKA_ACP_CREDENTIAL_BOOTSTRAP_NONCE"
 
 func validateRequest(request sdk.WorkloadRequest) error {
 	if err := request.Validate(); err != nil {
@@ -117,6 +118,9 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 }
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
+	if record.Request.Runtime.Template.Spec.ActiveDeadlineSeconds != nil {
+		return nil, fmt.Errorf("native runtime active deadline is unsupported")
+	}
 	if err := validateNativeScheduling(record.Request.Runtime.Template.Spec); err != nil {
 		return nil, err
 	}
@@ -129,6 +133,9 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		}
 	}
 	container := record.Request.Runtime.Template.Spec.Containers[0]
+	if _, err := nativeBootstrapNonce(container.Env); err != nil {
+		return nil, err
+	}
 	securityContext, err := compileSecurityContext(record.Request.Runtime.Template.Spec.SecurityContext, container.SecurityContext)
 	if err != nil {
 		return nil, err
@@ -222,6 +229,23 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 
 func hasKubernetesExpansion(value string) bool {
 	return strings.Contains(value, "$(") || strings.Contains(value, "$$")
+}
+
+func nativeBootstrapNonce(env []corev1.EnvVar) (string, error) {
+	nonce := ""
+	for _, variable := range env {
+		if variable.Name != bootstrapNonceEnv {
+			continue
+		}
+		if nonce != "" || variable.Value == "" || variable.ValueFrom != nil || hasKubernetesExpansion(variable.Value) {
+			return "", fmt.Errorf("native bootstrap nonce must be a unique nonempty literal")
+		}
+		nonce = variable.Value
+	}
+	if nonce == "" {
+		return "", fmt.Errorf("native bootstrap nonce must be a unique nonempty literal")
+	}
+	return nonce, nil
 }
 
 // Runtime Pod placement cannot be translated to the native Actor scheduler.
