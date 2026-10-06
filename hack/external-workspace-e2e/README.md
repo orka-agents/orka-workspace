@@ -53,8 +53,8 @@ The core phase builds a frozen Orka controller, installs its CRDs and a local
 self-signed admission certificate, and enables fail-closed class, provenance,
 execution-authority, Agent, and attachment-Secret webhooks. The controller's
 release manager role is bound in this isolated cluster. Fixture grants add fake
-parameter reads and leader-election leases. The in-process fake adapter remains
-disabled; the separate two-replica provider creates the runtime Pod.
+parameter reads and leader-election leases. The separate two-replica provider
+creates the runtime Pod; Core contains no fake provider implementation.
 
 The proof submits an Interactive class requiring `acp.runtime.v2` and a real
 agent Task. It observes authenticated Serving and the actual Pod UID, session
@@ -67,3 +67,31 @@ NetworkPolicy objects selecting the runtime Pod are checked. Packet enforcement
 is not proved with kind's default CNI. The deterministic agent never contacts a
 provider; its configured provider Service has no endpoints, so an unexpected
 provider request fails locally.
+
+The upgrade proof runs the same released stock core image in a separate
+Deployment, with an empty watch namespace and its own leader-election Lease. It
+copies the existing fixture's ServiceAccount and Secret mounts; its distinct
+labels prevent the existing Service and admission webhooks from selecting it.
+
+```sh
+ORKA_UPGRADE_PROOF_RELEASED=1 scripts/external-workspace-upgrade-e2e.sh \
+  --core-image IMAGE_ALREADY_LOADED_BY_THE_CORE_PROOF \
+  --core-source /path/to/the/frozen/core/source \
+  --old-crd /path/to/the/saved/pre-upgrade/runtimepools.yaml
+```
+
+The script stores an old-shaped RuntimePool and legacy routed workspaces in
+Ready, Suspended, Failed and Deleted states through the actual API server, in
+an unwatched namespace. Stock startup must exit and name every object while
+their exact UID, spec, status and metadata remain unchanged. It then installs
+the frozen pruned CRD, persists the pool again, and proves that pruning legacy
+settings still cannot authorize startup without the generic binding. After
+UID and resource-version guarded deletion of these synthetic lifetimes, the
+isolated stock manager must become Ready. Shared credentials, Services,
+NetworkPolicies and admission configuration remain unchanged. Provider bindings,
+core conditions and advertised status stay unchanged while independently running
+provider heartbeats may advance.
+
+Only synthetic proof resources are removed on success. Failures preserve
+resources and artifacts for inspection; controller logs stay in a private
+artifact directory. The final pruned CRD and the kind cluster are retained.

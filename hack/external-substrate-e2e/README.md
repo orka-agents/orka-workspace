@@ -109,3 +109,63 @@ covers that boundary separately. NetworkPolicy objects and exact preboot worker
 selection are checked, but kind's default CNI does not prove packet enforcement.
 An enforcing production CNI and operator management-plane ingress rules remain
 deployment requirements.
+
+## Actual Core and deployed provider Task proof
+
+The separate `core/` fixture uses the installed native backend, a deployed
+standalone Substrate provider, the actual Orka controller and supervisor, and
+the existing deterministic ACP agent. Its in-cluster client creates a typed
+profile, class, Agent, and Task through their public APIs. It never invokes
+provider lifecycle methods or writes workspace admission/status itself.
+
+```sh
+bash scripts/external-substrate-core-e2e.sh preflight
+ORKA_CORE_BUILD_RELEASED=1 \
+  ORKA_CORE_SOURCE=/path/to/orka \
+  bash scripts/external-substrate-core-e2e.sh proof
+```
+
+`KINDCTL_BIN`, `GOCACHE`, and `GOMODCACHE` overrides are inherited. The proof
+requires the dedicated arm64 installation and registry described above. It
+freezes both source trees before compilation and records source hashes, commit
+IDs, a separate fixture hash, and built image digests in
+`bin/external-substrate-core-<UTC timestamp>/`. The fixture operator WorkerPool
+advertises four CPU and 8 GiB of memory to accommodate the admitted runtime
+limits. Preflight requires at least four CPU and 8 GiB of allocatable node memory.
+The worker image can be overridden with `SUBSTRATE_WORKER_IMAGE`; use a digest
+from the exact native source pin. Existing Core/provider deployments cause a
+refusal so a later run cannot replace an earlier accepted Task implicitly.
+
+The provider mounts rotating native Pod certificates and the native server
+trust bundle. The Task client uses a separate ServiceAccount with class-use
+permission and passes the real fail-closed class, provenance, and authority
+admission. A passing report requires current Core admission and provider
+acknowledgement, exact native Actor UID/version and worker Pod, private
+single-capacity placement with policy present before worker birth,
+authenticated Serving on the native supervisor port 80, an observed
+RuntimeSession UID and prompt result, and exact Actor/private-pool/worker
+retirement. Terminal evidence requires either public workspace absence or its
+exact UID, current generation, saved allocation fence, and validated interactive
+cleanup disposition. The exact Core RuntimePool must also be absent, with zero
+remaining attachment and pool auth/provider credential Secrets.
+
+Core consumes the one-time sealed challenge during credential delivery. The
+client independently checks it when still available and reports whether that
+read preceded closure. A closed listener is accepted only when the actual
+Core subsequently proves authenticated Serving for the recorded exact
+instance and supervisor boot. Full-memory restoration stays gated. This Task
+does not test checkpoint persistence; the Data fixture above proves that path.
+Failures retain their accepted Task and evidence for inspection and are not
+replayed; normal controllers may retire allocation resources.
+
+Installed run `bin/external-substrate-core-20261006022705/report.json` passed
+with Core commit `2599695ae06f5213d0411721347865888a0eff97`, provider commit
+`63f33e3dd3e4ce30d1066a99f0ea8bd184bd44a1`, and the pinned native backend above.
+It verified real Task admission, the separate native process and worker fence,
+policy before worker birth, authenticated Serving on port 80, a RuntimeSession
+prompt with persisted result, and all terminal cleanup assertions. The client
+observed the one-time challenge after Core had closed it, so
+`publicChallengeObservedBeforeClose` is `false`; authenticated Serving and the
+completed prompt verify Core's sealed bootstrap path. The agent is deterministic
+and does not make external model requests. Full-memory restoration remains gated,
+and packet enforcement remains outside this kind proof.

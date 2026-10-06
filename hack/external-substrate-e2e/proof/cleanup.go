@@ -48,6 +48,10 @@ func (p *proof) cleanup(ctx context.Context) error {
 			return fmt.Errorf("cleanup workspace exact identity is missing")
 		}
 		if err := p.retire(ctx, w, api.WorkloadRetirementDelete); err != nil {
+			actor, readErr := p.native.GetActor(ctx, &pb.GetActorRequest{Actor: &pb.ObjectRef{Atespace: p.namespace, Name: w.Status.ExternalID}})
+			if readErr == nil {
+				fmt.Printf("CLEANUP_TERMINAL_DIAGNOSTIC actorUID=%s state=%s assignment=%s\n", actor.GetMetadata().GetUid(), actor.GetStatus().GetState(), actor.GetStatus().GetWorkerAssignment())
+			}
 			return err
 		}
 		p.passed("failed-run allocation retired by exact provider identity without boot replay: " + w.Name)
@@ -81,6 +85,15 @@ func (p *proof) cleanup(ctx context.Context) error {
 			err := p.c.Get(ctx, client.ObjectKeyFromObject(w), &api.ExecutionWorkspace{})
 			return apierrors.IsNotFound(err), client.IgnoreNotFound(err)
 		}); err != nil {
+			return err
+		}
+	}
+	catalogs := &corev1.ConfigMapList{}
+	if err := p.c.List(ctx, catalogs, client.InNamespace(p.namespace), client.MatchingLabels{"substrate.workspace.orka.ai/checkpoint-catalog": "substrate.workspace.checkpoint.v1"}); err != nil {
+		return err
+	}
+	for _, cm := range catalogs.Items {
+		if err := p.collectCatalog(ctx, p.namespace, cm.Name, string(cm.UID)); err != nil {
 			return err
 		}
 	}
@@ -128,5 +141,38 @@ func (p *proof) cleanup(ctx context.Context) error {
 		return err
 	}
 	fmt.Println("NATIVE_CLEANUP_PROOF", string(report))
+	return nil
+}
+
+func (p *proof) collectCatalog(ctx context.Context, namespace, name, uid string) error {
+	if !strings.HasPrefix(namespace, "external-substrate-proof-") || !strings.HasPrefix(name, "substrate-data-") || uid == "" {
+		return fmt.Errorf("catalog sweep scope is invalid")
+	}
+	target := &corev1.Namespace{}
+	if err := p.c.Get(ctx, client.ObjectKey{Name: namespace}, target); err != nil {
+		return err
+	}
+	if string(target.UID) != os.Getenv("SUBSTRATE_E2E_NAMESPACE_UID") {
+		return fmt.Errorf("catalog sweep namespace lifetime changed")
+	}
+	controller := &provider.CheckpointReconciler{Client: p.c, Control: p.native, Config: p.config}
+	if err := poll(ctx, func() (bool, error) {
+		cm := &corev1.ConfigMap{}
+		err := p.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cm)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if string(cm.UID) != uid {
+			return false, fmt.Errorf("catalog sweep UID changed")
+		}
+		_, err = controller.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: "catalog/" + name}})
+		return false, err
+	}); err != nil {
+		return err
+	}
+	p.passed("provider catalog controller finalized exact collected catalog: " + namespace + "/" + name)
 	return nil
 }

@@ -81,6 +81,11 @@ providers. An explicit ACP contract does not imply generic workspace-agent exec,
 reset, or TLS support. Suspension additionally needs Session reuse, a DataOnly
 profile, and bounded retention. Providers advertise only capabilities they prove.
 
+Core's external workload defaults request CPU and memory before computing the
+workload revision. They do not impose Kubernetes ephemeral-storage quotas on
+external backends. The native Substrate provider rejects unsupported positive
+resource requirements; it does not discard admitted limits during translation.
+
 ## Compatibility
 
 These implementations use `workspace.orka.ai/v1alpha1` and
@@ -92,10 +97,10 @@ workload contract.
 | Component | Supported boundary | Verification |
 | --- | --- | --- |
 | Kubernetes | v1.37.0 with CEL admission authorization | Scoped live fixtures; other versions unverified |
-| Fake provider | Separate Pod runtime; `orka.harness.v2` | Two-replica ownership and exact-lifetime proof; real-core Task proof tracked in implementation status |
+| Fake provider | Separate Pod runtime; `orka.harness.v2` | Two-replica ownership, actual Core Task/RuntimeSession, and exact credential/Pod retirement |
 | Agent Sandbox | Unmodified upstream v1.0.3; dynamic PVC with Delete reclaim | Installed filesystem persistence and exact Pod/PVC/PV deletion |
-| Agent Substrate | Native v0.1.0 at `fa6d949685a6318940a9a0195c867c864009b820`; gVisor; Data/Data/ColdBoot | Installed Data capture, export, source deletion, fresh cold import, and native artifact cleanup |
-| Legacy allocations | Original in-tree owner only | Upgrade gate rejects cutover while legacy pools or retained workspaces remain |
+| Agent Substrate | Native v0.1.0 at `fa6d949685a6318940a9a0195c867c864009b820`; gVisor; Data/Data/ColdBoot | Installed Data capture/export/import plus actual Core Task/RuntimeSession and exact native/credential retirement |
+| Legacy allocations | Original in-tree owner only | Stock upgrade gate rejects all retained states before and after schema pruning; fresh startup follows exact cleanup |
 | Pooled Substrate MCP Tools | Existing in-tree implementation | Retained migration boundary |
 | Fiberd | No external provider yet | Upstream prerequisites remain unsatisfied |
 
@@ -125,7 +130,10 @@ provider. Cold resume qualifies. `Disabled` denies continuation and allows clean
 Keep the controller and native backend running until all owned allocations retire.
 
 Core closes runtime admission and completes exact authenticated drain before
-publishing retirement. The provider observes termination and records data
+publishing retirement. A lost Pod-backed supervisor can retire after Core is
+quiescent and independently proves its persisted exact Pod UID is absent.
+Provider status and infrastructure-worker absence cannot establish that exception
+for a native process. The provider observes termination and records data
 disposition. Core then removes its credentials and endpoint policies and releases
 its finalizers. A missing response or changed identity leaves cleanup pending.
 Provider journals remain until workspace finalization. Retained checkpoint
@@ -152,10 +160,14 @@ journals, anchors, compute, or retained storage. Remove provider-specific CRDs o
 after their config/profile objects are no longer referenced. The shared bundle
 stays installed while any other provider uses it.
 
-Pooled Substrate MCP Tools still use the in-tree path. Removing its flags or
-controllers before that boundary migrates would break those Tools. Installed
-backend persistence and retained-resource upgrade tests remain prerequisites for
-complete migration closeout.
+Pooled Substrate MCP Tools still use the in-tree path through
+`--substrate-mcp-tools-enabled`. Its Tool and SubstrateActorPool controllers,
+authenticated control transport, and cleanup remain in Orka. This flag never
+enables ACP workspace allocation. The old `--agent-sandbox-enabled`,
+`--substrate-enabled`, and `--enable-fake-workspace-provider` flags are removed.
+Remove them from controller arguments and use the separate providers for ACP.
+Generic native worker observation uses read-only Pod permissions; the provider
+owns worker compute and egress policies.
 
 ## Local verification
 
@@ -178,3 +190,8 @@ admission and do not claim real-core credential bootstrap or RuntimeSession exec
 The Sandbox fixture runs with `scripts/external-sandbox-e2e.sh`. The native
 fixture uses an isolated cluster with the backend's required certificate feature
 gates; see [its setup and proof](../hack/external-substrate-e2e/README.md).
+The additional `scripts/external-substrate-core-e2e.sh proof` runs an actual Task
+through deployed Core and native provider controllers. It proves authenticated
+Serving, RuntimeSession execution, and exact compute and credential retirement.
+The [retained-resource upgrade proof](../hack/external-workspace-e2e/README.md)
+uses the same stock Core image as the fake Task proof.

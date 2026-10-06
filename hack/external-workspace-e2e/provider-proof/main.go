@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -242,10 +243,10 @@ func (p *proof) run(ctx context.Context) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	before := p.workspace.DeepCopy()
-	p.workspace.Spec.Workload = &request
-	p.workspace.Spec.CoreAdmission.AdmittedGeneration = p.workspace.Generation + 1
-	if err := p.core.Patch(ctx, p.workspace, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := p.updateSpec(ctx, func(w *workspacev1alpha1.ExecutionWorkspace) {
+		w.Spec.Workload = &request
+		w.Spec.CoreAdmission.AdmittedGeneration = w.Generation + 1
+	}); err != nil {
 		return err
 	}
 	if err := p.admitStatus(ctx); err != nil {
@@ -295,10 +296,10 @@ func (p *proof) run(ctx context.Context) error {
 	}
 	p.passed("consumer startup validation rejects mismatched instance identity")
 
-	before = p.workspace.DeepCopy()
-	p.workspace.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
-	p.workspace.Spec.Attachment = nil
-	if err := p.core.Patch(ctx, p.workspace, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := p.updateSpec(ctx, func(w *workspacev1alpha1.ExecutionWorkspace) {
+		w.Spec.DesiredState = workspacev1alpha1.ExecutionWorkspaceDesiredDeleted
+		w.Spec.Attachment = nil
+	}); err != nil {
 		return err
 	}
 	time.Sleep(2 * time.Second)
@@ -309,9 +310,9 @@ func (p *proof) run(ctx context.Context) error {
 	if err := p.admin.Get(ctx, client.ObjectKeyFromObject(p.workspace), p.workspace); err != nil {
 		return err
 	}
-	before = p.workspace.DeepCopy()
-	p.workspace.Spec.Retirement = &workspacev1alpha1.WorkloadRetirement{Sequence: request.Sequence, Identity: observed.Identity, Action: workspacev1alpha1.WorkloadRetirementDelete}
-	if err := p.core.Patch(ctx, p.workspace, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := p.updateSpec(ctx, func(w *workspacev1alpha1.ExecutionWorkspace) {
+		w.Spec.Retirement = &workspacev1alpha1.WorkloadRetirement{Sequence: request.Sequence, Identity: observed.Identity, Action: workspacev1alpha1.WorkloadRetirementDelete}
+	}); err != nil {
 		return err
 	}
 	if err := until(ctx, func() (bool, error) {
@@ -333,10 +334,43 @@ func (p *proof) run(ctx context.Context) error {
 	return nil
 }
 
+// The provider writes status concurrently. Re-read the exact workspace on a
+// bounded conflict retry so the fixture does not mistake a status race for a
+// lifecycle failure or overwrite another writer's conditions.
+func (p *proof) updateWorkspace(ctx context.Context, status bool, mutate func(*workspacev1alpha1.ExecutionWorkspace)) error {
+	key, uid := client.ObjectKeyFromObject(p.workspace), p.workspace.UID
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &workspacev1alpha1.ExecutionWorkspace{}
+		if err := p.core.Get(ctx, key, current); err != nil {
+			return err
+		}
+		if current.UID != uid {
+			return errors.New("proof workspace UID changed")
+		}
+		before := current.DeepCopy()
+		mutate(current)
+		patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+		var err error
+		if status {
+			err = p.core.Status().Patch(ctx, current, patch)
+		} else {
+			err = p.core.Patch(ctx, current, patch)
+		}
+		if err == nil {
+			p.workspace = current
+		}
+		return err
+	})
+}
+
+func (p *proof) updateSpec(ctx context.Context, mutate func(*workspacev1alpha1.ExecutionWorkspace)) error {
+	return p.updateWorkspace(ctx, false, mutate)
+}
+
 func (p *proof) admitStatus(ctx context.Context) error {
-	before := p.workspace.DeepCopy()
-	workspaceprovider.SetCondition(&p.workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceAdmitted), Status: metav1.ConditionTrue, Reason: string(workspacev1alpha1.ReasonReady), ObservedGeneration: p.workspace.Generation})
-	return p.core.Status().Patch(ctx, p.workspace, client.MergeFrom(before))
+	return p.updateWorkspace(ctx, true, func(w *workspacev1alpha1.ExecutionWorkspace) {
+		workspaceprovider.SetCondition(&w.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceAdmitted), Status: metav1.ConditionTrue, Reason: string(workspacev1alpha1.ReasonReady), ObservedGeneration: w.Generation})
+	})
 }
 
 func (p *proof) ownershipChecks(ctx context.Context) error {

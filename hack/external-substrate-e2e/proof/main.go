@@ -224,7 +224,7 @@ func (p *proof) reconcileWorkspace(ctx context.Context, w *api.ExecutionWorkspac
 	var lastErr error
 	err := poll(ctx, func() (bool, error) {
 		_, lastErr = r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(w)})
-		if errors.Is(lastErr, sdk.ErrStaleIdentity) || errors.Is(lastErr, sdk.ErrRequestConflict) {
+		if target != api.AllocationDeleted && (errors.Is(lastErr, sdk.ErrStaleIdentity) || errors.Is(lastErr, sdk.ErrRequestConflict)) {
 			return false, lastErr
 		}
 		if err := p.c.Get(ctx, client.ObjectKeyFromObject(w), w); err != nil {
@@ -556,7 +556,9 @@ func main() {
 			p := &proof{c: c, native: pb.NewControlClient(conn), config: transport, namespace: os.Getenv("POD_NAMESPACE"), image: os.Getenv("RUNTIME_IMAGE"), marker: randomValue(), sourceNonce: randomValue(),
 				class: api.ImmutableObjectBinding{Name: "native-data-class", UID: "native-data-class-fixture", Generation: 1, ProfileHash: "sha256:" + strings.Repeat("a", 64)}}
 			p.native = &guardedControl{ControlClient: p.native, proof: p}
-			if os.Getenv("SUBSTRATE_E2E_CLEANUP") == "1" {
+			if os.Getenv("SUBSTRATE_E2E_CATALOG_NAMESPACE") != "" {
+				err = p.collectCatalog(ctx, os.Getenv("SUBSTRATE_E2E_CATALOG_NAMESPACE"), os.Getenv("SUBSTRATE_E2E_CATALOG_NAME"), os.Getenv("SUBSTRATE_E2E_CATALOG_UID"))
+			} else if os.Getenv("SUBSTRATE_E2E_CLEANUP") == "1" {
 				err = p.cleanup(ctx)
 			} else {
 				err = p.run(ctx)
