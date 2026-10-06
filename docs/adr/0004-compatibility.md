@@ -18,7 +18,7 @@ Use exact contract discriminators rather than interpreting a Go module version a
 | Runtime supervisor protocol | Exact `orka.harness.v2` | Orka and supervisor; not implemented by a generic workspace connection |
 | ACP runtime profile | Exact `acp.v1` at the reviewed baseline, plus pinned adapter and runtime profile digests | Orka and selected runtime |
 | Provider-native APIs | Provider-specific pinned native schema/API revision | Each provider's release and conformance evidence |
-| Operation journals | Fake `fake.workspace.journal.v1`; each production provider owns its exact discriminator and migration | Owning provider |
+| Operation journals | Fake `fake.workspace.journal.v2`; each production provider owns its exact discriminator and migration | Owning provider |
 | Data layout/checkpoint format | Provider-specific digest, source provenance, content scope, and restore compatibility | Owning provider; no cross-provider portability promise |
 
 The preserved API and workspace-agent happen to use the same `workspace.orka.ai/v1` string. This historical overlap does not make ACP and workspace-agent interchangeable. The lifecycle contract has its own discriminator, following the exact-match pattern used by Orka's versioned protocols.

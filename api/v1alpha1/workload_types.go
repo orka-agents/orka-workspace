@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -141,17 +142,27 @@ func defaultEmbeddedWorkloadPod(pod *corev1.PodSpec) {
 			}
 		}
 	}
+	defaultProbes := func(probes ...*corev1.Probe) {
+		for _, probe := range probes {
+			if probe != nil && probe.GRPC != nil && probe.GRPC.Service == nil {
+				probe.GRPC.Service = new(string)
+			}
+		}
+	}
 	for i := range pod.Containers {
 		defaultPorts(pod.Containers[i].Ports)
 		defaultEnv(pod.Containers[i].Env)
+		defaultProbes(pod.Containers[i].LivenessProbe, pod.Containers[i].ReadinessProbe, pod.Containers[i].StartupProbe)
 	}
 	for i := range pod.InitContainers {
 		defaultPorts(pod.InitContainers[i].Ports)
 		defaultEnv(pod.InitContainers[i].Env)
+		defaultProbes(pod.InitContainers[i].LivenessProbe, pod.InitContainers[i].ReadinessProbe, pod.InitContainers[i].StartupProbe)
 	}
 	for i := range pod.EphemeralContainers {
 		defaultPorts(pod.EphemeralContainers[i].Ports)
 		defaultEnv(pod.EphemeralContainers[i].Env)
+		defaultProbes(pod.EphemeralContainers[i].LivenessProbe, pod.EphemeralContainers[i].ReadinessProbe, pod.EphemeralContainers[i].StartupProbe)
 	}
 	for i := range pod.Volumes {
 		volume := &pod.Volumes[i]
@@ -455,8 +466,14 @@ func ValidateStartup(request WorkloadRequest, observed AllocationObservation) er
 		return ErrStaleIdentity
 	}
 	u, err := url.Parse(evidence.Endpoint)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("startup endpoint must be an HTTP(S) URL without credentials, query or fragment")
+	}
+	if port := u.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return fmt.Errorf("startup endpoint port must be between 1 and 65535")
+		}
 	}
 	if request.Runtime != nil && evidence.Pod == nil && evidence.Process == nil {
 		return fmt.Errorf("runtime startup requires an exact Pod or native process identity")

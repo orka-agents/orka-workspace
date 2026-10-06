@@ -261,6 +261,9 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	if record.Worker != nil && *record.Worker != *fence {
 		return false, sdk.ErrStaleIdentity
 	}
+	if err := d.verifyWorkerNetworkPolicies(ctx, record, pod); err != nil {
+		return false, err
+	}
 	if record.Worker == nil {
 		record.Worker = fence
 		if err := d.save(ctx, cm, record); err != nil {

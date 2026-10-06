@@ -122,6 +122,9 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if workspace.UID != checkpoint.Spec.WorkspaceRef.UID || provider.UID != workspace.Spec.ProviderBinding.UID {
 			return r.phase(ctx, checkpoint, "Failed", "SourceChanged", "the exact source workspace or provider binding changed")
 		}
+		if !provider.DeletionTimestamp.IsZero() {
+			return r.phase(ctx, checkpoint, "Pending", "Deleting", "new checkpoint export is blocked while the provider registration is deleting")
+		}
 		if provider.Spec.LifecycleState == api.ExecutionWorkspaceProviderDisabled {
 			return r.phase(ctx, checkpoint, "Pending", "Disabled", "checkpoint export is disabled")
 		}

@@ -24,7 +24,10 @@ import (
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func actorRef(record *journalRecord) *pb.ObjectRef {
@@ -182,17 +185,138 @@ func nativeNetworkPolicy(record *journalRecord) networkingv1.NetworkPolicySpec {
 	desired.PodSelector = metav1.LabelSelector{MatchLabels: workerLabels(record)}
 	desired.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
 	desired.Ingress = nil
-	for i := range desired.Egress {
-		for j := range desired.Egress[i].To {
-			peer := &desired.Egress[i].To[j]
+	namespace := record.Request.Runtime.Template.Namespace
+	if namespace == "" {
+		namespace = record.Request.Key.Namespace
+	}
+	qualifyNativeEgressPeers(&desired, namespace)
+	return sdk.NormalizedNetworkPolicySpec(desired)
+}
+
+func qualifyNativeEgressPeers(policy *networkingv1.NetworkPolicySpec, namespace string) {
+	for i := range policy.Egress {
+		for j := range policy.Egress[i].To {
+			peer := &policy.Egress[i].To[j]
 			if peer.PodSelector != nil && peer.NamespaceSelector == nil {
-				// A Pod-only peer is relative to the runtime namespace, while this
-				// policy lives with the infrastructure worker in another namespace.
-				peer.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{corev1.LabelMetadataName: record.Request.Runtime.Template.Namespace}}
+				// Resolve Pod-only peers in the namespace of the original policy
+				// before comparing policies from different namespaces.
+				peer.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{corev1.LabelMetadataName: namespace}}
 			}
 		}
 	}
-	return sdk.NormalizedNetworkPolicySpec(desired)
+}
+
+// NetworkPolicies add permissions. Inherited operator labels may select more
+// policies than the recorded confinement policy, so inspect their complete
+// egress union on the exact worker before Resume and every Ready observation.
+// Ingress remains operator-owned; this object check does not prove CNI packet
+// enforcement or replace the installation's direct-egress acknowledgement.
+func (d *Lifecycle) verifyWorkerNetworkPolicies(ctx context.Context, record *journalRecord, pod *corev1.Pod) error {
+	policies := &networkingv1.NetworkPolicyList{}
+	if err := d.client.List(ctx, policies, client.InNamespace(pod.Namespace)); err != nil {
+		return fmt.Errorf("read native worker NetworkPolicies: %w", err)
+	}
+	admitted := nativeNetworkPolicy(record)
+	found, isolated := false, false
+	for _, policy := range policies.Items {
+		actual := sdk.NormalizedNetworkPolicySpec(policy.Spec)
+		if policy.Name == record.NetworkPolicy.Name {
+			if record.NetworkPolicy.UID == "" || string(policy.UID) != record.NetworkPolicy.UID || policy.DeletionTimestamp != nil || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(actual, admitted) {
+				return fmt.Errorf("native network confinement identity or admitted rules changed")
+			}
+			found = true
+		}
+		selector, err := metav1.LabelSelectorAsSelector(&actual.PodSelector)
+		if err != nil {
+			return fmt.Errorf("native NetworkPolicy %q selector is invalid: %w", policy.Name, err)
+		}
+		if !selector.Matches(klabels.Set(pod.Labels)) {
+			continue
+		}
+		if policy.DeletionTimestamp != nil {
+			return fmt.Errorf("native worker NetworkPolicy %q is being deleted", policy.Name)
+		}
+		for _, direction := range actual.PolicyTypes {
+			if direction != networkingv1.PolicyTypeIngress && direction != networkingv1.PolicyTypeEgress {
+				return fmt.Errorf("native worker NetworkPolicy %q has unsupported direction %q", policy.Name, direction)
+			}
+		}
+		if !slices.Contains(actual.PolicyTypes, networkingv1.PolicyTypeEgress) {
+			continue
+		}
+		isolated = true
+		// Extra Pod-only peers refer to the worker's namespace, whereas the
+		// admitted request's peers were translated from the runtime namespace.
+		qualifyNativeEgressPeers(&actual, pod.Namespace)
+		for _, rule := range actual.Egress {
+			if !slices.ContainsFunc(admitted.Egress, func(allowed networkingv1.NetworkPolicyEgressRule) bool {
+				return nativePeersWithin(rule.To, allowed.To) && nativePortsWithin(rule.Ports, allowed.Ports)
+			}) {
+				return fmt.Errorf("native worker labels select unadmitted egress permissions in NetworkPolicy %q", policy.Name)
+			}
+		}
+	}
+	if !found || !isolated {
+		return fmt.Errorf("native worker is missing its admitted egress isolation")
+	}
+	return nil
+}
+
+// Within a rule, peers and ports form independent OR lists combined with AND.
+// Keep both subsets in one admitted rule to avoid cross-grants between rules.
+// Selector implication and IP-block exclusions remain conservatively exact.
+func nativePeersWithin(actual, allowed []networkingv1.NetworkPolicyPeer) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if len(actual) == 0 {
+		return false
+	}
+	for _, peer := range actual {
+		if !slices.ContainsFunc(allowed, func(candidate networkingv1.NetworkPolicyPeer) bool { return reflect.DeepEqual(peer, candidate) }) {
+			return false
+		}
+	}
+	return true
+}
+
+func nativePortsWithin(actual, allowed []networkingv1.NetworkPolicyPort) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if len(actual) == 0 {
+		return false
+	}
+	for _, port := range actual {
+		if !slices.ContainsFunc(allowed, func(candidate networkingv1.NetworkPolicyPort) bool { return nativePortWithin(port, candidate) }) {
+			return false
+		}
+	}
+	return true
+}
+
+func nativePortWithin(actual, allowed networkingv1.NetworkPolicyPort) bool {
+	if !reflect.DeepEqual(actual.Protocol, allowed.Protocol) {
+		return false
+	}
+	if allowed.Port == nil {
+		return allowed.EndPort == nil
+	}
+	if actual.Port == nil {
+		return false
+	}
+	if actual.Port.Type != intstr.Int || allowed.Port.Type != intstr.Int {
+		return reflect.DeepEqual(actual, allowed)
+	}
+	start, end := actual.Port.IntVal, actual.Port.IntVal
+	if actual.EndPort != nil {
+		end = *actual.EndPort
+	}
+	allowedStart, allowedEnd := allowed.Port.IntVal, allowed.Port.IntVal
+	if allowed.EndPort != nil {
+		allowedEnd = *allowed.EndPort
+	}
+	return start > 0 && end >= start && end <= 65535 && allowedStart > 0 && allowedEnd >= allowedStart && allowedEnd <= 65535 && start >= allowedStart && end <= allowedEnd
 }
 
 func workerLabels(record *journalRecord) map[string]string {
@@ -218,9 +342,11 @@ func (d *Lifecycle) bindWorker(ctx context.Context, record *journalRecord) error
 			return fmt.Errorf("native worker has a foreign allocation label: %w", sdk.ErrStaleIdentity)
 		}
 	}
-	return nil
+	return d.verifyWorkerNetworkPolicies(ctx, record, pod)
 }
 
+// Worker identity lookup also supports exact retirement recovery. Confinement
+// is checked separately on startup paths so policy drift cannot prevent Stop.
 func (d *Lifecycle) worker(ctx context.Context, record *journalRecord, actor *pb.Actor) (*workerFence, error) {
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	if assignment.GetWorker().GetName() == "" || assignment.GetWorkerPodUid() == "" {
@@ -397,6 +523,9 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	}
 	if record.Worker == nil || *worker != *record.Worker {
 		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
+	}
+	if err := d.bindWorker(ctx, record); err != nil {
+		return sdk.AllocationObservation{}, err
 	}
 	hash, err := d.challenge(ctx, record, actor)
 	if err != nil {

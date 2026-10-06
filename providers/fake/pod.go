@@ -292,14 +292,33 @@ func normalizePodSpec(spec *corev1.PodSpec) {
 		if volume.ConfigMap != nil && volume.ConfigMap.DefaultMode == nil {
 			volume.ConfigMap.DefaultMode = &mode
 		}
-		if volume.Projected != nil && volume.Projected.DefaultMode == nil {
-			volume.Projected.DefaultMode = &mode
+		if volume.Projected != nil {
+			if volume.Projected.DefaultMode == nil {
+				volume.Projected.DefaultMode = &mode
+			}
+			for j := range volume.Projected.Sources {
+				if downwardAPI := volume.Projected.Sources[j].DownwardAPI; downwardAPI != nil {
+					normalizeDownwardAPIItems(downwardAPI.Items)
+				}
+			}
 		}
-		if volume.DownwardAPI != nil && volume.DownwardAPI.DefaultMode == nil {
-			volume.DownwardAPI.DefaultMode = &mode
+		if volume.DownwardAPI != nil {
+			if volume.DownwardAPI.DefaultMode == nil {
+				volume.DownwardAPI.DefaultMode = &mode
+			}
+			normalizeDownwardAPIItems(volume.DownwardAPI.Items)
 		}
 	}
 }
+
+func normalizeDownwardAPIItems(items []corev1.DownwardAPIVolumeFile) {
+	for i := range items {
+		if fieldRef := items[i].FieldRef; fieldRef != nil && fieldRef.APIVersion == "" {
+			fieldRef.APIVersion = "v1"
+		}
+	}
+}
+
 func normalizeContainer(container *corev1.Container) {
 	if container.ImagePullPolicy == "" {
 		container.ImagePullPolicy = corev1.PullIfNotPresent
