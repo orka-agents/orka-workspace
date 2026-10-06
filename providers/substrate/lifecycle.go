@@ -64,6 +64,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			return err
 		}
 		if record == nil {
+			// New journals carry protection atomically at creation.
 			if err := d.proveNoAllocation(ctx, request.Key); err != nil {
 				return err
 			}
@@ -85,7 +86,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 				return err
 			}
 			key := journalKey(request.Key)
-			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: labels(record), OwnerReferences: []metav1.OwnerReference{workspaceOwner(request.Key)}}, Data: map[string]string{journalDataKey: data}}
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: labels(record), Finalizers: []string{journalProtectionFinalizer}, OwnerReferences: []metav1.OwnerReference{workspaceOwner(request.Key)}}, Data: map[string]string{journalDataKey: data}}
 			if err := d.client.Create(ctx, cm); err != nil {
 				if apierrors.IsAlreadyExists(err) {
 					return apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, err)

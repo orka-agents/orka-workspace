@@ -63,6 +63,14 @@ Every record includes an exact schema discriminator, owner workspace UID, provid
 4. Preserve a completed deletion tombstone while the owning workspace remains. It prevents a late ensure retry from recreating the allocation. Delete the journal only after confirmed backend cleanup and durable terminal disposition accepted by core.
 5. Keep retained artifact/catalog records until all owners release them. Never delete the sole recovery record through an owner reference while a backend operation remains uncertain.
 
+Provider-specific ConfigMap finalizers protect current and historical journals
+before backend effects, including during foreground and namespace deletion.
+The provider releases that protection only after verified terminal cleanup and
+Core finalization or confirmed owner absence; malformed or nonterminal orphan
+records require recovery.
+Legacy live journals can acquire protection before effects. An unprotected
+journal already being deleted cannot safely acquire a new finalizer.
+
 ConfigMap CAS serializes journal updates. It is not a backend fence or proof that a native mutation executes exactly once. At the baseline, native Substrate mutation APIs do not accept the caller's UID/version preconditions. That implementation relies on exclusive infrastructure ownership, immutable identity checks, non-reused native names, durable uncertain-operation recovery, and fresh runtime acceptance. It must continue to say so. Conformance must not report stronger backend guarantees than tested.
 
 ## Acceptance gates

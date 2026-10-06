@@ -326,6 +326,23 @@ func validateNativeScheduling(pod corev1.PodSpec) error {
 // changes. Accept explicit constraints matching those defaults, and reject any
 // other supplied setting instead of silently discarding it.
 func compileSecurityContext(podContext *corev1.PodSecurityContext, containerContext *corev1.SecurityContext) (*pb.SecurityContext, error) {
+	var user, group *int64
+	if podContext != nil {
+		user, group = podContext.RunAsUser, podContext.RunAsGroup
+	}
+	if containerContext != nil {
+		if containerContext.RunAsUser != nil {
+			user = containerContext.RunAsUser
+		}
+		if containerContext.RunAsGroup != nil {
+			group = containerContext.RunAsGroup
+		}
+	}
+	// The native OCI builder always starts UID/GID 0. An omitted Kubernetes
+	// identity can instead select the image USER, which cannot be honored here.
+	if user == nil || group == nil {
+		return nil, fmt.Errorf("native process requires explicit effective UID/GID 0")
+	}
 	validateIdentity := func(user, group *int64, nonRoot *bool) error {
 		if user != nil && *user != 0 || group != nil && *group != 0 || nonRoot != nil && *nonRoot {
 			return fmt.Errorf("native process requires UID/GID 0 and cannot require non-root")

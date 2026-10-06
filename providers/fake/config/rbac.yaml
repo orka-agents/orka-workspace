@@ -21,7 +21,7 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [configmaps]
-    verbs: [get, create, update]
+    verbs: [get, list, watch, create, update]
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, create, delete]

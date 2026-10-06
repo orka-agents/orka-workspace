@@ -97,7 +97,9 @@ rejected. Core omits these overrides, Kubernetes health/shutdown fields, and
 declares port 80 before hashing fresh native intent.
 
 The pinned native process starts as UID/GID 0 regardless of image `USER`.
-Explicit user/group constraints must match 0, and non-root or privileged execution
+Requests must explicitly set effective `RunAsUser` and `RunAsGroup` to 0, either
+on the supervisor container or inherited from the Pod security context. Every
+supplied user/group constraint must match 0; non-root or privileged execution
 requirements are rejected. Admitted capability add/drop lists are translated
 without adding capabilities; absent lists use the pinned backend defaults.
 Other supplied security settings, including privilege escalation, seccomp,

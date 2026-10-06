@@ -232,7 +232,7 @@ type DownloadedArtifact struct {
 
 // ExecStatusPath returns the escaped status endpoint for operationID.
 func ExecStatusPath(operationID string) string {
-	return ExecStatusPrefix + url.PathEscape(strings.TrimSpace(operationID))
+	return ExecStatusPrefix + url.PathEscape(operationID)
 }
 
 // ExecCancelPath returns the escaped cancellation endpoint for operationID.

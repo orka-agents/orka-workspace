@@ -338,7 +338,7 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 		container.Env = append(container.Env, corev1.EnvVar{Name: "ORKA_ACP_DURABLE_WORKSPACE_DIR", Value: durableMountPath}, corev1.EnvVar{Name: "ORKA_ACP_DURABLE_WORKSPACE_KEY", Value: "shared"})
 		container.VolumeMounts = []corev1.VolumeMount{{Name: durableVolumeName, MountPath: durableMountPath}}
 	}
-	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), Containers: []corev1.Container{container}}}, NetworkPolicy: &networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}}}}
+	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}}, NetworkPolicy: &networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}}}}
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
 	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1alpha1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClass": "gvisor"}}}
@@ -479,6 +479,11 @@ func TestNativeJournalLossStopsAdmissionAndCleanup(t *testing.T) {
 	first := ready(t, c, native, request)
 	cm := &corev1.ConfigMap{}
 	if err := c.Get(t.Context(), journalKey(request.Key), cm); err != nil {
+		t.Fatal(err)
+	}
+	// Model forced journal loss after operator removal of provider protection.
+	cm.Finalizers = nil
+	if err := c.Update(t.Context(), cm); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Delete(t.Context(), cm); err != nil {

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -107,11 +108,8 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 		return nil, nil, err
 	}
 	if record.Observation.State == workspaceprovider.AllocationDeleted {
-		if record.DeletionPolicy == nil {
-			return nil, nil, fmt.Errorf("deleted fake journal has no deletion policy")
-		}
-		if err := workspaceprovider.ValidateDeletedDisposition(record.Observation.Disposition, *record.DeletionPolicy); err != nil {
-			return nil, nil, fmt.Errorf("invalid deleted fake journal disposition: %w", err)
+		if err := validateJournalRecord(&record); err != nil {
+			return nil, nil, err
 		}
 		// Older journals claimed cleanup of credentials owned only by Core.
 		// Correct the returned observation without rewriting their tombstones
@@ -123,6 +121,18 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 	}
 	return cm, &record, nil
 }
+func validateJournalRecord(record *journalRecord) error {
+	if record.Observation.State == workspaceprovider.AllocationDeleted {
+		if record.DeletionPolicy == nil {
+			return fmt.Errorf("deleted fake journal has no deletion policy")
+		}
+		if err := workspaceprovider.ValidateDeletedDisposition(record.Observation.Disposition, *record.DeletionPolicy); err != nil {
+			return fmt.Errorf("invalid deleted fake journal disposition: %w", err)
+		}
+	}
+	return nil
+}
+
 func encode(record *journalRecord) (string, error) {
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -134,6 +144,9 @@ func encode(record *journalRecord) (string, error) {
 	return string(data), nil
 }
 func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if err := d.protectJournal(ctx, cm); err != nil {
+		return err
+	}
 	data, err := encode(record)
 	if err != nil {
 		return err
@@ -148,7 +161,13 @@ func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *j
 	archived.ResourceVersion = ""
 	archived.UID = ""
 	archived.CreationTimestamp = metav1.Time{}
+	archived.DeletionTimestamp = nil
+	archived.DeletionGracePeriodSeconds = nil
+	if !slices.Contains(archived.Finalizers, journalProtectionFinalizer) {
+		archived.Finalizers = append(archived.Finalizers, journalProtectionFinalizer)
+	}
 	archived.ManagedFields = nil
+	delete(archived.Annotations, journalReleasedAnnotation)
 	if err := d.client.Create(ctx, archived); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -275,6 +294,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 			}
 		}
 		if record == nil {
+			// New journals carry protection atomically at creation.
 			if request.Sequence != 1 {
 				return workspaceprovider.ErrRequestConflict
 			}
@@ -287,7 +307,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				return err
 			}
 			key := journalKey(request.Key)
-			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: map[string]string{journalLabel: "v2"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: workspacev1alpha1.GroupVersion.String(), Kind: "ExecutionWorkspace", Name: workspace.Name, UID: workspace.UID}}}, Data: map[string]string{journalDataKey: data}}
+			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: map[string]string{journalLabel: "v2"}, Finalizers: []string{journalProtectionFinalizer}, OwnerReferences: []metav1.OwnerReference{{APIVersion: workspacev1alpha1.GroupVersion.String(), Kind: "ExecutionWorkspace", Name: workspace.Name, UID: workspace.UID}}}, Data: map[string]string{journalDataKey: data}}
 			if err := d.client.Create(ctx, cm); err != nil {
 				if apierrors.IsAlreadyExists(err) {
 					return apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, err)
@@ -312,6 +332,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				return err
 			}
 			record = next
+		}
+		if err := d.protectJournal(ctx, cm); err != nil {
+			return err
 		}
 		if err := d.guardJournal(ctx, request.Key, record); err != nil {
 			return err

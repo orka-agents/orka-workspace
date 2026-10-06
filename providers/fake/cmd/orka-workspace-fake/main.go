@@ -12,6 +12,7 @@ import (
 	fakev1alpha1 "github.com/orka-agents/orka-workspace/providers/fake/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,12 +39,20 @@ func main() {
 	}
 }
 
-func run(conformanceMode, leaderElection bool, leaderNamespace string) error {
+func newProviderScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, workspacev1alpha1.AddToScheme, fakev1alpha1.AddToScheme} {
+	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, workspacev1alpha1.AddToScheme, fakev1alpha1.AddToScheme} {
 		if err := register(scheme); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	return scheme, nil
+}
+
+func run(conformanceMode, leaderElection bool, leaderNamespace string) error {
+	scheme, err := newProviderScheme()
+	if err != nil {
+		return err
 	}
 	if conformanceMode {
 		ctx := context.Background()

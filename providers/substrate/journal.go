@@ -174,25 +174,34 @@ func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name type
 	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !reflect.DeepEqual(cm.Labels, labels(record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
 		return nil, nil, sdk.ErrStaleIdentity
 	}
-	if record.TemplateSpec == nil || record.Template.Name == "" || record.Actor.Name == "" || record.Atespace == "" || record.Placement.UID == "" || record.Anchor.Name == "" || record.NetworkPolicy.Name == "" {
-		return nil, nil, fmt.Errorf("native journal has incomplete infrastructure intent")
-	}
-	if err := validateRequest(record.Request); err != nil {
+	if err := validateJournalRecord(record); err != nil {
 		return nil, nil, err
-	}
-	if record.Worker != nil && (record.Worker.AllocationID != record.Observation.Identity.AllocationID || record.Worker.InstanceID != record.Observation.Identity.InstanceID) {
-		return nil, nil, sdk.ErrStaleIdentity
-	}
-	if len(record.RetirementWorkers) > 16 {
-		return nil, nil, sdk.ErrStaleIdentity
-	}
-	for _, worker := range record.RetirementWorkers {
-		if worker.AllocationID != record.Observation.Identity.AllocationID || worker.InstanceID != record.Observation.Identity.InstanceID || worker.Namespace != record.Placement.Namespace || worker.Pool != record.RuntimePool.Name || worker.PodUID == "" {
-			return nil, nil, sdk.ErrStaleIdentity
-		}
 	}
 	return cm, record, nil
 }
+
+// validateJournalRecord is shared by read-only lifecycle recovery and GC release.
+func validateJournalRecord(record *journalRecord) error {
+	if record.TemplateSpec == nil || record.Template.Name == "" || record.Actor.Name == "" || record.Atespace == "" || record.Placement.UID == "" || record.Anchor.Name == "" || record.NetworkPolicy.Name == "" {
+		return fmt.Errorf("native journal has incomplete infrastructure intent")
+	}
+	if err := validateRequest(record.Request); err != nil {
+		return err
+	}
+	if record.Worker != nil && (record.Worker.AllocationID != record.Observation.Identity.AllocationID || record.Worker.InstanceID != record.Observation.Identity.InstanceID) {
+		return sdk.ErrStaleIdentity
+	}
+	if len(record.RetirementWorkers) > 16 {
+		return sdk.ErrStaleIdentity
+	}
+	for _, worker := range record.RetirementWorkers {
+		if worker.AllocationID != record.Observation.Identity.AllocationID || worker.InstanceID != record.Observation.Identity.InstanceID || worker.Namespace != record.Placement.Namespace || worker.Pool != record.RuntimePool.Name || worker.PodUID == "" {
+			return sdk.ErrStaleIdentity
+		}
+	}
+	return nil
+}
+
 func encode(record *journalRecord) (string, error) {
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -204,6 +213,9 @@ func encode(record *journalRecord) (string, error) {
 	return string(data), nil
 }
 func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if err := d.protectJournal(ctx, cm); err != nil {
+		return err
+	}
 	data, err := encode(record)
 	if err != nil {
 		return err
@@ -217,7 +229,13 @@ func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *j
 	archived.ResourceVersion = ""
 	archived.UID = ""
 	archived.CreationTimestamp = metav1.Time{}
+	archived.DeletionTimestamp = nil
+	archived.DeletionGracePeriodSeconds = nil
+	if !slices.Contains(archived.Finalizers, journalProtectionFinalizer) {
+		archived.Finalizers = append(archived.Finalizers, journalProtectionFinalizer)
+	}
 	archived.ManagedFields = nil
+	delete(archived.Annotations, journalReleasedAnnotation)
 	if err := d.client.Create(ctx, archived); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -280,6 +298,9 @@ func (d *Lifecycle) proveNoAllocation(ctx context.Context, key sdk.AllocationKey
 	return nil
 }
 func (d *Lifecycle) requireJournal(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if err := d.protectJournal(ctx, cm); err != nil {
+		return err
+	}
 	if cm.UID == "" {
 		return fmt.Errorf("native journal has no API-assigned UID")
 	}

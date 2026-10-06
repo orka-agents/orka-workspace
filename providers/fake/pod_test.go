@@ -502,6 +502,11 @@ func TestMissingJournalBeforeStatusCannotRecreateOrClaimDeletion(t *testing.T) {
 	if err := c.Get(t.Context(), journalKey(request.Key), cm); err != nil {
 		t.Fatal(err)
 	}
+	// Model forced journal loss after operator removal of provider protection.
+	cm.Finalizers = nil
+	if err := c.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Delete(t.Context(), cm); err != nil {
 		t.Fatal(err)
 	}

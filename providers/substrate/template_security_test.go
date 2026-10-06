@@ -126,7 +126,7 @@ func TestNativeRejectsUnsupportedSecurityBeforeEffects(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c, native, request := fixture(t, false)
-			podContext, containerContext := &corev1.PodSecurityContext{}, &corev1.SecurityContext{}
+			podContext, containerContext := &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, &corev1.SecurityContext{}
 			test.apply(podContext, containerContext)
 			request.Runtime.Template.Spec.SecurityContext = podContext
 			request.Runtime.Template.Spec.Containers[0].SecurityContext = containerContext

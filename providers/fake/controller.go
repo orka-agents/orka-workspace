@@ -388,6 +388,9 @@ func workspaceWinsFakePoolCapacity(
 }
 
 func (r *FakeExecutionWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := (&JournalProtectionReconciler{Client: r.Client}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
 	}

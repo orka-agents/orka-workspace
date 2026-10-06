@@ -95,5 +95,8 @@ func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *ExecutionWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := (&JournalProtectionReconciler{Client: r.Client}).SetupWithManager(mgr); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).For(&workspacev1alpha1.ExecutionWorkspace{}).WithEventFilter(predicate.GenerationChangedPredicate{}).Named("substrate-execution-workspace").Complete(r)
 }

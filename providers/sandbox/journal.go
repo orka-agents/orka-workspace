@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -126,25 +127,33 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 		!reflect.DeepEqual(cm.Labels, labels(&record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
 		return nil, nil, workspaceprovider.ErrStaleIdentity
 	}
+	if err := validateJournalRecord(&record); err != nil {
+		return nil, nil, err
+	}
+	return cm, &record, nil
+}
+
+// validateJournalRecord is shared by read-only lifecycle recovery and GC release.
+func validateJournalRecord(record *journalRecord) error {
 	if err := record.Request.Validate(); err != nil {
-		return nil, nil, fmt.Errorf("invalid journal request: %w", err)
+		return fmt.Errorf("invalid journal request: %w", err)
 	}
 	if record.Volume != nil {
 		volume, err := (&profilev1alpha1.SandboxSuspendPolicy{Mode: profilev1alpha1.SandboxSuspendModeDataOnly, Volume: *record.Volume}).ResolveVolume()
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid journal durable volume: %w", err)
+			return fmt.Errorf("invalid journal durable volume: %w", err)
 		}
 		if volume.StorageClassName == "" || record.StorageClassUID == "" || !reflect.DeepEqual(volume, *record.Volume) {
-			return nil, nil, fmt.Errorf("journal durable volume is not a normalized pinned volume: %w", workspaceprovider.ErrStaleIdentity)
+			return fmt.Errorf("journal durable volume is not a normalized pinned volume: %w", workspaceprovider.ErrStaleIdentity)
 		}
 	}
 	if record.MaxSuspended != nil && *record.MaxSuspended < 0 {
-		return nil, nil, workspaceprovider.ErrStaleIdentity
+		return workspaceprovider.ErrStaleIdentity
 	}
 	if reservation := record.RetentionReservation; reservation != nil && (record.MaxSuspended == nil || reservation.LedgerUID == "" || reservation.Sequence <= 0 || reservation.Sequence > record.Request.Sequence) {
-		return nil, nil, workspaceprovider.ErrStaleIdentity
+		return workspaceprovider.ErrStaleIdentity
 	}
-	return cm, &record, nil
+	return nil
 }
 
 func encode(record *journalRecord) (string, error) {
@@ -159,6 +168,9 @@ func encode(record *journalRecord) (string, error) {
 }
 
 func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if err := d.protectJournal(ctx, cm); err != nil {
+		return err
+	}
 	data, err := encode(record)
 	if err != nil {
 		return err
@@ -174,7 +186,13 @@ func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *j
 	archived.ResourceVersion = ""
 	archived.UID = ""
 	archived.CreationTimestamp = metav1.Time{}
+	archived.DeletionTimestamp = nil
+	archived.DeletionGracePeriodSeconds = nil
+	if !slices.Contains(archived.Finalizers, journalProtectionFinalizer) {
+		archived.Finalizers = append(archived.Finalizers, journalProtectionFinalizer)
+	}
 	archived.ManagedFields = nil
+	delete(archived.Annotations, journalReleasedAnnotation)
 	if err := d.client.Create(ctx, archived); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return err
@@ -261,6 +279,9 @@ func (d *Lifecycle) proveNoAllocation(ctx context.Context, key workspaceprovider
 }
 
 func (d *Lifecycle) requireJournal(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if err := d.protectJournal(ctx, cm); err != nil {
+		return err
+	}
 	if cm.UID == "" {
 		return fmt.Errorf("journal has no API-assigned UID")
 	}

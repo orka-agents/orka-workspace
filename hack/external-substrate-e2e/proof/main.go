@@ -275,7 +275,7 @@ func (p *proof) newWorkspace(ctx context.Context, name string, initialize bool, 
 		ParametersBinding: &api.ImmutableObjectBinding{Name: p.profile.Name, UID: p.profile.UID, Generation: p.profile.Generation, ProfileHash: hash},
 		Runtime: &api.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: name + "-pool", UID: types.UID(name + "-pool-fixture"), Generation: 1, ProfileHash: p.class.ProfileHash},
 			ClassBinding: p.class, Protocol: "orka.harness.v2", ContainerName: container.Name, RequiredFeatures: []api.ExecutionWorkspaceFeature{api.WorkspaceFeatureSuspend, api.WorkspaceFeatureCheckpoint, api.WorkspaceFeatureRestore},
-			Template:      corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: p.namespace}, Spec: corev1.PodSpec{AutomountServiceAccountToken: new(false), RestartPolicy: corev1.RestartPolicyNever, Containers: []corev1.Container{container}}},
+			Template:      corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: p.namespace}, Spec: corev1.PodSpec{AutomountServiceAccountToken: new(false), RestartPolicy: corev1.RestartPolicyNever, SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}},
 			NetworkPolicy: &networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}, Egress: []networkingv1.NetworkPolicyEgressRule{{}}}}}
 	if cp != nil {
 		request.RestoreFrom = &api.WorkloadCheckpointReference{Name: cp.Name, UID: cp.UID, Digest: cp.Status.Digest}
