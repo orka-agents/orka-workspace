@@ -422,8 +422,10 @@ func fakeDeletedDisposition(policy workspacev1alpha1.ExecutionWorkspaceDeletionP
 		Checkpoints:       retainedOrDeleted(policy.Checkpoints),
 		ProviderResources: retainedOrDeleted(policy.ProviderResources),
 	}
-	setAccessDisposition(disposition, workspacev1alpha1.DispositionRevoked)
-	setEphemeralDisposition(disposition, workspacev1alpha1.DispositionDeleted)
+	// Core owns attachment and runtime credentials. Deleting provider compute
+	// does not attest revocation or deletion of those independently owned Secrets.
+	setAccessDisposition(disposition, workspacev1alpha1.DispositionNotApplicable)
+	setEphemeralDisposition(disposition, workspacev1alpha1.DispositionNotApplicable)
 	return disposition
 }
 

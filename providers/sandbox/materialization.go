@@ -173,6 +173,58 @@ func normalizeContainer(container *corev1.Container) {
 			fieldRef.FieldRef.APIVersion = "v1"
 		}
 	}
+	normalizeProbe(container.LivenessProbe)
+	normalizeProbe(container.ReadinessProbe)
+	normalizeProbe(container.StartupProbe)
+	if container.Lifecycle != nil {
+		if container.Lifecycle.PostStart != nil {
+			normalizeHTTPGetAction(container.Lifecycle.PostStart.HTTPGet)
+		}
+		if container.Lifecycle.PreStop != nil {
+			normalizeHTTPGetAction(container.Lifecycle.PreStop.HTTPGet)
+		}
+	}
+}
+
+// Match Kubernetes v1.37 core/v1 probe and action defaults on both copies;
+// explicit thresholds and handlers remain part of the admitted template.
+func normalizeProbe(probe *corev1.Probe) {
+	if probe == nil {
+		return
+	}
+	if probe.TimeoutSeconds == 0 {
+		probe.TimeoutSeconds = 1
+	}
+	if probe.PeriodSeconds == 0 {
+		probe.PeriodSeconds = 10
+	}
+	if probe.SuccessThreshold == 0 {
+		probe.SuccessThreshold = 1
+	}
+	if probe.FailureThreshold == 0 {
+		probe.FailureThreshold = 3
+	}
+	normalizeHTTPGetAction(probe.HTTPGet)
+	if probe.GRPC != nil && probe.GRPC.Service == nil {
+		probe.GRPC.Service = new(string)
+	}
+}
+
+func normalizeHTTPGetAction(action *corev1.HTTPGetAction) {
+	if action == nil {
+		return
+	}
+	if action.Path == "" {
+		action.Path = "/"
+	}
+	if action.Scheme == "" {
+		action.Scheme = corev1.URISchemeHTTP
+	}
+	// Nil means HTTP/1.1 even when H2CContainerProbe is disabled. When the
+	// gate is enabled, Pod defaulting also writes this value explicitly.
+	if action.Protocol == nil {
+		action.Protocol = new(corev1.HTTPProtocolHTTP1)
+	}
 }
 
 func stripDefaultTolerationInjection(expected, actual []corev1.Toleration) []corev1.Toleration {

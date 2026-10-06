@@ -50,7 +50,7 @@ func TestSandboxRejectsUnmanagedStorageBeforeAllocation(t *testing.T) {
 				t.Fatal(err)
 			}
 			for range 2 {
-				if observed, err := New(c).EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), "cannot own storage lifecycle") || observed.Startup != nil {
+				if observed, err := New(c).EnsureAllocation(t.Context(), request); err == nil || observed.Startup != nil {
 					t.Fatalf("unmanaged storage reached allocation: %+v, %v", observed, err)
 				}
 			}

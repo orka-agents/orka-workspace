@@ -106,6 +106,21 @@ func (d *Lifecycle) readAt(ctx context.Context, key workspaceprovider.Allocation
 	if err := d.validateJournalGuard(ctx, key, &record); err != nil {
 		return nil, nil, err
 	}
+	if record.Observation.State == workspaceprovider.AllocationDeleted {
+		if record.DeletionPolicy == nil {
+			return nil, nil, fmt.Errorf("deleted fake journal has no deletion policy")
+		}
+		if err := workspaceprovider.ValidateDeletedDisposition(record.Observation.Disposition, *record.DeletionPolicy); err != nil {
+			return nil, nil, fmt.Errorf("invalid deleted fake journal disposition: %w", err)
+		}
+		// Older journals claimed cleanup of credentials owned only by Core.
+		// Correct the returned observation without rewriting their tombstones
+		// or supplying any missing provider cleanup evidence.
+		disposition := *record.Observation.Disposition
+		disposition.AccessCredentials = workspacev1alpha1.DispositionNotApplicable
+		disposition.EphemeralSecrets = workspacev1alpha1.DispositionNotApplicable
+		record.Observation.Disposition = &disposition
+	}
 	return cm, &record, nil
 }
 func encode(record *journalRecord) (string, error) {

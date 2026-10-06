@@ -305,8 +305,11 @@ func (r WorkloadRequest) validateRuntime() error {
 		}
 		if volume.Projected != nil {
 			for _, source := range volume.Projected.Sources {
-				if source.Secret != nil || source.ConfigMap != nil || source.ServiceAccountToken != nil {
-					return fmt.Errorf("runtime cannot project credentials before bootstrap")
+				// Only downward metadata belongs in public allocation intent.
+				// Reject unknown or mixed sources as well as credential/config
+				// projections, including certificate and trust-bundle rotation.
+				if source.DownwardAPI == nil || !apiequality.Semantic.DeepEqual(source, corev1.VolumeProjection{DownwardAPI: source.DownwardAPI}) {
+					return fmt.Errorf("runtime projected volumes allow only downward API metadata before bootstrap")
 				}
 			}
 		}

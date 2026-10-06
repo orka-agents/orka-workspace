@@ -125,7 +125,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	httpClient.CheckRedirect = rejectWorkspaceAgentRedirect
 
-	parsed.Path = strings.TrimSuffix(parsed.Path, "/")
 	return &Client{
 		baseURL:     parsed,
 		httpClient:  httpClient,
@@ -381,7 +380,14 @@ func (c *Client) do(
 	}
 
 	endpoint := *c.baseURL
-	endpoint.Path = strings.TrimSuffix(c.baseURL.Path, "/") + path
+	// Routes already escape dynamic path segments. Keep that encoding and any
+	// escaped endpoint prefix instead of escaping percent signs a second time.
+	endpoint.RawPath = strings.TrimSuffix(c.baseURL.EscapedPath(), "/") + path
+	decodedPath, err := url.PathUnescape(endpoint.RawPath)
+	if err != nil {
+		return &Error{Reason: ErrorReasonCreateRequest, Message: "failed to create workspace-agent request", Cause: err}
+	}
+	endpoint.Path = decodedPath
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), payload)
 	if err != nil {
 		return &Error{Reason: ErrorReasonCreateRequest, Message: "failed to create workspace-agent request", Cause: err}
