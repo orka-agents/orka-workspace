@@ -7,6 +7,7 @@ import (
 	"reflect"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
+	"strings"
 )
 
 func podLabelsMatch(sandbox *sandboxv1beta1.Sandbox, pod *corev1.Pod) bool {
@@ -158,6 +159,12 @@ func normalizeContainer(container *corev1.Container) {
 	}
 	if container.ImagePullPolicy == "" {
 		container.ImagePullPolicy = corev1.PullIfNotPresent
+		// Kubernetes retains an explicit latest tag even beside a digest. All
+		// admitted images are digest-pinned, so an omitted tag stays IfNotPresent.
+		imageName, _, _ := strings.Cut(container.Image, "@")
+		if strings.HasSuffix(imageName, ":latest") {
+			container.ImagePullPolicy = corev1.PullAlways
+		}
 	}
 	if container.TerminationMessagePath == "" {
 		container.TerminationMessagePath = corev1.TerminationMessagePathDefault

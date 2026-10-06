@@ -51,11 +51,20 @@ type checkpointArtifact struct {
 // This index is named from the public object's UID, never from its name or
 // status digest. Native identities remain in the private artifact catalog.
 type checkpointExport struct {
-	Version         string                      `json:"version"`
-	Checkpoint      api.ObjectIdentityReference `json:"checkpoint"`
-	SourceWorkspace api.ObjectIdentityReference `json:"sourceWorkspace"`
-	ProviderUID     types.UID                   `json:"providerUID"`
-	Artifact        catalogReference            `json:"artifact"`
+	Version           string                      `json:"version"`
+	Checkpoint        api.ObjectIdentityReference `json:"checkpoint"`
+	SourceWorkspace   api.ObjectIdentityReference `json:"sourceWorkspace"`
+	ProviderUID       types.UID                   `json:"providerUID"`
+	Artifact          catalogReference            `json:"artifact"`
+	AcquisitionIssued *bool                       `json:"acquisitionIssued,omitempty"`
+	Retiring          bool                        `json:"retiring,omitempty"`
+	Transfers         []checkpointTransfer        `json:"transfers,omitempty"`
+}
+
+type checkpointTransfer struct {
+	Key      api.AllocationKey `json:"key"`
+	Sequence int64             `json:"sequence"`
+	Revision string            `json:"revision"`
 }
 
 func catalogKey(namespace, tagUID string) types.NamespacedName {
@@ -345,15 +354,16 @@ func (d *Lifecycle) collectCatalog(ctx context.Context, key types.NamespacedName
 			return false, err
 		}
 	}
+	pending, err := d.catalogExportReleasePending(ctx, cm, artifact)
+	if err != nil || pending {
+		return pending, err
+	}
 	for owner := range artifact.Owners {
 		object, key, uid, err := ownerObject(owner)
 		if err != nil {
 			return false, err
 		}
-		if err := d.client.Get(ctx, key, object); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
+		if err := d.client.Get(ctx, key, object); err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
 		if object.GetUID() == uid {

@@ -75,13 +75,21 @@ func (d *Lifecycle) importCheckpoint(ctx context.Context, cm *corev1.ConfigMap, 
 			if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Request.Key.Namespace, Name: ref.Name}, checkpoint); err != nil {
 				return err
 			}
-			ready := meta.FindStatusCondition(checkpoint.Status.Conditions, "Ready")
-			if checkpoint.UID != ref.UID || (checkpoint.DeletionTimestamp != nil && !controllerutil.ContainsFinalizer(checkpoint, checkpointFinalizer)) || checkpoint.Status.Digest != ref.Digest || checkpoint.Status.Phase != "Ready" || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != checkpoint.Generation || checkpoint.Spec.WorkspaceRef.UID == record.Request.Key.WorkspaceUID || checkpoint.Status.ClassBinding == nil || *checkpoint.Status.ClassBinding != record.Request.Runtime.ClassBinding {
-				return fmt.Errorf("restoreFrom does not identify a Ready checkpoint at the exact UID, digest and class revision")
-			}
-			_, index, err := d.readExport(ctx, checkpoint)
+			indexCM, index, err := d.readExport(ctx, checkpoint)
 			if err != nil {
 				return err
+			}
+			if err := requireExportProtection(indexCM); err != nil {
+				return err
+			}
+			if index.AcquisitionIssued != nil && !*index.AcquisitionIssued {
+				return fmt.Errorf("checkpoint export never issued its retained-reference acquisition")
+			}
+			ready := meta.FindStatusCondition(checkpoint.Status.Conditions, "Ready")
+			readyForImport := checkpoint.DeletionTimestamp == nil && !index.Retiring && checkpoint.Status.Phase == "Ready" && ready != nil && ready.Status == metav1.ConditionTrue && ready.ObservedGeneration == checkpoint.Generation
+			retiringTransfer := checkpoint.DeletionTimestamp != nil && controllerutil.ContainsFinalizer(checkpoint, checkpointFinalizer) && checkpoint.Status.Phase == "Deleting" && index.allowsRetiringTransfer(record.Request)
+			if checkpoint.UID != ref.UID || checkpoint.Status.Digest != ref.Digest || (!readyForImport && !retiringTransfer) || checkpoint.Spec.WorkspaceRef.UID == record.Request.Key.WorkspaceUID || checkpoint.Status.ClassBinding == nil || *checkpoint.Status.ClassBinding != record.Request.Runtime.ClassBinding {
+				return fmt.Errorf("restoreFrom does not identify a Ready checkpoint at the exact UID, digest and class revision")
 			}
 			_, selected, err := d.readCatalogReference(ctx, checkpoint.Namespace, &index.Artifact)
 			if err != nil {

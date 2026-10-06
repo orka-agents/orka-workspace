@@ -36,20 +36,23 @@ func (d *Lifecycle) readExport(ctx context.Context, checkpoint *api.ExecutionWor
 	if err := d.client.Get(ctx, exportKey(checkpoint.Namespace, checkpoint.UID), cm); err != nil {
 		return nil, nil, err
 	}
-	var index checkpointExport
-	if err := json.Unmarshal([]byte(cm.Data[exportDataKey]), &index); err != nil {
-		return nil, nil, fmt.Errorf("checkpoint export index is unreadable")
+	index, err := exportRecord(cm)
+	if err != nil {
+		return nil, nil, err
 	}
-	if cm.UID == "" || index.Version != catalogVersion || index.Checkpoint.Name != checkpoint.Name || index.Checkpoint.UID != checkpoint.UID || index.SourceWorkspace != checkpoint.Spec.WorkspaceRef || index.ProviderUID == "" || cm.Labels[exportLabel] != string(checkpoint.UID) || cm.Labels[providerLabel] != string(index.ProviderUID) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspaceCheckpoint", Name: checkpoint.Name, UID: checkpoint.UID}}) {
+	if index.Checkpoint.Name != checkpoint.Name || index.Checkpoint.UID != checkpoint.UID || index.SourceWorkspace != checkpoint.Spec.WorkspaceRef {
 		return nil, nil, sdk.ErrStaleIdentity
 	}
-	return cm, &index, nil
+	return cm, index, nil
 }
 
 func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	d := New(r.Client, r.Control, r.Config)
 	if name, ok := strings.CutPrefix(req.Name, "catalog/"); ok {
 		return r.reconcileCatalog(ctx, d, types.NamespacedName{Namespace: req.Namespace, Name: name})
+	}
+	if name, ok := strings.CutPrefix(req.Name, "export/"); ok {
+		return r.reconcileExport(ctx, d, types.NamespacedName{Namespace: req.Namespace, Name: name})
 	}
 	checkpoint := &api.ExecutionWorkspaceCheckpoint{}
 	if err := r.Get(ctx, req.NamespacedName, checkpoint); err != nil {
@@ -59,15 +62,53 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
+	if index != nil {
+		if changed, err := d.protectExport(ctx, indexCM); changed || err != nil {
+			return ctrl.Result{RequeueAfter: time.Millisecond}, err
+		}
+		if (indexCM.Annotations[exportReleasedAnnotation] != "" || index.Retiring) && checkpoint.DeletionTimestamp.IsZero() {
+			return ctrl.Result{}, fmt.Errorf("released checkpoint export cannot publish or acquire retained data")
+		}
+	}
 	if checkpoint.DeletionTimestamp != nil {
 		if !controllerutil.ContainsFinalizer(checkpoint, checkpointFinalizer) {
+			if index != nil {
+				return r.reconcileExport(ctx, d, client.ObjectKeyFromObject(indexCM))
+			}
 			return ctrl.Result{}, nil
 		}
-		if index == nil && checkpoint.Status.Digest != "" && checkpoint.Status.Phase != "Deleting" {
+		if index == nil && checkpoint.Status.Digest != "" && !checkpointReleaseAccepted(checkpoint) {
 			return ctrl.Result{}, fmt.Errorf("checkpoint export catalog disappeared; cleanup is closed")
 		}
 		if index != nil {
-			transferred, err := d.checkpointTransfersComplete(ctx, checkpoint, &index.Artifact)
+			if indexCM.Annotations[exportReleasedAnnotation] != "" {
+				if err := r.releaseExport(ctx, indexCM); err != nil {
+					return ctrl.Result{}, err
+				}
+				controllerutil.RemoveFinalizer(checkpoint, checkpointFinalizer)
+				return ctrl.Result{}, r.Update(ctx, checkpoint)
+			}
+			if checkpoint.Status.Phase != "Deleting" {
+				return r.phase(ctx, checkpoint, "Deleting", "TransferringReferences", "closed new restore admission before freezing previously published workspace references")
+			}
+			neverAcquired, err := d.exportNeverAcquired(ctx, indexCM, index)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if neverAcquired {
+				if !index.Retiring {
+					index.Retiring = true
+					return ctrl.Result{RequeueAfter: time.Millisecond}, d.saveExport(ctx, indexCM, index)
+				}
+				if !checkpointReleaseAccepted(checkpoint) {
+					return r.phase(ctx, checkpoint, "Deleting", "ReferenceReleased", "released only the exact export metadata; no retained-reference acquisition was ever issued")
+				}
+				return ctrl.Result{RequeueAfter: time.Millisecond}, r.releaseExport(ctx, indexCM)
+			}
+			if !index.Retiring {
+				return ctrl.Result{RequeueAfter: time.Millisecond}, d.freezeExportTransfers(ctx, indexCM, index)
+			}
+			transferred, err := d.checkpointTransfersComplete(ctx, checkpoint, index)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -84,14 +125,10 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if !complete {
 				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
-			if checkpoint.Status.Phase != "Deleting" {
+			if !checkpointReleaseAccepted(checkpoint) {
 				return r.phase(ctx, checkpoint, "Deleting", "ReferenceReleased", "the exact checkpoint reference was released after inheriting workspaces acquired their own references")
 			}
-			uid := indexCM.UID
-			if err := r.Delete(ctx, indexCM, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+			return ctrl.Result{RequeueAfter: time.Millisecond}, r.releaseExport(ctx, indexCM)
 		}
 		controllerutil.RemoveFinalizer(checkpoint, checkpointFinalizer)
 		return ctrl.Result{}, r.Update(ctx, checkpoint)
@@ -160,13 +197,13 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if artifact.ClassBinding != workspace.Spec.ClassBinding || artifact.ProviderBinding != workspace.Spec.ProviderBinding || !artifact.Owners[workspaceArtifactOwner(key)] || !reflect.DeepEqual(artifact.Checkpoint, *selected) {
 			return r.phase(ctx, checkpoint, "Failed", "ArtifactUnavailable", "the exact source no longer owns the verified Data artifact")
 		}
-		index = &checkpointExport{Version: catalogVersion, Checkpoint: api.ObjectIdentityReference{Name: checkpoint.Name, UID: checkpoint.UID}, SourceWorkspace: checkpoint.Spec.WorkspaceRef, ProviderUID: provider.UID, Artifact: *ref}
+		index = &checkpointExport{Version: catalogVersion, Checkpoint: api.ObjectIdentityReference{Name: checkpoint.Name, UID: checkpoint.UID}, SourceWorkspace: checkpoint.Spec.WorkspaceRef, ProviderUID: provider.UID, Artifact: *ref, AcquisitionIssued: new(bool)}
 		data, err := json.Marshal(index)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		keyCM := exportKey(checkpoint.Namespace, checkpoint.UID)
-		indexCM = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: keyCM.Namespace, Name: keyCM.Name, Labels: map[string]string{exportLabel: string(checkpoint.UID), providerLabel: string(provider.UID)}, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspaceCheckpoint", Name: checkpoint.Name, UID: checkpoint.UID}}}, Data: map[string]string{exportDataKey: string(data)}}
+		indexCM = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: keyCM.Namespace, Name: keyCM.Name, Labels: map[string]string{exportLabel: string(checkpoint.UID), providerLabel: string(provider.UID)}, Finalizers: []string{exportProtectionFinalizer}, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspaceCheckpoint", Name: checkpoint.Name, UID: checkpoint.UID}}}, Data: map[string]string{exportDataKey: string(data)}}
 		if err := r.Create(ctx, indexCM); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -177,12 +214,21 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		checkpoint.Status.CreatedAt = artifact.Checkpoint.CreatedAt.DeepCopy()
 		return r.phase(ctx, checkpoint, "Pending", "CapturingReference", "recorded the immutable Data checkpoint selected for export")
 	}
-	_, artifact, err := d.readCatalogReference(ctx, checkpoint.Namespace, &index.Artifact)
+	catalogCM, artifact, err := d.readCatalogReference(ctx, checkpoint.Namespace, &index.Artifact)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if index.ProviderUID != artifact.ProviderBinding.UID || (checkpoint.Status.Digest != "" && checkpoint.Status.Digest != artifact.Digest) || (checkpoint.Status.ClassBinding != nil && *checkpoint.Status.ClassBinding != artifact.ClassBinding) {
 		return ctrl.Result{}, sdk.ErrStaleIdentity
+	}
+	if index.AcquisitionIssued == nil || !*index.AcquisitionIssued {
+		sourceOwner := "workspace:" + checkpoint.Namespace + "/" + index.SourceWorkspace.Name + ":" + string(index.SourceWorkspace.UID)
+		if artifact.Deleting || artifact.Collected || !catalogCM.DeletionTimestamp.IsZero() || !controllerutil.ContainsFinalizer(catalogCM, catalogFinalizer) ||
+			(!artifact.Owners[sourceOwner] && !artifact.Owners[publicArtifactOwner(checkpoint)]) {
+			return r.phase(ctx, checkpoint, "Failed", "ReferenceUnavailable", "the selected Data artifact is unavailable; retained-reference acquisition was not issued")
+		}
+		index.AcquisitionIssued = new(true)
+		return ctrl.Result{RequeueAfter: time.Millisecond}, d.saveExport(ctx, indexCM, index)
 	}
 	if err := d.acquireCatalog(ctx, checkpoint.Namespace, &index.Artifact, "workspace:"+checkpoint.Namespace+"/"+index.SourceWorkspace.Name+":"+string(index.SourceWorkspace.UID), publicArtifactOwner(checkpoint)); err != nil {
 		return r.phase(ctx, checkpoint, "Failed", "ReferenceUnavailable", "the selected Data artifact was released before export completed")
@@ -196,26 +242,38 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return r.phase(ctx, checkpoint, "Ready", "DataRetained", "verified Data is retained independently of its source workspace")
 }
 
-func (d *Lifecycle) checkpointTransfersComplete(ctx context.Context, checkpoint *api.ExecutionWorkspaceCheckpoint, ref *catalogReference) (bool, error) {
-	_, artifact, err := d.readCatalogReference(ctx, checkpoint.Namespace, ref)
+func checkpointReleaseAccepted(checkpoint *api.ExecutionWorkspaceCheckpoint) bool {
+	condition := meta.FindStatusCondition(checkpoint.Status.Conditions, "Ready")
+	return checkpoint.Status.Phase == "Deleting" && condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "ReferenceReleased" && condition.ObservedGeneration == checkpoint.Generation
+}
+
+func (d *Lifecycle) checkpointTransfersComplete(ctx context.Context, checkpoint *api.ExecutionWorkspaceCheckpoint, index *checkpointExport) (bool, error) {
+	_, artifact, err := d.readCatalogReference(ctx, checkpoint.Namespace, &index.Artifact)
 	if err != nil {
 		return false, err
 	}
-	workspaces := &api.ExecutionWorkspaceList{}
-	if err := d.client.List(ctx, workspaces, client.InNamespace(checkpoint.Namespace)); err != nil {
-		return false, err
+	if !index.Retiring {
+		return false, fmt.Errorf("checkpoint transfers have no durable retirement fence")
 	}
-	for _, workspace := range workspaces.Items {
-		request := workspace.Spec.Workload
-		if request == nil || request.RestoreFrom == nil || request.RestoreFrom.Name != checkpoint.Name || request.RestoreFrom.UID != checkpoint.UID || request.RestoreFrom.Digest != artifact.Digest || workspace.Spec.ProviderBinding.UID != artifact.ProviderBinding.UID || !workspaceHasCoreAdmission(&workspace) || workspaceHasMaintenanceIntent(&workspace) || workspace.DeletionTimestamp != nil {
+	for _, transfer := range index.Transfers {
+		workspace := &api.ExecutionWorkspace{}
+		err := d.client.Get(ctx, clientKey(transfer.Key), workspace)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		if apierrors.IsNotFound(err) || workspace.UID != transfer.Key.WorkspaceUID || workspaceHasMaintenanceIntent(workspace) || workspace.DeletionTimestamp != nil || !workspaceHasCoreAdmission(workspace) {
 			continue
 		}
-		if request.Key.WorkspaceUID != workspace.UID || request.Runtime == nil || request.Runtime.ClassBinding != artifact.ClassBinding || request.Key.ProviderUID != artifact.ProviderBinding.UID {
+		if artifact.Owners[workspaceArtifactOwner(transfer.Key)] {
+			continue
+		}
+		request := workspace.Spec.Workload
+		if request == nil || request.Key != transfer.Key || request.Sequence != transfer.Sequence || request.Revision != transfer.Revision || request.RestoreFrom == nil ||
+			request.RestoreFrom.Name != checkpoint.Name || request.RestoreFrom.UID != checkpoint.UID || request.RestoreFrom.Digest != artifact.Digest ||
+			request.Runtime == nil || request.Runtime.ClassBinding != artifact.ClassBinding || workspace.Spec.ProviderBinding != artifact.ProviderBinding || !workspaceHasCoreAdmission(workspace) {
 			return false, sdk.ErrStaleIdentity
 		}
-		if !artifact.Owners[workspaceArtifactOwner(request.Key)] {
-			return false, nil
-		}
+		return false, nil
 	}
 	return true, nil
 }
@@ -227,6 +285,9 @@ func (r *CheckpointReconciler) phase(ctx context.Context, checkpoint *api.Execut
 	}
 	if before.UID != checkpoint.UID {
 		return ctrl.Result{}, sdk.ErrStaleIdentity
+	}
+	if before.ResourceVersion != checkpoint.ResourceVersion || before.Generation != checkpoint.Generation {
+		return ctrl.Result{}, apierrors.NewConflict(api.GroupVersion.WithResource("executionworkspacecheckpoints").GroupResource(), checkpoint.Name, fmt.Errorf("checkpoint changed before phase publication"))
 	}
 	checkpoint.Status.Phase = phase
 	status := metav1.ConditionFalse
@@ -288,6 +349,9 @@ func (r *CheckpointReconciler) reconcileCatalog(ctx context.Context, d *Lifecycl
 func (r *CheckpointReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).Named("substrate-workspace-checkpoint").For(&api.ExecutionWorkspaceCheckpoint{}).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+			if object.GetLabels()[exportLabel] != "" || controllerutil.ContainsFinalizer(object, exportProtectionFinalizer) {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: object.GetNamespace(), Name: "export/" + object.GetName()}}}
+			}
 			if object.GetLabels()[catalogLabel] != catalogVersion {
 				return nil
 			}

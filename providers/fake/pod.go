@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"strconv"
+	"strings"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
@@ -352,6 +353,12 @@ func normalizeDownwardAPIItems(items []corev1.DownwardAPIVolumeFile) {
 func normalizeContainer(container *corev1.Container) {
 	if container.ImagePullPolicy == "" {
 		container.ImagePullPolicy = corev1.PullIfNotPresent
+		// Kubernetes retains an explicit latest tag even beside a digest. All
+		// admitted images are digest-pinned, so an omitted tag stays IfNotPresent.
+		imageName, _, _ := strings.Cut(container.Image, "@")
+		if strings.HasSuffix(imageName, ":latest") {
+			container.ImagePullPolicy = corev1.PullAlways
+		}
 	}
 	if container.TerminationMessagePath == "" {
 		container.TerminationMessagePath = corev1.TerminationMessagePathDefault

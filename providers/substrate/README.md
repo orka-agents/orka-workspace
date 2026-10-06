@@ -188,15 +188,25 @@ retries uncertain work. A private index pins the exact public checkpoint UID and
 selected artifact. Public status exposes only its digest, class binding,
 completion time, and readiness. Private catalog owners use Kubernetes CAS to
 retain the native Tag and immutable template across source deletion.
+The export index has its own finalizer before publication or reference acquisition.
+It survives foreground and namespace deletion until exact reference release and
+native collection are accepted; a UID-bound receipt makes release retries safe.
+An acquisition-intent marker is persisted before retaining the public reference.
+If the selected catalog disappears before acquisition was ever issued, only the
+exact index and checkpoint metadata can close. Legacy or issued acquisitions
+remain closed on catalog loss.
 
 An admitted `RestoreFrom` request must match the checkpoint UID and digest,
 namespace, class and provider revisions, WorkerPool UID, and durable layout.
 Import commits its own workspace reference before native creation, then cold
-boots a fresh Actor with the new bootstrap template. A pending public checkpoint
-deletion waits for already published workspace references to acquire their own
-ownership. Lost acquisition responses recover from the committed private owner,
+boots a fresh Actor with the new bootstrap template. Checkpoint deletion first
+withdraws Ready, then freezes the exact pending workspace UIDs and workload
+revisions in its protected index. It waits for those references to acquire their
+own ownership; later restores cannot join the wait set or acquire the retiring
+reference. Lost acquisition responses recover from the committed private owner,
 even after public finalization. The last owner releases and observes exact native
-Tag/template deletion; catalog tombstones remain through owner finalization.
+Tag/template deletion; catalog tombstones remain through owner finalization and
+protected export-index release.
 
 Run `cd providers && go test -race ./substrate/...` and `go vet ./substrate/...`.
 The suite includes all shared lifecycle, replacement, and suspension conformance

@@ -32,12 +32,32 @@ func validateRequest(request workspaceprovider.WorkloadRequest) error {
 	if len(request.Runtime.Template.Spec.Containers) != 1 || len(request.Runtime.Template.Spec.InitContainers) != 0 {
 		return fmt.Errorf("Sandbox requires one supervisor container and no init containers")
 	}
+	if err := validateRuntimeMetadata(request.Runtime); err != nil {
+		return err
+	}
 	for key := range request.Runtime.Template.Labels {
 		if key == extv1beta1.SandboxIDLabel || key == sandboxv1beta1.SandboxTemplateRefHashLabel || key == sandboxcontrollers.SandboxNameHashLabel {
 			return fmt.Errorf("runtime template carries provider-owned label %q", key)
 		}
 	}
 	return validateRuntimeVolumes(request.Runtime)
+}
+
+// agent-sandbox PodMetadata carries only labels and annotations. Namespace is
+// applied to the native objects separately; every other requested metadata
+// field would be lost when the admitted PodTemplate becomes a SandboxTemplate.
+func validateRuntimeMetadata(runtime *workspaceprovider.RuntimeWorkload) error {
+	if runtime == nil {
+		return fmt.Errorf("Sandbox metadata requires an admitted runtime")
+	}
+	metadata := runtime.Template.ObjectMeta
+	metadata.Namespace = ""
+	metadata.Labels = nil
+	metadata.Annotations = nil
+	if !apiequality.Semantic.DeepEqual(metadata, metav1.ObjectMeta{}) {
+		return fmt.Errorf("Sandbox runtime template metadata supports only namespace, labels, and annotations")
+	}
+	return nil
 }
 
 func validateRequiredFeatures(request workspaceprovider.WorkloadRequest) error {
@@ -274,6 +294,9 @@ func (d *Lifecycle) sandbox(ctx context.Context, record *journalRecord) (*sandbo
 func (d *Lifecycle) readSandbox(ctx context.Context, record *journalRecord, validateSpec bool) (*sandboxv1beta1.Sandbox, error) {
 	if validateSpec {
 		if err := validateRequiredFeatures(record.Request); err != nil {
+			return nil, err
+		}
+		if err := validateRuntimeMetadata(record.Request.Runtime); err != nil {
 			return nil, err
 		}
 		if err := validateRuntimeVolumes(record.Request.Runtime); err != nil {

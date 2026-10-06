@@ -355,8 +355,11 @@ func TestCheckpointFinalizerWaitsForPublishedImportOwnership(t *testing.T) {
 	if err := c.Get(t.Context(), client.ObjectKeyFromObject(cp), current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Status.Phase != "Ready" || len(current.Finalizers) == 0 {
-		t.Fatal("checkpoint closed before the published import acquired ownership")
+	if current.Status.Phase != "Deleting" || len(current.Finalizers) == 0 {
+		t.Fatal("checkpoint did not close new admission while preserving the published import")
+	}
+	if _, err := checkpointController(c, native).Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cp)}); err != nil {
+		t.Fatal(err)
 	}
 	first := ready(t, c, native, request)
 	for range 10 {
