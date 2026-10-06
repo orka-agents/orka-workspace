@@ -50,12 +50,15 @@ func createPolicy(t *testing.T, c client.Client, namespace, name string, spec ne
 }
 
 func TestNetworkPolicyRequiredBeforeNativeAllocation(t *testing.T) {
-	for _, failure := range []string{"missing", "wrong namespace", "wrong selector", "admitted selector mismatch", "unadmitted ingress", "unadmitted egress", "missing egress isolation", "terminating", "host network"} {
+	for _, failure := range []string{"missing", "wrong namespace", "wrong selector", "admitted selector mismatch", "unknown policy type", "unadmitted ingress", "unadmitted egress", "missing egress isolation", "terminating", "host network"} {
 		t.Run(failure, func(t *testing.T) {
 			c, request := fixture(t, false)
 			admitted := denyNetwork()
 			if failure == "admitted selector mismatch" {
 				admitted.PodSelector.MatchLabels["orka.ai/pool"] = "foreign"
+			}
+			if failure == "unknown policy type" {
+				admitted.PolicyTypes = []networkingv1.PolicyType{"Unsupported"}
 			}
 			if failure == "host network" {
 				request.Runtime.Template.Spec.HostNetwork = true

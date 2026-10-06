@@ -23,6 +23,11 @@ func (d *Lifecycle) verifyNetworkPolicies(ctx context.Context, runtime *workspac
 	if admitted == nil {
 		return nil
 	}
+	for _, direction := range admitted.PolicyTypes {
+		if direction != networkingv1.PolicyTypeIngress && direction != networkingv1.PolicyTypeEgress {
+			return fmt.Errorf("admitted network policy has unsupported direction %q", direction)
+		}
+	}
 	if runtime.Template.Spec.HostNetwork {
 		return fmt.Errorf("Sandbox cannot enforce admitted NetworkPolicy on a host-networked runtime")
 	}
