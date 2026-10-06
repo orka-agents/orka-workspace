@@ -75,6 +75,8 @@ writable container filesystem with no Kubernetes scratch mounts and require exac
 process startup evidence. Core freezes this choice before workload admission;
 Pod-backed providers keep their own scratch-volume layout. Existing admitted
 requests are never rewritten.
+Core publishes Egress-only intent for this capability. Native infrastructure and
+router ingress remain the operator's responsibility described above.
 
 A workspace-owned ConfigMap persists bounded creation and retirement intent,
 random never-reused Actor names, native UIDs, immutable template digests, exact

@@ -88,6 +88,7 @@ const (
 	WorkspaceFeatureACPRuntime ExecutionWorkspaceFeature = "acp.runtime.v2"
 	// WorkspaceFeatureNativeProcess declares process startup evidence and a fresh writable
 	// container filesystem. Kubernetes scratch mounts are not part of this intent.
+	// Infrastructure/router ingress is operator-managed; runtime policy covers egress.
 	WorkspaceFeatureNativeProcess ExecutionWorkspaceFeature = "runtime.native-process"
 	WorkspaceFeatureExec          ExecutionWorkspaceFeature = "exec"
 	WorkspaceFeatureFiles         ExecutionWorkspaceFeature = "files"
