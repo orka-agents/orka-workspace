@@ -10,7 +10,7 @@ The script uses `kindctl` from `PATH` by default; set
 
 The proof also requires the paired Orka Core checkout's
 `hack/demos/cluster/install-agent-sandbox.sh`; that installer is not bundled here.
-By default it reads the adjacent `../orka.workspace-external-providers` checkout.
+By default it reads the adjacent `../orka.workspace-out-of-tree` checkout.
 For a different checkout location, supply its installer explicitly:
 
 ```sh

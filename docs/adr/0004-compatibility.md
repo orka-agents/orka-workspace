@@ -25,11 +25,12 @@ The preserved API and workspace-agent happen to use the same `workspace.orka.ai/
 
 ## Supported combination
 
-There is one development combination. It is deliberately narrower than the eventual release table.
+There are two development combinations. Both are deliberately narrower than the eventual release table.
 
 | Shared source | CRDs | Provider | Verified scope | Orka/runtime integration |
 | --- | --- | --- | --- | --- |
 | `v0.1.0-alpha.1`, Phase 1 | Byte-identical to Orka `1cd16c88b43410e0ea46463f8a39b473d8e5250e` | Fake from the same checkout | Shared API/helpers, lifecycle conformance, and simulated provider behavior; no real compute backend | No supported external RuntimePool/RuntimeSession combination yet; secure startup and cluster proof remain Phase 2 |
+| `feat/workspace-external-providers` HEAD, Phases 2 through 6 | Copied from the pinned module into Orka `config/crd/bases` by `make workspace-crds` | Fake (Pod mode), Agent Sandbox, Agent Substrate from the same revision | The verified scope listed in [docs/external-providers.md](../external-providers.md) | Orka `feat/workspace-out-of-tree` with the workspace provider API and ACP workspace dispatch enabled; Orka and provider binaries must come from the same pinned revision |
 
 The Orka commit is the schema and behavior reference, not a claim that its unchanged controller can use an external provider. Do not add a released compatibility row until the exact shared tag, provider image digest, Kubernetes admission behavior, Orka version, runtime image/protocol, and native backend version have passed the required tests. An SDK test or advertised feature alone cannot establish that row.
 

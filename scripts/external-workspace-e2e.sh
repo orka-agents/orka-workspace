@@ -45,9 +45,9 @@ printf 'cluster tag: %s\nnode: %s\nartifacts: %s\n' "${cluster_tag}" "${node_nam
 
 if [[ "${mode}" == prepare-runtime || "${mode}" == core ]]; then
   [[ "${ORKA_CORE_BUILD_RELEASED:-}" == 1 ]] || fail "Core runtime compilation requires ORKA_CORE_BUILD_RELEASED=1 after the core build is released"
-  core_source="${ORKA_CORE_SOURCE:-${repo_root}/../orka.workspace-external-providers}"
+  core_source="${ORKA_CORE_SOURCE:-${repo_root}/../orka.workspace-out-of-tree}"
   [[ -f "${core_source}/cmd/orka-acp-runtime/main.go" ]] || fail "Orka ACP runtime source unavailable: ${core_source}"
-  core_snapshot="${artifact_dir}/orka.workspace-external-providers"
+  core_snapshot="${artifact_dir}/orka-core"
   mkdir -p "${core_snapshot}"
   rsync -a --exclude=.git --exclude=bin --exclude='*.test' --exclude=.tmp --exclude=node_modules "${core_source}/" "${core_snapshot}/"
   runtime_context="${artifact_dir}/images/acp-runtime"

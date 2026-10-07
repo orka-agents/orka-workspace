@@ -2,10 +2,11 @@
 
 Source plan: `orka-workspace-implementation-plan.md`, revised 2026-10-02 against Orka `1cd16c88b43410e0ea46463f8a39b473d8e5250e` and fiberd `6e58535`. The plan takes precedence over the older repository-family proposal in [issue #1](https://github.com/orka-agents/orka-workspace/issues/1).
 
-The [Core implementation at `2599695ae`](https://github.com/orka-agents/orka/commit/2599695ae06f5213d0411721347865888a0eff97)
-pins the shared module at [production revision `63f33e3`](https://github.com/orka-agents/orka-workspace/commit/63f33e3dd3e4ce30d1066a99f0ea8bd184bd44a1).
-Both are pushed on `feat/workspace-external-providers`. #572 is included and does
-not block this implementation.
+The Core integration lives on the orka `feat/workspace-out-of-tree` branch. Its
+`go.mod` pins this module from `feat/workspace-external-providers`, and its
+`make workspace-crds` copies the shared CRDs from that pinned revision. Keep the
+two at the same revision as [docs/external-providers.md](external-providers.md)
+requires. #572 is included and does not block this implementation.
 
 | Stage | Delivered or remaining |
 | --- | --- |

@@ -29,7 +29,7 @@ if [[ "${mode}" == preflight ]]; then exit 0; fi
 # Compilation and installation are a separate release point from preparing this
 # harness. A failed or uncertain accepted Task is retained and never replayed.
 test "${ORKA_CORE_BUILD_RELEASED:-}" = 1
-core_source="${ORKA_CORE_SOURCE:-${PWD}/../orka.workspace-external-providers}"
+core_source="${ORKA_CORE_SOURCE:-${PWD}/../orka.workspace-out-of-tree}"
 test -f "${core_source}/cmd/orka-acp-runtime/main.go"
 test -f "${core_source}/cmd/main.go"
 if test "$(kubectl get deployments -A -o json | jq '[.items[] | select(.metadata.name == "external-substrate-core" or .metadata.labels.app == "external-substrate-core")] | length')" != 0; then

@@ -11,7 +11,7 @@ command -v "${kindctl}" >/dev/null 2>&1 || {
   exit 1
 }
 # The upstream installer is supplied by the paired Core checkout.
-installer="${ORKA_AGENT_SANDBOX_INSTALLER:-${repo_root}/../orka.workspace-external-providers/hack/demos/cluster/install-agent-sandbox.sh}"
+installer="${ORKA_AGENT_SANDBOX_INSTALLER:-${repo_root}/../orka.workspace-out-of-tree/hack/demos/cluster/install-agent-sandbox.sh}"
 if [[ ! -f "${installer}" ]]; then
   printf 'Agent Sandbox installer not found: %s. Set ORKA_AGENT_SANDBOX_INSTALLER to the absolute path of Core hack/demos/cluster/install-agent-sandbox.sh. See hack/external-sandbox-e2e/README.md.\n' "${installer}" >&2
   exit 1
