@@ -25,6 +25,7 @@ const (
 	FakeWorkspaceControllerName = "fake.workspace.orka.ai"
 	fakeWorkspaceAdapterVersion = "0.1.0-dev"
 	fakeProviderConfigKind      = "FakeProviderConfig"
+	fakePoolParametersKind      = "FakePoolParameters"
 	fakeProviderHeartbeatPeriod = 20 * time.Second
 )
 
@@ -147,43 +148,71 @@ func (r *FakeExecutionWorkspacePoolReconciler) Reconcile(ctx context.Context, re
 	if err != nil || !owned {
 		return ctrl.Result{}, err
 	}
-	allocated, suspended, err := r.countPoolWorkspaces(ctx, pool)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	used := allocated + suspended
-	total := min(pool.Spec.Capacity.MinReady+used, pool.Spec.Capacity.MaxSize)
-	// A downsize never evicts active or suspended workspaces; total may temporarily exceed maxSize.
-	total = max(total, used)
-	available := max(total-used, 0)
 	return ctrl.Result{RequeueAfter: fakeProviderHeartbeatPeriod}, retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		// Derive every published value from the object being patched so a
+		// conflict retry never stamps stale capacity with a newer generation.
 		current := &workspacev1alpha1.ExecutionWorkspacePool{}
 		if err := r.Get(ctx, req.NamespacedName, current); err != nil {
 			return err
 		}
+		parametersReady, err := r.poolParametersAvailable(ctx, current)
+		if err != nil {
+			return err
+		}
+		allocated, suspended, err := r.countPoolWorkspaces(ctx, current)
+		if err != nil {
+			return err
+		}
+		used := allocated + suspended
+		total := min(current.Spec.Capacity.MinReady+used, current.Spec.Capacity.MaxSize)
+		// A downsize never evicts active or suspended workspaces; total may temporarily exceed maxSize.
+		total = max(total, used)
+		if !parametersReady {
+			total = used
+		}
 		before := current.DeepCopy()
 		current.Status.ObservedGeneration = current.Generation
-		current.Status.Available = available
+		current.Status.Available = max(total-used, 0)
 		current.Status.Allocated = allocated
 		current.Status.Suspended = suspended
 		current.Status.Total = total
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{
 			Type:               string(workspacev1alpha1.ConditionPoolReady),
-			Status:             metav1.ConditionTrue,
-			Reason:             string(workspacev1alpha1.ReasonReady),
-			Message:            "fake pool capacity is reconciled",
+			Status:             conditionStatus(parametersReady),
+			Reason:             conditionReason(parametersReady, string(workspacev1alpha1.ReasonProgressing)),
+			Message:            chooseMessage(parametersReady, "fake pool capacity is reconciled", "fake pool parameters are missing, deleting, or not FakePoolParameters"),
 			ObservedGeneration: current.Generation,
 		})
-		admitted := used < current.Spec.Capacity.MaxSize
+		admitted := parametersReady && used < current.Spec.Capacity.MaxSize
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{
 			Type:               string(workspacev1alpha1.ConditionPoolAdmitted),
 			Status:             conditionStatus(admitted),
 			Reason:             conditionReason(admitted, string(workspacev1alpha1.ReasonCapacityUnavailable)),
-			Message:            chooseMessage(admitted, "pool has allocation capacity", "pool capacity is exhausted"),
+			Message:            chooseMessage(admitted, "pool has allocation capacity", "pool capacity is exhausted or unconfigured"),
 			ObservedGeneration: current.Generation,
 		})
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
+}
+
+// The immutable parametersRef names the pool's namespaced adapter-owned
+// configuration identity. Missing, deleting, or foreign objects are not ready.
+func (r *FakeExecutionWorkspacePoolReconciler) poolParametersAvailable(
+	ctx context.Context,
+	pool *workspacev1alpha1.ExecutionWorkspacePool,
+) (bool, error) {
+	ref := pool.Spec.ParametersRef
+	if ref.Group != fakeworkspacev1alpha1.GroupVersion.Group || ref.Kind != fakePoolParametersKind || ref.Name == "" {
+		return false, nil
+	}
+	parameters := &fakeworkspacev1alpha1.FakePoolParameters{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: pool.Namespace, Name: ref.Name}, parameters); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get fake pool parameters %q: %w", ref.Name, err)
+	}
+	return parameters.DeletionTimestamp == nil && parameters.UID != "", nil
 }
 
 func (r *FakeExecutionWorkspacePoolReconciler) countPoolWorkspaces(
