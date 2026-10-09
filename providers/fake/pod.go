@@ -31,6 +31,9 @@ func validatePodRequest(request workspaceprovider.WorkloadRequest) error {
 	if err := validatePodStorage(request); err != nil {
 		return err
 	}
+	if err := validatePodMetadata(request); err != nil {
+		return err
+	}
 	runtime := request.Runtime
 	if runtime.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		return fmt.Errorf("fake runtime requires restartPolicy Never; another process needs a new workload sequence")
@@ -95,6 +98,19 @@ func validatePodStorage(request workspaceprovider.WorkloadRequest) error {
 	return nil
 }
 
+// desiredPod carries only template labels and annotations. Reject every other
+// requested metadata field instead of silently dropping it from the realized Pod.
+func validatePodMetadata(request workspaceprovider.WorkloadRequest) error {
+	metadata := request.Runtime.Template.ObjectMeta
+	metadata.Namespace = ""
+	metadata.Labels = nil
+	metadata.Annotations = nil
+	if !apiequality.Semantic.DeepEqual(metadata, metav1.ObjectMeta{}) {
+		return fmt.Errorf("fake runtime template metadata supports only namespace, labels, and annotations")
+	}
+	return nil
+}
+
 func desiredPod(record *journalRecord) *corev1.Pod {
 	template := record.Request.Runtime.Template
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: record.Pod.Namespace, Name: record.Pod.Name, Labels: map[string]string{}, Annotations: map[string]string{}}, Spec: *template.Spec.DeepCopy()}
@@ -143,6 +159,7 @@ func (d *Lifecycle) pod(ctx context.Context, record *journalRecord) (*corev1.Pod
 	if expectedSpec.PriorityClassName == "" {
 		actualSpec.PriorityClassName = ""
 	}
+	actualSpec.Tolerations = stripDefaultTolerationInjection(expectedSpec.Tolerations, actualSpec.Tolerations)
 	normalizePodSpec(&actualSpec)
 	normalizePodSpec(&expectedSpec)
 	if !apiequality.Semantic.DeepEqual(actualSpec, expectedSpec) {
@@ -265,6 +282,31 @@ func (d *Lifecycle) stopPod(ctx context.Context, record *journalRecord) (bool, e
 	return false, nil
 }
 
+// DefaultTolerationSeconds injects a 300-second NoExecute toleration only when
+// no declared toleration covers that key and effect. Strip that injection from
+// the realized spec; a frozen toleration for the same taint stays exact.
+func stripDefaultTolerationInjection(expected, actual []corev1.Toleration) []corev1.Toleration {
+	var result []corev1.Toleration
+	for _, toleration := range actual {
+		if toleration.Operator == corev1.TolerationOpExists && toleration.Effect == corev1.TaintEffectNoExecute &&
+			toleration.Value == "" && toleration.TolerationSeconds != nil && *toleration.TolerationSeconds == 300 &&
+			(toleration.Key == corev1.TaintNodeNotReady || toleration.Key == corev1.TaintNodeUnreachable) {
+			declared := false
+			for _, frozen := range expected {
+				if (frozen.Key == toleration.Key || frozen.Key == "") && (frozen.Effect == corev1.TaintEffectNoExecute || frozen.Effect == "") {
+					declared = true
+					break
+				}
+			}
+			if !declared {
+				continue
+			}
+		}
+		result = append(result, toleration)
+	}
+	return result
+}
+
 // Normalize only documented API defaults and scheduler-assigned fields. Extra
 // containers, mounts, privileges and mutated request fields still fail equality.
 func normalizePodSpec(spec *corev1.PodSpec) {
@@ -300,17 +342,9 @@ func normalizePodSpec(spec *corev1.PodSpec) {
 	if spec.SecurityContext != nil && reflect.DeepEqual(*spec.SecurityContext, corev1.PodSecurityContext{}) {
 		spec.SecurityContext = nil
 	}
-	tolerations := make([]corev1.Toleration, 0, len(spec.Tolerations))
-	for _, value := range spec.Tolerations {
-		if value.Operator == corev1.TolerationOpExists && value.Effect == corev1.TaintEffectNoExecute && value.TolerationSeconds != nil && *value.TolerationSeconds == 300 && (value.Key == corev1.TaintNodeNotReady || value.Key == corev1.TaintNodeUnreachable) {
-			continue
-		}
-		tolerations = append(tolerations, value)
+	if len(spec.Tolerations) == 0 {
+		spec.Tolerations = nil
 	}
-	if len(tolerations) == 0 {
-		tolerations = nil
-	}
-	spec.Tolerations = tolerations
 	for i := range spec.Containers {
 		normalizeContainer(&spec.Containers[i])
 	}
