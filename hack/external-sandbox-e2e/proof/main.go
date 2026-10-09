@@ -173,7 +173,7 @@ func (p *proof) waitAllocation(ctx context.Context, state workspace.AllocationSt
 func (p *proof) exec(ctx context.Context, pod *core.Pod, command ...string) (string, error) {
 	kindctl := os.Getenv("KINDCTL_BIN")
 	if kindctl == "" {
-		kindctl = "/Users/sozercan/projects/kindctl/bin/kindctl"
+		kindctl = "kindctl"
 	}
 	repo := os.Getenv("ORKA_SANDBOX_E2E_REPO_ROOT")
 	if repo == "" {

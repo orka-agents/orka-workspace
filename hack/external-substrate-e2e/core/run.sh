@@ -10,8 +10,11 @@ test -n "${KUBECONFIG:-}"
 test "$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')" = arm64
 node_cpu="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.cpu}')"
 node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memory}')"
-[[ "${node_cpu}" =~ ^[0-9]+$ ]] && (( node_cpu >= 4 ))
-[[ "${node_memory}" =~ ^([0-9]+)Ki$ ]] && (( BASH_REMATCH[1] >= 8 * 1024 * 1024 ))
+# A failed test before && does not trip set -e; reject unknown formats explicitly.
+[[ "${node_cpu}" =~ ^[0-9]+$ ]] || { printf 'Unsupported allocatable CPU format: %s\n' "${node_cpu}" >&2; exit 1; }
+(( node_cpu >= 4 ))
+[[ "${node_memory}" =~ ^([0-9]+)Ki$ ]] || { printf 'Unsupported allocatable memory format: %s\n' "${node_memory}" >&2; exit 1; }
+(( BASH_REMATCH[1] >= 8 * 1024 * 1024 ))
 kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router -o json |
   jq -e 'all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
 # The isolated fixture enables direct egress explicitly. Refuse a backend still
