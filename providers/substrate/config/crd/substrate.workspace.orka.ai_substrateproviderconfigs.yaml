@@ -1,0 +1,62 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: substrateproviderconfigs.substrate.workspace.orka.ai
+spec:
+  group: substrate.workspace.orka.ai
+  names:
+    categories:
+    - orka
+    kind: SubstrateProviderConfig
+    listKind: SubstrateProviderConfigList
+    plural: substrateproviderconfigs
+    singular: substrateproviderconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SubstrateProviderConfig is the cluster-scoped parameter kind referenced by a
+          Substrate ExecutionWorkspaceProvider. It does not transfer ownership from a
+          legacy ACP provider or adopt that provider's retained resources.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SubstrateProviderConfigSpec is the immutable configuration for a Substrate
+              installation. The kind selects the backend; there is no shared backend enum.
+              Native control transport and credential references remain installation-owned.
+            type: object
+            x-kubernetes-validations:
+            - message: SubstrateProviderConfig spec is immutable; create a new config
+              rule: self == oldSelf
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

@@ -1,0 +1,229 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: workspace-field-ownership.orka.ai
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [workspace.orka.ai]
+      apiVersions: [v1alpha1]
+      operations: [CREATE, UPDATE]
+      resources:
+      - executionworkspaceproviders
+      - executionworkspaceproviders/status
+      - executionworkspaceclasses
+      - executionworkspaceclasses/status
+      - executionworkspacepools
+      - executionworkspacepools/status
+      - executionworkspaces
+      - executionworkspaces/status
+      - executionworkspacecheckpoints
+      - executionworkspacecheckpoints/status
+  variables:
+  - name: resource
+    expression: request.resource.resource
+  - name: core
+    expression: >-
+      authorizer.group('workspace.orka.ai').resource(variables.resource)
+        .namespace(has(request.namespace) ? request.namespace : '').name(object.metadata.name).check('admit').allowed()
+  - name: operator
+    expression: >-
+      authorizer.group('workspace.orka.ai').resource(variables.resource)
+        .namespace(has(request.namespace) ? request.namespace : '').name(object.metadata.name).check('configure').allowed()
+  - name: newLabels
+    expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+  - name: oldLabels
+    expression: "oldObject != null && has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+  - name: controller
+    expression: "'workspace.orka.ai/controller-name' in variables.newLabels ? variables.newLabels['workspace.orka.ai/controller-name'] : ''"
+  - name: oldController
+    expression: "'workspace.orka.ai/controller-name' in variables.oldLabels ? variables.oldLabels['workspace.orka.ai/controller-name'] : ''"
+  - name: providerName
+    expression: >-
+      variables.resource == 'executionworkspaceproviders' ? object.metadata.name :
+      variables.resource == 'executionworkspaces' ? object.spec.providerBinding.name :
+      variables.resource == 'executionworkspacepools' ? object.spec.providerRef.name :
+      variables.resource == 'executionworkspacecheckpoints' && 'workspace.orka.ai/provider-name' in variables.newLabels
+        ? variables.newLabels['workspace.orka.ai/provider-name'] : ''
+  - name: oldProviderName
+    expression: >-
+      oldObject == null ? variables.providerName :
+      variables.resource == 'executionworkspaceproviders' ? oldObject.metadata.name :
+      variables.resource == 'executionworkspaces' ? oldObject.spec.providerBinding.name :
+      variables.resource == 'executionworkspacepools' ? oldObject.spec.providerRef.name :
+      variables.resource == 'executionworkspacecheckpoints' && 'workspace.orka.ai/provider-name' in variables.oldLabels
+        ? variables.oldLabels['workspace.orka.ai/provider-name'] : ''
+  - name: provider
+    expression: >-
+      variables.providerName != '' && variables.providerName == variables.oldProviderName &&
+      authorizer.group('workspace.orka.ai').resource('executionworkspaceproviders')
+        .namespace('').name(variables.providerName).check('provider-status').allowed()
+  - name: newStatus
+    expression: "has(object.status) ? object.status : {}"
+  - name: oldStatus
+    expression: "oldObject != null && has(oldObject.status) ? oldObject.status : {}"
+  - name: newConditions
+    expression: "'conditions' in variables.newStatus ? variables.newStatus.conditions : []"
+  - name: oldConditions
+    expression: "'conditions' in variables.oldStatus ? variables.oldStatus.conditions : []"
+  - name: coreConditions
+    expression: >-
+      variables.resource == 'executionworkspaceproviders' ? ['Ready', 'Compatible', 'HeartbeatFresh'] :
+      variables.resource == 'executionworkspaceclasses' ? ['Ready'] :
+      variables.resource == 'executionworkspaces' ? ['Admitted', 'Quarantined'] : []
+  - name: providerConditions
+    expression: >-
+      variables.resource == 'executionworkspacepools' ? ['Ready', 'Admitted'] :
+      variables.resource == 'executionworkspaces' ? ['Provisioned', 'DataPlaneReady', 'Attached', 'Finalized'] :
+      variables.resource == 'executionworkspacecheckpoints' ? ['Ready'] : []
+  - name: newAnnotations
+    expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+  - name: oldAnnotations
+    expression: "oldObject != null && has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+  - name: newFinalizers
+    expression: "has(object.metadata.finalizers) ? object.metadata.finalizers : []"
+  - name: oldFinalizers
+    expression: "oldObject != null && has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []"
+  - name: providerPrefix
+    expression: >-
+      variables.controller != '' &&
+      variables.controller != 'workspace.orka.ai'
+        ? variables.controller + '/' : '/'
+  - name: newCoreLabels
+    expression: "variables.newLabels.filter(k, k.startsWith('workspace.orka.ai/'))"
+  - name: oldCoreLabels
+    expression: "variables.oldLabels.filter(k, k.startsWith('workspace.orka.ai/'))"
+  - name: newCoreAnnotations
+    expression: "variables.newAnnotations.filter(k, k.startsWith('workspace.orka.ai/'))"
+  - name: oldCoreAnnotations
+    expression: "variables.oldAnnotations.filter(k, k.startsWith('workspace.orka.ai/'))"
+  - name: newProviderAnnotations
+    expression: "variables.newAnnotations.filter(k, k.startsWith(variables.providerPrefix))"
+  - name: oldProviderAnnotations
+    expression: "variables.oldAnnotations.filter(k, k.startsWith(variables.providerPrefix))"
+  - name: newOtherAnnotations
+    expression: "variables.newAnnotations.filter(k, !(k in variables.newCoreAnnotations) && !(k in variables.newProviderAnnotations))"
+  - name: oldOtherAnnotations
+    expression: "variables.oldAnnotations.filter(k, !(k in variables.oldCoreAnnotations) && !(k in variables.oldProviderAnnotations))"
+  - name: coreFinalizers
+    expression: "['workspace.orka.ai/provider-protection', 'workspace.orka.ai/class-protection', 'workspace.orka.ai/finalizer']"
+  - name: newProviderFinalizers
+    expression: >-
+      variables.newFinalizers.filter(k, k.startsWith(variables.providerPrefix))
+  - name: oldProviderFinalizers
+    expression: >-
+      variables.oldFinalizers.filter(k, k.startsWith(variables.providerPrefix))
+  validations:
+  - expression: >-
+      (oldObject != null && object.spec == oldObject.spec) ||
+      (variables.resource == 'executionworkspaces' ? variables.core : variables.operator)
+    message: workspace intent requires core admit; configuration requires operator configure
+    reason: Forbidden
+  - expression: >-
+      variables.resource != 'executionworkspaces' || !has(object.spec.attachment) ||
+      (oldObject != null && has(oldObject.spec.attachment) &&
+       object.spec.attachment == oldObject.spec.attachment &&
+       has(object.spec.attachmentEpoch) == has(oldObject.spec.attachmentEpoch) &&
+       (!has(object.spec.attachmentEpoch) || object.spec.attachmentEpoch == oldObject.spec.attachmentEpoch)) ||
+      (has(object.spec.attachment.epoch) && has(object.spec.attachmentEpoch) &&
+       object.spec.attachment.epoch > 0 && object.spec.attachment.epoch == object.spec.attachmentEpoch)
+    message: changed attachment intent must match the positive attachmentEpoch counter
+  - expression: >-
+      variables.resource != 'executionworkspaces' || !has(object.spec.attachment) || oldObject == null ||
+      (has(oldObject.spec.attachment) && object.spec.attachment == oldObject.spec.attachment) ||
+      (has(object.spec.attachment.epoch) &&
+       (!has(oldObject.spec.attachmentEpoch) || object.spec.attachment.epoch > oldObject.spec.attachmentEpoch) &&
+       (!has(oldObject.spec.attachment) || object.spec.attachment.epoch > oldObject.spec.attachment.epoch))
+    message: a new attachment intent must advance the previous attachment high-water mark
+  - expression: >-
+      variables.resource != 'executionworkspaces' || oldObject == null || !has(oldObject.spec.attachment) ||
+      (has(object.spec.attachment) && object.spec.attachment == oldObject.spec.attachment &&
+       has(object.spec.attachmentEpoch) == has(oldObject.spec.attachmentEpoch) &&
+       (!has(object.spec.attachmentEpoch) || object.spec.attachmentEpoch == oldObject.spec.attachmentEpoch)) ||
+      (has(object.spec.attachmentEpoch) && object.spec.attachmentEpoch >= oldObject.spec.attachment.epoch)
+    message: clearing attachment intent must preserve its epoch high-water mark
+  - expression: >-
+      (size(variables.newStatus.filter(k, k != 'conditions')) == size(variables.oldStatus.filter(k, k != 'conditions')) &&
+       variables.newStatus.filter(k, k != 'conditions').all(k, k in variables.oldStatus && variables.newStatus[k] == variables.oldStatus[k])) ||
+      (variables.resource == 'executionworkspaceclasses' ? variables.core : variables.provider)
+    message: only the assigned controller may change observed status fields
+    reason: Forbidden
+  - expression: >-
+      variables.newConditions.filter(c, c.type in variables.coreConditions) ==
+        variables.oldConditions.filter(c, c.type in variables.coreConditions) || variables.core
+    message: only core admit may change core conditions
+    reason: Forbidden
+  - expression: >-
+      variables.newConditions.filter(c, c.type in variables.providerConditions) ==
+        variables.oldConditions.filter(c, c.type in variables.providerConditions) || variables.provider
+    message: only the selected provider may change provider conditions
+    reason: Forbidden
+  - expression: >-
+      variables.newConditions.filter(c, !(c.type in variables.coreConditions) && !(c.type in variables.providerConditions)) ==
+        variables.oldConditions.filter(c, !(c.type in variables.coreConditions) && !(c.type in variables.providerConditions))
+    message: condition types must have an assigned writer before use
+    reason: Forbidden
+  - expression: >-
+      variables.controller == '' ||
+      (size(variables.controller) <= 63 && variables.controller.matches('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$'))
+    message: controller routing label must be a valid DNS label value usable as an annotation prefix
+  - expression: >-
+      variables.oldController == '' || variables.controller == variables.oldController
+    message: an established controller routing identity is immutable
+  - expression: >-
+      oldObject == null || !('workspace.orka.ai/provider-name' in variables.oldLabels) ||
+      ('workspace.orka.ai/provider-name' in variables.newLabels &&
+       variables.newLabels['workspace.orka.ai/provider-name'] == variables.oldLabels['workspace.orka.ai/provider-name'])
+    message: an established provider registration routing identity is immutable
+  - expression: >-
+      (size(variables.newCoreLabels) == size(variables.oldCoreLabels) &&
+       variables.newCoreLabels.all(k, k in variables.oldCoreLabels && variables.newLabels[k] == variables.oldLabels[k])) || variables.core
+    message: only core admit may set or change controller routing and reserved labels
+    reason: Forbidden
+  - expression: >-
+      (size(variables.newCoreAnnotations) == size(variables.oldCoreAnnotations) &&
+       variables.newCoreAnnotations.all(k, k in variables.oldCoreAnnotations && variables.newAnnotations[k] == variables.oldAnnotations[k])) || variables.core
+    message: only core admit may set or change core materialization annotations
+    reason: Forbidden
+  - expression: >-
+      (size(variables.newProviderAnnotations) == size(variables.oldProviderAnnotations) &&
+       variables.newProviderAnnotations.all(k, k in variables.oldProviderAnnotations && variables.newAnnotations[k] == variables.oldAnnotations[k])) || variables.provider
+    message: only the selected provider may change its observation annotations
+    reason: Forbidden
+  - expression: >-
+      (oldObject == null ? !has(object.metadata.ownerReferences) :
+       has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+       (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)) || variables.core
+    message: only core admit may establish or change controller owner references
+    reason: Forbidden
+  - expression: >-
+      variables.newFinalizers.filter(k, k in variables.coreFinalizers) ==
+        variables.oldFinalizers.filter(k, k in variables.coreFinalizers) || variables.core
+    message: only core admit may change core protection finalizers
+    reason: Forbidden
+  - expression: >-
+      variables.newProviderFinalizers == variables.oldProviderFinalizers || variables.provider
+    message: only the selected provider may change its cleanup finalizers
+    reason: Forbidden
+  - expression: >-
+      (size(variables.newOtherAnnotations) == size(variables.oldOtherAnnotations) &&
+       variables.newOtherAnnotations.all(k, k in variables.oldOtherAnnotations && variables.newAnnotations[k] == variables.oldAnnotations[k]) &&
+       size(variables.newLabels.filter(k, !(k in variables.newCoreLabels))) == size(variables.oldLabels.filter(k, !(k in variables.oldCoreLabels))) &&
+       variables.newLabels.filter(k, !(k in variables.newCoreLabels)).all(k, k in variables.oldLabels && variables.newLabels[k] == variables.oldLabels[k])) ||
+      variables.operator || variables.core
+    message: descriptive metadata requires operator configure or core admit
+    reason: Forbidden
+  - expression: >-
+      variables.newFinalizers.filter(k, !(k in variables.coreFinalizers) && !(k in variables.newProviderFinalizers) && !(k in ['foregroundDeletion', 'orphan'])) ==
+        variables.oldFinalizers.filter(k, !(k in variables.coreFinalizers) && !(k in variables.oldProviderFinalizers) && !(k in ['foregroundDeletion', 'orphan'])) || variables.operator
+    message: unrelated finalizers require operator configure
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: workspace-field-ownership.orka.ai
+spec:
+  policyName: workspace-field-ownership.orka.ai
+  validationActions: [Deny]

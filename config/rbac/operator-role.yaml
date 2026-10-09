@@ -1,0 +1,12 @@
+# Bind to operators who may create or change shared configuration.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: workspace-configuration
+rules:
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspacecheckpoints]
+  verbs: [configure, get, list, watch, create, update, patch, delete]
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspaces]
+  verbs: [configure, get, list, watch]

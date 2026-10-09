@@ -1,0 +1,34 @@
+# Template: replace example-provider with the exact provider registration name.
+# Bind this role only to that installation's provider ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: workspace-provider-example-provider
+rules:
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspaceproviders]
+  resourceNames: [example-provider]
+  verbs: [provider-status]
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspaceproviders, executionworkspaceclasses, executionworkspacepools, executionworkspaces, executionworkspacecheckpoints]
+  verbs: [get, list, watch]
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspaceproviders, executionworkspaceproviders/status]
+  resourceNames: [example-provider]
+  verbs: [update, patch]
+- apiGroups: [workspace.orka.ai]
+  resources: [executionworkspacepools, executionworkspacepools/status, executionworkspaces, executionworkspaces/status, executionworkspacecheckpoints, executionworkspacecheckpoints/status]
+  verbs: [update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: workspace-provider-example-provider
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: workspace-provider-example-provider
+subjects:
+- kind: ServiceAccount
+  name: example-provider
+  namespace: workspace-system

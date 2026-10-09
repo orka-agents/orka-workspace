@@ -1,0 +1,9 @@
+orka-workspace includes code extracted from Orka at commit
+1cd16c88b43410e0ea46463f8a39b473d8e5250e:
+https://github.com/orka-agents/orka/tree/1cd16c88b43410e0ea46463f8a39b473d8e5250e
+
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License. See LICENSE.
+
+The extracted workspace API, provider helpers, workspace-agent client, and
+baseline generated artifacts retain their original notices.

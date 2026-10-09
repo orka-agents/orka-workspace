@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-proof-core
+  namespace: external-sandbox-proof
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-proof-core
+  namespace: external-sandbox-proof
+rules:
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceclasses, executionworkspaces]
+    verbs: [get, list, create, update, patch, admit]
+  - apiGroups: [workspace.orka.ai]
+    resources: [executionworkspaceclasses/status, executionworkspaces/status]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-proof-core
+  namespace: external-sandbox-proof
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-proof-core
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-proof-core
+    namespace: external-sandbox-proof

@@ -1,0 +1,35 @@
+apiVersion: sandbox.workspace.orka.ai/v1alpha1
+kind: SandboxProviderConfig
+metadata:
+  name: sandbox
+spec: {}
+---
+apiVersion: workspace.orka.ai/v1alpha1
+kind: ExecutionWorkspaceProvider
+metadata:
+  name: sandbox
+spec:
+  controllerName: sandbox.workspace.orka.ai
+  serviceAccountRef:
+    namespace: orka-workspace-system
+    name: orka-workspace-sandbox
+  lifecycleState: Active
+  requiredContracts:
+    - workspace.orka.ai/v1
+    - orka.workspace.lifecycle.v1
+  parametersRef:
+    group: sandbox.workspace.orka.ai
+    kind: SandboxProviderConfig
+    name: sandbox
+
+---
+apiVersion: sandbox.workspace.orka.ai/v1alpha1
+kind: SandboxWorkspaceProfile
+metadata:
+  name: sandbox-data
+  namespace: default
+spec:
+  suspend:
+    mode: DataOnly
+    volume:
+      capacity: 1Gi

@@ -1,0 +1,62 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: sandboxproviderconfigs.sandbox.workspace.orka.ai
+spec:
+  group: sandbox.workspace.orka.ai
+  names:
+    categories:
+    - orka
+    kind: SandboxProviderConfig
+    listKind: SandboxProviderConfigList
+    plural: sandboxproviderconfigs
+    singular: sandboxproviderconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          SandboxProviderConfig is the cluster-scoped parameter kind referenced by an
+          agent-sandbox ExecutionWorkspaceProvider. Existing ACP configuration objects
+          remain with their original provider; this kind does not adopt them.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SandboxProviderConfigSpec is the immutable configuration for an agent-sandbox
+              installation. The kind selects the backend; there is no shared backend enum.
+              Connection and controller deployment settings remain installation-owned.
+            type: object
+            x-kubernetes-validations:
+            - message: SandboxProviderConfig spec is immutable; create a new config
+              rule: self == oldSelf
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}
