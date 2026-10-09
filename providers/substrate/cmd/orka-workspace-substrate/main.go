@@ -42,11 +42,19 @@ func main() {
 	}
 }
 func run(leader bool, leaderNamespace string, config provider.Config) error {
-	conn, err := provider.Dial(config)
-	if err != nil {
-		return err
+	// Without acknowledged native control, run only the provider reconciler so
+	// it withdraws any stale advertisement instead of crash-looping.
+	var native pb.ControlClient
+	if err := config.Validate(); err != nil {
+		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
+	} else {
+		conn, err := provider.Dial(config)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		native = pb.NewControlClient(conn)
 	}
-	defer conn.Close()
 	scheme := runtime.NewScheme()
 	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
 		if err := register(scheme); err != nil {
@@ -61,8 +69,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	if err != nil {
 		return err
 	}
-	native := pb.NewControlClient(conn)
-	for _, setup := range []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager} {
+	for _, setup := range controllerSetups(c, config, native) {
 		if err := setup(mgr); err != nil {
 			return err
 		}
@@ -74,4 +81,13 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 		return err
 	}
 	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+// controllerSetups registers lifecycle controllers only with native control.
+func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient) []func(ctrl.Manager) error {
+	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager}
+	if native == nil {
+		return setups
+	}
+	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager)
 }
