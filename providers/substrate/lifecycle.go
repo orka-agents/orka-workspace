@@ -129,6 +129,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			}
 			fresh.InheritedCheckpoint = record.Checkpoint
 			fresh.InheritedCatalog = record.CheckpointCatalog
+			fresh.SuspendedReservation = record.SuspendedReservation || (record.Checkpoint != nil && record.MaxSuspended != nil)
 			if record.Checkpoint != nil {
 				fresh.CreateTemplate = record.Checkpoint.Template
 			}
@@ -203,6 +204,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			if err := d.releaseSuspended(ctx, record); err != nil {
 				return err
 			}
+			record.SuspendedReservation = false
 		}
 		return d.save(ctx, cm, record)
 	})

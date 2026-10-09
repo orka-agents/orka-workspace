@@ -569,6 +569,7 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key sdk.AllocationKey,
 		if err := d.releaseSuspended(ctx, record); err != nil {
 			return err
 		}
+		record.SuspendedReservation = false
 		record.Observation.State = sdk.AllocationDeleted
 		record.Observation.Startup = nil
 		record.Observation.RetainedData = nil

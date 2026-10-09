@@ -35,32 +35,8 @@ func (d *Lifecycle) reserveSuspended(ctx context.Context, record *journalRecord)
 		cm := &corev1.ConfigMap{}
 		err := d.client.Get(ctx, key, cm)
 		if apierrors.IsNotFound(err) {
-			var journals corev1.ConfigMapList
-			if err := d.client.List(ctx, &journals, client.InNamespace(key.Namespace), client.MatchingLabels{providerLabel: string(record.Request.Key.ProviderUID)}); err != nil {
+			if err := d.verifySuspendedOccupancy(ctx, record, nil); err != nil {
 				return err
-			}
-			for _, object := range journals.Items {
-				raw, hasRecord := object.Data[journalDataKey]
-				if !hasRecord && !strings.HasPrefix(object.Name, "substrate-workspace-") && !strings.HasPrefix(object.Name, "substrate-history-") {
-					continue // Ownership anchors and quota ledgers are not journals.
-				}
-				if len(raw) == 0 || len(raw) > MaxJournalBytes {
-					return fmt.Errorf("cannot account for native journal %q: invalid record size", object.Name)
-				}
-				var existing journalRecord
-				if err := json.Unmarshal([]byte(raw), &existing); err != nil {
-					return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
-				}
-				if existing.Version != journalVersion {
-					return fmt.Errorf("cannot account for native journal %q: unsupported journal version %q", object.Name, existing.Version)
-				}
-				_, verified, err := d.readAt(ctx, existing.Request.Key, client.ObjectKeyFromObject(&object))
-				if err != nil {
-					return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
-				}
-				if verified.Request.Runtime.ClassBinding.UID == record.Request.Runtime.ClassBinding.UID && verified.Operation == "suspend" && verified.Observation.State != sdk.AllocationDeleted {
-					return fmt.Errorf("suspended occupancy journal is missing while retained lifecycle evidence remains")
-				}
 			}
 			cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: map[string]string{providerLabel: string(record.Request.Key.ProviderUID), "substrate.workspace.orka.ai/class-uid": string(record.Request.Runtime.ClassBinding.UID)}, OwnerReferences: []metav1.OwnerReference{{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspaceClass", Name: record.Request.Runtime.ClassBinding.Name, UID: record.Request.Runtime.ClassBinding.UID}}}, Data: map[string]string{"limit": strconv.Itoa(int(*record.MaxSuspended))}}
 			if err := d.client.Create(ctx, cm); err != nil {
@@ -82,12 +58,66 @@ func (d *Lifecycle) reserveSuspended(ctx context.Context, record *journalRecord)
 		if record.Operation == "suspend" {
 			return fmt.Errorf("suspended workspace lost its reserved occupancy identity")
 		}
+		// The ledger name, labels, and limit are reproducible by anyone who can
+		// write ConfigMaps here. Rescan retained evidence before adding an occupant
+		// so a recreated or edited ledger cannot reset the quota.
+		if err := d.verifySuspendedOccupancy(ctx, record, cm); err != nil {
+			return err
+		}
 		if len(cm.Data)-1 >= int(*record.MaxSuspended) {
 			return fmt.Errorf("native class suspended workspace capacity is full")
 		}
 		cm.Data[owner] = journalKey(record.Request.Key).Name
 		return d.client.Update(ctx, cm)
 	})
+}
+
+// verifySuspendedOccupancy fails closed when retained suspend evidence for the
+// record's class is unreadable or absent from the ledger. A nil ledger accepts
+// no retained evidence at all.
+func (d *Lifecycle) verifySuspendedOccupancy(ctx context.Context, record *journalRecord, ledger *corev1.ConfigMap) error {
+	var journals corev1.ConfigMapList
+	if err := d.client.List(ctx, &journals, client.InNamespace(record.Request.Key.Namespace), client.MatchingLabels{providerLabel: string(record.Request.Key.ProviderUID)}); err != nil {
+		return err
+	}
+	for _, object := range journals.Items {
+		raw, hasRecord := object.Data[journalDataKey]
+		if !hasRecord && !strings.HasPrefix(object.Name, "substrate-workspace-") && !strings.HasPrefix(object.Name, "substrate-history-") {
+			continue // Ownership anchors and quota ledgers are not journals.
+		}
+		if len(raw) == 0 || len(raw) > MaxJournalBytes {
+			return fmt.Errorf("cannot account for native journal %q: invalid record size", object.Name)
+		}
+		var existing journalRecord
+		if err := json.Unmarshal([]byte(raw), &existing); err != nil {
+			return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
+		}
+		if existing.Version != journalVersion {
+			return fmt.Errorf("cannot account for native journal %q: unsupported journal version %q", object.Name, existing.Version)
+		}
+		_, verified, err := d.readAt(ctx, existing.Request.Key, client.ObjectKeyFromObject(&object))
+		if err != nil {
+			return fmt.Errorf("cannot account for native journal %q: %w", object.Name, err)
+		}
+		if verified.Request.Runtime.ClassBinding.UID != record.Request.Runtime.ClassBinding.UID || verified.Observation.State == sdk.AllocationDeleted {
+			continue
+		}
+		suspended := verified.Operation == "suspend"
+		if ledger == nil {
+			if suspended {
+				return fmt.Errorf("suspended occupancy journal is missing while retained lifecycle evidence remains")
+			}
+			continue
+		}
+		// A workspace's current journal owns its occupancy while suspended and
+		// until a resumed successor first reaches Ready; archived records are
+		// superseded by it.
+		current := journalKey(verified.Request.Key).Name
+		if object.Name == current && (suspended || verified.SuspendedReservation) && ledger.Data["workspace-"+string(verified.Request.Key.WorkspaceUID)] != current {
+			return fmt.Errorf("suspended occupancy ledger is missing retained workspace %q", verified.Request.Key.Name)
+		}
+	}
+	return nil
 }
 func (d *Lifecycle) releaseSuspended(ctx context.Context, record *journalRecord) error {
 	if record.MaxSuspended == nil {

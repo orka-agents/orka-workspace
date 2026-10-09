@@ -73,39 +73,42 @@ type catalogReference struct {
 	Digest string `json:"digest"`
 }
 type journalRecord struct {
-	Version             string                                `json:"version"`
-	Request             sdk.WorkloadRequest                   `json:"request"`
-	Observation         sdk.AllocationObservation             `json:"observation"`
-	Operation           string                                `json:"operation"`
-	Atespace            string                                `json:"atespace"`
-	SuspendEnabled      bool                                  `json:"suspendEnabled"`
-	MaxSuspended        *int32                                `json:"maxSuspended,omitempty"`
-	Placement           api.PodReference                      `json:"placement"`
-	SourceSelector      map[string]string                     `json:"sourceSelector"`
-	RuntimePool         nativeReference                       `json:"runtimePool"`
-	RuntimePoolSpec     json.RawMessage                       `json:"runtimePoolSpec"`
-	RuntimePoolLabels   map[string]string                     `json:"runtimePoolLabels"`
-	RuntimePoolDeleting bool                                  `json:"runtimePoolDeleting,omitempty"`
-	Anchor              nativeReference                       `json:"anchor"`
-	NetworkPolicy       nativeReference                       `json:"networkPolicy"`
-	Template            nativeReference                       `json:"template"`
-	TemplateSpec        *pb.ActorTemplate                     `json:"templateSpec"`
-	CreateTemplate      nativeReference                       `json:"createTemplate"`
-	Actor               nativeReference                       `json:"actor"`
-	BootRequested       bool                                  `json:"bootRequested,omitempty"`
-	Worker              *workerFence                          `json:"worker,omitempty"`
-	RetirementWorkers   []workerFence                         `json:"retirementWorkers,omitempty"`
-	WorkerDrained       bool                                  `json:"workerDrained,omitempty"`
-	WorkloadAbsent      bool                                  `json:"workloadAbsent,omitempty"`
-	ChallengeSHA256     string                                `json:"challengeSHA256,omitempty"`
-	ChallengeVersion    int64                                 `json:"challengeVersion,omitempty"`
-	Pending             *checkpointIntent                     `json:"pending,omitempty"`
-	Checkpoint          *checkpointRecord                     `json:"checkpoint,omitempty"`
-	InheritedCheckpoint *checkpointRecord                     `json:"inheritedCheckpoint,omitempty"`
-	CheckpointCatalog   *catalogReference                     `json:"checkpointCatalog,omitempty"`
-	InheritedCatalog    *catalogReference                     `json:"inheritedCatalog,omitempty"`
-	DeleteIssued        bool                                  `json:"deleteIssued,omitempty"`
-	DeletionPolicy      *api.ExecutionWorkspaceDeletionPolicy `json:"deletionPolicy,omitempty"`
+	Version             string                    `json:"version"`
+	Request             sdk.WorkloadRequest       `json:"request"`
+	Observation         sdk.AllocationObservation `json:"observation"`
+	Operation           string                    `json:"operation"`
+	Atespace            string                    `json:"atespace"`
+	SuspendEnabled      bool                      `json:"suspendEnabled"`
+	MaxSuspended        *int32                    `json:"maxSuspended,omitempty"`
+	Placement           api.PodReference          `json:"placement"`
+	SourceSelector      map[string]string         `json:"sourceSelector"`
+	RuntimePool         nativeReference           `json:"runtimePool"`
+	RuntimePoolSpec     json.RawMessage           `json:"runtimePoolSpec"`
+	RuntimePoolLabels   map[string]string         `json:"runtimePoolLabels"`
+	RuntimePoolDeleting bool                      `json:"runtimePoolDeleting,omitempty"`
+	Anchor              nativeReference           `json:"anchor"`
+	NetworkPolicy       nativeReference           `json:"networkPolicy"`
+	Template            nativeReference           `json:"template"`
+	TemplateSpec        *pb.ActorTemplate         `json:"templateSpec"`
+	CreateTemplate      nativeReference           `json:"createTemplate"`
+	Actor               nativeReference           `json:"actor"`
+	BootRequested       bool                      `json:"bootRequested,omitempty"`
+	Worker              *workerFence              `json:"worker,omitempty"`
+	RetirementWorkers   []workerFence             `json:"retirementWorkers,omitempty"`
+	WorkerDrained       bool                      `json:"workerDrained,omitempty"`
+	WorkloadAbsent      bool                      `json:"workloadAbsent,omitempty"`
+	ChallengeSHA256     string                    `json:"challengeSHA256,omitempty"`
+	ChallengeVersion    int64                     `json:"challengeVersion,omitempty"`
+	Pending             *checkpointIntent         `json:"pending,omitempty"`
+	Checkpoint          *checkpointRecord         `json:"checkpoint,omitempty"`
+	InheritedCheckpoint *checkpointRecord         `json:"inheritedCheckpoint,omitempty"`
+	CheckpointCatalog   *catalogReference         `json:"checkpointCatalog,omitempty"`
+	InheritedCatalog    *catalogReference         `json:"inheritedCatalog,omitempty"`
+	DeleteIssued        bool                      `json:"deleteIssued,omitempty"`
+	// SuspendedReservation marks a successor that still holds its suspended
+	// predecessor's retention slot until it first reaches Ready.
+	SuspendedReservation bool                                  `json:"suspendedReservation,omitempty"`
+	DeletionPolicy       *api.ExecutionWorkspaceDeletionPolicy `json:"deletionPolicy,omitempty"`
 }
 
 // Lifecycle owns native resources; it never holds ACP credentials. Client must
