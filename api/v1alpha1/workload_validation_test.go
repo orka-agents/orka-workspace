@@ -82,7 +82,7 @@ func TestRuntimeRequestRejectsStorageCredentialReferences(t *testing.T) {
 }
 
 func TestRuntimeRequestPinsEveryMaterializedContainerImage(t *testing.T) {
-	for _, kind := range []string{"init", "regular"} {
+	for _, kind := range []string{"init", "regular", "image volume"} {
 		for name, image := range map[string]string{
 			"tag":      "registry.example/helper:latest",
 			"empty":    "",
@@ -94,9 +94,12 @@ func TestRuntimeRequestPinsEveryMaterializedContainerImage(t *testing.T) {
 			t.Run(kind+"/"+name, func(t *testing.T) {
 				request := validationRuntimeRequest(t)
 				helper := corev1.Container{Name: "helper", Image: image}
-				if kind == "init" {
+				switch kind {
+				case "init":
 					request.Runtime.Template.Spec.InitContainers = []corev1.Container{helper}
-				} else {
+				case "image volume":
+					request.Runtime.Template.Spec.Volumes = append(request.Runtime.Template.Spec.Volumes, corev1.Volume{Name: "helper", VolumeSource: corev1.VolumeSource{Image: &corev1.ImageVolumeSource{Reference: image}}})
+				default:
 					request.Runtime.Template.Spec.Containers = append(request.Runtime.Template.Spec.Containers, helper)
 				}
 				setValidationRevision(t, &request)

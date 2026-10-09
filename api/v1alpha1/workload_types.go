@@ -314,6 +314,11 @@ func (r WorkloadRequest) validateRuntime() error {
 		if volumeUsesSecret(volume.VolumeSource) || volume.ConfigMap != nil {
 			return fmt.Errorf("runtime cannot reference credential Secrets or mutable configuration before bootstrap")
 		}
+		if volume.Image != nil {
+			if err := validatePinnedImage(volume.Image.Reference); err != nil {
+				return fmt.Errorf("runtime image volume %q: %w", volume.Name, err)
+			}
+		}
 		if volume.Projected != nil {
 			for _, source := range volume.Projected.Sources {
 				// Only downward metadata belongs in public allocation intent.
