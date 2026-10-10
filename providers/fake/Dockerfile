@@ -1,4 +1,4 @@
-FROM golang:1.27.0 AS build
+FROM docker.io/library/golang:1.27.2@sha256:5bc7f572bbaa98885a3a1fd9c0aa76b59e3e14e8628bfc316bbfd0c701e4818c AS build
 WORKDIR /src
 COPY . .
 WORKDIR /src/providers
