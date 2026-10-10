@@ -199,7 +199,7 @@ func TestDeleteBeforeReadinessStillWaitsForBackingPV(t *testing.T) {
 		t.Fatal("cleanup failed to pin storage created before readiness")
 	}
 	for _, object := range []client.Object{&sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Namespace: record.Namespace, Name: record.Sandbox.Name}}, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: record.Namespace, Name: record.Storage.ClaimName}}} {
-		if err := c.Delete(t.Context(), object); err != nil {
+		if err := c.Delete(t.Context(), object, client.PropagationPolicy(metav1.DeletePropagationOrphan)); err != nil {
 			t.Fatal(err)
 		}
 	}

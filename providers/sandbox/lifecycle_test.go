@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,64 @@ func (c *uidClient) Create(ctx context.Context, object client.Object, options ..
 		object.SetGeneration(1)
 	}
 	return c.Client.Create(ctx, object, options...)
+}
+
+// The fake client does not enforce UID delete preconditions or model GC.
+// Model them here so orphaning and replacement safety are observable.
+func (c *uidClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	deleteOptions := &client.DeleteOptions{}
+	deleteOptions.ApplyOptions(options)
+	current := object.DeepCopyObject().(client.Object)
+	if err := c.Client.Get(ctx, client.ObjectKeyFromObject(object), current); err != nil {
+		return err
+	}
+	if deleteOptions.Preconditions != nil && deleteOptions.Preconditions.UID != nil && current.GetUID() != *deleteOptions.Preconditions.UID {
+		return apierrors.NewConflict(corev1.Resource("objects"), object.GetName(), workspaceprovider.ErrStaleIdentity)
+	}
+	if err := c.Client.Delete(ctx, object, options...); err != nil {
+		return err
+	}
+	var dependents []client.Object
+	switch object.(type) {
+	case *extv1beta1.SandboxClaim:
+		var sandboxes sandboxv1beta1.SandboxList
+		if err := c.List(ctx, &sandboxes, client.InNamespace(object.GetNamespace())); err != nil {
+			return err
+		}
+		for i := range sandboxes.Items {
+			dependents = append(dependents, &sandboxes.Items[i])
+		}
+	case *sandboxv1beta1.Sandbox:
+		var pods corev1.PodList
+		if err := c.List(ctx, &pods, client.InNamespace(object.GetNamespace())); err != nil {
+			return err
+		}
+		for i := range pods.Items {
+			dependents = append(dependents, &pods.Items[i])
+		}
+		var claims corev1.PersistentVolumeClaimList
+		if err := c.List(ctx, &claims, client.InNamespace(object.GetNamespace())); err != nil {
+			return err
+		}
+		for i := range claims.Items {
+			dependents = append(dependents, &claims.Items[i])
+		}
+	}
+	for _, dependent := range dependents {
+		owners := dependent.GetOwnerReferences()
+		if !slices.ContainsFunc(owners, func(owner metav1.OwnerReference) bool { return owner.UID == current.GetUID() }) {
+			continue
+		}
+		if deleteOptions.PropagationPolicy != nil && *deleteOptions.PropagationPolicy == metav1.DeletePropagationOrphan {
+			dependent.SetOwnerReferences(slices.DeleteFunc(owners, func(owner metav1.OwnerReference) bool { return owner.UID == current.GetUID() }))
+			if err := c.Update(ctx, dependent); err != nil {
+				return err
+			}
+		} else if err := c.Delete(ctx, dependent); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func fixture(t *testing.T, persistent bool) (client.Client, workspaceprovider.WorkloadRequest) {
@@ -140,6 +199,9 @@ func nativeTick(ctx context.Context, c client.Client) error {
 	}
 	for i := range claims.Items {
 		claim := &claims.Items[i]
+		if claim.DeletionTimestamp != nil {
+			continue
+		}
 		sb := &sandboxv1beta1.Sandbox{}
 		key := client.ObjectKeyFromObject(claim)
 		if err := c.Get(ctx, key, sb); apierrors.IsNotFound(err) {
@@ -175,36 +237,10 @@ func nativeTick(ctx context.Context, c client.Client) error {
 		sb := &sandboxes.Items[i]
 		pod := &corev1.Pod{}
 		key := client.ObjectKeyFromObject(sb)
-		claim := &extv1beta1.SandboxClaim{}
-		claimErr := c.Get(ctx, key, claim)
-		if apierrors.IsNotFound(claimErr) {
-			for _, object := range []client.Object{pod, &corev1.PersistentVolumeClaim{}} {
-				name := sb.Name
-				if _, ok := object.(*corev1.PersistentVolumeClaim); ok {
-					name = durableVolumeName + "-" + sb.Name
-				}
-				if err := c.Get(ctx, types.NamespacedName{Namespace: sb.Namespace, Name: name}, object); err == nil {
-					if pvc, ok := object.(*corev1.PersistentVolumeClaim); ok {
-						pv := &corev1.PersistentVolume{}
-						if err := c.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err == nil {
-							if err := c.Delete(ctx, pv); err != nil {
-								return err
-							}
-						}
-					}
-					if err := c.Delete(ctx, object); err != nil {
-						return err
-					}
-				} else if !apierrors.IsNotFound(err) {
-					return err
-				}
-			}
-			if err := c.Delete(ctx, sb); err != nil {
-				return err
-			}
+		// A missing Claim is not authority to collect an orphaned Sandbox.
+		// GC follows owner UIDs and Delete propagation in uidClient.Delete.
+		if sb.DeletionTimestamp != nil {
 			continue
-		} else if claimErr != nil {
-			return claimErr
 		}
 		if sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
 			if err := c.Get(ctx, key, pod); err == nil {
@@ -249,6 +285,29 @@ func nativeTick(ctx context.Context, c client.Client) error {
 		}
 		if err := c.Create(ctx, pod); err != nil {
 			return err
+		}
+	}
+	// A dynamic provisioner releases Delete-policy PVs only after the exact
+	// bound PVC is gone. A same-name replacement is a different claim.
+	var volumes corev1.PersistentVolumeList
+	if err := c.List(ctx, &volumes); err != nil {
+		return err
+	}
+	for i := range volumes.Items {
+		volume := &volumes.Items[i]
+		ref := volume.Spec.ClaimRef
+		if ref == nil || volume.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+			continue
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := c.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, pvc)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if apierrors.IsNotFound(err) || pvc.UID != ref.UID {
+			if err := c.Delete(ctx, volume); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

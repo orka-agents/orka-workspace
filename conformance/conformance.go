@@ -272,23 +272,12 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	if err != nil {
 		return err
 	}
-	if retired.Identity != first.Identity || retired.Sequence != request.Sequence || retired.Startup != nil {
+	if retired.Key != request.Key || retired.Identity != first.Identity || retired.Sequence != request.Sequence || retired.Startup != nil {
 		return fmt.Errorf("retirement changed the predecessor fence")
 	}
 	if suspend {
 		if retired.RetainedData == nil || !retired.RetainedData.Valid() || retired.RetainedData.SourceInstance != first.Identity {
 			return fmt.Errorf("suspension lacks verified retained lineage")
-		}
-		forged := *retired.RetainedData
-		forged.ID += "-foreign"
-		forgedRequest := nextRequest(request, first.Identity, &forged)
-		if admit != nil {
-			if err := admit(ctx, forgedRequest); err != nil {
-				return err
-			}
-		}
-		if _, err := factory().EnsureAllocation(ctx, forgedRequest); err == nil {
-			return fmt.Errorf("forged retained lineage was accepted")
 		}
 	}
 	next = nextRequest(request, first.Identity, retired.RetainedData)
@@ -317,10 +306,43 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	if err := sameReady(ctx, factory(), next, second.Identity); err != nil {
 		return err
 	}
-	if _, err := until(ctx, func() (workspaceprovider.AllocationObservation, error) {
+	retired, err = until(ctx, func() (workspaceprovider.AllocationObservation, error) {
+		if suspend {
+			driver, ok := factory().(workspaceprovider.SuspensionController)
+			if !ok {
+				return workspaceprovider.AllocationObservation{}, fmt.Errorf("provider has no suspension capability")
+			}
+			return driver.SuspendInstance(ctx, next.Key, second.Identity)
+		}
 		return factory().StopInstance(ctx, next.Key, second.Identity)
-	}, workspaceprovider.AllocationStopped); err != nil {
+	}, workspaceprovider.AllocationStopped)
+	if err != nil {
 		return err
+	}
+	if suspend {
+		if retired.Key != next.Key || retired.Identity != second.Identity || retired.Sequence != next.Sequence || retired.Startup != nil ||
+			retired.RetainedData == nil || !retired.RetainedData.Valid() || retired.RetainedData.SourceInstance != second.Identity {
+			return fmt.Errorf("successor suspension lacks exact termination and verified retained lineage")
+		}
+		// Run the admitted adversarial request last. Persisting it consumes the
+		// next immutable sequence, so the successful resume fixture cannot be
+		// repaired by admitting a different request at that same sequence.
+		forged := *retired.RetainedData
+		forged.ID += "-foreign"
+		forgedRequest := nextRequest(next, second.Identity, &forged)
+		if admit != nil {
+			if err := admit(ctx, forgedRequest); err != nil {
+				return err
+			}
+		}
+		if _, err := factory().EnsureAllocation(ctx, forgedRequest); err == nil {
+			return fmt.Errorf("forged retained lineage was accepted")
+		}
+		observed, err := factory().Observe(ctx, next.Key)
+		if err != nil || observed.Key != next.Key || observed.Sequence != next.Sequence || observed.Identity != second.Identity || observed.State != workspaceprovider.AllocationStopped ||
+			observed.Startup != nil || observed.RetainedData == nil || *observed.RetainedData != *retired.RetainedData {
+			return fmt.Errorf("rejected retained lineage changed its predecessor: %v", err)
+		}
 	}
 	policy := workspacev1alpha1.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspacev1alpha1.WorkspaceDeletionActionDelete, PersistentVolumes: workspacev1alpha1.WorkspaceDeletionActionDelete, Checkpoints: workspacev1alpha1.WorkspaceDeletionActionDelete}
 	deleted, err := until(ctx, func() (workspaceprovider.AllocationObservation, error) {
@@ -328,6 +350,9 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	}, workspaceprovider.AllocationDeleted)
 	if err != nil {
 		return err
+	}
+	if deleted.Key != next.Key || deleted.Sequence != next.Sequence || deleted.Identity != second.Identity || deleted.Startup != nil {
+		return fmt.Errorf("continuation cleanup changed its exact predecessor fence")
 	}
 	return workspaceprovider.ValidateDeletedDisposition(deleted.Disposition, policy)
 }

@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -646,6 +647,29 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		}
 	}
 	if record.Template.CreateIssued {
+		// Infrastructure creation can be accepted before either its response
+		// or journaled UID survives. Cancellation must recover that lifetime
+		// before checking references or attempting deletion.
+		if record.Template.UID == "" {
+			template, err := d.control.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name}})
+			if status.Code(err) == codes.NotFound {
+				return false, fmt.Errorf("native template creation outcome is unresolved")
+			}
+			if err != nil {
+				return false, err
+			}
+			hash, err := templateDigest(template)
+			if err != nil {
+				return false, err
+			}
+			if template.GetMetadata().GetUid() == "" || hash != record.Template.Digest {
+				return false, sdk.ErrStaleIdentity
+			}
+			record.Template.UID = template.GetMetadata().GetUid()
+			if err := d.save(ctx, cm, record); err != nil {
+				return false, err
+			}
+		}
 		referenced, err := d.catalogTemplateReferenced(ctx, record.Request.Key.Namespace, record.Atespace, record.Template.UID)
 		if err != nil {
 			return false, err
@@ -670,9 +694,9 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		}
 	}
 	for _, entry := range []struct {
-		ref    nativeReference
+		ref    *nativeReference
 		object client.Object
-	}{{record.NetworkPolicy, &networkingv1.NetworkPolicy{}}, {record.Anchor, &corev1.ConfigMap{}}} {
+	}{{&record.NetworkPolicy, &networkingv1.NetworkPolicy{}}, {&record.Anchor, &corev1.ConfigMap{}}} {
 		if !entry.ref.CreateIssued {
 			continue
 		}
@@ -686,8 +710,25 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		if err != nil {
 			return false, err
 		}
-		if string(entry.object.GetUID()) != entry.ref.UID || !reflect.DeepEqual(entry.object.GetLabels(), labels(record)) {
+		if entry.object.GetUID() == "" || entry.ref.UID != "" && string(entry.object.GetUID()) != entry.ref.UID || !reflect.DeepEqual(entry.object.GetLabels(), labels(record)) {
 			return false, sdk.ErrStaleIdentity
+		}
+		if entry.ref.UID == "" {
+			switch object := entry.object.(type) {
+			case *networkingv1.NetworkPolicy:
+				if !reflect.DeepEqual(object.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(object.Spec), nativeNetworkPolicy(record)) {
+					return false, sdk.ErrStaleIdentity
+				}
+			case *corev1.ConfigMap:
+				expected := map[string]string{"journalName": cm.Name, "journalNamespace": cm.Namespace, "journalUID": string(cm.UID)}
+				if !reflect.DeepEqual(object.Data, expected) || len(object.BinaryData) != 0 || len(object.OwnerReferences) != 0 {
+					return false, sdk.ErrStaleIdentity
+				}
+			}
+			entry.ref.UID = string(entry.object.GetUID())
+			if err := d.save(ctx, cm, record); err != nil {
+				return false, err
+			}
 		}
 		uid := entry.object.GetUID()
 		if err := d.client.Delete(ctx, entry.object, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {

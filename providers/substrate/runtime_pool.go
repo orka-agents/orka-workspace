@@ -288,8 +288,17 @@ func (d *Lifecycle) deleteRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 	if err != nil {
 		return false, err
 	}
-	if string(pool.GetUID()) != record.RuntimePool.UID || !runtimePoolMatches(pool, record) {
+	if pool.GetUID() == "" || record.RuntimePool.UID != "" && string(pool.GetUID()) != record.RuntimePool.UID || !runtimePoolMatches(pool, record) {
 		return false, sdk.ErrStaleIdentity
+	}
+	// A create response or UID save can be lost before cancellation switches
+	// the journal out of ensure. Recover only the exact frozen pool, without
+	// issuing another create, and persist its lifetime before deletion.
+	if record.RuntimePool.UID == "" {
+		record.RuntimePool.UID = string(pool.GetUID())
+		if err := d.save(ctx, cm, record); err != nil {
+			return false, err
+		}
 	}
 	if !record.RuntimePoolDeleting {
 		record.RuntimePoolDeleting = true
