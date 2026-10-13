@@ -5,4 +5,5 @@ resources:
   - crd/substrate.workspace.orka.ai_substrateproviderconfigs.yaml
   - deployment.yaml
   - rbac.yaml
+  - core-reader-rbac.yaml
   - registration.yaml

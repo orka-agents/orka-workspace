@@ -122,10 +122,10 @@ func desiredPod(record *journalRecord) *corev1.Pod {
 	}
 	pod.Labels[podInstanceLabel] = record.Observation.Identity.InstanceID
 	pod.Annotations[podRequestAnnotation] = record.Request.Revision
-	if pod.Namespace == record.Request.Key.Namespace {
-		controller := true
-		pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: workspacev1alpha1.GroupVersion.String(), Kind: "ExecutionWorkspace", Name: record.Request.Key.Name, UID: record.Request.Key.WorkspaceUID, Controller: &controller}}
-	}
+	// A Workspace owner would let foreground GC terminate the runtime before
+	// Core authorizes retirement. The protected journal tracks the exact Pod
+	// UID for provider cleanup. Prior owned Pods fail validation
+	// without migration, but remain stoppable by their journaled UID.
 	return pod
 }
 func (d *Lifecycle) pod(ctx context.Context, record *journalRecord) (*corev1.Pod, error) {

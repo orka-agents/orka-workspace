@@ -5,4 +5,5 @@ resources:
   - crd/sandbox.workspace.orka.ai_sandboxproviderconfigs.yaml
   - deployment.yaml
   - rbac.yaml
+  - core-reader-rbac.yaml
   - registration.yaml

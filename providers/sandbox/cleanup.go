@@ -332,8 +332,8 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
-		// Close the producer without letting a parent cascade delete a newly
-		// replaced descendant. The journaled Sandbox is deleted by its own UID.
+		// Close both producers without cascading into replacement descendants.
+		// Delete the journaled Sandbox, Pod, and PVC by their own UID/RV fences.
 		gone, err := d.deleteObject(ctx, record.Namespace, record.Claim, &extv1beta1.SandboxClaim{}, metav1.DeletePropagationOrphan)
 		if err != nil || !gone {
 			return err
@@ -342,19 +342,13 @@ func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.
 		if sandboxRef.Name == "" {
 			sandboxRef.Name = record.Claim.Name
 		}
-		gone, err = d.deleteObject(ctx, record.Namespace, sandboxRef, &sandboxv1beta1.Sandbox{})
+		gone, err = d.deleteObject(ctx, record.Namespace, sandboxRef, &sandboxv1beta1.Sandbox{}, metav1.DeletePropagationOrphan)
 		if err != nil || !gone {
 			return err
 		}
-		if record.Pod != nil {
-			pod := &corev1.Pod{}
-			err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Pod.Namespace, Name: record.Pod.Name}, pod)
-			if err == nil {
-				return workspaceprovider.ErrInstanceRunning
-			}
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
+		gone, err = d.stopJournaledPod(ctx, record)
+		if err != nil || !gone {
+			return err
 		}
 		if record.Storage != nil {
 			gone, err = d.deleteObject(ctx, record.Namespace, objectReference{Name: record.Storage.ClaimName, UID: record.Storage.ClaimUID}, &corev1.PersistentVolumeClaim{})

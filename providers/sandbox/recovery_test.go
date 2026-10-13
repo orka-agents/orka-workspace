@@ -241,7 +241,8 @@ func TestPendingSuspensionCanEscalateToDeleteWithoutRetainedClaim(t *testing.T) 
 		t.Fatal("pending suspension prevented terminal stop")
 	}
 	policy := workspacev1alpha1.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspacev1alpha1.WorkspaceDeletionActionDelete, PersistentVolumes: workspacev1alpha1.WorkspaceDeletionActionDelete, Checkpoints: workspacev1alpha1.WorkspaceDeletionActionDelete}
-	for range 6 {
+	// Claim, Sandbox, and PVC now retire separately before PV absence closes cleanup.
+	for range 8 {
 		observed, err = (&simulatedLifecycle{New(c)}).DeleteAllocation(t.Context(), request.Key, first.Identity, policy)
 		if err != nil {
 			t.Fatal(err)

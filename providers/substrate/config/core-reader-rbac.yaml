@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orka-workspace-substrate-provider-config-reader
+  labels:
+    workspace.orka.ai/aggregate-to-provider-config-reader: "true"
+rules:
+  - apiGroups: [substrate.workspace.orka.ai]
+    resources: [substrateproviderconfigs]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orka-workspace-substrate-profile-reader
+  labels:
+    workspace.orka.ai/aggregate-to-parameter-reader: "true"
+rules:
+  - apiGroups: [substrate.workspace.orka.ai]
+    resources: [substrateworkspaceprofiles]
+    verbs: [get, list, watch]
