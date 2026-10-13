@@ -319,10 +319,12 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	if err != nil {
 		return err
 	}
+	if retired.Key != next.Key || retired.Identity != second.Identity || retired.Sequence != next.Sequence || retired.Startup != nil {
+		return fmt.Errorf("successor termination changed its exact fence")
+	}
 	if suspend {
-		if retired.Key != next.Key || retired.Identity != second.Identity || retired.Sequence != next.Sequence || retired.Startup != nil ||
-			retired.RetainedData == nil || !retired.RetainedData.Valid() || retired.RetainedData.SourceInstance != second.Identity {
-			return fmt.Errorf("successor suspension lacks exact termination and verified retained lineage")
+		if retired.RetainedData == nil || !retired.RetainedData.Valid() || retired.RetainedData.SourceInstance != second.Identity {
+			return fmt.Errorf("successor suspension lacks verified retained lineage")
 		}
 		// Run the admitted adversarial request last. Persisting it consumes the
 		// next immutable sequence, so the successful resume fixture cannot be

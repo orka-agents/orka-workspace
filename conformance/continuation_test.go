@@ -35,6 +35,8 @@ type continuationStore struct {
 	history        map[int64]sdk.AllocationObservation
 	forgedAttempts int
 	ignoreLineage  bool
+	replacement    bool
+	staleStopFence bool
 	deleted        bool
 }
 
@@ -70,7 +72,7 @@ func (s *continuationStore) EnsureAllocation(_ context.Context, request sdk.Work
 			validationRequest.Revision, _ = sdk.WorkloadRevision(validationRequest)
 		}
 	}
-	if err := sdk.ValidateWorkloadTransition(s.current, validationRequest, &s.observed, s.current != nil); err != nil {
+	if err := sdk.ValidateWorkloadTransition(s.current, validationRequest, &s.observed, s.current != nil && !s.replacement); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
 	if s.current != nil {
@@ -97,6 +99,13 @@ func (s *continuationStore) StopInstance(_ context.Context, key sdk.AllocationKe
 	}
 	s.observed.State = sdk.AllocationStopped
 	s.observed.Startup = nil
+	if s.staleStopFence && s.observed.Sequence > 1 {
+		// Negative control: a broken provider reports its successor stop under
+		// the predecessor's sequence; cleanup still returns the exact fence.
+		stale := s.observed
+		stale.Sequence--
+		return stale, nil
+	}
 	return s.observed, nil
 }
 
@@ -225,5 +234,20 @@ func TestSuspensionConformanceRejectsProviderThatIgnoresRetainedLineage(t *testi
 	err := CheckSuspension(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store))
 	if err == nil || !strings.Contains(err.Error(), "forged retained lineage was accepted") || store.forgedAttempts != 1 {
 		t.Fatalf("provider bypassing lineage proof passed or failed only admission: attempts=%d err=%v", store.forgedAttempts, err)
+	}
+}
+
+func TestReplacementConformanceRejectsInexactSuccessorStopFence(t *testing.T) {
+	store := continuationFixture()
+	store.replacement = true
+	if err := CheckReplacement(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store)); err != nil {
+		t.Fatalf("exact replacement fixture failed: %v", err)
+	}
+	store = continuationFixture()
+	store.replacement = true
+	store.staleStopFence = true
+	err := CheckReplacement(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store))
+	if err == nil || !strings.Contains(err.Error(), "successor termination changed its exact fence") {
+		t.Fatalf("inexact successor stop fence passed replacement conformance: %v", err)
 	}
 }
