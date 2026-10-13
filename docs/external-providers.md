@@ -39,8 +39,15 @@ specs. Replacing a registration's config requires a new registration.
 Orka's integration branch enables the generic path with the workspace provider
 API and ACP workspace dispatch. Enable its class-use and Task provenance
 admission protections. New generic workspaces need no Sandbox/Substrate backend
-flag. Provider configuration kinds are resolved through the Kubernetes REST mapper;
-grant Orka read access to those installed kinds.
+flag. Provider configuration kinds are resolved through the Kubernetes REST mapper.
+The Sandbox and Substrate installation bundles include dedicated read-only reader
+ClusterRoles for their provider configs and workspace profiles. Config readers carry
+`workspace.orka.ai/aggregate-to-provider-config-reader: "true"`; profile readers carry
+`workspace.orka.ai/aggregate-to-parameter-reader: "true"`. Core binds the config
+aggregate cluster-wide and the profile aggregate only in its watch namespace. Keep
+those grants separate: do not add both labels to one role or label the provider's
+control role, which also grants writes. Other providers must supply equivalent
+narrow reader roles for their own parameter kinds.
 
 An ACP class declares its supervisor contract explicitly. For the fake provider,
 a minimal example is:
