@@ -12,6 +12,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
 	nativev1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -60,8 +61,12 @@ func run(leaderElection bool, leaderNamespace string) error {
 	if err != nil {
 		return err
 	}
+	backend, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
 	for _, setup := range []func(ctrl.Manager) error{
-		(&provider.ProviderReconciler{Client: c}).SetupWithManager,
+		(&provider.ProviderReconciler{Client: c, Discovery: backend}).SetupWithManager,
 		(&provider.ExecutionWorkspaceReconciler{Client: c}).SetupWithManager,
 	} {
 		if err := setup(mgr); err != nil {

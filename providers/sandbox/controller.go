@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -10,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -17,7 +19,42 @@ import (
 
 const providerHeartbeatPeriod = 20 * time.Second
 
-type ProviderReconciler struct{ client.Client }
+// backendResources are the pinned agent-sandbox APIs every allocation uses.
+var backendResources = map[string][]string{
+	"agents.x-k8s.io/v1beta1":            {"sandboxes"},
+	"extensions.agents.x-k8s.io/v1beta1": {"sandboxclaims", "sandboxtemplates"},
+}
+
+type ProviderReconciler struct {
+	client.Client
+	// Discovery proves the pinned backend APIs are served before capabilities
+	// are advertised. Nil skips the check.
+	Discovery discovery.ServerResourcesInterface
+}
+
+// backendServed reports false only when discovery definitively says a pinned
+// backend API is not served. Other errors keep the previous advertisement until
+// its heartbeat expires, so a transient discovery failure cannot close admission.
+func (r *ProviderReconciler) backendServed() (bool, error) {
+	if r.Discovery == nil {
+		return true, nil
+	}
+	for groupVersion, resources := range backendResources {
+		list, err := r.Discovery.ServerResourcesForGroupVersion(groupVersion)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, name := range resources {
+			if !slices.ContainsFunc(list.APIResources, func(resource metav1.APIResource) bool { return resource.Name == name }) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
 
 func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
@@ -40,6 +77,14 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			configUID = string(config.UID)
 			configured = config.DeletionTimestamp == nil && configUID != "" && (provider.Status.PinnedParametersUID == "" || provider.Status.PinnedParametersUID == configUID)
 		}
+	}
+	served, err := r.backendServed()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if configured && !served {
+		ctrl.LoggerFrom(ctx).Info("withholding provider advertisement: pinned agent-sandbox APIs are not served")
+		configured = false
 	}
 	before := provider.DeepCopy()
 	provider.Status.ObservedGeneration = 0
