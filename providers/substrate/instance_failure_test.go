@@ -2,6 +2,7 @@ package substrate
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -366,5 +367,51 @@ func TestFailedInstanceDoesNotPollStaleRetirement(t *testing.T) {
 	}
 	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.Allocation.State == sdk.AllocationStopped {
 		t.Fatalf("stale retirement stopped the failed instance: %v", err)
+	}
+}
+
+func TestFailureLookupRejectsAnotherInstanceJournal(t *testing.T) {
+	c, native, request := fixture(t, true)
+	identity := ready(t, c, native, request).Identity
+	identity.InstanceID += "-other"
+	if _, err := driver(c, native).failure(t.Context(), request.Key, identity); !errors.Is(err, sdk.ErrStaleIdentity) {
+		t.Fatalf("another instance's journal was trusted: %v", err)
+	}
+}
+
+// journalMissing reports the workspace's journal as absent.
+type journalMissing struct {
+	client.Client
+	journal client.ObjectKey
+}
+
+func (c *journalMissing) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.ConfigMap); ok && key == c.journal {
+		return apierrors.NewNotFound(corev1.Resource("configmaps"), key.Name)
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func TestFailedInstanceWithMissingJournalStaysFailedWithoutCleanup(t *testing.T) {
+	c, native, request := fixture(t, true)
+	identity := ready(t, c, native, request).Identity
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	workspace := reconcileFailureFixture(t, c, native, request)
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("lost instance reported %s", workspace.Status.State)
+	}
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: api.WorkloadRetirementStop}
+	updateFailureWorkspace(t, c, workspace)
+	missing := &journalMissing{Client: c, journal: journalKey(request.Key)}
+	r := &ExecutionWorkspaceReconciler{Client: missing, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil {
+		t.Fatal("missing journal after allocation evidence was hidden")
+	}
+	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.State != api.ExecutionWorkspaceStateFailed || workspace.Status.Allocation.State == sdk.AllocationStopped {
+		t.Fatalf("missing journal left %s %+v: %v", workspace.Status.State, workspace.Status.Allocation, err)
 	}
 }

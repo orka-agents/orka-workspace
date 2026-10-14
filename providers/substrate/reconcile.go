@@ -103,9 +103,10 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			// An unreadable failure record must block every operation below.
 			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
-		if disabled && missing {
-			// Disabled skips Ensure, so its missing-journal recovery guard must
-			// independently distinguish no allocation from lost durable evidence.
+		if missing && (disabled || before.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed) {
+			// Disabled skips Ensure, and a failed instance never reaches it, so
+			// their missing-journal guard must independently distinguish no
+			// allocation from lost durable evidence.
 			operationErr = driver.proveNoAllocation(ctx, key)
 		}
 		if operationErr == nil {
