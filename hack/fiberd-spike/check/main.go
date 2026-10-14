@@ -212,6 +212,10 @@ func run(o options) (*report, error) {
 		}
 		_, err := get(ctx, f.Endpoint, "/v2/health", 2*time.Second)
 		f.ReleasedGone = err != nil
+		if !f.ReleasedGone {
+			f.Error = strings.TrimSpace(f.Error + " release: supervisor still serves health")
+			r.Failures++
+		}
 	}
 	if r.Failures > 0 || !r.UniqueChallenges {
 		return r, fmt.Errorf("%d failures, unique challenges %v", r.Failures, r.UniqueChallenges)

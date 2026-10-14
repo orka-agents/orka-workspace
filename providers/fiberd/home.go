@@ -6,12 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/helayoty/fiberd/pkg/consumer"
@@ -49,6 +49,8 @@ type Home struct {
 	cfg    HomeConfig
 	reader client.Reader
 	issuer *grant.Issuer
+
+	mu     sync.Mutex
 	api    *consumer.Client
 	target string
 }
@@ -66,7 +68,17 @@ func NewHome(ctx context.Context, reader client.Reader, cfg HomeConfig) (*Home, 
 	if cfg.Lease <= 0 {
 		h.cfg.Lease = 24 * time.Hour
 	}
-	target := cfg.Target
+	if _, err := h.client(ctx); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// client returns the API client for the current home. Without a configured
+// Target it follows the home Pod's IP, so a replaced home is dialed anew;
+// instances recorded on the old home are fenced by its Pod UID.
+func (h *Home) client(ctx context.Context) (*consumer.Client, error) {
+	target := h.cfg.Target
 	if target == "" {
 		pod, err := h.pod(ctx)
 		if err != nil {
@@ -74,12 +86,20 @@ func NewHome(ctx context.Context, reader client.Reader, cfg HomeConfig) (*Home, 
 		}
 		target = net.JoinHostPort(pod.Status.PodIP, "8484")
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.api != nil && h.target == target {
+		return h.api, nil
+	}
 	api, err := consumer.Dial(ctx, target)
 	if err != nil {
 		return nil, err
 	}
+	if h.api != nil {
+		_ = h.api.Close()
+	}
 	h.api, h.target = api, target
-	return h, nil
+	return api, nil
 }
 
 func (h *Home) pod(ctx context.Context) (*corev1.Pod, error) {
@@ -117,7 +137,11 @@ func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte) (Fiber, e
 	if err != nil {
 		return Fiber{}, err
 	}
-	f, err := h.api.Clone(ctx, token, g.Session, 30*time.Second, launch)
+	api, err := h.client(ctx)
+	if err != nil {
+		return Fiber{}, err
+	}
+	f, err := api.Clone(ctx, token, g.Session, 30*time.Second, launch)
 	if err != nil {
 		return Fiber{}, err
 	}
@@ -129,28 +153,53 @@ func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte) (Fiber, e
 }
 
 func (h *Home) Release(ctx context.Context, fiberID string) error {
-	if err := h.api.Release(ctx, fiberID, true); err != nil && !consumer.NotFound(err) {
+	api, err := h.client(ctx)
+	if err != nil {
+		return err
+	}
+	if err := api.Release(ctx, fiberID, true); err != nil && !consumer.NotFound(err) {
 		return err
 	}
 	return nil
 }
 
-// Running reads the grant from Watch's initial snapshot. Watch has no batch
-// boundary or tombstone, so a grant absent after the snapshot window runs none.
+// Running reads the grant from Watch. The home sends one status per admitted
+// grant at once and again every status interval, but no batch boundary or
+// tombstone: a grant is absent only once a whole batch went by without it,
+// seen as a repeated grant, or when the home reports no grant at all.
 func (h *Home) Running(ctx context.Context, grantUID string) (int, error) {
-	wctx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
-	defer cancel()
-	running := -1
-	err := h.api.Watch(wctx, func(s consumer.Status) {
-		if s.GrantUID == grantUID {
-			running = int(s.Running)
-			cancel()
-		}
-	})
-	if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	api, err := h.client(ctx)
+	if err != nil {
 		return 0, err
 	}
-	return max(running, 0), nil
+	wctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	running, complete, seen := -1, false, map[string]bool{}
+	err = api.Watch(wctx, func(s consumer.Status) {
+		switch {
+		case s.GrantUID == grantUID:
+			running = int(s.Running)
+			cancel()
+		case seen[s.GrantUID]:
+			complete = true
+			cancel()
+		default:
+			seen[s.GrantUID] = true
+		}
+	})
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if err != nil {
+		return 0, err
+	}
+	if running >= 0 {
+		return running, nil
+	}
+	if complete || len(seen) == 0 {
+		return 0, nil
+	}
+	return 0, fmt.Errorf("fiberd home did not report grant %s within one status batch", grantUID)
 }
 
 func (h *Home) Challenge(ctx context.Context, relay string) (BootstrapChallenge, error) {

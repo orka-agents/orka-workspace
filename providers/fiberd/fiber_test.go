@@ -4,6 +4,7 @@ package fiberd
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -53,11 +54,78 @@ func TestRuntimeConformanceOnMemoryFibers(t *testing.T) {
 	}
 }
 
-func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
+func newTestClient(t *testing.T) client.Client {
+	t.Helper()
 	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = workspacev1alpha1.AddToScheme(scheme)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workspacev1alpha1.ExecutionWorkspace{}).Build()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, workspacev1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workspacev1alpha1.ExecutionWorkspace{}).Build()
+}
+
+func TestRetirementReleasesFiberWhoseCloneResponseWasLost(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := RuntimeConformanceFixture(ctx, c, ConformanceImage, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fibers := NewMemoryFibers(ConformanceImage)
+	fibers.LoseClones = 1
+	driver := New(c, fibers)
+	pending, err := driver.EnsureAllocation(ctx, request)
+	if err == nil {
+		t.Fatal("lost clone response was not reported")
+	}
+	if running, _ := fibers.Running(ctx, pending.Identity.InstanceID); running != 1 {
+		t.Fatalf("lost clone left %d fibers running, want 1", running)
+	}
+	stopped, err := driver.StopInstance(ctx, request.Key, pending.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.State != workspaceprovider.AllocationStopped || fibers.Releases != 1 {
+		t.Fatalf("retirement left state %s after %d releases", stopped.State, fibers.Releases)
+	}
+	if running, _ := fibers.Running(ctx, pending.Identity.InstanceID); running != 0 {
+		t.Fatalf("retirement left %d fibers running", running)
+	}
+	if fibers.seq != 1 {
+		t.Fatalf("retirement created %d fibers, want 1", fibers.seq)
+	}
+}
+
+func TestObserveWithdrawsEvidenceWhenServiceIsGone(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := RuntimeConformanceFixture(ctx, c, ConformanceImage, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fibers := NewMemoryFibers(ConformanceImage)
+	driver := New(c, fibers)
+	ready, err := driver.EnsureAllocation(ctx, request)
+	if err != nil || ready.State != workspaceprovider.AllocationReady {
+		t.Fatalf("allocation not ready: %v %v", ready.State, err)
+	}
+	services := &corev1.ServiceList{}
+	if err := c.List(ctx, services); err != nil || len(services.Items) != 1 {
+		t.Fatalf("want one fiber Service: %v", err)
+	}
+	if err := c.Delete(ctx, &services.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := driver.Observe(ctx, request.Key); !errors.Is(err, workspaceprovider.ErrStaleIdentity) || observed.Startup != nil {
+		t.Fatalf("observation without its Service: %v %v", observed.Startup, err)
+	}
+}
+
+func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
+	c := newTestClient(t)
 	request, err := RuntimeConformanceFixture(context.Background(), c, ConformanceImage, "n")
 	if err != nil {
 		t.Fatal(err)
@@ -84,5 +152,21 @@ func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
 	privileged.Runtime.Template.Spec.Containers[0].SecurityContext.Capabilities.Add = []corev1.Capability{"SETUID"}
 	if err := validateFiberRequest(privileged, []string{ConformanceImage}, []string{"CAP_SETUID"}); err != nil {
 		t.Fatalf("capability inside the home's set was refused: %v", err)
+	}
+	nonRoot := *request.DeepCopy()
+	nonRoot.Runtime.Template.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: new(true)}
+	nonRoot.Runtime.Template.Spec.Containers[0].SecurityContext = nil
+	if err := validateFiberRequest(nonRoot, []string{ConformanceImage}, nil); err == nil {
+		t.Fatal("runAsNonRoot was admitted")
+	}
+	nonRoot.Runtime.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{RunAsNonRoot: new(false)}
+	if err := validateFiberRequest(nonRoot, []string{ConformanceImage}, nil); err != nil {
+		t.Fatalf("container override of runAsNonRoot was refused: %v", err)
+	}
+	scratch := *request.DeepCopy()
+	scratch.Runtime.Template.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
+	scratch.Runtime.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+	if err := validateFiberRequest(scratch, []string{ConformanceImage}, nil); err == nil {
+		t.Fatal("emptyDir mount the template cannot provide was admitted")
 	}
 }

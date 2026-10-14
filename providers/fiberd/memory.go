@@ -27,6 +27,8 @@ type MemoryFibers struct {
 	grants   map[string]*memoryFiber
 	byRelay  map[string]*memoryFiber
 	Releases int
+	// LoseClones drops that many Clone responses after the fiber started.
+	LoseClones int
 }
 
 type memoryFiber struct {
@@ -68,6 +70,10 @@ func (m *MemoryFibers) Clone(_ context.Context, g FiberGrant, launch []byte) (Fi
 	f.challenge.BootNonce, f.challenge.PublicKey = random32(), random32()
 	f.challenge.Actor.Atespace, f.challenge.Actor.Name, f.challenge.Actor.UID = l.Identity.Namespace, l.Identity.Name, l.Identity.UID
 	m.grants[g.UID], m.byRelay[f.relay] = f, f
+	if m.LoseClones > 0 {
+		m.LoseClones--
+		return Fiber{}, fmt.Errorf("clone response lost")
+	}
 	return Fiber{ID: f.id, Relay: f.relay, Epoch: m.epoch}, nil
 }
 

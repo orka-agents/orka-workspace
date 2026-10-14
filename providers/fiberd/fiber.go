@@ -151,15 +151,28 @@ func validateFiberRequest(request workspaceprovider.WorkloadRequest, images, cap
 // validateFiberSecurity admits only what a sandbox restored from the home's
 // template holds: uid 0 inside the sandbox and the home's capability set.
 func validateFiberSecurity(spec corev1.PodSpec, capabilities []string) error {
-	if spec.SecurityContext != nil && spec.SecurityContext.RunAsUser != nil && *spec.SecurityContext.RunAsUser != 0 {
-		return fmt.Errorf("fiberd supervisors run as uid 0 inside their sandbox")
+	var runAsUser *int64
+	var runAsNonRoot *bool
+	if spec.SecurityContext != nil {
+		runAsUser, runAsNonRoot = spec.SecurityContext.RunAsUser, spec.SecurityContext.RunAsNonRoot
 	}
 	sc := spec.Containers[0].SecurityContext
+	if sc != nil {
+		if sc.RunAsUser != nil {
+			runAsUser = sc.RunAsUser
+		}
+		if sc.RunAsNonRoot != nil {
+			runAsNonRoot = sc.RunAsNonRoot
+		}
+	}
+	if (runAsUser != nil && *runAsUser != 0) || (runAsNonRoot != nil && *runAsNonRoot) {
+		return fmt.Errorf("fiberd supervisors run as uid 0 inside their sandbox")
+	}
 	if sc == nil {
 		return nil
 	}
-	if (sc.RunAsUser != nil && *sc.RunAsUser != 0) || (sc.Privileged != nil && *sc.Privileged) {
-		return fmt.Errorf("fiberd supervisors run unprivileged as uid 0 inside their sandbox")
+	if sc.Privileged != nil && *sc.Privileged {
+		return fmt.Errorf("fiberd supervisors run unprivileged inside their sandbox")
 	}
 	if sc.Capabilities != nil {
 		for _, add := range sc.Capabilities.Add {
@@ -175,15 +188,20 @@ func validateFiberSecurity(spec corev1.PodSpec, capabilities []string) error {
 	return nil
 }
 
+// validateFiberStorage rejects every volume. The launch payload carries no
+// mounts, so the fixed template could never materialize one; Core already
+// drops scratch emptyDirs from native process templates.
 func validateFiberStorage(request workspaceprovider.WorkloadRequest) error {
 	if request.Runtime == nil {
 		return nil
 	}
-	for _, volume := range request.Runtime.Template.Spec.Volumes {
-		source := volume.VolumeSource
-		source.EmptyDir = nil
-		if !reflect.DeepEqual(source, corev1.VolumeSource{}) {
-			return fmt.Errorf("fiberd runtime volume %q requires an unsupported storage lifecycle", volume.Name)
+	spec := request.Runtime.Template.Spec
+	if len(spec.Volumes) != 0 {
+		return fmt.Errorf("fiberd runtime volume %q is unsupported; fibers have no mounts", spec.Volumes[0].Name)
+	}
+	for _, container := range spec.Containers {
+		if len(container.VolumeMounts) != 0 || len(container.VolumeDevices) != 0 {
+			return fmt.Errorf("fiberd supervisor container %q mounts storage a fiber cannot provide", container.Name)
 		}
 	}
 	return nil
@@ -291,12 +309,27 @@ func (d *Lifecycle) observeFiber(ctx context.Context, record *journalRecord) (wo
 	if f == nil || f.FiberID == "" || f.Service == nil {
 		return pendingObservation(record), nil
 	}
-	home, _, err := d.fibers.Home(ctx)
+	home, labels, err := d.fibers.Home(ctx)
 	if err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
 	if home != f.Home {
 		return workspaceprovider.AllocationObservation{}, fmt.Errorf("fiber home was replaced; its fibers ended with it: %w", workspaceprovider.ErrStaleIdentity)
+	}
+	// Core dials the Service, not the relay; evidence stands only while the
+	// recorded Service still routes the bootstrap port to this fiber.
+	service := &corev1.Service{}
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: f.Service.Namespace, Name: f.Service.Name}, service); err != nil {
+		if apierrors.IsNotFound(err) {
+			return workspaceprovider.AllocationObservation{}, fmt.Errorf("fiber Service %s is gone: %w", f.Service.Name, workspaceprovider.ErrStaleIdentity)
+		}
+		return workspaceprovider.AllocationObservation{}, err
+	}
+	if service.UID != f.Service.UID || service.DeletionTimestamp != nil {
+		return workspaceprovider.AllocationObservation{}, fmt.Errorf("fiber Service %s was replaced: %w", f.Service.Name, workspaceprovider.ErrStaleIdentity)
+	}
+	if err := checkService(service, record, labels); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
 	}
 	running, err := d.fibers.Running(ctx, f.Grant)
 	if err != nil {
@@ -362,14 +395,36 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord) (strin
 }
 
 // stopFiber releases the exact fiber and reports true once the grant runs
-// none. An unrecorded clone is resolved through the grant it alone uses.
-func (d *Lifecycle) stopFiber(ctx context.Context, record *journalRecord) (bool, error) {
+// none. An unrecorded clone is resolved through the grant it alone uses:
+// a running fiber is attached through its named session, recorded and then
+// released; the grant admits one fiber, so attaching never creates another.
+func (d *Lifecycle) stopFiber(ctx context.Context, record *journalRecord, save func() error) (bool, error) {
 	f := record.Fiber
 	if f == nil {
 		return false, fmt.Errorf("runtime journal has no fiber intent")
 	}
 	if !record.CreateIssued {
 		return true, nil
+	}
+	if f.FiberID == "" {
+		running, err := d.fibers.Running(ctx, f.Grant)
+		if err != nil {
+			return false, err
+		}
+		if running != 0 {
+			launch, err := launchFor(record.Request, f.Process)
+			if err != nil {
+				return false, err
+			}
+			fiber, err := d.fibers.Clone(ctx, FiberGrant{UID: f.Grant, Tenant: tenantOf(record.Request.Key.Namespace), Session: f.Grant}, launch)
+			if err != nil {
+				return false, err
+			}
+			f.FiberID, f.Relay, f.Epoch = fiber.ID, fiber.Relay, fiber.Epoch
+			if err := save(); err != nil {
+				return false, err
+			}
+		}
 	}
 	if f.FiberID != "" {
 		if err := d.fibers.Release(ctx, f.FiberID); err != nil {
@@ -436,11 +491,30 @@ func (d *Lifecycle) ensureService(ctx context.Context, record *journalRecord) (*
 	if err := d.client.Get(ctx, client.ObjectKeyFromObject(desired), actual); err != nil {
 		return nil, err
 	}
-	if actual.Labels[fiberServiceLabel] != f.Grant || !reflect.DeepEqual(actual.Spec.Selector, labels) || len(actual.Spec.Ports) != 1 ||
-		actual.Spec.Ports[0].TargetPort != desired.Spec.Ports[0].TargetPort || actual.Spec.Ports[0].Port != desired.Spec.Ports[0].Port {
-		return nil, fmt.Errorf("fiber Service %s differs from its instance: %w", desired.Name, workspaceprovider.ErrStaleIdentity)
+	if err := checkService(actual, record, labels); err != nil {
+		return nil, err
 	}
 	return &workspaceprovider.PodReference{Namespace: actual.Namespace, Name: actual.Name, UID: actual.UID}, nil
+}
+
+// checkService reports whether service routes the instance's bootstrap port
+// to its fiber's relay port on the home Pod that labels select.
+func checkService(service *corev1.Service, record *journalRecord, labels map[string]string) error {
+	f := record.Fiber
+	_, relayPort, err := net.SplitHostPort(f.Relay)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(relayPort)
+	if err != nil {
+		return err
+	}
+	if service.Labels[fiberServiceLabel] != f.Grant || len(labels) == 0 || !reflect.DeepEqual(service.Spec.Selector, labels) || len(service.Spec.Ports) != 1 ||
+		service.Spec.Ports[0].Protocol != corev1.ProtocolTCP || service.Spec.Ports[0].Port != record.Request.Runtime.BootstrapPort ||
+		service.Spec.Ports[0].TargetPort != intstr.FromInt(port) {
+		return fmt.Errorf("fiber Service %s differs from its instance: %w", service.Name, workspaceprovider.ErrStaleIdentity)
+	}
+	return nil
 }
 
 // deleteService removes the recorded Service by UID and reports its absence.

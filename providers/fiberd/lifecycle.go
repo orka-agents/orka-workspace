@@ -440,7 +440,7 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 			return err
 		}
 		if record.Request.Runtime != nil && operation != "delete" {
-			stopped, err := d.stopFiber(ctx, record)
+			stopped, err := d.stopFiber(ctx, record, func() error { return d.save(ctx, cm, record) })
 			if err != nil {
 				return err
 			}

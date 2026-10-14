@@ -100,7 +100,7 @@ issuer_secret() {
 stage2() {
   issuer_secret tenant-a
   on_host "kubectl -n tenant-a delete job fiberd-conformance --ignore-not-found --wait=true >/dev/null && sed \"s#SUPERVISOR_IMAGE#\$(cat supervisor-image)#\" manifests/conformance.yaml | kubectl apply -f - >/dev/null"
-  on_host "kubectl -n tenant-a wait --for=condition=Complete job/fiberd-conformance --timeout=600s || true; kubectl -n tenant-a logs job/fiberd-conformance --tail=40"
+  on_host "rc=0; kubectl -n tenant-a wait --for=condition=Complete job/fiberd-conformance --timeout=600s || rc=\$?; kubectl -n tenant-a logs job/fiberd-conformance --tail=40; exit \$rc"
 }
 
 case "${1:-}" in
