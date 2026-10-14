@@ -8,9 +8,12 @@ import (
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	clienttesting "k8s.io/client-go/testing"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -120,6 +123,46 @@ func TestProviderAdvertisementRequiresServedBackendAPIs(t *testing.T) {
 	}
 	if !advertised(t) || !provider.Status.LastHeartbeat.Equal(heartbeat) {
 		t.Fatal("transient discovery failure withdrew the advertisement")
+	}
+}
+
+// groupDiscovery answers each group version independently.
+type groupDiscovery struct {
+	discovery.ServerResourcesInterface
+	errors map[string]error
+}
+
+func (d groupDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if err := d.errors[groupVersion]; err != nil {
+		return nil, err
+	}
+	for _, list := range servedBackend() {
+		if list.GroupVersion == groupVersion {
+			return list, nil
+		}
+	}
+	return nil, apierrors.NewNotFound(schema.GroupResource{}, groupVersion)
+}
+
+func TestBackendAbsenceWinsOverTransientDiscoveryError(t *testing.T) {
+	for _, missing := range []string{"agents.x-k8s.io/v1beta1", "extensions.agents.x-k8s.io/v1beta1"} {
+		errs := map[string]error{missing: apierrors.NewNotFound(schema.GroupResource{}, missing)}
+		for groupVersion := range backendResources {
+			if groupVersion != missing {
+				errs[groupVersion] = errors.New("discovery unavailable")
+			}
+		}
+		r := &ProviderReconciler{Discovery: groupDiscovery{errors: errs}}
+		// Map iteration order varies; the definitive absence must win every time.
+		for range 20 {
+			if served, err := r.backendServed(); served || err != nil {
+				t.Fatalf("missing %s with a transient sibling error: served=%v err=%v", missing, served, err)
+			}
+		}
+	}
+	errs := map[string]error{"agents.x-k8s.io/v1beta1": errors.New("discovery unavailable")}
+	if served, err := (&ProviderReconciler{Discovery: groupDiscovery{errors: errs}}).backendServed(); served || err == nil {
+		t.Fatalf("transient discovery error without absence was not reported: served=%v err=%v", served, err)
 	}
 }
 
