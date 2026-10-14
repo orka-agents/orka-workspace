@@ -100,7 +100,8 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		}
 		failure := ""
 		if err == nil {
-			failure, err = driver.failure(ctx, key, observed.Identity)
+			// An unreadable failure record must block every operation below.
+			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
 		if disabled && missing {
 			// Disabled skips Ensure, so its missing-journal recovery guard must
@@ -121,8 +122,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			case failure != "":
 				// A failed instance never restarts and has no new data to capture,
 				// so either exact Stop or Suspend authorization retires it.
-				if !missing && (workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil ||
-					workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil) {
+				if failedRetirementAuthorized(workload, &observed, current.Spec.Retirement, missing) {
 					observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
 				}
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
@@ -209,7 +209,8 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			}
 		}
 		// Failed is terminal; only an authorized cleanup still needs polling.
-		failedIdle := current.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed && (current.Spec.Retirement == nil || observed.State == workspaceprovider.AllocationStopped)
+		failedIdle := current.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed &&
+			(!failedRetirementAuthorized(workload, &observed, current.Spec.Retirement, missing) || observed.State == workspaceprovider.AllocationStopped)
 		pending = !disabled && operationErr == nil && !ready && !failedIdle && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
@@ -226,6 +227,13 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	return ctrl.Result{RequeueAfter: providerHeartbeatPeriod}, nil
+}
+
+// failedRetirementAuthorized reports an exact Stop or Suspend authorization
+// for a failed instance; a stale retirement authorizes nothing.
+func failedRetirementAuthorized(workload *workspaceprovider.WorkloadRequest, observed *workspaceprovider.AllocationObservation, retirement *workspacev1alpha1.WorkloadRetirement, missing bool) bool {
+	return !missing && (workspaceprovider.ValidateWorkloadRetirement(workload, observed, retirement, workspacev1alpha1.WorkloadRetirementStop) == nil ||
+		workspaceprovider.ValidateWorkloadRetirement(workload, observed, retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil)
 }
 
 // Provisioned records a durable allocation milestone, independently of startup

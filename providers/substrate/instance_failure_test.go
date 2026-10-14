@@ -344,3 +344,27 @@ func TestUnreadableFailureRecordNeverSelectsSuspensionOrLiveState(t *testing.T) 
 		t.Fatalf("Suspend authorization did not retire the failed instance by Stop: %s %+v", workspace.Status.State, workspace.Status.Allocation)
 	}
 }
+
+func TestFailedInstanceDoesNotPollStaleRetirement(t *testing.T) {
+	c, native, request := fixture(t, true)
+	identity := ready(t, c, native, request).Identity
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	workspace := reconcileFailureFixture(t, c, native, request)
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("lost instance reported %s", workspace.Status.State)
+	}
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence + 1, Identity: identity, Action: api.WorkloadRetirementStop}
+	updateFailureWorkspace(t, c, workspace)
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)})
+	if err != nil || result.RequeueAfter != providerHeartbeatPeriod {
+		t.Fatalf("stale retirement kept a failed workspace polling: %+v %v", result, err)
+	}
+	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.Allocation.State == sdk.AllocationStopped {
+		t.Fatalf("stale retirement stopped the failed instance: %v", err)
+	}
+}
