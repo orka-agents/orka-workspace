@@ -1,0 +1,24 @@
+# One gVisor home for the Orka supervisor template. Every grant on it,
+# whatever its digest, warms orka-fiber-shim in the Orka rootfs.
+apiVersion: fiberd.io/v1alpha1
+kind: CapacityGrant
+metadata:
+  name: orka-home
+  namespace: tenant-a
+spec:
+  template: sha256:orka-acp-supervisor
+  fibers: { max: 1, warm: 0 }
+  minTier: FIBER_SNAPSHOT
+  isolation: UNTRUSTED
+  lease: 2h
+  pod:
+    image: orka-fiber-home:spike
+    runtime: gvisor
+    endpointFamily: inet4
+    args:
+      - -gvisor-rootfs
+      - /usr/share/orka-fiber/rootfs
+      - -template
+      - default=/usr/local/bin/orka-fiber-shim
+    resources:
+      limits: { memory: 6Gi }
