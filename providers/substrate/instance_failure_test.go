@@ -153,6 +153,17 @@ func TestNativeBootTimeoutFailsAllocationWithoutProcessEvidence(t *testing.T) {
 	if _, err := d.EnsureAllocation(t.Context(), request); err != nil || resumes != 1 {
 		t.Fatalf("an unknown boot outcome was replayed: %d %v", resumes, err)
 	}
+	// A journal without a recorded start begins the window on its next pass.
+	record.StartedAt = metav1.Time{}
+	if err := d.save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.EnsureAllocation(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if cm, record, err = d.read(t.Context(), request.Key); err != nil || record.StartedAt.IsZero() || record.Failure != "" {
+		t.Fatalf("missing boot start was not initialized: %v", err)
+	}
 	record.StartedAt = metav1.NewTime(time.Now().Add(-defaultNativeBootTimeout - time.Minute))
 	if err := d.save(t.Context(), cm, record); err != nil {
 		t.Fatal(err)

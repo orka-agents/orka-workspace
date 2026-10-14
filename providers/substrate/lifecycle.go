@@ -146,7 +146,14 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		if err := d.requireJournal(ctx, cm, record); err != nil {
 			return err
 		}
-		if record.ChallengeSHA256 == "" && !record.StartedAt.IsZero() && time.Since(record.StartedAt.Time) > d.bootTimeout() {
+		if record.ChallengeSHA256 == "" && record.StartedAt.IsZero() {
+			// A journal written before the boot window starts it now.
+			record.StartedAt = metav1.Now()
+			if err := d.save(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		if record.ChallengeSHA256 == "" && time.Since(record.StartedAt.Time) > d.bootTimeout() {
 			observed, err = d.fail(ctx, cm, record, fmt.Sprintf("native allocation produced no process evidence within %s; the creation intent is preserved for exact cleanup and explicit recovery", d.bootTimeout()))
 			return err
 		}
