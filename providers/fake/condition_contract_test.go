@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -248,6 +249,10 @@ func TestProviderConditionErrorsWithdrawMilestonesWithoutClaimingAbsence(t *test
 			if workspace.Status.Allocation == nil || workspace.Status.Allocation.Identity != identity || workspace.Status.Allocation.State != sdk.AllocationPending || workspace.Status.Allocation.Startup != nil {
 				t.Fatal("observation failure lost the fence or asserted startup/termination")
 			}
+			provisioned := sdk.FindCondition(workspace.Status.Conditions, string(api.ConditionWorkspaceProvisioned))
+			if provisioned.Reason != providerOperationFailedReason || !strings.HasSuffix(provisioned.Message, ": allocation observation unavailable") {
+				t.Fatalf("backend outage cause is not visible in status: %+v", provisioned)
+			}
 			if sdk.ConditionIsTrue(workspace.Status.Conditions, string(api.ConditionWorkspaceDataPlaneReady)) {
 				t.Fatal("backend outage retained data-plane readiness")
 			}
@@ -313,5 +318,15 @@ func TestGenericFixtureConditionsDoNotClaimRuntimeOrCredentialEvidence(t *testin
 	workspace = assertConditionContract(t, f, metav1.ConditionFalse, metav1.ConditionTrue)
 	if workspace.Status.Disposition.AccessCredentials != api.DispositionNotApplicable || workspace.Status.Disposition.EphemeralSecrets != api.DispositionNotApplicable {
 		t.Fatal("generic Finalized claimed independently owned credential revocation")
+	}
+}
+
+func TestOperationFailureCauseIsOneBoundedLine(t *testing.T) {
+	if got := operationFailureCause(errors.New("first line\n\tsecond   line")); got != "first line second line" {
+		t.Fatalf("cause was not collapsed to one line: %q", got)
+	}
+	got := []rune(operationFailureCause(errors.New(strings.Repeat("é", 2*maxOperationFailureCauseRunes))))
+	if len(got) != maxOperationFailureCauseRunes || got[len(got)-1] != '…' {
+		t.Fatalf("cause was not bounded to %d runes: %d", maxOperationFailureCauseRunes, len(got))
 	}
 }
