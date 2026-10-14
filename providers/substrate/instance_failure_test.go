@@ -234,3 +234,49 @@ func TestDataOnlyProfileRunsWithoutSessionReuse(t *testing.T) {
 		t.Fatalf("session-less DataOnly workspace lost its durable layout: %v", err)
 	}
 }
+
+func TestLostResumedActorExportsInheritedCheckpointOnlyByExplicitRecovery(t *testing.T) {
+	c, native, request := fixture(t, true)
+	first := ready(t, c, native, request)
+	stopped := retired(t, c, native, request, first.Identity, true)
+	next := *request.DeepCopy()
+	next.Sequence++
+	next.PreviousInstance = &first.Identity
+	next.RetainedData = stopped.RetainedData
+	next.Runtime.Template.Spec.Containers[0].Env[0].Value = "rotated-public-nonce"
+	next.Revision, _ = sdk.WorkloadRevision(next)
+	if err := admit(c)(t.Context(), next); err != nil {
+		t.Fatal(err)
+	}
+	ready(t, c, native, next)
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil || record.Checkpoint != nil || record.InheritedCatalog == nil {
+		t.Fatalf("resumed successor does not carry only its inherited checkpoint: %v", err)
+	}
+	inherited := record.InheritedCatalog.Digest
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	if workspace := reconcileFailureFixture(t, c, native, next); workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("lost resumed instance reported %s", workspace.Status.State)
+	}
+
+	plain := &api.ExecutionWorkspaceCheckpoint{ObjectMeta: metav1.ObjectMeta{Namespace: request.Key.Namespace, Name: "unconfirmed", UID: "unconfirmed-uid", Generation: 1},
+		Spec: api.ExecutionWorkspaceCheckpointSpec{WorkspaceRef: api.ObjectIdentityReference{Name: request.Key.Name, UID: request.Key.WorkspaceUID}}}
+	if err := c.Create(t.Context(), plain); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 {
+		if _, err := checkpointController(c, native).Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(plain)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Get(t.Context(), client.ObjectKeyFromObject(plain), plain); err != nil {
+		t.Fatal(err)
+	}
+	if condition := sdk.FindCondition(plain.Status.Conditions, "Ready"); plain.Status.Phase != "Pending" || plain.Status.Digest != "" || condition == nil || condition.Reason != "AwaitingSuspension" {
+		t.Fatalf("plain export of a failed source did not wait for explicit recovery: %s %+v", plain.Status.Phase, condition)
+	}
+	recovered := exportReady(t, c, native, newCheckpoint(t, c, request, true))
+	if recovered.Status.Digest != inherited {
+		t.Fatalf("recovery exported %s, want the inherited checkpoint %s", recovered.Status.Digest, inherited)
+	}
+}
