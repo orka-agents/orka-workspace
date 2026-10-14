@@ -100,7 +100,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		}
 		failure := ""
 		if err == nil {
-			failure = driver.failure(ctx, key, observed.Identity)
+			failure, err = driver.failure(ctx, key, observed.Identity)
 		}
 		if disabled && missing {
 			// Disabled skips Ensure, so its missing-journal recovery guard must
@@ -145,7 +145,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		}
 		if failure == "" && operationErr == nil && !missing {
 			// EnsureAllocation can record the failure during this pass.
-			failure = driver.failure(ctx, key, observed.Identity)
+			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
 		if (workloadErr != nil || disabled) && observed.State == workspaceprovider.AllocationReady {
 			observed.State = workspaceprovider.AllocationPending
@@ -173,8 +173,9 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			if attached {
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
 			}
-			if failure != "" && !deleted && !quarantined {
-				// A transient cleanup error never makes a failed instance live again.
+			if (failure != "" || before.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed) && !deleted && !quarantined {
+				// Failed is terminal for the preserved fence: a transient error
+				// never makes the instance live again.
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
 			}
 		} else {

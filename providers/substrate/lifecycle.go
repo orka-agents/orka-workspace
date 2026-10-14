@@ -431,13 +431,17 @@ func (d *Lifecycle) recordFailure(ctx context.Context, key sdk.AllocationKey, lo
 	return observed, err
 }
 
-// failure reports the recorded terminal failure of the observed instance.
-func (d *Lifecycle) failure(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) string {
+// failure reports the recorded terminal failure of the observed instance. An
+// unreadable journal is an error, never evidence that the instance is live.
+func (d *Lifecycle) failure(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) (string, error) {
 	_, record, err := d.read(ctx, key)
-	if err != nil || record.Observation.Identity != identity {
-		return ""
+	if errors.Is(err, sdk.ErrNotFound) {
+		return "", fmt.Errorf("native journal disappeared during observation")
 	}
-	return record.Failure
+	if err != nil || record.Observation.Identity != identity {
+		return "", err
+	}
+	return record.Failure, nil
 }
 
 func (d *Lifecycle) Observe(ctx context.Context, key sdk.AllocationKey) (sdk.AllocationObservation, error) {
