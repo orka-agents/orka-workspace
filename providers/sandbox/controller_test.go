@@ -100,9 +100,20 @@ func TestProviderAdvertisementRequiresServedBackendAPIs(t *testing.T) {
 	if !advertised(t) {
 		t.Fatal("served backend was not advertised")
 	}
-	withoutTemplates := servedBackend()
-	withoutTemplates[1].APIResources = withoutTemplates[1].APIResources[:1]
-	for name, resources := range map[string][]*metav1.APIResourceList{"missing resource": withoutTemplates, "missing group version": servedBackend()[:1]} {
+	without := func(name string) []*metav1.APIResourceList {
+		lists := servedBackend()
+		for _, list := range lists {
+			list.APIResources = slices.DeleteFunc(list.APIResources, func(resource metav1.APIResource) bool { return resource.Name == name })
+		}
+		return lists
+	}
+	cases := map[string][]*metav1.APIResourceList{"missing group version": servedBackend()[:1]}
+	for _, group := range backendResources {
+		for _, name := range group {
+			cases["missing "+name] = without(name)
+		}
+	}
+	for name, resources := range cases {
 		backend.Resources = resources
 		reconcile(t)
 		if advertised(t) || provider.Status.Backend != nil {

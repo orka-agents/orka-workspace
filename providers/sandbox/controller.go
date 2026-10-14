@@ -22,7 +22,7 @@ const providerHeartbeatPeriod = 20 * time.Second
 // backendResources are the pinned agent-sandbox APIs every allocation uses.
 var backendResources = map[string][]string{
 	"agents.x-k8s.io/v1beta1":            {"sandboxes"},
-	"extensions.agents.x-k8s.io/v1beta1": {"sandboxclaims", "sandboxtemplates"},
+	"extensions.agents.x-k8s.io/v1beta1": {"sandboxclaims", "sandboxtemplates", "sandboxwarmpools"},
 }
 
 type ProviderReconciler struct {
