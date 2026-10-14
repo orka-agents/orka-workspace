@@ -173,6 +173,10 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			if attached {
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
 			}
+			if failure != "" && !deleted && !quarantined {
+				// A transient cleanup error never makes a failed instance live again.
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+			}
 		} else {
 			if !missing {
 				current.Status.Allocation = &observed

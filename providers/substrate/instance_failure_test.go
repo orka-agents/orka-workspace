@@ -80,6 +80,14 @@ func TestLostNativeActorFailsWithoutRestartAndRetiresOnlyByCoreStop(t *testing.T
 
 			workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: api.WorkloadRetirementStop}
 			updateFailureWorkspace(t, c, workspace)
+			native.failAfter = "drain"
+			r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil {
+				t.Fatal("transient cleanup error was hidden")
+			}
+			if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+				t.Fatalf("transient cleanup error made the failed instance %s: %v", workspace.Status.State, err)
+			}
 			for range 20 {
 				workspace = reconcileFailureFixture(t, c, native, request)
 				if workspace.Status.Allocation.State == sdk.AllocationStopped {
