@@ -337,6 +337,9 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			return sdk.ErrStaleIdentity
 		}
 		observed = record.Observation
+		if record.Failure != "" {
+			return fmt.Errorf("a failed native instance has no data to suspend; Stop retires it")
+		}
 		if record.Operation == "suspend" {
 			if err := d.reserveSuspended(ctx, record); err != nil {
 				return err

@@ -288,3 +288,59 @@ func TestLostResumedActorExportsInheritedCheckpointOnlyByExplicitRecovery(t *tes
 		t.Fatalf("recovery exported %s, want the inherited checkpoint %s", recovered.Status.Digest, inherited)
 	}
 }
+
+// journalReadFailsOnce fails one journal read, after `skip` successful reads.
+type journalReadFailsOnce struct {
+	client.Client
+	journal client.ObjectKey
+	skip    int
+	fired   bool
+}
+
+func (c *journalReadFailsOnce) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.ConfigMap); ok && key == c.journal && !c.fired {
+		if c.skip == 0 {
+			c.fired = true
+			return status.Error(codes.Unavailable, "journal read unavailable")
+		}
+		c.skip--
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func TestUnreadableFailureRecordNeverSelectsSuspensionOrLiveState(t *testing.T) {
+	c, native, request := fixture(t, true)
+	identity := ready(t, c, native, request).Identity
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	workspace := reconcileFailureFixture(t, c, native, request)
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("lost instance reported %s", workspace.Status.State)
+	}
+	workspace.Spec.DesiredState = api.ExecutionWorkspaceDesiredSuspended
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: api.WorkloadRetirementSuspend}
+	updateFailureWorkspace(t, c, workspace)
+	// Observe reads the journal first; the failure lookup's read then fails.
+	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key), skip: 1}
+	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil || !flaky.fired {
+		t.Fatalf("unreadable failure record was hidden: fired=%v err=%v", flaky.fired, err)
+	}
+	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("unreadable failure record made the instance %s: %v", workspace.Status.State, err)
+	}
+	if native.suspends != 0 {
+		t.Fatal("a failed instance entered suspension")
+	}
+	for range 20 {
+		if workspace = reconcileFailureFixture(t, c, native, request); workspace.Status.Allocation.State == sdk.AllocationStopped {
+			break
+		}
+	}
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed || workspace.Status.Allocation.State != sdk.AllocationStopped || workspace.Status.Allocation.RetainedData != nil || native.suspends != 0 {
+		t.Fatalf("Suspend authorization did not retire the failed instance by Stop: %s %+v", workspace.Status.State, workspace.Status.Allocation)
+	}
+}
