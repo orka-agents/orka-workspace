@@ -45,6 +45,8 @@ type Fibers interface {
 	Home(ctx context.Context) (workspaceprovider.PodReference, map[string]string, error)
 	// Images are the supervisor image references the home's rootfs serves.
 	Images() []string
+	// Capabilities are what every sandbox's init holds, as CAP_ names.
+	Capabilities() []string
 }
 
 // FiberGrant names one instance's grant and session on the home.
@@ -102,7 +104,7 @@ const (
 	fiberServiceLabel     = "fiberd.workspace.orka.ai/instance"
 )
 
-func validateFiberRequest(request workspaceprovider.WorkloadRequest, images []string) error {
+func validateFiberRequest(request workspaceprovider.WorkloadRequest, images, capabilities []string) error {
 	if request.RestoreFrom != nil {
 		return fmt.Errorf("fiberd provider does not support checkpoint import")
 	}
@@ -137,8 +139,38 @@ func validateFiberRequest(request workspaceprovider.WorkloadRequest, images []st
 	if !slices.Contains(images, request.Image) {
 		return fmt.Errorf("fiberd home does not serve supervisor image %q", request.Image)
 	}
+	if err := validateFiberSecurity(runtime.Template.Spec, capabilities); err != nil {
+		return err
+	}
 	if _, err := launchFor(request, payload.Identity{Namespace: "x", Name: "x", UID: "x"}); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateFiberSecurity admits only what a sandbox restored from the home's
+// template holds: uid 0 inside the sandbox and the home's capability set.
+func validateFiberSecurity(spec corev1.PodSpec, capabilities []string) error {
+	if spec.SecurityContext != nil && spec.SecurityContext.RunAsUser != nil && *spec.SecurityContext.RunAsUser != 0 {
+		return fmt.Errorf("fiberd supervisors run as uid 0 inside their sandbox")
+	}
+	sc := spec.Containers[0].SecurityContext
+	if sc == nil {
+		return nil
+	}
+	if (sc.RunAsUser != nil && *sc.RunAsUser != 0) || (sc.Privileged != nil && *sc.Privileged) {
+		return fmt.Errorf("fiberd supervisors run unprivileged as uid 0 inside their sandbox")
+	}
+	if sc.Capabilities != nil {
+		for _, add := range sc.Capabilities.Add {
+			name := strings.ToUpper(string(add))
+			if !strings.HasPrefix(name, "CAP_") {
+				name = "CAP_" + name
+			}
+			if !slices.Contains(capabilities, name) {
+				return fmt.Errorf("fiberd home sandboxes do not hold capability %s", add)
+			}
+		}
 	}
 	return nil
 }

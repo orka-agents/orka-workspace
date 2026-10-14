@@ -9,6 +9,7 @@
 #   hack/fiberd-spike/spike.sh home     (re)deploy the Orka gVisor home
 #   hack/fiberd-spike/spike.sh stage1 [check flags...]
 #   hack/fiberd-spike/spike.sh stage2   provider conformance on the real home
+#   hack/fiberd-spike/spike.sh stage3   actual Core Task through the fiberd provider
 #   hack/fiberd-spike/spike.sh memory   per-grant cgroup memory in the home
 #   hack/fiberd-spike/spike.sh baseline plain runc Pod supervisor start
 #   hack/fiberd-spike/spike.sh k <kubectl args...>
@@ -19,7 +20,7 @@ host="${SPIKE_HOST:-vm}"
 remote="${SPIKE_REMOTE_DIR:-spike/fiberd-orka}"
 cluster="${SPIKE_CLUSTER:-fiberd-spike}"
 core_source="${ORKA_CORE_SOURCE:-${repo_root}/../orka.fiberd-spike}"
-fiberd_source="${FIBERD_SOURCE:-${repo_root}/../fiberd}"
+fiberd_source="${FIBERD_SOURCE:-${repo_root}/../fiberd.orka-spike}"
 arch="${SPIKE_ARCH:-amd64}"
 bin="${repo_root}/bin/fiberd-spike"
 
@@ -41,16 +42,28 @@ build() {
   cp "${out}/orka-acp-runtime" "${out}/orka-acp-exec-helper" "${out}/acp-agent" "${bin}/runtime/bin/"
   cp "${out}/orka-fiber-shim" "${out}/orka-fiber-egress" "${out}/fiberd-spike-check" "${bin}/home/bin/"
   cp "${out}/orka-workspace-fiberd" "${bin}/provider/bin/"
+  # Stage 3: Core manager, its CRDs and role, the provider bundle and the proof.
+  [ -d "${core_source}/internal/uiembed/dist" ] || { mkdir -p "${core_source}/internal/uiembed/dist" && echo '<!doctype html><html><body>stub</body></html>' >"${core_source}/internal/uiembed/dist/index.html"; }
+  mkdir -p "${bin}/core"
+  go -C "${core_source}" build -trimpath -buildvcs=false -o "${bin}/core/manager" ./cmd
+  cp "${script_dir}/core-proof/core.Dockerfile" "${bin}/core/Dockerfile"
+  go -C "${script_dir}" build -trimpath -buildvcs=false -o "${out}/fiberd-core-proof" ./core-proof
   ssh "${host}" "mkdir -p \$HOME/${remote}"
-  for ctx in runtime home provider; do rsync -a --delete "${bin}/${ctx}/" "${host}:${remote}/${ctx}/"; done
+  for ctx in runtime home provider core; do rsync -a --delete "${bin}/${ctx}/" "${host}:${remote}/${ctx}/"; done
+  rsync -a --delete "${repo_root}/config/" "${host}:${remote}/ws-config/"
+  rsync -a --delete "${repo_root}/providers/fiberd/config/" "${host}:${remote}/fiberd-config/"
+  ssh "${host}" "mkdir -p \$HOME/${remote}/core-config"
+  rsync -a --delete "${core_source}/config/crd/" "${host}:${remote}/core-config/crd/"
+  rsync -a "${core_source}/config/rbac/role.yaml" "${host}:${remote}/core-config/role.yaml"
+  rsync -a "${script_dir}/core-install.py" "${script_dir}/stage3.sh" "${out}/fiberd-core-proof" "${host}:${remote}/"
   rsync -a --delete "${script_dir}/manifests/" "${host}:${remote}/manifests/"
   rsync -a --delete "${script_dir}/measure/" "${host}:${remote}/measure/"
   rsync -a --delete --exclude .git --exclude bin "${fiberd_source}/" "${host}:${remote}/fiberd/"
 }
 
 image() {
-  on_host "docker image inspect fiberd:kind >/dev/null 2>&1 || docker build -q -t fiberd:kind -f fiberd/docker/kubernetes/Dockerfile fiberd"
-  on_host "docker build -q -t orka-acp-runtime:spike runtime && docker build -q -t orka-fiber-home:spike home && docker build -q -t orka-workspace-fiberd:spike provider"
+  on_host "docker build -q -t fiberd:kind -f fiberd/docker/kubernetes/Dockerfile fiberd"
+  on_host "docker build -q -t orka-acp-runtime:spike runtime && docker build -q -t orka-fiber-home:spike home && docker build -q -t orka-workspace-fiberd:spike provider && docker build -q -t orka-core:spike core"
   # The served supervisor image is pinned by the runtime image's own ID: the
   # home rootfs is built from exactly that image, and nothing pulls it.
   on_host "echo orka-acp-runtime@\$(docker image inspect -f '{{.Id}}' orka-acp-runtime:spike) > supervisor-image"
@@ -97,9 +110,10 @@ case "${1:-}" in
   home) home ;;
   stage1) shift; stage1 "$@" ;;
   stage2) stage2 ;;
+  stage3) on_host "bash stage3.sh ${cluster}" ;;
   memory) on_host "kubectl -n tenant-a exec -i orka-home-grant -- sh < measure/memory.sh" ;;
   baseline) on_host "bash measure/pod-baseline.sh" ;;
   k) shift; k "$@" ;;
   sh) shift; on_host "$*" ;;
-  *) sed -n '2,15p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,16p' "$0" >&2; exit 2 ;;
 esac

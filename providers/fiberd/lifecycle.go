@@ -65,6 +65,13 @@ func (d *Lifecycle) images() []string {
 	return d.fibers.Images()
 }
 
+func (d *Lifecycle) capabilities() []string {
+	if d.fibers == nil {
+		return nil
+	}
+	return d.fibers.Capabilities()
+}
+
 func journalKey(key workspaceprovider.AllocationKey) types.NamespacedName {
 	sum := sha256.Sum256([]byte(key.Namespace + "\x00" + key.Name + "\x00" + string(key.WorkspaceUID)))
 	return types.NamespacedName{Namespace: key.Namespace, Name: "fiberd-workspace-" + hex.EncodeToString(sum[:20])}
@@ -254,7 +261,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 	if err := request.Validate(); err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
-	if err := validateFiberRequest(request, d.images()); err != nil {
+	if err := validateFiberRequest(request, d.images(), d.capabilities()); err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
 	var observed workspaceprovider.AllocationObservation

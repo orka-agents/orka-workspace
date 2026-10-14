@@ -62,18 +62,27 @@ func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateFiberRequest(request, []string{"other@sha256:" + ConformanceImage[len(ConformanceImage)-64:]}); err == nil {
+	if err := validateFiberRequest(request, []string{"other@sha256:" + ConformanceImage[len(ConformanceImage)-64:]}, nil); err == nil {
 		t.Fatal("unserved image was admitted")
 	}
 	pod := *request.DeepCopy()
 	pod.Runtime.RequiredFeatures = []workspacev1alpha1.ExecutionWorkspaceFeature{workspacev1alpha1.WorkspaceFeatureACPRuntime}
-	if err := validateFiberRequest(pod, []string{ConformanceImage}); err == nil {
+	if err := validateFiberRequest(pod, []string{ConformanceImage}, nil); err == nil {
 		t.Fatal("Pod-materialized request was admitted")
 	}
 	downward := *request.DeepCopy()
 	downward.Runtime.Template.Spec.Containers[0].Env = append(downward.Runtime.Template.Spec.Containers[0].Env,
 		corev1.EnvVar{Name: "X", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}})
-	if err := validateFiberRequest(downward, []string{ConformanceImage}); err == nil {
+	if err := validateFiberRequest(downward, []string{ConformanceImage}, nil); err == nil {
 		t.Fatal("downward environment was admitted")
+	}
+	privileged := *request.DeepCopy()
+	privileged.Runtime.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Capabilities: &corev1.Capabilities{Add: []corev1.Capability{"SETUID", "SYS_ADMIN"}}}
+	if err := validateFiberRequest(privileged, []string{ConformanceImage}, []string{"CAP_SETUID"}); err == nil {
+		t.Fatal("capability outside the home's set was admitted")
+	}
+	privileged.Runtime.Template.Spec.Containers[0].SecurityContext.Capabilities.Add = []corev1.Capability{"SETUID"}
+	if err := validateFiberRequest(privileged, []string{ConformanceImage}, []string{"CAP_SETUID"}); err != nil {
+		t.Fatalf("capability inside the home's set was refused: %v", err)
 	}
 }

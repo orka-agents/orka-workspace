@@ -272,7 +272,15 @@ func serveFiber(o options, lastToken *string) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.Dir = "/"
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	// A detached sandbox's stdio is discarded, so keep the supervisor's output
+	// in the instance's own run directory for diagnosis.
+	logPath := filepath.Join("/host", "supervisor-"+strings.ReplaceAll(id.fence, "/", "-")+".log")
+	out := io.Writer(os.Stderr)
+	if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		defer func() { _ = logFile.Close() }()
+		out = io.MultiWriter(os.Stderr, logFile)
+	}
+	cmd.Stdout, cmd.Stderr = out, out
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start supervisor: %w", err)
 	}
@@ -292,7 +300,9 @@ func serveFiber(o options, lastToken *string) error {
 	if launch.Probe {
 		go probe(id, launch, o, upstream)
 	}
-	return cmd.Wait()
+	err = cmd.Wait()
+	fmt.Fprintf(out, "orka-fiber-shim: supervisor exited: %v\n", err)
+	return err
 }
 
 func serveIdle(id *identity) error {
@@ -334,6 +344,9 @@ func supervisorEnv(admitted []string, egressAddr string) []string {
 	}
 	set("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	set("HOME", "/root")
+	// The supervisor requires a real session directory; the read-only rootfs
+	// only links /sessions into the sandbox's tmpfs.
+	set("ORKA_ACP_SESSION_BASE_DIR", "/tmp/sessions")
 	proxy := "http://" + egressAddr
 	for _, name := range []string{"HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"} {
 		set(name, proxy)

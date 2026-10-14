@@ -15,7 +15,7 @@ metadata:
   name: orka-workspace-fiberd
   namespace: orka-workspace-system
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: orka-workspace-fiberd
@@ -35,6 +35,17 @@ spec:
           args:
             - --leader-elect=true
             - --leader-election-namespace=orka-workspace-system
+            # The fiberd home and the issuer key its grants verify against.
+            - --home-namespace=tenant-a
+            - --home-pod=orka-home-grant
+            - --issuer-key-file=/var/run/fiberd/issuer/key.json
+            - --issuer-url=http://grant-issuer.fiberd-system.svc:8080
+            # The pinned supervisor image the home's gVisor rootfs is built from.
+            - --supervisor-images=SUPERVISOR_IMAGE
+          volumeMounts:
+            - name: issuer
+              mountPath: /var/run/fiberd/issuer
+              readOnly: true
           ports:
             - containerPort: 8081
               name: health
@@ -57,3 +68,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+      volumes:
+        - name: issuer
+          secret:
+            secretName: fiberd-issuer-key

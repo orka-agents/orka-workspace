@@ -38,6 +38,8 @@ type HomeConfig struct {
 	TemplateDigest string
 	// SupervisorImages are the images the home's rootfs was built from.
 	SupervisorImages []string
+	// Capabilities are the home's -gvisor-caps, as CAP_ names.
+	Capabilities []string
 	// Lease is each grant's lease. A running fiber ends when it lapses.
 	Lease time.Duration
 }
@@ -100,6 +102,8 @@ func (h *Home) Home(ctx context.Context) (workspaceprovider.PodReference, map[st
 }
 
 func (h *Home) Images() []string { return h.cfg.SupervisorImages }
+
+func (h *Home) Capabilities() []string { return h.cfg.Capabilities }
 
 func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte) (Fiber, error) {
 	// One fiber per grant: fibers of one grant share a run directory that

@@ -26,8 +26,8 @@ import (
 )
 
 type homeFlags struct {
-	namespace, pod, target, nodeID, issuerKey, issuerURL, template, images string
-	lease                                                                  time.Duration
+	namespace, pod, target, nodeID, issuerKey, issuerURL, template, images, caps string
+	lease                                                                        time.Duration
 }
 
 func (h homeFlags) config() provider.HomeConfig {
@@ -41,8 +41,17 @@ func (h homeFlags) config() provider.HomeConfig {
 			images = append(images, image)
 		}
 	}
+	var caps []string
+	for _, c := range strings.Split(h.caps, ",") {
+		if c = strings.ToUpper(strings.TrimSpace(c)); c != "" {
+			if !strings.HasPrefix(c, "CAP_") {
+				c = "CAP_" + c
+			}
+			caps = append(caps, c)
+		}
+	}
 	return provider.HomeConfig{Pod: types.NamespacedName{Namespace: h.namespace, Name: h.pod}, Target: h.target, NodeID: nodeID,
-		IssuerKeyFile: h.issuerKey, IssuerURL: h.issuerURL, TemplateDigest: h.template, SupervisorImages: images, Lease: h.lease}
+		IssuerKeyFile: h.issuerKey, IssuerURL: h.issuerURL, TemplateDigest: h.template, SupervisorImages: images, Capabilities: caps, Lease: h.lease}
 }
 
 func main() {
@@ -60,6 +69,7 @@ func main() {
 	flag.StringVar(&home.issuerURL, "issuer-url", "", "issuer URL the home trusts")
 	flag.StringVar(&home.template, "template-digest", "sha256:orka-acp-supervisor", "template digest every grant names")
 	flag.StringVar(&home.images, "supervisor-images", "", "comma-separated pinned supervisor images the home's rootfs serves")
+	flag.StringVar(&home.caps, "sandbox-capabilities", "CHOWN,KILL,SETGID,SETUID", "the home's -gvisor-caps; requests adding any other capability are refused")
 	flag.DurationVar(&home.lease, "grant-lease", 24*time.Hour, "lease of each per-instance grant")
 	flag.BoolVar(&leaderElection, "leader-elect", true, "elect one active controller")
 	flag.StringVar(&leaderNamespace, "leader-election-namespace", "orka-workspace-system", "namespace for the fiberd provider leader Lease")

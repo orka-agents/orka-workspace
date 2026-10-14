@@ -108,6 +108,10 @@ func (m *MemoryFibers) Home(context.Context) (workspaceprovider.PodReference, ma
 
 func (m *MemoryFibers) Images() []string { return m.Served }
 
+func (m *MemoryFibers) Capabilities() []string {
+	return []string{"CAP_CHOWN", "CAP_KILL", "CAP_SETGID", "CAP_SETUID"}
+}
+
 func random32() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)

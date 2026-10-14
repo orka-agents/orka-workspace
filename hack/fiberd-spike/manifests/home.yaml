@@ -20,5 +20,8 @@ spec:
       - /usr/share/orka-fiber/rootfs
       - -template
       - default=/usr/local/bin/orka-fiber-shim
+      # The supervisor runs each agent under its own uid inside the sandbox.
+      - -gvisor-caps
+      - CHOWN,KILL,SETGID,SETUID
     resources:
       limits: { memory: 6Gi }
