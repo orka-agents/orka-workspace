@@ -142,10 +142,12 @@ Attachment acknowledgement precedes startup and never waits for runtime admissio
 
 Every derived template enforces Data/Data/ColdBoot, including templates that do
 not permit user suspension. Full process memory restore stays closed. A suspend
-profile requires interactive session reuse, an allowed Suspend action, bounded
+profile requires an interactive workspace, an allowed Suspend action, bounded
 expiry, and the admitted mount and environment for `/durable/orka-workspace`,
 with `ORKA_ACP_DURABLE_WORKSPACE_KEY=shared` so a fresh session continues in the
-same retained directory.
+same retained directory. A workspace without a Session keeps that layout, so a
+checkpoint restore into a Delete-on-detach Task works; the bounded expiry covers
+any data it suspends.
 A suspended count cap additionally requires maxLifetime and uses a persistent
 ConfigMap reservation before capture. The provider drains the exact single-Actor
 worker, requests suspension once, verifies a new Data snapshot, copies it to a
@@ -173,6 +175,16 @@ also while desiredState remains Ready during epoch rotation.
 Actor creation intent is also journaled before its RPC. An issued create recovers
 only by observing the Actor; absence without a recorded UID blocks allocation
 and retirement rather than issuing another create.
+A boot request that the native API refuses outright, for example with
+`ResourceExhausted` while the private worker registers, is retried; any other
+outcome stays recorded and is recovered by observation. An allocation without
+process evidence after `--native-boot-timeout` (default 6m, the in-tree window)
+fails. So does a journaled Actor that disappears or leaves `RUNNING` outside the
+lifecycle. A failed allocation withdraws startup, reports the workspace `Failed`
+and never restarts; its retained checkpoints remain available to
+`recoverLastCheckpoint`. Physical cleanup still waits for Core's exact Stop (or
+Suspend) authorization, which drains the worker, deletes the private WorkerPool
+and removes any remaining Actor.
 
 Deletion requires observed termination and Delete disposition for provider
 resources, checkpoints, and storage. Cleanup removes recorded Tags, immutable

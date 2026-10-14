@@ -2,6 +2,7 @@ package substrate
 
 import (
 	"context"
+	"errors"
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,6 +69,9 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		err := workloadErr
 		if workloadErr == nil {
 			observed, err = driver.Observe(ctx, key)
+			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
+				observed, err = driver.recordFailure(ctx, key, lost)
+			}
 		}
 		if (workloadErr != nil && maintenance) || deleted || quarantined || current.Spec.Retirement != nil {
 			// Cleanup uses only this workspace's durable instance fence. A
@@ -94,6 +98,10 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		if err != nil && !missing {
 			operationErr = err
 		}
+		failure := ""
+		if err == nil {
+			failure = driver.failure(ctx, key, observed.Identity)
+		}
 		if disabled && missing {
 			// Disabled skips Ensure, so its missing-journal recovery guard must
 			// independently distinguish no allocation from lost durable evidence.
@@ -109,6 +117,13 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 					if operationErr == nil && deleted && observed.State == workspaceprovider.AllocationStopped && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementDelete) == nil {
 						observed, operationErr = driver.DeleteAllocation(ctx, key, observed.Identity, current.Spec.Lifecycle.DeletionPolicy)
 					}
+				}
+			case failure != "":
+				// A failed instance never restarts and has no new data to capture,
+				// so either exact Stop or Suspend authorization retires it.
+				if !missing && (workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil ||
+					workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil) {
+					observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
 				}
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
 				if !missing && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil {
@@ -127,6 +142,10 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		}
 		if operationErr == nil && !missing && observed.Key != key {
 			operationErr = workspaceprovider.ErrStaleIdentity
+		}
+		if failure == "" && operationErr == nil && !missing {
+			// EnsureAllocation can record the failure during this pass.
+			failure = driver.failure(ctx, key, observed.Identity)
 		}
 		if (workloadErr != nil || disabled) && observed.State == workspaceprovider.AllocationReady {
 			observed.State = workspaceprovider.AllocationPending
@@ -170,6 +189,8 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleting
 			case quarantined && (missing || observed.State == workspaceprovider.AllocationStopped || observed.State == workspaceprovider.AllocationDeleted):
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+			case failure != "" && !quarantined:
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && observed.State == workspaceprovider.AllocationStopped && observed.RetainedData != nil:
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
@@ -182,10 +203,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
 			}
 		}
-		pending = !disabled && operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+		// Failed is terminal; only an authorized cleanup still needs polling.
+		failedIdle := current.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed && (current.Spec.Retirement == nil || observed.State == workspaceprovider.AllocationStopped)
+		pending = !disabled && operationErr == nil && !ready && !failedIdle && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
 		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
-		setLifecycleMilestoneConditions(current, observed, missing, operationErr)
+		setLifecycleMilestoneConditions(current, observed, missing, operationErr, failure)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
 	if err != nil {
@@ -203,7 +226,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 // Provisioned records a durable allocation milestone, independently of startup
 // readiness. Finalized covers provider cleanup; core verifies its credentials
 // and retains sole ownership of the workspace finalizer.
-func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorkspace, observed workspaceprovider.AllocationObservation, missing bool, operationErr error) {
+func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorkspace, observed workspaceprovider.AllocationObservation, missing bool, operationErr error, failure string) {
 	provisioned := !missing && observed.Identity.Valid() &&
 		(observed.State == workspaceprovider.AllocationPending || observed.State == workspaceprovider.AllocationReady || observed.State == workspaceprovider.AllocationStopped)
 	provisionedStatus := conditionStatus(provisioned)
@@ -221,6 +244,10 @@ func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorks
 			provisionedReason = providerOperationFailedReason
 			provisionedMessage = "provider allocation could not be verified: " + operationFailureCause(operationErr)
 		}
+	} else if failure != "" && observed.State != workspaceprovider.AllocationDeleted {
+		provisionedStatus = metav1.ConditionFalse
+		provisionedReason = instanceFailedReason
+		provisionedMessage = operationFailureCause(errors.New(failure))
 	}
 	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: provisionedStatus, Reason: provisionedReason, Message: provisionedMessage, ObservedGeneration: workspace.Generation})
 	finalized := operationErr == nil && workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateDeleted &&
@@ -285,6 +312,7 @@ func chooseMessage(ok bool, success, failure string) string {
 }
 
 const (
+	instanceFailedReason          = "InstanceFailed"
 	providerOperationFailedReason = "ProviderOperationFailed"
 	maxOperationFailureCauseRunes = 256
 )

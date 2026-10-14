@@ -105,6 +105,11 @@ type journalRecord struct {
 	CheckpointCatalog   *catalogReference         `json:"checkpointCatalog,omitempty"`
 	InheritedCatalog    *catalogReference         `json:"inheritedCatalog,omitempty"`
 	DeleteIssued        bool                      `json:"deleteIssued,omitempty"`
+	// StartedAt bounds creation and boot until first process evidence.
+	StartedAt metav1.Time `json:"startedAt,omitempty"`
+	// Failure records an exact-instance loss. The instance never restarts;
+	// Core authorizes its cleanup, and retained checkpoints stay recoverable.
+	Failure string `json:"failure,omitempty"`
 	// SuspendedReservation marks a successor that still holds its suspended
 	// predecessor's retention slot until it first reaches Ready.
 	SuspendedReservation bool                                  `json:"suspendedReservation,omitempty"`
@@ -379,9 +384,12 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 		return fmt.Errorf("native runtime requires delete disposition policy")
 	}
 	if record.SuspendEnabled {
+		// A workspace without a Session still needs the DataOnly layout to
+		// restore a checkpoint. If it is ever suspended, nothing resumes it, so
+		// the retention expiry below bounds that data instead of session reuse.
 		lifecycle := workspace.Spec.Lifecycle
-		if workspace.Spec.Mode != api.ExecutionWorkspaceModeInteractive || workspace.Spec.SessionRef == nil || workspace.Spec.SessionRef.UID == "" || !slices.Contains(lifecycle.AllowedOnDetach, api.WorkspaceOnDetachSuspend) {
-			return fmt.Errorf("native suspension requires interactive session reuse and allowed Suspend")
+		if workspace.Spec.Mode != api.ExecutionWorkspaceModeInteractive || !slices.Contains(lifecycle.AllowedOnDetach, api.WorkspaceOnDetachSuspend) {
+			return fmt.Errorf("native suspension requires an interactive workspace that allows Suspend")
 		}
 		if (lifecycle.IdleTimeout == nil || lifecycle.IdleTimeout.Duration <= 0) && (lifecycle.MaxLifetime == nil || lifecycle.MaxLifetime.Duration <= 0) {
 			return fmt.Errorf("native suspension requires a positive retention expiry")
