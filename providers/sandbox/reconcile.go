@@ -10,6 +10,7 @@ import (
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"strings"
 	"time"
 )
 
@@ -205,13 +206,21 @@ func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorks
 		(observed.State == workspaceprovider.AllocationPending || observed.State == workspaceprovider.AllocationReady || observed.State == workspaceprovider.AllocationStopped)
 	provisionedStatus := conditionStatus(provisioned)
 	provisionedMessage := chooseMessage(provisioned, "durable provider allocation is recorded; startup readiness is independent", "provider allocation is absent or fully deleted")
+	provisionedReason := conditionReason(provisioned, string(workspacev1alpha1.ReasonProgressing))
 	if operationErr != nil || (observed.State == workspaceprovider.AllocationDeleted &&
 		workspaceprovider.ValidateDeletedDisposition(observed.Disposition, workspace.Spec.Lifecycle.DeletionPolicy) != nil) {
 		// An unavailable observation cannot establish physical absence.
 		provisionedStatus = metav1.ConditionUnknown
+		provisionedReason = string(workspacev1alpha1.ReasonProgressing)
 		provisionedMessage = "provider allocation could not be verified; the last instance fence is preserved"
+		if operationErr != nil {
+			// Operators otherwise see only a stalled allocation; the cause is
+			// in provider logs alone.
+			provisionedReason = providerOperationFailedReason
+			provisionedMessage = "provider allocation could not be verified: " + operationFailureCause(operationErr)
+		}
 	}
-	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: provisionedStatus, Reason: conditionReason(provisionedStatus == metav1.ConditionTrue, string(workspacev1alpha1.ReasonProgressing)), Message: provisionedMessage, ObservedGeneration: workspace.Generation})
+	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: provisionedStatus, Reason: provisionedReason, Message: provisionedMessage, ObservedGeneration: workspace.Generation})
 	finalized := operationErr == nil && workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateDeleted &&
 		workspaceprovider.ValidateDeletedDisposition(workspace.Status.Disposition, workspace.Spec.Lifecycle.DeletionPolicy) == nil
 	finalizedReason := conditionReason(finalized, string(workspacev1alpha1.ReasonProgressing))
@@ -271,4 +280,18 @@ func chooseMessage(ok bool, success, failure string) string {
 		return success
 	}
 	return failure
+}
+
+const (
+	providerOperationFailedReason = "ProviderOperationFailed"
+	maxOperationFailureCauseRunes = 256
+)
+
+// operationFailureCause renders a provider error as one bounded status line.
+func operationFailureCause(err error) string {
+	cause := []rune(strings.Join(strings.Fields(err.Error()), " "))
+	if len(cause) > maxOperationFailureCauseRunes {
+		cause = append(cause[:maxOperationFailureCauseRunes-1], '…')
+	}
+	return string(cause)
 }
