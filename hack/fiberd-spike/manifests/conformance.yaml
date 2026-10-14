@@ -1,0 +1,51 @@
+# Stage 2: provider lifecycle and replacement conformance on the real home.
+# Journals use an in-process fake client; fibers, grants and challenges are real.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fiberd-conformance
+  namespace: tenant-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fiberd-conformance
+  namespace: tenant-a
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fiberd-conformance
+  namespace: tenant-a
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: fiberd-conformance }
+subjects: [{ kind: ServiceAccount, name: fiberd-conformance, namespace: tenant-a }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fiberd-conformance
+  namespace: tenant-a
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: fiberd-conformance
+      restartPolicy: Never
+      containers:
+        - name: conformance
+          image: orka-workspace-fiberd:spike
+          imagePullPolicy: Never
+          args:
+            - --conformance
+            - --conformance-home
+            - --home-namespace=tenant-a
+            - --home-pod=orka-home-grant
+            - --issuer-key-file=/issuer/key.json
+            - --issuer-url=http://grant-issuer.fiberd-system.svc:8080
+            - --supervisor-images=SUPERVISOR_IMAGE
+          volumeMounts: [{ name: issuer, mountPath: /issuer, readOnly: true }]
+      volumes: [{ name: issuer, secret: { secretName: fiberd-issuer-key } }]

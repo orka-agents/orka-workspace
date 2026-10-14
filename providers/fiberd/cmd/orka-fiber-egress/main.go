@@ -25,7 +25,7 @@ import (
 func main() {
 	runDir := flag.String("run-dir", "/var/lib/fiberd/run", "fiberd's run directory, one subdirectory per grant")
 	name := flag.String("socket", "egress.sock", "socket name in each grant directory")
-	allow := flag.String("allow", "", "comma-separated host:port destinations; empty allows none")
+	allow := flag.String("allow", "", "comma-separated host:port destinations; a host may start with *. and a port may be *; empty allows none")
 	flag.Parse()
 	allowed := map[string]bool{}
 	for _, entry := range strings.Split(*allow, ",") {
@@ -75,6 +75,25 @@ func main() {
 	}
 }
 
+// permitted matches host:port against exact entries, "*.suffix" hosts and
+// "*" ports.
+func permitted(allowed map[string]bool, target string) bool {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	for entry := range allowed {
+		h, p, err := net.SplitHostPort(entry)
+		if err != nil || (p != "*" && p != port) {
+			continue
+		}
+		if h == host || (strings.HasPrefix(h, "*.") && strings.HasSuffix(host, h[1:])) {
+			return true
+		}
+	}
+	return false
+}
+
 func serve(ln net.Listener, grant string, allowed map[string]bool) {
 	for {
 		c, err := ln.Accept()
@@ -100,7 +119,7 @@ func handle(c net.Conn, grant string, allowed map[string]bool) {
 		return
 	}
 	target := strings.ToLower(req.Host)
-	if !allowed[target] {
+	if !permitted(allowed, target) {
 		log.Printf("grant %s: denied CONNECT %s", grant, target)
 		_, _ = fmt.Fprint(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
 		return

@@ -34,6 +34,7 @@ manifests: controller-gen
 check-generated: controller-gen
 	bash scripts/check-generated.sh "$(CONTROLLER_GEN)"
 	bash providers/fake/check-generated.sh "$(CONTROLLER_GEN)"
+	bash providers/fiberd/check-generated.sh "$(CONTROLLER_GEN)"
 	bash scripts/check-provider-generated.sh "$(CONTROLLER_GEN)" sandbox
 	bash scripts/check-provider-generated.sh "$(CONTROLLER_GEN)" substrate
 

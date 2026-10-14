@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -49,6 +50,7 @@ type options struct {
 	egressSock  string
 	egressAddr  string
 	writable    string
+	hostsFile   string
 	dialWait    time.Duration
 }
 
@@ -60,6 +62,7 @@ func main() {
 	flag.StringVar(&o.egressSock, "egress-socket", "/host/egress.sock", "home egress proxy socket")
 	flag.StringVar(&o.egressAddr, "egress-listen", "127.0.0.1:3128", "loopback address bridged to the egress socket")
 	flag.StringVar(&o.writable, "writable", "/tmp/root,/tmp/run,/tmp/sessions", "tmpfs directories prepared before the template checkpoint")
+	flag.StringVar(&o.hostsFile, "hosts-file", "/tmp/run/hosts", "writable hosts file the rootfs /etc/hosts links to")
 	flag.DurationVar(&o.dialWait, "dial-wait", 15*time.Second, "how long a bridged connection waits for the supervisor listener")
 	flag.Parse()
 	if err := run(o); err != nil {
@@ -79,6 +82,9 @@ func run(o options) error {
 				return err
 			}
 		}
+	}
+	if err := os.WriteFile(o.hostsFile, []byte(baseHosts), 0o644); err != nil {
+		return err
 	}
 	f, err := os.OpenFile(warmMarker, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -245,6 +251,11 @@ func serveFiber(o options, lastToken *string) error {
 		return err
 	}
 	env := supervisorEnv(launch.Env, o.egressAddr)
+	// The supervisor's Core clients ignore proxy variables by design, so
+	// every admitted URL host resolves to a loopback forwarder instead.
+	if err := forwardURLHosts(env, o.hostsFile, o.egressSock); err != nil {
+		return fmt.Errorf("url forwarders: %w", err)
+	}
 	upstream := o.upstream
 	if listen := envValue(env, "ORKA_ACP_LISTEN_ADDRESS"); listen != "" {
 		upstream = loopbackOf(listen)
@@ -375,6 +386,89 @@ func bridgeEndpoint(ln net.Listener, upstream string, wait time.Duration) {
 			}
 		}()
 	}
+}
+
+const baseHosts = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+
+// forwardURLHosts gives each non-loopback host named by an http(s) URL in env
+// its own loopback address in the hosts file and listens there on the URL's
+// port. Each connection is tunnelled with CONNECT through the home's egress
+// proxy to the original host:port, so TLS server names stay unchanged.
+func forwardURLHosts(env []string, hostsFile, egressSock string) error {
+	hosts := map[string]string{}
+	ports := map[string]map[string]bool{}
+	for _, entry := range env {
+		_, value, _ := strings.Cut(entry, "=")
+		u, err := url.Parse(strings.TrimSpace(value))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			continue
+		}
+		host := u.Hostname()
+		if host == "localhost" || net.ParseIP(host) != nil {
+			continue
+		}
+		port := u.Port()
+		if port == "" {
+			port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+		}
+		if hosts[host] == "" {
+			hosts[host] = fmt.Sprintf("127.0.1.%d", len(hosts)+1)
+			ports[host] = map[string]bool{}
+		}
+		ports[host][port] = true
+	}
+	lines := baseHosts
+	for host, ip := range hosts {
+		lines += ip + "\t" + host + "\n"
+		for port := range ports[host] {
+			ln, err := net.Listen("tcp", net.JoinHostPort(ip, port))
+			if err != nil {
+				return err
+			}
+			go tunnel(ln, egressSock, net.JoinHostPort(host, port))
+		}
+	}
+	return os.WriteFile(hostsFile, []byte(lines), 0o644)
+}
+
+func tunnel(ln net.Listener, sock, target string) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			u, err := net.DialTimeout("unix", sock, 5*time.Second)
+			if err != nil {
+				_ = c.Close()
+				return
+			}
+			if _, err := fmt.Fprintf(u, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+				_ = c.Close()
+				_ = u.Close()
+				return
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(&byteReader{u}), &http.Request{Method: http.MethodConnect})
+			if err != nil || resp.StatusCode != http.StatusOK {
+				fmt.Fprintf(os.Stderr, "orka-fiber-shim: CONNECT %s refused: %v %v\n", target, err, resp)
+				_ = c.Close()
+				_ = u.Close()
+				return
+			}
+			splice(c, u)
+		}()
+	}
+}
+
+// byteReader keeps bufio from reading past the CONNECT response, so the
+// tunnelled stream starts exactly after its blank line.
+type byteReader struct{ c net.Conn }
+
+func (r *byteReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return r.c.Read(p[:1])
 }
 
 func bridgeEgress(ln net.Listener, sock string) {

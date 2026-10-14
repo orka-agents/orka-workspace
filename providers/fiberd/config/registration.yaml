@@ -1,0 +1,22 @@
+apiVersion: fiberd.workspace.orka.ai/v1alpha1
+kind: FiberdProviderConfig
+metadata:
+  name: fiberd
+---
+apiVersion: workspace.orka.ai/v1alpha1
+kind: ExecutionWorkspaceProvider
+metadata:
+  name: fiberd
+spec:
+  controllerName: fiberd.workspace.orka.ai
+  serviceAccountRef:
+    namespace: orka-workspace-system
+    name: orka-workspace-fiberd
+  lifecycleState: Active
+  requiredContracts:
+    - workspace.orka.ai/v1
+    - orka.workspace.lifecycle.v1
+  parametersRef:
+    group: fiberd.workspace.orka.ai
+    kind: FiberdProviderConfig
+    name: fiberd
