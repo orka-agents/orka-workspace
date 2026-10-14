@@ -179,7 +179,12 @@ func (r *CheckpointReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if !record.SuspendEnabled {
 			return r.phase(ctx, checkpoint, "Failed", "UnsupportedSource", "checkpoint export requires a DataOnly workspace")
 		}
-		recovery := checkpoint.Spec.RecoverLastCheckpoint && (workspace.Status.State == api.ExecutionWorkspaceStateFailed || workspace.Status.State == api.ExecutionWorkspaceStateQuarantined)
+		failedSource := workspace.Status.State == api.ExecutionWorkspaceStateFailed || workspace.Status.State == api.ExecutionWorkspaceStateQuarantined
+		recovery := checkpoint.Spec.RecoverLastCheckpoint && failedSource
+		if failedSource && !recovery {
+			// A failed source never suspends again; only explicit recovery exports it.
+			return r.phase(ctx, checkpoint, "Pending", "AwaitingSuspension", "waiting for idle DataOnly suspension; failed work requires explicit recovery")
+		}
 		selected, ref := record.Checkpoint, record.CheckpointCatalog
 		if recovery && selected == nil {
 			selected, ref = record.InheritedCheckpoint, record.InheritedCatalog
