@@ -438,8 +438,11 @@ func (d *Lifecycle) failure(ctx context.Context, key sdk.AllocationKey, identity
 	if errors.Is(err, sdk.ErrNotFound) {
 		return "", fmt.Errorf("native journal disappeared during observation")
 	}
-	if err != nil || record.Observation.Identity != identity {
+	if err != nil {
 		return "", err
+	}
+	if record.Observation.Identity != identity {
+		return "", sdk.ErrStaleIdentity
 	}
 	return record.Failure, nil
 }
