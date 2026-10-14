@@ -33,19 +33,22 @@ type ProviderReconciler struct {
 }
 
 // backendServed reports false only when discovery definitively says a pinned
-// backend API is not served. Other errors keep the previous advertisement until
-// its heartbeat expires, so a transient discovery failure cannot close admission.
+// backend API is not served; that answer wins over a transient error for
+// another group. Transient errors alone keep the previous advertisement until
+// its heartbeat expires, so a discovery blip cannot close admission.
 func (r *ProviderReconciler) backendServed() (bool, error) {
 	if r.Discovery == nil {
 		return true, nil
 	}
+	var transient error
 	for groupVersion, resources := range backendResources {
 		list, err := r.Discovery.ServerResourcesForGroupVersion(groupVersion)
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
 		if err != nil {
-			return false, err
+			transient = err
+			continue
 		}
 		for _, name := range resources {
 			if !slices.ContainsFunc(list.APIResources, func(resource metav1.APIResource) bool { return resource.Name == name }) {
@@ -53,7 +56,7 @@ func (r *ProviderReconciler) backendServed() (bool, error) {
 			}
 		}
 	}
-	return true, nil
+	return transient == nil, transient
 }
 
 func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
