@@ -139,9 +139,14 @@ Keep the controller and native backend running until all owned allocations retir
 Core closes runtime admission and completes exact authenticated drain before
 publishing retirement. A lost Pod-backed supervisor can retire after Core is
 quiescent and independently proves its persisted exact Pod UID is absent.
-Provider status and infrastructure-worker absence cannot establish that exception
-for a native process. The provider observes termination and records data
-disposition. Core then removes its credentials and endpoint policies and releases
+Infrastructure-worker absence cannot establish that exception for a native
+process. Instead, a provider that has authoritative native evidence of the exact
+instance's loss, or that gave up on a boot that never produced process evidence,
+reports the workspace `Failed` with startup withdrawn and never restarts it. Core
+then writes an exact `Stop` retirement without a drain and releases credentials
+only after the provider reports that instance `Stopped`; the provider performs
+physical cleanup only under that authorization. The provider observes
+termination and records data disposition. Core then removes its credentials and endpoint policies and releases
 its finalizers. A missing response or changed identity leaves cleanup pending.
 Provider journals remain until workspace finalization. Retained checkpoint
 artifacts have their own references and must be released separately.
