@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -8,7 +9,10 @@ import (
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	fakediscovery "k8s.io/client-go/discovery/fake"
+	clienttesting "k8s.io/client-go/testing"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,6 +54,72 @@ func TestProviderAdvertisementPinsConfigAndSupportedContracts(t *testing.T) {
 	}
 	if provider.Status.PinnedParametersUID != "config" || len(provider.Status.SupportedContracts) != 0 || provider.Status.LastHeartbeat != nil {
 		t.Fatal("same-name replacement config was repinned or advertised")
+	}
+}
+
+func servedBackend() []*metav1.APIResourceList {
+	return []*metav1.APIResourceList{
+		{GroupVersion: "agents.x-k8s.io/v1beta1", APIResources: []metav1.APIResource{{Name: "sandboxes"}}},
+		{GroupVersion: "extensions.agents.x-k8s.io/v1beta1", APIResources: []metav1.APIResource{{Name: "sandboxclaims"}, {Name: "sandboxtemplates"}, {Name: "sandboxwarmpools"}}},
+	}
+}
+
+func TestProviderAdvertisementRequiresServedBackendAPIs(t *testing.T) {
+	c, _ := fixture(t, false)
+	config := &profilev1alpha1.SandboxProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", UID: "config"}}
+	if err := c.Create(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: "sandbox"}, provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.ParametersRef = workspacev1alpha1.TypedObjectReference{Group: profilev1alpha1.GroupVersion.Group, Kind: "SandboxProviderConfig", Name: config.Name}
+	if err := c.Update(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakediscovery.FakeDiscovery{Fake: &clienttesting.Fake{Resources: servedBackend()}}
+	r := &ProviderReconciler{Client: c, Discovery: backend}
+	advertised := func(t *testing.T) bool {
+		t.Helper()
+		if err := c.Get(t.Context(), client.ObjectKeyFromObject(provider), provider); err != nil {
+			t.Fatal(err)
+		}
+		return provider.Status.LastHeartbeat != nil && len(provider.Status.SupportedFeatures) != 0
+	}
+	reconcile := func(t *testing.T) {
+		t.Helper()
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile(t)
+	if !advertised(t) {
+		t.Fatal("served backend was not advertised")
+	}
+	withoutTemplates := servedBackend()
+	withoutTemplates[1].APIResources = withoutTemplates[1].APIResources[:1]
+	for name, resources := range map[string][]*metav1.APIResourceList{"missing resource": withoutTemplates, "missing group version": servedBackend()[:1]} {
+		backend.Resources = resources
+		reconcile(t)
+		if advertised(t) || provider.Status.Backend != nil {
+			t.Fatalf("%s: provider advertised an unserved backend", name)
+		}
+		backend.Resources = servedBackend()
+		reconcile(t)
+		if !advertised(t) {
+			t.Fatalf("%s: restored backend was not advertised", name)
+		}
+	}
+	heartbeat := provider.Status.LastHeartbeat.DeepCopy()
+	backend.PrependReactor("*", "*", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("discovery unavailable")
+	})
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err == nil {
+		t.Fatal("transient discovery failure was hidden")
+	}
+	if !advertised(t) || !provider.Status.LastHeartbeat.Equal(heartbeat) {
+		t.Fatal("transient discovery failure withdrew the advertisement")
 	}
 }
 
