@@ -23,6 +23,9 @@ type Config struct {
 	APIEndpoint, CAFile, CertFile, KeyFile, BearerTokenFile string
 	ActorDNSSuffix                                          string
 	DirectEgressEnabled                                     bool
+	// BootTimeout bounds native creation and boot before first process
+	// evidence. Zero selects defaultNativeBootTimeout.
+	BootTimeout time.Duration
 }
 
 func (c Config) Validate() error {
@@ -37,6 +40,9 @@ func (c Config) Validate() error {
 	}
 	if !c.DirectEgressEnabled {
 		return fmt.Errorf("native ACP requires operator-configured direct egress")
+	}
+	if c.BootTimeout < 0 {
+		return fmt.Errorf("native boot timeout must not be negative")
 	}
 	return nil
 }

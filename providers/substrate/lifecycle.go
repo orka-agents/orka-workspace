@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -24,7 +25,7 @@ func newRecord(request sdk.WorkloadRequest) (*journalRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, NetworkPolicy: nativeReference{Name: id + "-network"}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
+	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", StartedAt: metav1.Now(), Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, NetworkPolicy: nativeReference{Name: id + "-network"}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
 }
 
 func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRequest) (sdk.AllocationObservation, error) {
@@ -56,7 +57,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 				return sdk.ErrRequestConflict
 			}
 			observed = record.Observation
-			if record.Operation != "ensure" {
+			if record.Operation != "ensure" || record.Failure != "" {
 				return nil
 			}
 		}
@@ -145,6 +146,10 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		if err := d.requireJournal(ctx, cm, record); err != nil {
 			return err
 		}
+		if record.ChallengeSHA256 == "" && !record.StartedAt.IsZero() && time.Since(record.StartedAt.Time) > d.bootTimeout() {
+			observed, err = d.fail(ctx, cm, record, fmt.Sprintf("native allocation produced no process evidence within %s; the creation intent is preserved for exact cleanup and explicit recovery", d.bootTimeout()))
+			return err
+		}
 		if err := d.importCheckpoint(ctx, cm, record); err != nil {
 			return err
 		}
@@ -155,6 +160,10 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			return err
 		}
 		if err := d.ensureNative(ctx, cm, record); err != nil {
+			var lost *nativeInstanceLostError
+			if errors.As(err, &lost) {
+				observed, err = d.fail(ctx, cm, record, lost.reason)
+			}
 			return err
 		}
 		actor, err := d.actor(ctx, record)
@@ -197,6 +206,10 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		}
 		observed, err = d.observeReady(ctx, record)
 		if err != nil {
+			var lost *nativeInstanceLostError
+			if errors.As(err, &lost) {
+				observed, err = d.fail(ctx, cm, record, lost.reason)
+			}
 			return err
 		}
 		record.Observation = observed
@@ -258,7 +271,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 	}
 	if actor == nil {
 		if record.Actor.UID != "" {
-			return fmt.Errorf("recorded native Actor disappeared; uncertain work is never replayed")
+			return lostInstance(record, nativeActorDisappeared)
 		}
 		if record.Actor.CreateIssued {
 			return fmt.Errorf("native Actor creation was already issued without an observed lifetime; uncertain work is never replayed")
@@ -322,12 +335,102 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 			return err
 		}
 		_, err = d.control.ResumeActor(ctx, &pb.ResumeActorRequest{Actor: actorRef(record), Boot: record.InheritedCheckpoint == nil})
+		if nativeBootRejected(err) {
+			// The API refused this request before applying it, so the Actor is
+			// still suspended and a later request cannot replay a boot.
+			record.BootRequested = false
+			if saveErr := d.save(ctx, cm, record); saveErr != nil {
+				return saveErr
+			}
+		}
 		return err
 	}
 	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED || record.ChallengeSHA256 != "" && actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
-		return fmt.Errorf("native boot stopped outside the lifecycle; admission is closed")
+		return lostInstance(record, nativeActorStopped)
 	}
 	return nil
+}
+
+// defaultNativeBootTimeout matches the in-tree recovery window: the larger
+// of three claim timeouts (2m each) and six minutes.
+const defaultNativeBootTimeout = 6 * time.Minute
+
+const (
+	nativeActorDisappeared = "the recorded native Actor disappeared; retained checkpoints are available for explicit recovery, but uncertain work is never replayed"
+	nativeActorStopped     = "the native Actor stopped outside the recorded lifecycle; admission is closed and uncertain work is never replayed"
+)
+
+func (d *Lifecycle) bootTimeout() time.Duration {
+	if d.config.BootTimeout > 0 {
+		return d.config.BootTimeout
+	}
+	return defaultNativeBootTimeout
+}
+
+// nativeInstanceLostError reports authoritative native evidence that the exact
+// recorded instance can never run again.
+type nativeInstanceLostError struct {
+	identity sdk.InstanceIdentity
+	reason   string
+}
+
+func (e *nativeInstanceLostError) Error() string { return e.reason }
+
+func lostInstance(record *journalRecord, reason string) error {
+	return &nativeInstanceLostError{identity: record.Observation.Identity, reason: reason}
+}
+
+// These codes refuse a request before it takes effect. Any other outcome may
+// have started the boot and stays recorded as requested.
+func nativeBootRejected(err error) bool {
+	switch status.Code(err) {
+	case codes.ResourceExhausted, codes.PermissionDenied, codes.Unauthenticated:
+		return true
+	default:
+		return false
+	}
+}
+
+// fail records a terminal exact-instance failure. Startup evidence is
+// withdrawn; physical cleanup waits for Core's exact Stop authorization.
+func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) (sdk.AllocationObservation, error) {
+	if record.Failure == "" {
+		record.Failure = reason
+		record.Observation = pendingObservation(record)
+		if err := d.save(ctx, cm, record); err != nil {
+			return sdk.AllocationObservation{}, err
+		}
+	}
+	return record.Observation, nil
+}
+
+// recordFailure persists an exact-instance loss found by read-only observation.
+func (d *Lifecycle) recordFailure(ctx context.Context, key sdk.AllocationKey, lost *nativeInstanceLostError) (sdk.AllocationObservation, error) {
+	var observed sdk.AllocationObservation
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		cm, record, err := d.read(ctx, key)
+		if err != nil {
+			return err
+		}
+		if record.Observation.Identity != lost.identity {
+			return sdk.ErrStaleIdentity
+		}
+		if record.Operation != "ensure" {
+			return lost
+		}
+		observed, err = d.fail(ctx, cm, record, lost.reason)
+		return err
+	})
+	return observed, err
+}
+
+// failure reports the recorded terminal failure of the observed instance.
+func (d *Lifecycle) failure(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) string {
+	_, record, err := d.read(ctx, key)
+	if err != nil || record.Observation.Identity != identity {
+		return ""
+	}
+	return record.Failure
 }
 
 func (d *Lifecycle) Observe(ctx context.Context, key sdk.AllocationKey) (sdk.AllocationObservation, error) {
@@ -338,7 +441,7 @@ func (d *Lifecycle) Observe(ctx context.Context, key sdk.AllocationKey) (sdk.All
 	if err := d.requireJournalReadOnly(ctx, cm, record); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
-	if record.Operation == "ensure" {
+	if record.Operation == "ensure" && record.Failure == "" {
 		return d.observeReady(ctx, record)
 	}
 	return record.Observation, nil

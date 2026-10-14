@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	provider "github.com/orka-agents/orka-workspace/providers/substrate"
@@ -32,6 +33,7 @@ func main() {
 	flag.StringVar(&config.BearerTokenFile, "native-token-file", "", "rotating control bearer token file")
 	flag.StringVar(&config.ActorDNSSuffix, "actor-dns-suffix", "actors.resources.substrate.ate.dev", "DNS suffix routed directly to native actor router")
 	flag.BoolVar(&config.DirectEgressEnabled, "native-direct-egress", false, "acknowledge provider egress gateway disabled and WorkerPool NetworkPolicy enforcement")
+	flag.DurationVar(&config.BootTimeout, "native-boot-timeout", 6*time.Minute, "fail a native allocation that has no process evidence after this long")
 	options := zap.Options{}
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()

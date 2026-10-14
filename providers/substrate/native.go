@@ -508,11 +508,11 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	if err != nil {
 		return sdk.AllocationObservation{}, err
 	}
-	if actor == nil || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
-		if record.ChallengeSHA256 != "" {
-			return sdk.AllocationObservation{}, fmt.Errorf("recorded native Actor stopped; uncertain work cannot be replayed")
-		}
-		return pendingObservation(record), nil
+	if actor == nil {
+		return sdk.AllocationObservation{}, lostInstance(record, nativeActorDisappeared)
+	}
+	if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+		return sdk.AllocationObservation{}, lostInstance(record, nativeActorStopped)
 	}
 	if actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
 		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
