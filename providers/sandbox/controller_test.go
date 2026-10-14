@@ -135,6 +135,14 @@ func TestProviderAdvertisementRequiresServedBackendAPIs(t *testing.T) {
 	if !advertised(t) || !provider.Status.LastHeartbeat.Equal(heartbeat) {
 		t.Fatal("transient discovery failure withdrew the advertisement")
 	}
+	// A definitively invalid configuration is withdrawn even while discovery fails.
+	if err := c.Delete(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(t)
+	if advertised(t) {
+		t.Fatal("transient discovery failure preserved an invalid configuration's advertisement")
+	}
 }
 
 // groupDiscovery answers each group version independently.

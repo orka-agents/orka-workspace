@@ -81,13 +81,17 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			configured = config.DeletionTimestamp == nil && configUID != "" && (provider.Status.PinnedParametersUID == "" || provider.Status.PinnedParametersUID == configUID)
 		}
 	}
-	served, err := r.backendServed()
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if configured && !served {
-		ctrl.LoggerFrom(ctx).Info("withholding provider advertisement: pinned agent-sandbox APIs are not served")
-		configured = false
+	// Discovery can only withhold a valid configuration; an invalid one is
+	// withdrawn below even while discovery is failing.
+	if configured {
+		served, err := r.backendServed()
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !served {
+			ctrl.LoggerFrom(ctx).Info("withholding provider advertisement: pinned agent-sandbox APIs are not served")
+			configured = false
+		}
 	}
 	before := provider.DeepCopy()
 	provider.Status.ObservedGeneration = 0
