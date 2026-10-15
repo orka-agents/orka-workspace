@@ -116,6 +116,9 @@ design, not something a provider can fix.
   endpoint refused connections.
 - Direct egress and DNS fail inside a fiber. A CONNECT proxy on a socket in the
   run directory works with an allowlist. The allowlist is coarse (`*.svc`).
+- The grant directory is writable by every fiber of the grant. Any root
+  process on the home that touches a path there must not follow symlinks. The
+  spike's egress proxy did so, and review caught it.
 - The provider admits only what a sandbox holds:
   - uid 0, and no `runAsNonRoot`
   - the home's exact capability set
@@ -293,7 +296,7 @@ Sampled from the kind node's cgroups during one Task, twice per provider:
 
 ## Code review findings
 
-Automated review on the PR raised 18 comments covering 16 issues. All were
+Automated review on the PR raised 19 comments covering 17 issues. All were
 assessed against the code. Unit tests cover the lifecycle and validation fixes,
 and the shim and harness fixes were verified on the live cluster.
 
@@ -313,6 +316,7 @@ and the shim and harness fixes were verified on the live cluster.
 | `HTTP_PROXY` pointed plain HTTP clients at a CONNECT-only proxy | Only `HTTPS_PROXY` is set. |
 | The timed proof's blocking challenge read biased fiberd's timings | The read is opt-in and off for timed runs. The comparison was rerun, which reversed two earlier conclusions. |
 | A host-load sentence overstated the Stage 1 control | Qualified by mode. |
+| The root egress proxy chmodded its socket in the fiber-writable grant directory, so a swapped-in symlink could make a home file world-writable | The socket's mode is set at bind through the umask, and no path in a grant directory is chmodded. Test added; verified live. |
 | Stage 1 passed when a released supervisor still served | A still-healthy endpoint now counts as a failure. |
 | Stage 2 exited 0 when its conformance Job failed | The wait status propagates after the logs print. |
 

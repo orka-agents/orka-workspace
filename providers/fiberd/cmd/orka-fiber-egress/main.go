@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -52,11 +53,10 @@ func main() {
 			}
 			path := filepath.Join(dir, *name)
 			_ = os.Remove(path)
-			ln, err := net.Listen("unix", path)
+			ln, err := listenWorldWritable(path)
 			if err != nil {
 				continue
 			}
-			_ = os.Chmod(path, 0o666)
 			mu.Lock()
 			serving[dir] = ln
 			mu.Unlock()
@@ -73,6 +73,17 @@ func main() {
 		mu.Unlock()
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// listenWorldWritable binds a unix socket that fibers, which run as other
+// users, can connect to. The grant directory is fiber-writable, so the mode
+// is set by bind itself: a later chmod of the path could follow a symlink a
+// fiber swapped in and change a file outside the grant. This process
+// creates no other files, so changing its umask briefly is safe.
+func listenWorldWritable(path string) (net.Listener, error) {
+	old := syscall.Umask(0o111)
+	defer syscall.Umask(old)
+	return net.Listen("unix", path)
 }
 
 // permitted matches host:port against exact entries, "*.suffix" hosts and
