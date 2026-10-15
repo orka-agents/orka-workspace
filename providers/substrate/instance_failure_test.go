@@ -346,6 +346,34 @@ func TestUnreadableFailureRecordNeverSelectsSuspensionOrLiveState(t *testing.T) 
 	}
 }
 
+func TestActiveAttachmentNeverHidesFailedStateFromAnUnreadableJournal(t *testing.T) {
+	c, native, request := fixture(t, false)
+	ready(t, c, native, request)
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	workspace := reconcileFailureFixture(t, c, native, request)
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("lost instance reported %s", workspace.Status.State)
+	}
+	// Core has not yet revoked the attachment; admission stays current.
+	workspace.Spec.Attachment = &api.ExecutionWorkspaceAttachment{Epoch: 1}
+	workspace.Spec.AttachmentEpoch = 1
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key), skip: 1}
+	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil || !flaky.fired {
+		t.Fatalf("unreadable failure record was hidden: fired=%v err=%v", flaky.fired, err)
+	}
+	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil || workspace.Status.State != api.ExecutionWorkspaceStateFailed || workspace.Status.AttachedEpoch != 1 {
+		t.Fatalf("attachment acknowledgement replaced Failed with %s (epoch %d): %v", workspace.Status.State, workspace.Status.AttachedEpoch, err)
+	}
+}
+
 func TestFailedInstanceDoesNotPollStaleRetirement(t *testing.T) {
 	c, native, request := fixture(t, true)
 	identity := ready(t, c, native, request).Identity

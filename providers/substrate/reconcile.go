@@ -51,7 +51,8 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		current.Status.AttachedEpoch = 0
 		if workloadErr == nil && admitted && provider.Spec.LifecycleState != workspacev1alpha1.ExecutionWorkspaceProviderDisabled && !deleted && !quarantined && current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredReady && current.Spec.Attachment != nil {
 			current.Status.AttachedEpoch = workspaceprovider.AttachmentEpochAcknowledgement(current)
-			if current.Status.AttachedEpoch > 0 {
+			// Failed stays terminal; this pass's later failure guards read it.
+			if current.Status.AttachedEpoch > 0 && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateFailed {
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateAttached
 			}
 		}
