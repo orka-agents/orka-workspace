@@ -52,7 +52,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 				return workspaceprovider.ErrRequestConflict
 			}
 			observed = record.Observation
-			if record.Operation != "ensure" {
+			if record.Operation != "ensure" || record.Failure != "" {
 				return nil
 			}
 		}
@@ -186,6 +186,13 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		if err := d.requireJournal(ctx, cm, record); err != nil {
 			return err
 		}
+		if err := d.exactPodLost(ctx, record); err != nil {
+			var lost *runtimeLostError
+			if errors.As(err, &lost) {
+				observed, err = d.fail(ctx, cm, record, lost.reason)
+			}
+			return err
+		}
 		if request.Sequence > 1 && record.Sandbox.UID != "" {
 			if err := d.resume(ctx, cm, record); err != nil {
 				return err
@@ -236,6 +243,10 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request workspaceprovi
 		}
 		observed, err = d.observeReady(ctx, record)
 		if err != nil {
+			var lost *runtimeLostError
+			if errors.As(err, &lost) {
+				observed, err = d.fail(ctx, cm, record, lost.reason)
+			}
 			return err
 		}
 		record.Observation = observed
@@ -286,6 +297,12 @@ func (d *Lifecycle) attestPod(ctx context.Context, record *journalRecord, sb *sa
 }
 
 func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (workspaceprovider.AllocationObservation, error) {
+	// Loss of the exact Pod wins over every readiness check: agent-sandbox
+	// replaces a lost Pod, and the replacement would otherwise read as a
+	// stale identity forever.
+	if err := d.exactPodLost(ctx, record); err != nil {
+		return workspaceprovider.AllocationObservation{}, err
+	}
 	if err := d.validateWorkspaceLifecycle(ctx, record, record.Volume != nil); err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
@@ -334,7 +351,7 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 			return workspaceprovider.AllocationObservation{}, err
 		}
 	}
-	if record.Operation == "ensure" {
+	if record.Operation == "ensure" && record.Failure == "" {
 		return d.observeReady(ctx, record)
 	}
 	if record.Operation == "suspend" {
@@ -349,6 +366,96 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 		}
 	}
 	return record.Observation, nil
+}
+
+// runtimeLostError reports authoritative evidence that the exact journaled
+// runtime Pod can never serve again.
+type runtimeLostError struct {
+	identity workspaceprovider.InstanceIdentity
+	reason   string
+}
+
+func (e *runtimeLostError) Error() string { return e.reason }
+
+// exactPodLost checks the journaled runtime Pod by UID. The client is
+// uncached, so absence is authoritative, and restartPolicy Never makes a
+// terminal phase or a container restart permanent.
+func (d *Lifecycle) exactPodLost(ctx context.Context, record *journalRecord) error {
+	if record.Pod == nil {
+		return nil
+	}
+	pod := &corev1.Pod{}
+	err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Pod.Namespace, Name: record.Pod.Name}, pod)
+	reason := ""
+	switch {
+	case apierrors.IsNotFound(err):
+		reason = "runtime Pod disappeared"
+	case err != nil:
+		return err
+	case pod.UID != record.Pod.UID:
+		reason = "runtime Pod was replaced"
+	case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded:
+		reason = "runtime Pod terminated"
+	default:
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.RestartCount > 0 {
+				reason = "runtime process restarted within the same Pod"
+			}
+		}
+	}
+	if reason == "" {
+		return nil
+	}
+	return &runtimeLostError{identity: record.Observation.Identity, reason: reason + "; uncertain work is never replayed"}
+}
+
+// fail records a terminal exact-instance failure. Startup evidence is
+// withdrawn; physical cleanup waits for Core's exact Stop authorization.
+func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) (workspaceprovider.AllocationObservation, error) {
+	if record.Failure == "" {
+		record.Failure = reason
+		record.Observation = pendingObservation(record)
+		if err := d.save(ctx, cm, record); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
+	}
+	return record.Observation, nil
+}
+
+// recordFailure persists an exact-instance loss found by read-only observation.
+func (d *Lifecycle) recordFailure(ctx context.Context, key workspaceprovider.AllocationKey, lost *runtimeLostError) (workspaceprovider.AllocationObservation, error) {
+	var observed workspaceprovider.AllocationObservation
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		cm, record, err := d.read(ctx, key)
+		if err != nil {
+			return err
+		}
+		if record.Observation.Identity != lost.identity {
+			return workspaceprovider.ErrStaleIdentity
+		}
+		if record.Operation != "ensure" {
+			return lost
+		}
+		observed, err = d.fail(ctx, cm, record, lost.reason)
+		return err
+	})
+	return observed, err
+}
+
+// failure reports the recorded terminal failure of the observed instance. An
+// unreadable journal is an error, never evidence that the instance is live.
+func (d *Lifecycle) failure(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity) (string, error) {
+	_, record, err := d.read(ctx, key)
+	if errors.Is(err, workspaceprovider.ErrNotFound) {
+		return "", fmt.Errorf("native journal disappeared during observation")
+	}
+	if err != nil {
+		return "", err
+	}
+	if record.Observation.Identity != identity {
+		return "", workspaceprovider.ErrStaleIdentity
+	}
+	return record.Failure, nil
 }
 
 func (d *Lifecycle) confirmSuspended(ctx context.Context, record *journalRecord, sb *sandboxv1beta1.Sandbox) error {

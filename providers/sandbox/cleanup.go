@@ -47,6 +47,9 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 			return nil
 		}
 		observed = record.Observation
+		if suspend && record.Failure != "" {
+			return fmt.Errorf("a failed runtime Pod has no data to suspend; Stop retires it")
+		}
 		if suspend {
 			if err := d.resolveRetention(ctx, record); err != nil {
 				return err
@@ -98,19 +101,23 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 				if suspend || record.Pod == nil || !errors.Is(podErr, workspaceprovider.ErrStaleIdentity) {
 					return podErr
 				}
-				// Metadata loss permits cleanup only when the separately journaled
-				// Pod still has its exact UID, before the upstream producer changes.
-				exact, err := d.journaledPod(ctx, record)
-				if err != nil {
-					return err
-				}
-				var pods corev1.PodList
-				if err := d.client.List(ctx, &pods, client.InNamespace(record.Namespace)); err != nil {
-					return err
-				}
-				for _, candidate := range pods.Items {
-					if candidate.UID != exact.UID && metav1.IsControlledBy(&candidate, sb) {
-						return workspaceprovider.ErrStaleIdentity
+				// A failed instance's exact Pod is already lost; suspending its
+				// Sandbox retires any upstream replacement below.
+				if record.Failure == "" {
+					// Metadata loss permits cleanup only when the separately journaled
+					// Pod still has its exact UID, before the upstream producer changes.
+					exact, err := d.journaledPod(ctx, record)
+					if err != nil {
+						return err
+					}
+					var pods corev1.PodList
+					if err := d.client.List(ctx, &pods, client.InNamespace(record.Namespace)); err != nil {
+						return err
+					}
+					for _, candidate := range pods.Items {
+						if candidate.UID != exact.UID && metav1.IsControlledBy(&candidate, sb) {
+							return workspaceprovider.ErrStaleIdentity
+						}
 					}
 				}
 			}
@@ -155,6 +162,14 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 				return nil
 			}
 			if !suspend {
+				if record.Failure != "" {
+					// Wait for the suspended Sandbox to retire a replacement Pod
+					// rather than treating it as the journaled one.
+					if _, err := d.pod(ctx, record, sb); errors.Is(err, workspaceprovider.ErrStaleIdentity) {
+						observed = record.Observation
+						return nil
+					}
+				}
 				gone, err := d.stopJournaledPod(ctx, record)
 				if err != nil {
 					return err

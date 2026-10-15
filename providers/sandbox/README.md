@@ -23,7 +23,10 @@ authentication, exact runtime probes, session policy, and drain settlement remai
 with Orka. Attachment acknowledgement precedes runtime startup. Infrastructure
 readiness reports the exact Pod and its bootstrap endpoint without waiting for
 runtime admission. Stop, suspension, and deletion require core's matching
-sequence and instance retirement authorization.
+sequence and instance retirement authorization. Loss of the exact runtime Pod
+(deletion or upstream replacement, a terminal phase, or a container restart)
+reports the workspace `Failed` and is never restarted; core's exact Stop then
+retires it, including any replacement agent-sandbox created.
 
 Admitted storage is limited to EmptyDir, DownwardAPI and projected DownwardAPI
 sources, plus the provider-injected durable workspace volume. HostPath,

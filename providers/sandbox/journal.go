@@ -70,6 +70,9 @@ type journalRecord struct {
 	RetentionReservation *retentionReservation                               `json:"retentionReservation,omitempty"`
 	ResumePrepared       bool                                                `json:"resumePrepared,omitempty"`
 	DeletionPolicy       *workspacev1alpha1.ExecutionWorkspaceDeletionPolicy `json:"deletionPolicy,omitempty"`
+	// Failure records the loss of the exact runtime Pod. With restartPolicy
+	// Never it never runs again; Core authorizes its Stop.
+	Failure string `json:"failure,omitempty"`
 }
 
 // Lifecycle uses an uncached client. Every native mutation follows durable CAS
