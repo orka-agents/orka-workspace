@@ -374,6 +374,26 @@ func TestActiveAttachmentNeverHidesFailedStateFromAnUnreadableJournal(t *testing
 	}
 }
 
+func TestActorLossIsReportedWhenItsWorkerPoolIsAlsoGone(t *testing.T) {
+	c, native, request := fixture(t, false)
+	ready(t, c, native, request)
+	_, record, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	pools := privateWorkerPools(t, c)
+	if len(pools) != 1 {
+		t.Fatalf("want one private WorkerPool, got %d", len(pools))
+	}
+	if err := c.Delete(t.Context(), &pools[0]); err != nil {
+		t.Fatal(err)
+	}
+	if workspace := reconcileFailureFixture(t, c, native, request); workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("Actor loss with its WorkerPool gone reported %s", workspace.Status.State)
+	}
+}
+
 func TestFailedInstanceDoesNotPollStaleRetirement(t *testing.T) {
 	c, native, request := fixture(t, true)
 	identity := ready(t, c, native, request).Identity
@@ -445,6 +465,12 @@ func TestFailedInstanceWithMissingJournalStaysFailedWithoutCleanup(t *testing.T)
 }
 
 func TestActorLossDuringSuspendCaptureFailsAndRetiresByStop(t *testing.T) {
+	for _, mode := range []string{"disappeared", "crashed"} {
+		t.Run(mode, func(t *testing.T) { actorLossDuringSuspendCapture(t, mode) })
+	}
+}
+
+func actorLossDuringSuspendCapture(t *testing.T, mode string) {
 	c, native, request := fixture(t, true)
 	first := ready(t, c, native, request)
 	control := &suspensionReviewControl{nativeFixture: native, submit: func(request *pb.SuspendActorRequest) (*pb.SuspendActorResponse, error) {
@@ -460,7 +486,12 @@ func TestActorLossDuringSuspendCaptureFailsAndRetiresByStop(t *testing.T) {
 	if err != nil || record.Pending == nil || !record.Pending.SuspendIssued {
 		t.Fatalf("capture did not start: %v", err)
 	}
-	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+	actorKey := record.Atespace + "/" + record.Actor.Name
+	if mode == "disappeared" {
+		delete(native.actors, actorKey)
+	} else {
+		native.actors[actorKey].Status.State = pb.ActorState_ACTOR_STATE_CRASHED
+	}
 
 	workspace := &api.ExecutionWorkspace{}
 	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil {

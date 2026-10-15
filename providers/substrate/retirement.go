@@ -414,6 +414,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if actor == nil && record.Actor.UID != "" {
 		return lostInstance(record, nativeActorDisappeared)
 	}
+	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED {
+		return lostInstance(record, nativeActorStopped)
+	}
 	if actor == nil || record.Worker == nil || actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
 		return fmt.Errorf("native checkpoint lost its source lifetime or template")
 	}
