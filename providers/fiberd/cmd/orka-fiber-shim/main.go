@@ -367,8 +367,9 @@ func supervisorEnv(admitted []string, egressAddr string) []string {
 	// The supervisor requires a real session directory; the read-only rootfs
 	// only links /sessions into the sandbox's tmpfs.
 	set("ORKA_ACP_SESSION_BASE_DIR", "/tmp/sessions")
+	// The home proxy speaks CONNECT only, so only HTTPS clients use it.
 	proxy := "http://" + egressAddr
-	for _, name := range []string{"HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"} {
+	for _, name := range []string{"HTTPS_PROXY", "https_proxy"} {
 		set(name, proxy)
 	}
 	set("NO_PROXY", "localhost,127.0.0.1,::1")

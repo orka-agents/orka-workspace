@@ -51,6 +51,8 @@ type Lifecycle struct {
 	client client.Client
 	fibers Fibers
 	now    func() time.Time
+	// beforeServiceCreate lets tests interleave retirement with Ensure.
+	beforeServiceCreate func()
 }
 
 var _ workspaceprovider.Lifecycle = (*Lifecycle)(nil)

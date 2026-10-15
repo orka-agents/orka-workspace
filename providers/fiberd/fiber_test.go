@@ -164,6 +164,55 @@ func TestRetirementWaitsOutAnInFlightClone(t *testing.T) {
 	}
 }
 
+// Retirement can finish between Ensure recording its fiber and creating the
+// fiber's Service. That Service must not outlive the instance.
+func TestRetirementRemovesAServiceCreatedAfterIt(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := RuntimeConformanceFixture(ctx, c, ConformanceImage, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fibers := NewMemoryFibers(ConformanceImage)
+	driver := New(c, fibers)
+	reached, hold := make(chan struct{}), make(chan struct{})
+	driver.beforeServiceCreate = func() {
+		close(reached)
+		<-hold
+	}
+	ensured := make(chan error, 1)
+	go func() {
+		_, err := driver.EnsureAllocation(ctx, request)
+		ensured <- err
+	}()
+	select {
+	case <-reached:
+	case <-ctx.Done():
+		t.Fatal("Ensure never reached Service creation")
+	}
+	_, record, err := driver.read(ctx, request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := driver.StopInstance(ctx, request.Key, record.Observation.Identity)
+	if err != nil || stopped.State != workspaceprovider.AllocationStopped {
+		t.Fatalf("retirement before the Service existed: %v %v", stopped.State, err)
+	}
+	driver.beforeServiceCreate = nil
+	close(hold)
+	if err := <-ensured; err != nil {
+		t.Fatalf("ensure after retirement: %v", err)
+	}
+	services := &corev1.ServiceList{}
+	if err := c.List(ctx, services); err != nil {
+		t.Fatal(err)
+	}
+	if len(services.Items) != 0 {
+		t.Fatalf("a Service created after retirement remains: %s", services.Items[0].Name)
+	}
+}
+
 func TestObserveWithdrawsEvidenceWhenServiceIsGone(t *testing.T) {
 	c := newTestClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -243,6 +292,11 @@ func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
 	nonRoot.Runtime.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{RunAsNonRoot: new(false)}
 	if err := validateFiberRequest(nonRoot, []string{ConformanceImage}, nil); err != nil {
 		t.Fatalf("container override of runAsNonRoot was refused: %v", err)
+	}
+	workdir := *request.DeepCopy()
+	workdir.Runtime.Template.Spec.Containers[0].WorkingDir = "/workspace"
+	if err := validateFiberRequest(workdir, []string{ConformanceImage}, nil); err == nil {
+		t.Fatal("a working directory the template cannot apply was admitted")
 	}
 	scratch := *request.DeepCopy()
 	scratch.Runtime.Template.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}

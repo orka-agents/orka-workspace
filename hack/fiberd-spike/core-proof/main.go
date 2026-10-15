@@ -76,6 +76,7 @@ type observation struct {
 	startup          *workspaceapi.StartupEvidence
 	service          *corev1.Service
 	worker           *corev1.Pod
+	readChallenge    bool
 	challengeChecked bool
 	firstStartup     time.Duration
 }
@@ -116,7 +117,9 @@ func observe(ctx context.Context, c client.Client, provider string, w *workspace
 		return fmt.Errorf("per-instance Service does not map the bootstrap port")
 	}
 	o.service = service
-	if o.challengeChecked {
+	// The direct read blocks on the Pod network, which the proof host may not
+	// route; it would delay every timed poll, so timed runs leave it off.
+	if !o.readChallenge || o.challengeChecked {
 		return nil
 	}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+home.Status.PodIP+":"+strconv.Itoa(service.Spec.Ports[0].TargetPort.IntValue())+"/v2/credential-bootstrap", nil)
@@ -165,7 +168,7 @@ var profiles = map[string]struct {
 		map[string]any{"templateRef": map[string]any{"namespace": "orka-system", "name": "orka-acp-infra"}}},
 }
 
-func run(ctx context.Context, c client.Client, provider, runID string) (map[string]any, error) {
+func run(ctx context.Context, c client.Client, provider, runID string, readChallenge bool) (map[string]any, error) {
 	profile, ok := profiles[provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider %q", provider)
@@ -221,7 +224,7 @@ func run(ctx context.Context, c client.Client, provider, runID string) (map[stri
 	fmt.Println("PASS fail-closed Task class/provenance/authority admission accepts the request")
 	workspaceName := ""
 	var workspace *workspaceapi.ExecutionWorkspace
-	o := &observation{}
+	o := &observation{readChallenge: readChallenge}
 	var serving time.Duration
 	var servingInstance, servingBoot string
 	if err := wait(ctx, func() (bool, error) {
@@ -338,6 +341,7 @@ func run(ctx context.Context, c client.Client, provider, runID string) (map[stri
 func main() {
 	runID := flag.String("run-id", "", "isolated resource suffix")
 	provider := flag.String("provider", "fiberd", "workspace provider: fiberd or substrate")
+	readChallenge := flag.Bool("read-challenge", false, "also read fiberd's bootstrap challenge directly; needs a route to Pod IPs and skews timings")
 	report := flag.String("report", "", "public JSON proof report")
 	flag.Parse()
 	if *runID == "" || os.Getenv("KUBECONFIG") == "" {
@@ -360,7 +364,7 @@ func main() {
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 		defer cancel()
-		result, err = run(ctx, c, *provider, *runID)
+		result, err = run(ctx, c, *provider, *runID, *readChallenge)
 	}
 	if result != nil && *report != "" {
 		data, _ := json.MarshalIndent(result, "", "  ")

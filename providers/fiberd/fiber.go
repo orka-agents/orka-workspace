@@ -148,6 +148,11 @@ func validateFiberRequest(request workspaceprovider.WorkloadRequest, images, cap
 	if !slices.Contains(images, request.Image) {
 		return fmt.Errorf("fiberd home does not serve supervisor image %q", request.Image)
 	}
+	// The template starts the supervisor in the sandbox root; the payload
+	// carries no working directory.
+	if dir := runtime.Template.Spec.Containers[0].WorkingDir; dir != "" && dir != "/" {
+		return fmt.Errorf("fiberd supervisors start in /, not working directory %q", dir)
+	}
 	if err := validateFiberSecurity(runtime.Template.Spec, capabilities); err != nil {
 		return err
 	}
@@ -323,6 +328,13 @@ func (d *Lifecycle) ensureFiber(ctx context.Context, record *journalRecord, save
 		}
 		f.Service = service
 		if err := save(); err != nil {
+			// Retirement may have run since the fiber was recorded and found no
+			// Service; one it never saw must not outlive the instance.
+			if apierrors.IsConflict(err) {
+				uid := service.UID
+				_ = d.client.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: service.Namespace, Name: service.Name}},
+					&client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+			}
 			return workspaceprovider.AllocationObservation{}, err
 		}
 	}
@@ -528,6 +540,9 @@ func (d *Lifecycle) ensureService(ctx context.Context, record *journalRecord) (*
 		Spec: corev1.ServiceSpec{Selector: labels, Ports: []corev1.ServicePort{{
 			Name: "supervisor", Protocol: corev1.ProtocolTCP, Port: record.Request.Runtime.BootstrapPort, TargetPort: intstr.FromInt(port),
 		}}},
+	}
+	if d.beforeServiceCreate != nil {
+		d.beforeServiceCreate()
 	}
 	if err := d.client.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
 		return nil, err
