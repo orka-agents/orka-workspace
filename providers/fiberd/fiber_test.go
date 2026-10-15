@@ -5,6 +5,7 @@ package fiberd
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -76,6 +78,8 @@ func TestRetirementReleasesFiberWhoseCloneResponseWasLost(t *testing.T) {
 	fibers := NewMemoryFibers(ConformanceImage)
 	fibers.LoseClones = 1
 	driver := New(c, fibers)
+	clock := time.Now()
+	driver.now = func() time.Time { return clock }
 	pending, err := driver.EnsureAllocation(ctx, request)
 	if err == nil {
 		t.Fatal("lost clone response was not reported")
@@ -83,6 +87,7 @@ func TestRetirementReleasesFiberWhoseCloneResponseWasLost(t *testing.T) {
 	if running, _ := fibers.Running(ctx, pending.Identity.InstanceID); running != 1 {
 		t.Fatalf("lost clone left %d fibers running, want 1", running)
 	}
+	clock = clock.Add(cloneBudget + cloneGrace)
 	stopped, err := driver.StopInstance(ctx, request.Key, pending.Identity)
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +100,67 @@ func TestRetirementReleasesFiberWhoseCloneResponseWasLost(t *testing.T) {
 	}
 	if fibers.seq != 1 {
 		t.Fatalf("retirement created %d fibers, want 1", fibers.seq)
+	}
+}
+
+// A Clone already sent when retirement begins may still start a fiber.
+// Retirement waits out its journaled deadline, then releases that fiber.
+func TestRetirementWaitsOutAnInFlightClone(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := RuntimeConformanceFixture(ctx, c, ConformanceImage, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fibers := NewMemoryFibers(ConformanceImage)
+	fibers.CloneGate = make(chan struct{})
+	driver := New(c, fibers)
+	var mu sync.Mutex
+	clock := time.Now()
+	driver.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	ensured := make(chan error, 1)
+	go func() {
+		_, err := driver.EnsureAllocation(ctx, request)
+		ensured <- err
+	}()
+	var identity workspaceprovider.InstanceIdentity
+	if err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, 10*time.Second, true, func(ctx context.Context) (bool, error) {
+		_, record, err := driver.read(ctx, request.Key)
+		if err != nil || record.Fiber == nil || record.Fiber.CloneDeadline.IsZero() {
+			return false, nil
+		}
+		identity = record.Observation.Identity
+		return true, nil
+	}); err != nil {
+		t.Fatalf("clone was never issued: %v", err)
+	}
+	stopping, err := driver.StopInstance(ctx, request.Key, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopping.State == workspaceprovider.AllocationStopped {
+		t.Fatal("retirement reported Stopped while a sent Clone could still start a fiber")
+	}
+	close(fibers.CloneGate)
+	if err := <-ensured; err != nil {
+		t.Fatalf("ensure after retirement began: %v", err)
+	}
+	if running, _ := fibers.Running(ctx, identity.InstanceID); running != 1 {
+		t.Fatalf("the in-flight clone left %d fibers, want 1", running)
+	}
+	mu.Lock()
+	clock = clock.Add(cloneBudget + cloneGrace)
+	mu.Unlock()
+	stopped, err := driver.StopInstance(ctx, request.Key, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.State != workspaceprovider.AllocationStopped || fibers.Releases != 1 || fibers.seq != 1 {
+		t.Fatalf("retirement left state %s after %d releases and %d clones", stopped.State, fibers.Releases, fibers.seq)
+	}
+	if running, _ := fibers.Running(ctx, identity.InstanceID); running != 0 {
+		t.Fatalf("retirement left %d fibers running", running)
 	}
 }
 
@@ -152,6 +218,21 @@ func TestFiberRequestRejectsUnservedImageAndPodOnlyShapes(t *testing.T) {
 	privileged.Runtime.Template.Spec.Containers[0].SecurityContext.Capabilities.Add = []corev1.Capability{"SETUID"}
 	if err := validateFiberRequest(privileged, []string{ConformanceImage}, []string{"CAP_SETUID"}); err != nil {
 		t.Fatalf("capability inside the home's set was refused: %v", err)
+	}
+	coreCaps := []string{"CAP_CHOWN", "CAP_KILL", "CAP_SETGID", "CAP_SETUID"}
+	dropped := *request.DeepCopy()
+	dropped.Runtime.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Capabilities: &corev1.Capabilities{
+		Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"CHOWN", "KILL", "SETGID", "SETUID"}}}
+	if err := validateFiberRequest(dropped, []string{ConformanceImage}, coreCaps); err != nil {
+		t.Fatalf("Core's drop-ALL-then-add shape was refused: %v", err)
+	}
+	dropped.Runtime.Template.Spec.Containers[0].SecurityContext.Capabilities.Add = []corev1.Capability{"SETUID"}
+	if err := validateFiberRequest(dropped, []string{ConformanceImage}, coreCaps); err == nil {
+		t.Fatal("dropping capabilities every sandbox holds was admitted")
+	}
+	dropped.Runtime.Template.Spec.Containers[0].SecurityContext.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"KILL"}}
+	if err := validateFiberRequest(dropped, []string{ConformanceImage}, coreCaps); err == nil {
+		t.Fatal("a named drop of a held capability was admitted")
 	}
 	nonRoot := *request.DeepCopy()
 	nonRoot.Runtime.Template.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: new(true)}

@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
@@ -49,6 +50,7 @@ type journalRecord struct {
 type Lifecycle struct {
 	client client.Client
 	fibers Fibers
+	now    func() time.Time
 }
 
 var _ workspaceprovider.Lifecycle = (*Lifecycle)(nil)
@@ -56,7 +58,9 @@ var _ workspaceprovider.SuspensionController = (*Lifecycle)(nil)
 
 // New returns a lifecycle on fibers. A nil Fibers serves only simulation
 // requests without a runtime.
-func New(c client.Client, fibers Fibers) *Lifecycle { return &Lifecycle{client: c, fibers: fibers} }
+func New(c client.Client, fibers Fibers) *Lifecycle {
+	return &Lifecycle{client: c, fibers: fibers, now: time.Now}
+}
 
 func (d *Lifecycle) images() []string {
 	if d.fibers == nil {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/orka-agents/orka-workspace/providers/fiberd/payload"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
@@ -29,6 +30,8 @@ type MemoryFibers struct {
 	Releases int
 	// LoseClones drops that many Clone responses after the fiber started.
 	LoseClones int
+	// CloneGate, when set, holds every Clone until it is closed.
+	CloneGate chan struct{}
 }
 
 type memoryFiber struct {
@@ -49,7 +52,10 @@ func NewMemoryFibers(image string) *MemoryFibers {
 	}
 }
 
-func (m *MemoryFibers) Clone(_ context.Context, g FiberGrant, launch []byte) (Fiber, error) {
+func (m *MemoryFibers) Clone(_ context.Context, g FiberGrant, launch []byte, _ time.Time) (Fiber, error) {
+	if m.CloneGate != nil {
+		<-m.CloneGate
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if f := m.grants[g.UID]; f != nil && f.running {

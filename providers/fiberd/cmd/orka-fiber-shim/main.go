@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -274,6 +275,11 @@ func serveFiber(o options, lastToken *string) error {
 	if listen := envValue(env, "ORKA_ACP_LISTEN_ADDRESS"); listen != "" {
 		upstream = loopbackOf(listen)
 	}
+	// The supervisor listens only where the bridge dials it: a wildcard
+	// listener would collide with a URL forwarder bound on the same port.
+	env = append(slices.DeleteFunc(env, func(entry string) bool {
+		return strings.HasPrefix(entry, "ORKA_ACP_LISTEN_ADDRESS=")
+	}), "ORKA_ACP_LISTEN_ADDRESS="+upstream)
 	egress, err := net.Listen("tcp", o.egressAddr)
 	if err != nil {
 		return fmt.Errorf("egress listener: %w", err)

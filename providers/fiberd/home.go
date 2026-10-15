@@ -125,7 +125,9 @@ func (h *Home) Images() []string { return h.cfg.SupervisorImages }
 
 func (h *Home) Capabilities() []string { return h.cfg.Capabilities }
 
-func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte) (Fiber, error) {
+func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte, deadline time.Time) (Fiber, error) {
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	// One fiber per grant: fibers of one grant share a run directory that
 	// each can read, write and connect into. Pressure never parks a
 	// supervisor, whose memory holds credentials.
@@ -141,7 +143,7 @@ func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte) (Fiber, e
 	if err != nil {
 		return Fiber{}, err
 	}
-	f, err := api.Clone(ctx, token, g.Session, 30*time.Second, launch)
+	f, err := api.Clone(ctx, token, g.Session, time.Until(deadline), launch)
 	if err != nil {
 		return Fiber{}, err
 	}

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	"github.com/orka-agents/orka-workspace/providers/fiberd/payload"
@@ -31,8 +32,9 @@ import (
 // its own grant, so its run directory, Watch status and capacity are its own.
 type Fibers interface {
 	// Clone admits the instance's grant and creates or attaches its session.
-	// A retry after a lost response attaches the same running fiber.
-	Clone(ctx context.Context, grant FiberGrant, launch []byte) (Fiber, error)
+	// A retry after a lost response attaches the same running fiber. The
+	// home starts no fiber for this call after deadline.
+	Clone(ctx context.Context, grant FiberGrant, launch []byte, deadline time.Time) (Fiber, error)
 	// Release ends the fiber; an unknown fiber is already gone.
 	Release(ctx context.Context, fiberID string) error
 	// Running reports how many fibers the grant runs.
@@ -94,6 +96,9 @@ type fiberRecord struct {
 	Epoch           int64                           `json:"epoch,omitempty"`
 	Service         *workspaceprovider.PodReference `json:"service,omitempty"`
 	ChallengeSHA256 string                          `json:"challengeSHA256,omitempty"`
+	// CloneDeadline is journaled before every Clone is sent. Until it
+	// passes, a fiber absent from the home may still be starting.
+	CloneDeadline time.Time `json:"cloneDeadline,omitzero"`
 }
 
 const (
@@ -102,6 +107,10 @@ const (
 	sealedBootstrapSchema = "orka.harness.v2/sealed-bootstrap/v1"
 	fiberTenantMaxLength  = 253
 	fiberServiceLabel     = "fiberd.workspace.orka.ai/instance"
+	// cloneBudget bounds each Clone; cloneGrace covers clock skew and
+	// transit before retirement trusts that an issued Clone cannot land.
+	cloneBudget = 30 * time.Second
+	cloneGrace  = 10 * time.Second
 )
 
 func validateFiberRequest(request workspaceprovider.WorkloadRequest, images, capabilities []string) error {
@@ -174,18 +183,42 @@ func validateFiberSecurity(spec corev1.PodSpec, capabilities []string) error {
 	if sc.Privileged != nil && *sc.Privileged {
 		return fmt.Errorf("fiberd supervisors run unprivileged inside their sandbox")
 	}
-	if sc.Capabilities != nil {
-		for _, add := range sc.Capabilities.Add {
-			name := strings.ToUpper(string(add))
-			if !strings.HasPrefix(name, "CAP_") {
-				name = "CAP_" + name
-			}
-			if !slices.Contains(capabilities, name) {
-				return fmt.Errorf("fiberd home sandboxes do not hold capability %s", add)
-			}
+	if sc.Capabilities == nil {
+		return nil
+	}
+	// Every sandbox holds exactly the home's capabilities. A request may
+	// add only those, and may not drop one it does not add back; a dropped
+	// capability would still be held. A named drop wins over an add.
+	held := map[string]bool{}
+	dropAll := slices.ContainsFunc(sc.Capabilities.Drop, func(c corev1.Capability) bool { return capabilityName(c) == "CAP_ALL" })
+	for _, name := range capabilities {
+		held[name] = !dropAll
+	}
+	for _, add := range sc.Capabilities.Add {
+		if !slices.Contains(capabilities, capabilityName(add)) {
+			return fmt.Errorf("fiberd home sandboxes do not hold capability %s", add)
+		}
+		held[capabilityName(add)] = true
+	}
+	for _, drop := range sc.Capabilities.Drop {
+		if name := capabilityName(drop); name != "CAP_ALL" {
+			held[name] = false
+		}
+	}
+	for _, name := range capabilities {
+		if !held[name] {
+			return fmt.Errorf("fiberd home sandboxes hold capability %s, which the request drops", name)
 		}
 	}
 	return nil
+}
+
+func capabilityName(c corev1.Capability) string {
+	name := strings.ToUpper(string(c))
+	if !strings.HasPrefix(name, "CAP_") {
+		name = "CAP_" + name
+	}
+	return name
 }
 
 // validateFiberStorage rejects every volume. The launch payload carries no
@@ -265,13 +298,16 @@ func (d *Lifecycle) ensureFiber(ctx context.Context, record *journalRecord, save
 		if !record.CreateIssued {
 			f.Home = home
 			record.CreateIssued = true
-			if err := save(); err != nil {
-				return workspaceprovider.AllocationObservation{}, err
-			}
+		}
+		// The deadline is durable before the Clone is sent, and a journal
+		// conflict with retirement stops this call before it clones.
+		f.CloneDeadline = d.now().Add(cloneBudget)
+		if err := save(); err != nil {
+			return workspaceprovider.AllocationObservation{}, err
 		}
 		// A retry of the named session attaches the fiber a lost response
 		// created; no evidence of an unrecorded fiber was ever published.
-		fiber, err := d.fibers.Clone(ctx, FiberGrant{UID: f.Grant, Tenant: tenantOf(record.Request.Key.Namespace), Session: f.Grant}, launch)
+		fiber, err := d.fibers.Clone(ctx, FiberGrant{UID: f.Grant, Tenant: tenantOf(record.Request.Key.Namespace), Session: f.Grant}, launch, f.CloneDeadline)
 		if err != nil {
 			return pendingObservation(record), err
 		}
@@ -395,9 +431,11 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord) (strin
 }
 
 // stopFiber releases the exact fiber and reports true once the grant runs
-// none. An unrecorded clone is resolved through the grant it alone uses:
-// a running fiber is attached through its named session, recorded and then
-// released; the grant admits one fiber, so attaching never creates another.
+// none. An unrecorded clone is resolved through the grant it alone uses.
+// Retirement first waits out the last journaled Clone deadline, since a
+// Clone already sent may still start a fiber. Then a running fiber is
+// attached through its named session, recorded and released; the grant
+// admits one fiber, so attaching never creates another.
 func (d *Lifecycle) stopFiber(ctx context.Context, record *journalRecord, save func() error) (bool, error) {
 	f := record.Fiber
 	if f == nil {
@@ -407,6 +445,9 @@ func (d *Lifecycle) stopFiber(ctx context.Context, record *journalRecord, save f
 		return true, nil
 	}
 	if f.FiberID == "" {
+		if d.now().Before(f.CloneDeadline.Add(cloneGrace)) {
+			return false, nil
+		}
 		running, err := d.fibers.Running(ctx, f.Grant)
 		if err != nil {
 			return false, err
@@ -416,7 +457,11 @@ func (d *Lifecycle) stopFiber(ctx context.Context, record *journalRecord, save f
 			if err != nil {
 				return false, err
 			}
-			fiber, err := d.fibers.Clone(ctx, FiberGrant{UID: f.Grant, Tenant: tenantOf(record.Request.Key.Namespace), Session: f.Grant}, launch)
+			f.CloneDeadline = d.now().Add(cloneBudget)
+			if err := save(); err != nil {
+				return false, err
+			}
+			fiber, err := d.fibers.Clone(ctx, FiberGrant{UID: f.Grant, Tenant: tenantOf(record.Request.Key.Namespace), Session: f.Grant}, launch, f.CloneDeadline)
 			if err != nil {
 				return false, err
 			}
