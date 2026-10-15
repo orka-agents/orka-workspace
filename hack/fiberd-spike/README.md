@@ -3,8 +3,9 @@
 This spike asks whether an Orka ACP workspace can run as a
 [fiberd](https://github.com/helayoty/fiberd) fiber, and at what cost. It is a
 throwaway feasibility probe, not a supported provider. It pins fiberd
-`b3b5b47` (2026-10-13) and Orka `feat/workspace-out-of-tree` `d5d887e`, plus the
-one-flag Core patch on `spike/fiberd-provider`.
+`cddb385` (2026-10-14; first run `b3b5b47`) with the local `-gvisor-caps` patch,
+and Orka `feat/workspace-out-of-tree` `d5d887e` plus the one-flag Core patch on
+`spike/fiberd-provider`.
 
 ## Layout
 
@@ -15,7 +16,9 @@ one-flag Core patch on `spike/fiberd-provider`.
 | `providers/fiberd/payload` | The Clone payload: identity, command, arguments and literal environment |
 | `providers/fiberd` | Provider forked from the fake provider's reconcile flow, with fibers instead of Pods |
 | `hack/fiberd-spike/check` | Stage 1 harness: clones supervisors and reads their sealed bootstrap challenges |
-| `hack/fiberd-spike/core-proof`, `stage3.sh`, `core-install.py` | Stage 3: actual Core Task through the provider |
+| `hack/fiberd-spike/core-proof`, `stage3.sh`, `core.sh`, `core-install.py` | Stage 3: actual, timed Core Task through the fiberd or Substrate provider |
+| `hack/fiberd-spike/substrate.sh` | Substrate provider and fixture Core on the comparison cluster |
+| `hack/fiberd-spike/measure.sh`, `measure/footprint.sh` | Timed Task batches, and one instance's memory, for either provider |
 | `hack/fiberd-spike/spike.sh` | Driver: builds locally, runs images and a kind cluster on a remote Docker host |
 
 ## Run
@@ -26,10 +29,15 @@ hack/fiberd-spike/spike.sh up && hack/fiberd-spike/spike.sh home
 hack/fiberd-spike/spike.sh stage1 -mode shared -workspaces 4 -probe 2
 hack/fiberd-spike/spike.sh stage2
 hack/fiberd-spike/spike.sh stage3
+# Substrate comparison; ORKA_E2E_SOURCE is an Orka test/workspace-provider-e2e checkout.
+hack/fiberd-spike/spike.sh substrate-up && hack/fiberd-spike/spike.sh substrate
+hack/fiberd-spike/spike.sh measure fiberd 4 4 && hack/fiberd-spike/spike.sh measure substrate 4 4
+hack/fiberd-spike/spike.sh footprint fiberd && hack/fiberd-spike/spike.sh footprint substrate
 ```
 
 `SPIKE_HOST` (default `vm`) names the Docker host; nothing is built or loaded
-into a local daemon.
+into a local daemon. Substrate runs on its own cluster (`substrate-compare`),
+created by Orka's `scripts/workspace-substrate-cluster.sh`.
 
 ## Results (2026-10-14, kind v1.37.0 on one 16-vCPU KVM VM, runsc release-20260817.0)
 
@@ -98,6 +106,80 @@ Changes this needed beyond the provider:
   URL host resolves to a loopback forwarder through the home proxy; the session
   base directory defaults to the sandbox tmpfs because the rootfs is read-only.
 
+### Rerun on fiberd `cddb385` (2026-10-15)
+
+fiberd now hands each gVisor fiber its Clone session in a tenth identity-record
+field, and moved the Go client to `sdk/go/client`. The shim reads the new
+record and refuses a payload whose identity is not the session fiberd attests.
+The capability patch rebased unchanged. Stages 1 to 3 pass again with unique,
+identity-bound challenges, the same isolation findings and clean retirement.
+
+The VM was shared with other sessions' clusters (load average 35 to 50), so
+absolute latency rose. The plain runc Pod control rose by the same factor, to
+1.8 to 2.3 s, so the slowdown is the host, not fiberd:
+
+| Mode, 2026-10-15 (first clone of a grant excluded) | Clone | Clone to supervisor health |
+| --- | ---: | ---: |
+| Shared grant, on-demand restore | 124–156 ms | 176–222 ms |
+| Shared grant, warm pool of 4, settled | 27–105 ms | 210–322 ms |
+| Shared grant, 8 concurrent clones | 582–1352 ms | 1.29–1.59 s |
+| One grant per workspace | 720–1182 ms | 0.77–1.29 s |
+| Plain runc Pod, image cached | — | 1.8–2.3 s |
+
+Stage 2 lifecycle and replacement conformance take 1.5 s and 2.7 s.
+
+### Comparison with Substrate (2026-10-15)
+
+Both providers ran the same deterministic Core Task on the same VM, with the
+same Core build and the same supervisor image digest. fiberd alone needs the
+shared-worker flag. Substrate is the official v0.1.0 pin (`fa6d949`), set up
+by Orka's workspace provider E2E script on its own single-node kind cluster.
+Its provider is this branch's, deployed with a native Pod certificate and
+direct Actor egress as that E2E deploys it. Three interleaved batch pairs ran
+at load average 13 to 40. Each batch restarted Core, then ran 4 Tasks in
+sequence and 4 at once.
+
+| Sequential Tasks, median (range), n=12 each | fiberd | Substrate |
+| --- | ---: | ---: |
+| Task to startup evidence | 6.2 s (4.0–9.2) | 8.0 s (6.9–28.0) |
+| Startup evidence to Serving | 2.0 s (2.0–4.2) | 0.2 s (0.1–0.8) |
+| Serving to Succeeded (the prompt) | 6.4 s (4.3–11.4) | 4.5 s (3.8–7.0) |
+| Task to Succeeded | 14.6 s (12.4–22.1) | 12.6 s (11.0–32.8) |
+| Succeeded to instance released | 0.4 s (0.0–2.6) | 9.0 s (7.1–13.3) |
+| Task to instance released | 15.1 s (12.9–22.1) | 22.1 s (19.7–41.8) |
+
+Four concurrent Tasks (n=12 each) took 17.7 s (11.2–36.2) for fiberd and
+14.8 s (12.3–34.6) for Substrate to Succeeded.
+
+- fiberd provisions about 2 s sooner, and releases about 9 s sooner, because
+  Release is one call while Substrate deletes an Actor, a private WorkerPool
+  and its Pod.
+- Substrate serves about 2 s sooner after startup evidence and runs the prompt
+  about 2 s faster. fiberd's supervisor traffic crosses more hops: Core reaches
+  it through the per-instance Service, the home relay and the shim's bridge;
+  it reaches Core through a loopback forwarder and the home's CONNECT proxy.
+  The constant 2.0 s before Serving was not isolated further.
+- The fiberd provider reconciles one workspace at a time and Clone blocks, so
+  concurrent starts queue (up to 17 s to startup evidence).
+
+Memory comes from the kind node's cgroups during one Task, twice each:
+
+| | fiberd | Substrate |
+| --- | ---: | ---: |
+| One instance at peak | 63–67 MiB: its grant's template and fiber | 42–43 MiB: its private worker Pod, sandbox included |
+| Held after retirement | 22 MiB, until the grant lease lapses (24 h) | 0 |
+| Fixed | ~30 MiB: home baseline and issuer | ~0.9 GiB of `ate-system` on one node (half is `atelet`, page cache included), plus two idle operator workers |
+
+A fiber is restored from the template's fully read image, so it is larger
+than Substrate's cold-booted sandbox. After about 30 Tasks the home held 28
+leftover templates, 633 MiB. fiberd's smaller fixed footprint is its only
+memory advantage, and it erodes at about 40 workspaces a day per home.
+
+The fixture Core keeps its store on an emptyDir. Tasks left across a Core
+restart never finalize and are retried every second (13 on the fiberd
+cluster, 9 on Substrate's); `measure.sh` now deletes its own Tasks first.
+kind's CNI enforces neither provider's network policy.
+
 ### Gaps the spike leaves open
 
 - Each retired instance leaves its grant's warm template (~22 MiB) until the
@@ -109,4 +191,5 @@ Changes this needed beyond the provider:
 - Core's NetworkPolicy envelope is not translated; egress is the home proxy's
   coarse allowlist (`*.svc`). kind's CNI does not prove packet enforcement.
 - No suspension, persistent volume, or checkpoint import.
+- The provider reconciles one workspace at a time, so concurrent starts queue.
 - The supervisor image is pinned by its local image ID, not a registry digest.

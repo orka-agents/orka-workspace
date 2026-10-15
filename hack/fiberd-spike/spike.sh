@@ -10,6 +10,10 @@
 #   hack/fiberd-spike/spike.sh stage1 [check flags...]
 #   hack/fiberd-spike/spike.sh stage2   provider conformance on the real home
 #   hack/fiberd-spike/spike.sh stage3   actual Core Task through the fiberd provider
+#   hack/fiberd-spike/spike.sh substrate-up  Substrate cluster via Orka's E2E setup
+#   hack/fiberd-spike/spike.sh substrate     actual Core Task through the Substrate provider
+#   hack/fiberd-spike/spike.sh measure <fiberd|substrate> <runs> <burst>
+#   hack/fiberd-spike/spike.sh footprint <fiberd|substrate>  one Task's instance memory
 #   hack/fiberd-spike/spike.sh memory   per-grant cgroup memory in the home
 #   hack/fiberd-spike/spike.sh baseline plain runc Pod supervisor start
 #   hack/fiberd-spike/spike.sh k <kubectl args...>
@@ -22,10 +26,17 @@ cluster="${SPIKE_CLUSTER:-fiberd-spike}"
 core_source="${ORKA_CORE_SOURCE:-${repo_root}/../orka.fiberd-spike}"
 fiberd_source="${FIBERD_SOURCE:-${repo_root}/../fiberd.orka-spike}"
 arch="${SPIKE_ARCH:-amd64}"
+substrate_cluster="${SUBSTRATE_CLUSTER:-substrate-compare}"
+substrate_remote="${SUBSTRATE_REMOTE_DIR:-spike/substrate-compare}"
+# Orka's test/workspace-provider-e2e branch: scripts/workspace-substrate-cluster.sh.
+orka_e2e_source="${ORKA_E2E_SOURCE:-${repo_root}/../orka.workspace-provider-e2e}"
 bin="${repo_root}/bin/fiberd-spike"
 
 on_host() { ssh "${host}" "export PATH=/home/linuxbrew/.linuxbrew/bin:\$PATH KUBECONFIG=\$HOME/.kube/kind/${cluster}.kubeconfig; cd \$HOME/${remote} && $*"; }
 k() { on_host kubectl "$(printf '%q ' "$@")"; }
+# The Substrate cluster's kubeconfig is the one Orka's setup script wrote.
+on_substrate() { ssh "${host}" "export PATH=/home/linuxbrew/.linuxbrew/bin:\$PATH KUBECONFIG=\$HOME/${substrate_remote}/orka/bin/substrate-e2e-${substrate_cluster}/kubeconfig; cd \$HOME/${remote} && $*"; }
+on_cluster() { if [ "$1" = substrate ]; then shift; on_substrate "$@"; else shift; on_host "$@"; fi; }
 
 build() {
   local out="${bin}/bin"
@@ -33,15 +44,16 @@ build() {
   export CGO_ENABLED=0 GOOS=linux GOARCH="${arch}"
   go -C "${core_source}" build -trimpath -buildvcs=false -o "${out}/" ./cmd/orka-acp-runtime ./cmd/orka-acp-exec-helper
   go -C "${repo_root}" build -trimpath -buildvcs=false -o "${out}/acp-agent" ./hack/external-workspace-e2e/acp-agent
-  go -C "${repo_root}/providers" build -trimpath -buildvcs=false -o "${out}/" ./fiberd/cmd/orka-fiber-shim ./fiberd/cmd/orka-fiber-egress ./fiberd/cmd/orka-workspace-fiberd
+  go -C "${repo_root}/providers" build -trimpath -buildvcs=false -o "${out}/" ./fiberd/cmd/orka-fiber-shim ./fiberd/cmd/orka-fiber-egress ./fiberd/cmd/orka-workspace-fiberd ./substrate/cmd/orka-workspace-substrate
   go -C "${script_dir}" build -trimpath -buildvcs=false -o "${out}/fiberd-spike-check" ./check
-  for ctx in runtime home provider; do
+  for ctx in runtime home provider substrate-provider; do
     mkdir -p "${bin}/${ctx}/bin"
     cp "${script_dir}/${ctx}/"* "${bin}/${ctx}/"
   done
   cp "${out}/orka-acp-runtime" "${out}/orka-acp-exec-helper" "${out}/acp-agent" "${bin}/runtime/bin/"
   cp "${out}/orka-fiber-shim" "${out}/orka-fiber-egress" "${out}/fiberd-spike-check" "${bin}/home/bin/"
   cp "${out}/orka-workspace-fiberd" "${bin}/provider/bin/"
+  cp "${out}/orka-workspace-substrate" "${bin}/substrate-provider/bin/"
   # Stage 3: Core manager, its CRDs and role, the provider bundle and the proof.
   [ -d "${core_source}/internal/uiembed/dist" ] || { mkdir -p "${core_source}/internal/uiembed/dist" && echo '<!doctype html><html><body>stub</body></html>' >"${core_source}/internal/uiembed/dist/index.html"; }
   mkdir -p "${bin}/core"
@@ -49,13 +61,15 @@ build() {
   cp "${script_dir}/core-proof/core.Dockerfile" "${bin}/core/Dockerfile"
   go -C "${script_dir}" build -trimpath -buildvcs=false -o "${out}/fiberd-core-proof" ./core-proof
   ssh "${host}" "mkdir -p \$HOME/${remote}"
-  for ctx in runtime home provider core; do rsync -a --delete "${bin}/${ctx}/" "${host}:${remote}/${ctx}/"; done
+  for ctx in runtime home provider substrate-provider core; do rsync -a --delete "${bin}/${ctx}/" "${host}:${remote}/${ctx}/"; done
   rsync -a --delete "${repo_root}/config/" "${host}:${remote}/ws-config/"
   rsync -a --delete "${repo_root}/providers/fiberd/config/" "${host}:${remote}/fiberd-config/"
+  rsync -a --delete "${repo_root}/providers/substrate/config/" "${host}:${remote}/substrate-config/"
   ssh "${host}" "mkdir -p \$HOME/${remote}/core-config"
   rsync -a --delete "${core_source}/config/crd/" "${host}:${remote}/core-config/crd/"
   rsync -a "${core_source}/config/rbac/role.yaml" "${host}:${remote}/core-config/role.yaml"
-  rsync -a "${script_dir}/core-install.py" "${script_dir}/stage3.sh" "${out}/fiberd-core-proof" "${host}:${remote}/"
+  rsync -a "${script_dir}/core-install.py" "${script_dir}/core.sh" "${script_dir}/stage3.sh" "${script_dir}/substrate.sh" \
+    "${script_dir}/measure.sh" "${out}/fiberd-core-proof" "${host}:${remote}/"
   rsync -a --delete "${script_dir}/manifests/" "${host}:${remote}/manifests/"
   rsync -a --delete "${script_dir}/measure/" "${host}:${remote}/measure/"
   rsync -a --delete --exclude .git --exclude bin "${fiberd_source}/" "${host}:${remote}/fiberd/"
@@ -63,7 +77,7 @@ build() {
 
 image() {
   on_host "docker build -q -t fiberd:kind -f fiberd/docker/kubernetes/Dockerfile fiberd"
-  on_host "docker build -q -t orka-acp-runtime:spike runtime && docker build -q -t orka-fiber-home:spike home && docker build -q -t orka-workspace-fiberd:spike provider && docker build -q -t orka-core:spike core"
+  on_host "docker build -q -t orka-acp-runtime:spike runtime && docker build -q -t orka-fiber-home:spike home && docker build -q -t orka-workspace-fiberd:spike provider && docker build -q -t orka-workspace-substrate:spike substrate-provider && docker build -q -t orka-core:spike core"
   # The served supervisor image is pinned by the runtime image's own ID: the
   # home rootfs is built from exactly that image, and nothing pulls it.
   on_host "echo orka-acp-runtime@\$(docker image inspect -f '{{.Id}}' orka-acp-runtime:spike) > supervisor-image"
@@ -103,6 +117,18 @@ stage2() {
   on_host "rc=0; kubectl -n tenant-a wait --for=condition=Complete job/fiberd-conformance --timeout=600s || rc=\$?; kubectl -n tenant-a logs job/fiberd-conformance --tail=40; exit \$rc"
 }
 
+# Orka's workspace provider E2E setup: the official Substrate pin, its
+# ate-system, a gVisor WorkerPool, the orka-acp-infra ActorTemplate and Actor
+# DNS, on a dedicated cluster. It reuses the shared kind-registry.
+substrate_up() {
+  local dir="${substrate_remote}/orka"
+  ssh "${host}" "mkdir -p \$HOME/${dir}/scripts/lib \$HOME/${dir}/hack/agent-substrate"
+  rsync -a "${orka_e2e_source}/scripts/workspace-substrate-cluster.sh" "${host}:${dir}/scripts/"
+  rsync -a "${orka_e2e_source}/scripts/lib/substrate-upstream.sh" "${host}:${dir}/scripts/lib/"
+  rsync -a "${orka_e2e_source}/hack/agent-substrate/upstream.env" "${host}:${dir}/hack/agent-substrate/"
+  ssh "${host}" "cd \$HOME/${dir} && PATH=/home/linuxbrew/.linuxbrew/bin:\$PATH KIND_CLUSTER=${substrate_cluster} bash scripts/workspace-substrate-cluster.sh"
+}
+
 case "${1:-}" in
   build) build ;;
   image) image ;;
@@ -111,9 +137,15 @@ case "${1:-}" in
   stage1) shift; stage1 "$@" ;;
   stage2) stage2 ;;
   stage3) on_host "bash stage3.sh ${cluster}" ;;
+  substrate-up) substrate_up ;;
+  substrate) on_substrate "bash substrate.sh ${substrate_cluster}" ;;
+  measure) on_cluster "$2" "bash measure.sh $2 ${3:-3} ${4:-4}" ;;
+  footprint)
+    node="${cluster}-control-plane"; [ "$2" = substrate ] && node="${substrate_cluster}-control-plane"
+    on_cluster "$2" "bash measure/footprint.sh $2 ${node}" ;;
   memory) on_host "kubectl -n tenant-a exec -i orka-home-grant -- sh < measure/memory.sh" ;;
   baseline) on_host "bash measure/pod-baseline.sh" ;;
   k) shift; k "$@" ;;
   sh) shift; on_host "$*" ;;
-  *) sed -n '2,16p' "$0" >&2; exit 2 ;;
+  *) sed -n '2,20p' "$0" >&2; exit 2 ;;
 esac

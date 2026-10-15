@@ -1,8 +1,8 @@
 // Copyright (c) 2026. MIT License - see LICENSE file for details.
 
 // Command fiberd-core-proof runs an actual Orka Task through deployed Core and
-// the fiberd provider. It creates only public objects and never calls the
-// provider lifecycle or writes workspace status.
+// the fiberd or Substrate provider, and times it. It creates only public
+// objects and never calls the provider lifecycle or writes workspace status.
 package main
 
 import (
@@ -75,29 +75,38 @@ func wait(ctx context.Context, check func() (bool, error)) error {
 type observation struct {
 	startup          *workspaceapi.StartupEvidence
 	service          *corev1.Service
-	home             *corev1.Pod
+	worker           *corev1.Pod
 	challengeChecked bool
 	firstStartup     time.Duration
 }
 
-// observe checks the provider's native evidence against independent reads:
-// the home Pod, the per-instance Service and the supervisor's own challenge.
-func observe(ctx context.Context, c client.Client, w *workspaceapi.ExecutionWorkspace, o *observation) error {
+// observe checks the provider's native evidence against independent reads.
+// fiberd: the shared home Pod, the per-instance Service and the supervisor's
+// own challenge. Substrate: the instance's private worker Pod.
+func observe(ctx context.Context, c client.Client, provider string, w *workspaceapi.ExecutionWorkspace, o *observation) error {
 	startup := w.Status.Allocation.Startup
 	process := startup.Process
 	if process == nil || startup.Pod != nil {
-		return fmt.Errorf("fiberd startup omitted native process identity")
+		return fmt.Errorf("%s startup omitted native process identity", provider)
 	}
 	endpoint, err := url.Parse(startup.Endpoint)
-	if err != nil || endpoint.Scheme != "http" || endpoint.Port() != "80" {
-		return fmt.Errorf("fiberd startup endpoint %q does not serve the bootstrap port", startup.Endpoint)
+	if err != nil || endpoint.Scheme != "http" || (endpoint.Port() != "80" && endpoint.Port() != "") {
+		return fmt.Errorf("%s startup endpoint %q does not serve the bootstrap port", provider, startup.Endpoint)
 	}
-	home := &corev1.Pod{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: process.Worker.Namespace, Name: process.Worker.Name}, home); err != nil {
+	worker := &corev1.Pod{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: process.Worker.Namespace, Name: process.Worker.Name}, worker); err != nil {
 		return err
 	}
-	if home.UID != process.Worker.UID || home.DeletionTimestamp != nil || home.Labels["fiberd.io/grant"] == "" {
-		return fmt.Errorf("native worker is not the live fiberd home Pod")
+	if worker.UID != process.Worker.UID || worker.DeletionTimestamp != nil {
+		return fmt.Errorf("native worker %s/%s is not the recorded live Pod", process.Worker.Namespace, process.Worker.Name)
+	}
+	o.startup, o.worker = startup.DeepCopy(), worker
+	if provider != "fiberd" {
+		return nil
+	}
+	home := worker
+	if home.Labels["fiberd.io/grant"] == "" {
+		return fmt.Errorf("native worker is not the fiberd home Pod")
 	}
 	service := &corev1.Service{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: home.Namespace, Name: w.Status.Allocation.Identity.InstanceID}, service); err != nil {
@@ -106,7 +115,7 @@ func observe(ctx context.Context, c client.Client, w *workspaceapi.ExecutionWork
 	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != 80 || service.Labels["fiberd.workspace.orka.ai/instance"] != w.Status.Allocation.Identity.InstanceID {
 		return fmt.Errorf("per-instance Service does not map the bootstrap port")
 	}
-	o.startup, o.service, o.home = startup.DeepCopy(), service, home
+	o.service = service
 	if o.challengeChecked {
 		return nil
 	}
@@ -145,9 +154,24 @@ func createAdmitted(ctx context.Context, c client.Client, obj client.Object) err
 	}
 }
 
-func run(ctx context.Context, c client.Client, runID string) (map[string]any, error) {
-	params := object("FiberdPoolParameters", "core-"+runID, map[string]any{})
-	params.SetAPIVersion("fiberd.workspace.orka.ai/v1alpha1")
+// profiles are each provider's opaque class parameters.
+var profiles = map[string]struct {
+	group, kind string
+	spec        map[string]any
+}{
+	"fiberd": {"fiberd.workspace.orka.ai", "FiberdPoolParameters", map[string]any{}},
+	// The ActorTemplate comes from Orka's workspace-substrate-cluster.sh.
+	"substrate": {"substrate.workspace.orka.ai", "SubstrateWorkspaceProfile",
+		map[string]any{"templateRef": map[string]any{"namespace": "orka-system", "name": "orka-acp-infra"}}},
+}
+
+func run(ctx context.Context, c client.Client, provider, runID string) (map[string]any, error) {
+	profile, ok := profiles[provider]
+	if !ok {
+		return nil, fmt.Errorf("unknown provider %q", provider)
+	}
+	params := object(profile.kind, "core-"+runID, profile.spec)
+	params.SetAPIVersion(profile.group + "/v1alpha1")
 	if err := c.Create(ctx, params); err != nil {
 		return nil, err
 	}
@@ -157,8 +181,8 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 		DeletionPolicy: workspaceapi.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspaceapi.WorkspaceDeletionActionDelete,
 			PersistentVolumes: workspaceapi.WorkspaceDeletionActionDelete, Checkpoints: workspaceapi.WorkspaceDeletionActionDelete}}
 	class := &workspaceapi.ExecutionWorkspaceClass{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "core-" + runID},
-		Spec: workspaceapi.ExecutionWorkspaceClassSpec{ProviderRef: &workspaceapi.ClusterObjectReference{Name: "fiberd"},
-			ParametersRef: &workspaceapi.TypedObjectReference{Group: "fiberd.workspace.orka.ai", Kind: "FiberdPoolParameters", Name: params.GetName()},
+		Spec: workspaceapi.ExecutionWorkspaceClassSpec{ProviderRef: &workspaceapi.ClusterObjectReference{Name: provider},
+			ParametersRef: &workspaceapi.TypedObjectReference{Group: profile.group, Kind: profile.kind, Name: params.GetName()},
 			Mode:          workspaceapi.ExecutionWorkspaceModeInteractive, RequiredFeatures: []workspaceapi.ExecutionWorkspaceFeature{workspaceapi.WorkspaceFeatureACPRuntime},
 			AllowedReuseScopes: []workspaceapi.WorkspaceReuseScope{workspaceapi.WorkspaceReuseScopeNone}, Lifecycle: lifecycle}}
 	if err := c.Create(ctx, class); err != nil {
@@ -175,9 +199,9 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 		}
 		return false, nil
 	}); err != nil {
-		return nil, fmt.Errorf("fiberd class readiness: %w; conditions=%v", err, class.Status.Conditions)
+		return nil, fmt.Errorf("%s class readiness: %w; conditions=%v", provider, err, class.Status.Conditions)
 	}
-	fmt.Println("PASS Orka resolves the fiberd provider and its opaque profile")
+	fmt.Printf("PASS Orka resolves the %s provider and its opaque profile\n", provider)
 	agent := object("Agent", "core-"+runID, map[string]any{
 		"runtime": map[string]any{"contractVersion": "orka.harness.v2", "type": "codex", "defaultMaxTurns": int64(1),
 			"defaultAllowedTools": []any{"Glob", "Grep", "Read"}, "defaultAllowBash": false},
@@ -187,7 +211,7 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 	}
 	task := object("Task", "core-"+runID, map[string]any{
 		"type": "agent", "agentRef": map[string]any{"name": agent.GetName()},
-		"prompt": "Run the deterministic fiberd workspace fixture.", "timeout": "5m",
+		"prompt": "Run the deterministic workspace fixture.", "timeout": "5m",
 		"execution":    map[string]any{"workspace": map[string]any{"classRef": map[string]any{"name": class.Name}, "reusePolicy": "none", "onDetach": "Delete"}},
 		"agentRuntime": map[string]any{"maxTurns": int64(1), "allowedTools": []any{"Glob", "Grep", "Read"}, "allowBash": false}})
 	created := time.Now()
@@ -217,7 +241,7 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 					if o.firstStartup == 0 {
 						o.firstStartup = time.Since(created)
 					}
-					if err := observe(ctx, c, current, o); err != nil {
+					if err := observe(ctx, c, provider, current, o); err != nil {
 						return false, err
 					}
 				}
@@ -257,9 +281,9 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 		}
 	}
 	if o.startup == nil || servingInstance != identity["runtimeInstanceID"] || servingBoot != identity["runtimeSessionSupervisorBootID"] {
-		return nil, fmt.Errorf("could not tie the Serving runtime to the fiberd startup evidence")
+		return nil, fmt.Errorf("could not tie the Serving runtime to the %s startup evidence", provider)
 	}
-	fmt.Println("PASS supervisor in a gVisor fiber bootstraps, serves and executes a deterministic ACP RuntimeSession prompt")
+	fmt.Println("PASS the native supervisor bootstraps, serves and executes a deterministic ACP RuntimeSession prompt")
 	if err := wait(ctx, func() (bool, error) {
 		err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: workspaceName}, workspace)
 		if apierrors.IsNotFound(err) {
@@ -272,9 +296,24 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 	}); err != nil {
 		return nil, fmt.Errorf("core exact-instance retirement: %w", err)
 	}
-	if err := c.Get(ctx, client.ObjectKeyFromObject(o.service), &corev1.Service{}); !apierrors.IsNotFound(err) {
-		return nil, fmt.Errorf("retired fiber Service remains: %v", err)
+	retired := time.Since(created)
+	// fiberd's home outlives its fibers; the per-instance Service must go.
+	// Substrate's private worker Pod must go with its instance.
+	var gone client.Object = &corev1.Pod{}
+	key := client.ObjectKeyFromObject(o.worker)
+	if o.service != nil {
+		gone, key = &corev1.Service{}, client.ObjectKeyFromObject(o.service)
 	}
+	if err := wait(ctx, func() (bool, error) {
+		err := c.Get(ctx, key, gone)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return err == nil && gone.GetUID() != o.worker.UID && o.service == nil, err
+	}); err != nil {
+		return nil, fmt.Errorf("retired instance resource %s remains: %w", key, err)
+	}
+	released := time.Since(created)
 	var tokens corev1.SecretList
 	if err := c.List(ctx, &tokens, client.InNamespace(namespace), client.MatchingLabels{"workspace.orka.ai/attachment-for": string(workspace.UID)}); err != nil {
 		return nil, err
@@ -282,17 +321,23 @@ func run(ctx context.Context, c client.Client, runID string) (map[string]any, er
 	if len(tokens.Items) != 0 {
 		return nil, fmt.Errorf("retired workspace retains %d attachment token Secrets", len(tokens.Items))
 	}
-	fmt.Println("PASS terminal Task revokes attachment credentials, releases the fiber and removes its Service")
-	return map[string]any{"task": namespace + "/" + task.GetName(), "phase": "Succeeded", "workspace": namespace + "/" + workspaceName,
-		"startup": o.startup, "home": map[string]any{"name": o.home.Name, "uid": o.home.UID}, "service": o.service.Name,
+	fmt.Println("PASS terminal Task revokes attachment credentials and releases its native instance")
+	ms := func(d time.Duration) int64 { return d.Milliseconds() }
+	result := map[string]any{"provider": provider, "task": namespace + "/" + task.GetName(), "phase": "Succeeded", "workspace": namespace + "/" + workspaceName,
+		"startup": o.startup, "worker": map[string]any{"namespace": o.worker.Namespace, "name": o.worker.Name, "uid": o.worker.UID},
 		"challengeReadBeforeCore": o.challengeChecked, "runtimeSession": identity,
-		"timings": map[string]string{"taskToStartupEvidence": o.firstStartup.Round(time.Millisecond).String(),
-			"taskToServing": serving.Round(time.Millisecond).String(), "taskToSucceeded": succeeded.Round(time.Millisecond).String()},
-		"attachmentSecretsRemaining": 0}, nil
+		"timingsMS": map[string]int64{"taskToStartupEvidence": ms(o.firstStartup), "taskToServing": ms(serving),
+			"taskToSucceeded": ms(succeeded), "taskToWorkspaceRetired": ms(retired), "taskToInstanceReleased": ms(released)},
+		"attachmentSecretsRemaining": 0}
+	if o.service != nil {
+		result["service"] = o.service.Name
+	}
+	return result, nil
 }
 
 func main() {
 	runID := flag.String("run-id", "", "isolated resource suffix")
+	provider := flag.String("provider", "fiberd", "workspace provider: fiberd or substrate")
 	report := flag.String("report", "", "public JSON proof report")
 	flag.Parse()
 	if *runID == "" || os.Getenv("KUBECONFIG") == "" {
@@ -315,15 +360,15 @@ func main() {
 	if err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 		defer cancel()
-		result, err = run(ctx, c, *runID)
+		result, err = run(ctx, c, *provider, *runID)
 	}
 	if result != nil && *report != "" {
 		data, _ := json.MarshalIndent(result, "", "  ")
 		_ = os.WriteFile(*report, append(data, '\n'), 0o600)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "fiberd core proof failed:", err)
+		fmt.Fprintf(os.Stderr, "%s core proof failed: %v\n", *provider, err)
 		os.Exit(1)
 	}
-	fmt.Println("fiberd Core RuntimeSession proof passed.")
+	fmt.Printf("%s Core RuntimeSession proof passed.\n", *provider)
 }

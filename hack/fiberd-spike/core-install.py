@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Render the fiberd spike Core deployment: the fake proof's Core with fiberd
-profile readers and shared native worker Pods enabled."""
+"""Render the spike's fixture Core deployment: the fake proof's Core with the
+provider's profile readers. fiberd also needs shared native worker Pods."""
 import base64
 import json
 import pathlib
 import sys
 
-core_image, runtime_image, certificate = sys.argv[1:]
+provider, core_image, runtime_image, certificate = sys.argv[1:]
+readers = {
+    "fiberd": ("fiberd.workspace.orka.ai", ["fiberdproviderconfigs", "fiberdpoolparameters"]),
+    "substrate": ("substrate.workspace.orka.ai", ["substrateproviderconfigs", "substrateworkspaceprofiles"]),
+}[provider]
 namespace = "orka-system"
 objects = []
 
@@ -31,7 +35,7 @@ add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", "external-workspace-co
     roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "external-workspace-core"},
     subjects=[{"kind": "ServiceAccount", "name": "orka-controller-manager", "namespace": namespace}])
 add("rbac.authorization.k8s.io/v1", "ClusterRole", "external-workspace-core-fixture",
-    rules=[{"apiGroups": ["fiberd.workspace.orka.ai"], "resources": ["fiberdproviderconfigs", "fiberdpoolparameters"], "verbs": ["get", "list", "watch"]},
+    rules=[{"apiGroups": [readers[0]], "resources": readers[1], "verbs": ["get", "list", "watch"]},
            {"apiGroups": ["apiextensions.k8s.io"], "resources": ["customresourcedefinitions"], "verbs": ["get"]},
            {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"]}])
 add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", "external-workspace-core-fixture",
@@ -54,7 +58,9 @@ args = ["--leader-elect", "--health-probe-bind-address=:8081", "--metrics-bind-a
         "--acp-runtime-namespace=orka-runtimes", "--acp-codex-runtime-image=" + runtime_image,
         "--acp-provider-proxy-base-url=http://fixture-provider-proxy.orka-system.svc:8080",
         "--acp-provider-proxy-namespace=orka-system", "--acp-provider-proxy-token-file=/var/run/orka/fixture/token",
-        "--gateway-enabled=false", "--external-native-shared-workers=true"]
+        "--gateway-enabled=false"]
+if provider == "fiberd":
+    args.append("--external-native-shared-workers=true")
 add("apps/v1", "Deployment", "external-workspace-core", ns=namespace, spec={
     "replicas": 1, "selector": {"matchLabels": {"app": "external-workspace-core"}},
     "strategy": {"type": "Recreate"}, "template": {"metadata": {"labels": labels}, "spec": {
