@@ -9,7 +9,7 @@ replace github.com/orka-agents/orka-workspace => ../..
 replace github.com/orka-agents/orka-workspace/providers => ../../providers
 
 require (
-	github.com/helayoty/fiberd v0.1.1-0.20261013212911-b3b5b4735cff
+	github.com/helayoty/fiberd v0.1.1-0.20261014194844-cddb38570fd9
 	github.com/orka-agents/orka-workspace v0.0.0
 	github.com/orka-agents/orka-workspace/providers v0.0.0
 	google.golang.org/grpc v1.83.2

@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/helayoty/fiberd/pkg/consumer"
 	"github.com/helayoty/fiberd/pkg/core"
 	"github.com/helayoty/fiberd/pkg/grant"
+	fiberclient "github.com/helayoty/fiberd/sdk/go/client"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -51,7 +51,7 @@ type Home struct {
 	issuer *grant.Issuer
 
 	mu     sync.Mutex
-	api    *consumer.Client
+	api    *fiberclient.Client
 	target string
 }
 
@@ -77,7 +77,7 @@ func NewHome(ctx context.Context, reader client.Reader, cfg HomeConfig) (*Home, 
 // client returns the API client for the current home. Without a configured
 // Target it follows the home Pod's IP, so a replaced home is dialed anew;
 // instances recorded on the old home are fenced by its Pod UID.
-func (h *Home) client(ctx context.Context) (*consumer.Client, error) {
+func (h *Home) client(ctx context.Context) (*fiberclient.Client, error) {
 	target := h.cfg.Target
 	if target == "" {
 		pod, err := h.pod(ctx)
@@ -91,7 +91,7 @@ func (h *Home) client(ctx context.Context) (*consumer.Client, error) {
 	if h.api != nil && h.target == target {
 		return h.api, nil
 	}
-	api, err := consumer.Dial(ctx, target)
+	api, err := fiberclient.Dial(ctx, target)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +157,7 @@ func (h *Home) Release(ctx context.Context, fiberID string) error {
 	if err != nil {
 		return err
 	}
-	if err := api.Release(ctx, fiberID, true); err != nil && !consumer.NotFound(err) {
+	if err := api.Release(ctx, fiberID, true); err != nil && !fiberclient.NotFound(err) {
 		return err
 	}
 	return nil
@@ -175,7 +175,7 @@ func (h *Home) Running(ctx context.Context, grantUID string) (int, error) {
 	wctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	running, complete, seen := -1, false, map[string]bool{}
-	err = api.Watch(wctx, func(s consumer.Status) {
+	err = api.Watch(wctx, func(s fiberclient.Status) {
 		switch {
 		case s.GrantUID == grantUID:
 			running = int(s.Running)

@@ -5,7 +5,7 @@ go 1.26.2
 toolchain go1.27.2
 
 require (
-	github.com/helayoty/fiberd v0.1.1-0.20261013212911-b3b5b4735cff
+	github.com/helayoty/fiberd v0.1.1-0.20261014194844-cddb38570fd9
 	github.com/orka-agents/orka-workspace v0.0.0
 	google.golang.org/grpc v1.83.2
 	k8s.io/api v0.37.0

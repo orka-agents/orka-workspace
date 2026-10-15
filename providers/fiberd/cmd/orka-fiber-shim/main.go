@@ -131,6 +131,7 @@ type identity struct {
 	fence    string
 	endpoint string
 	payload  []byte
+	session  string
 	conn     *net.UnixConn
 }
 
@@ -200,13 +201,14 @@ func specToken() string {
 }
 
 // parseIdentity splits 'i' <generation> <kind> <fence> <endpoint>
-// <payload-hex|-> <key|-> <cert|-> <caller|-> <seed-hex>, NUL-terminated.
+// <payload-hex|-> <key|-> <cert|-> <caller|-> <session-hex|-> <seed-hex>,
+// NUL-terminated.
 func parseIdentity(rec []byte) (*identity, error) {
 	if len(rec) < 2 || rec[0] != 'i' || rec[len(rec)-1] != 0 {
 		return nil, errors.New("malformed identity record")
 	}
 	fields := strings.Split(string(rec[1:len(rec)-1]), "\x00")
-	if len(fields) != 9 || fields[2] == "" || fields[3] == "" {
+	if len(fields) != 10 || fields[2] == "" || fields[3] == "" {
 		return nil, fmt.Errorf("identity record has %d fields", len(fields))
 	}
 	id := &identity{kind: fields[1], fence: fields[2], endpoint: fields[3]}
@@ -217,7 +219,14 @@ func parseIdentity(rec []byte) (*identity, error) {
 		}
 		id.payload = p
 	}
-	if seed, err := hex.DecodeString(fields[8]); err != nil || len(seed) != 32 {
+	if fields[8] != "-" {
+		session, err := hex.DecodeString(fields[8])
+		if err != nil {
+			return nil, fmt.Errorf("session: %w", err)
+		}
+		id.session = string(session)
+	}
+	if seed, err := hex.DecodeString(fields[9]); err != nil || len(seed) != 32 {
 		return nil, errors.New("identity seed is not 32 bytes")
 	}
 	return id, nil
@@ -246,6 +255,11 @@ func serveFiber(o options, lastToken *string) error {
 	launch, err := payload.Decode(id.payload)
 	if err != nil {
 		return fmt.Errorf("payload: %w", err)
+	}
+	// fiberd attests the session the fiber was cloned for; a named fiber
+	// serves only the identity of that session.
+	if id.session != "" && id.session != launch.Identity.Name {
+		return fmt.Errorf("payload names %q, but fiberd cloned session %q", launch.Identity.Name, id.session)
 	}
 	if err := writeIdentity(o.identityDir, launch.Identity); err != nil {
 		return err

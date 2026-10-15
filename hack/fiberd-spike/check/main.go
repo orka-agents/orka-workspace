@@ -28,10 +28,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/helayoty/fiberd/pkg/consumer"
 	"github.com/helayoty/fiberd/pkg/core"
 	"github.com/helayoty/fiberd/pkg/endpoint"
 	"github.com/helayoty/fiberd/pkg/grant"
+	fiberclient "github.com/helayoty/fiberd/sdk/go/client"
 
 	"github.com/orka-agents/orka-workspace/providers/fiberd/payload"
 )
@@ -124,7 +124,7 @@ func run(o options) (*report, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := consumer.New(conn)
+	c := fiberclient.New(conn)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -223,7 +223,7 @@ func run(o options) (*report, error) {
 	return r, nil
 }
 
-func cloneOne(ctx context.Context, c *consumer.Client, token, grantUID string, i int, o options) fiberResult {
+func cloneOne(ctx context.Context, c *fiberclient.Client, token, grantUID string, i int, o options) fiberResult {
 	res := fiberResult{Workspace: fmt.Sprintf("ws-%d", i), Grant: grantUID}
 	nonce := randomHex(32)
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
