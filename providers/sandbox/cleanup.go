@@ -164,8 +164,9 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 			if !suspend {
 				if record.Failure != "" {
 					// Wait for the suspended Sandbox to retire a replacement Pod
-					// rather than treating it as the journaled one.
-					if _, err := d.pod(ctx, record, sb); errors.Is(err, workspaceprovider.ErrStaleIdentity) {
+					// under the journaled name rather than treating it as the
+					// journaled one.
+					if _, err := d.journaledPod(ctx, record); errors.Is(err, workspaceprovider.ErrStaleIdentity) {
 						observed = record.Observation
 						return nil
 					}

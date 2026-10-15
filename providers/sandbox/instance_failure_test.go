@@ -74,6 +74,19 @@ func TestRuntimePodLossFailsAndRetiresByStop(t *testing.T) {
 			if err := c.Update(t.Context(), workspace); err != nil {
 				t.Fatal(err)
 			}
+			if loss == "deleted" {
+				// Until the suspended Sandbox removes its replacement, Stop
+				// waits without deleting it or reporting an error.
+				for range 2 {
+					observed, err := New(c).StopInstance(t.Context(), request.Key, first.Identity)
+					if err != nil || observed.State != workspaceprovider.AllocationPending {
+						t.Fatalf("Stop did not wait for the replacement: %#v, %v", observed, err)
+					}
+				}
+				if err := c.Get(t.Context(), podKey, pod); err != nil || pod.UID == first.Startup.Pod.UID || pod.DeletionTimestamp != nil {
+					t.Fatalf("the provider deleted the upstream replacement itself: %v", err)
+				}
+			}
 			for range 3 {
 				if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); err != nil {
 					t.Fatal(err)
