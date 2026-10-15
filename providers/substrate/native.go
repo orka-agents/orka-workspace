@@ -492,6 +492,18 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	if record.Template.UID == "" || record.Worker == nil || record.ChallengeSHA256 == "" {
 		return pendingObservation(record), nil
 	}
+	// Exact loss is checked first: removed infrastructure can be part of the
+	// same loss and must not hide it behind a readiness error.
+	actor, err := d.actor(ctx, record)
+	if err != nil {
+		return sdk.AllocationObservation{}, err
+	}
+	if actor == nil {
+		return sdk.AllocationObservation{}, lostInstance(record, nativeActorDisappeared)
+	}
+	if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+		return sdk.AllocationObservation{}, lostInstance(record, nativeActorStopped)
+	}
 	if err := d.verifyInheritedCheckpoint(ctx, record); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
@@ -503,16 +515,6 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	}
 	if err := d.verifyTemplate(ctx, record.Atespace, record.Template); err != nil {
 		return sdk.AllocationObservation{}, err
-	}
-	actor, err := d.actor(ctx, record)
-	if err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if actor == nil {
-		return sdk.AllocationObservation{}, lostInstance(record, nativeActorDisappeared)
-	}
-	if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
-		return sdk.AllocationObservation{}, lostInstance(record, nativeActorStopped)
 	}
 	if actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
 		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity

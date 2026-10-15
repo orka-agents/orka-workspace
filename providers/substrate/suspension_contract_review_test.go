@@ -140,6 +140,11 @@ func TestLegacyIssuedSuspensionUsesExactBackendStateWithoutReplay(t *testing.T) 
 					if err != nil {
 						t.Fatalf("legacy accepted progress rejected: %v", err)
 					}
+				} else if state == pb.ActorState_ACTOR_STATE_CRASHED {
+					// A crashed source is an exact loss: it fails without replay.
+					if _, failed, readErr := d.read(t.Context(), request.Key); readErr != nil || failed.Failure == "" {
+						t.Fatalf("crashed capture source was not recorded as failed: %v %v", err, readErr)
+					}
 				} else if err == nil || !strings.Contains(err.Error(), "outcome is unresolved") {
 					t.Fatalf("legacy failed outcome silently accepted: %v", err)
 				}
