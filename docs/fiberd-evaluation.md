@@ -10,13 +10,16 @@ and its run steps are in [hack/fiberd-spike](../hack/fiberd-spike/README.md).
 ## Recommendation
 
 Do not build a supported fiberd provider now. A fiberd provider works end to
-end, but it does not beat the Substrate provider for Orka:
+end, but it gives Orka nothing the Substrate provider lacks that is worth its
+costs:
 
-- It finishes a Task about 2 s later, and one running instance uses about 50%
-  more memory.
-- It wins only on provisioning (about 2 s sooner) and release after the Task
-  (about 9 s sooner). Its fastest mode, a shared warm pool, is unsafe because
-  fibers of one grant reach each other.
+- A single Task performs about the same: 13.0 s against 13.8 s to Succeeded.
+  fiberd starts the instance about 1 s sooner and releases it about 5 s sooner.
+- Under concurrency the spike provider is slower, because it reconciles one
+  workspace at a time.
+- One running instance uses about 50% more memory.
+- Its fastest mode, a shared warm pool, is unsafe because fibers of one grant
+  reach each other.
 - It needs a Core flag that weakens per-instance network binding, a fiberd
   patch, and fiberd changes Orka cannot make.
 - Orka requires a fresh, fenced process with fresh bootstrap material for
@@ -138,6 +141,13 @@ design, not something a provider can fix.
 - Each comparison batch restarted Core, then ran 4 Tasks in sequence and 4 at
   once. Three interleaved batch pairs gave 12 sequential and 12 concurrent
   Tasks per provider.
+- The proof host reads Task, workspace and RuntimePool status every 100 ms.
+  The first comparison also read fiberd's bootstrap challenge directly,
+  inside that loop. The VM has no route to Pod IPs, so each read timed out
+  after 2 s. That delayed every fiberd observation after startup evidence. It
+  produced a constant 2.0 s before Serving and inflated the prompt phase. The
+  numbers below come from a rerun with that read disabled, at load average 38
+  to 58.
 - Both providers used the same Core build and the same supervisor image
   digest. Substrate was the official v0.1.0 pin `fa6d949`, set up by Orka's
   `scripts/workspace-substrate-cluster.sh` on its own single-node cluster. Its
@@ -157,8 +167,9 @@ modes.
 | One grant per workspace | 580–625 ms | ~660 ms | 720–1182 ms | 0.77–1.29 s |
 | Plain runc Pod, image cached | — | 0.90–0.98 s | — | 1.8–2.3 s |
 
-The plain Pod slowed by the same factor as fiberd, so the 2026-10-15 rise is
-host load, not the fiberd update.
+Both fiberd and the plain Pod control slowed on 2026-10-15. The Pod slowed
+about 2x, roughly as much as fiberd's on-demand and per-workspace modes. The
+pooled and concurrent modes slowed 4–5x and were not rechecked on a quiet host.
 
 Measured with the home's cgroups on a quiet VM:
 
@@ -186,42 +197,55 @@ The `cddb385` runs were under load.
 | Task to Succeeded | 24.1 s | 13.9 s |
 
 The clone was about 0.6 s of the time to startup evidence. Core's pipeline
-before it publishes the workload dominates.
+before it publishes the workload dominates. These runs included the blocking
+challenge read described above, so Serving and Succeeded may each be up to 2 s
+late; startup evidence is unaffected.
 
 ### fiberd and Substrate on the same Core Task, 2026-10-15
 
-Sequential Tasks, median (range), n=12 for each provider:
+Sequential Tasks, median (range); n=12 for fiberd, 11 for Substrate plus one
+failure:
 
 | Phase | fiberd | Substrate |
 | --- | ---: | ---: |
-| Task to startup evidence | 6.2 s (4.0–9.2) | 8.0 s (6.9–28.0) |
-| Startup evidence to Serving | 2.0 s (2.0–4.2) | 0.2 s (0.1–0.8) |
-| Serving to Succeeded (the prompt) | 6.4 s (4.3–11.4) | 4.5 s (3.8–7.0) |
-| Task to Succeeded | 14.6 s (12.4–22.1) | 12.6 s (11.0–32.8) |
-| Succeeded to instance released | 0.4 s (0.0–2.6) | 9.0 s (7.1–13.3) |
-| Task to instance released | 15.1 s (12.9–22.1) | 22.1 s (19.7–41.8) |
+| Task to startup evidence | 7.1 s (4.8–9.3) | 8.3 s (6.7–23.7) |
+| Startup evidence to Serving | 1.3 s (0.5–3.7) | 0.3 s (0.1–0.6) |
+| Serving to Succeeded (the prompt) | 4.7 s (4.0–6.9) | 4.8 s (4.3–6.3) |
+| Task to Succeeded | 13.0 s (10.2–17.9) | 13.8 s (11.5–30.4) |
+| Succeeded to instance released | 5.4 s (3.6–6.0) | 10.1 s (9.3–13.1) |
+| Task to instance released | 18.2 s (16.0–21.6) | 23.7 s (21.3–40.1) |
 
 Four Tasks at once, median (range), n=12 for each provider:
 
 | Phase | fiberd | Substrate |
 | --- | ---: | ---: |
-| Task to startup evidence | 7.2 s (2.8–17.2) | 9.8 s (6.6–17.8) |
-| Task to Succeeded | 17.7 s (11.2–36.2) | 14.8 s (12.3–34.6) |
-| Task to instance released | 18.7 s (14.3–37.4) | 25.6 s (23.8–47.2) |
+| Task to startup evidence | 8.6 s (5.6–24.4) | 12.9 s (5.7–29.8) |
+| Task to Serving | 18.8 s (7.1–25.5) | 15.8 s (6.4–34.8) |
+| Task to Succeeded | 26.2 s (11.5–31.2) | 23.4 s (12.5–45.6) |
+| Task to instance released | 32.1 s (25.1–36.6) | 34.6 s (23.9–58.1) |
 
-- fiberd provisions about 2 s sooner. It releases about 9 s sooner, because
-  Release is one call while Substrate deletes an Actor, a private WorkerPool
-  and its Pod.
-- Substrate serves about 2 s sooner after startup evidence and runs the prompt
-  about 2 s faster. fiberd's supervisor traffic crosses more hops in both
-  directions:
+- For a single Task, the two providers finish within a second of each other,
+  and the prompt runs at the same speed. fiberd's extra hops do not slow the
+  prompt measurably:
   - Core to supervisor: the per-instance Service, the home relay, then the
     shim's bridge.
   - Supervisor to Core: a loopback forwarder, then the home's CONNECT proxy.
+- fiberd provisions about 1 s sooner but reaches Serving about 1 s later after
+  startup evidence.
+- fiberd releases about 5 s sooner, because Release is one call while
+  Substrate deletes an Actor, a private WorkerPool and its Pod.
+- Under concurrency fiberd reaches Serving and Succeeded about 3 s later. Its
+  provider reconciles one workspace at a time and Clone blocks, so starts
+  queue. That is a provider limit, not a fiberd one.
+- One Substrate Task timed out before runtime admission. Substrate refused its
+  boot ("no free workers available"), and this provider build does not retry a
+  refused boot; #5 adds that. No fiberd Task failed.
 
-  The constant 2.0 s before Serving was not isolated further.
-- The fiberd provider reconciles one workspace at a time and Clone blocks, so
-  concurrent starts queue.
+The first comparison, with the blocking challenge read, showed:
+- Substrate about 2 s faster to Succeeded, with a 2 s faster prompt.
+- fiberd releasing 0.4 s after Succeeded.
+
+All three were artifacts of that read.
 
 ### Memory
 
@@ -244,8 +268,9 @@ Sampled from the kind node's cgroups during one Task, twice per provider:
 
 ### Caveats
 
-- The VM was shared and the runs were on a single node. Ranges are wide, and
-  Substrate had one 28 s outlier.
+- The VM was shared and the runs were on a single node. Load was higher during
+  the corrected rerun than the first comparison, so the two sets of absolute
+  numbers are not comparable. Ranges are wide.
 - The fixture Core keeps its store on an emptyDir. Tasks left across a Core
   restart never finalize, and Core retries them every second: 13 on the fiberd
   cluster and 9 on Substrate's. The measurement script now deletes its own
@@ -259,7 +284,7 @@ Sampled from the kind node's cgroups during one Task, twice per provider:
 | Advantage | Status for Orka |
 | --- | --- |
 | Pooled clone in 8–15 ms, supervisor healthy in 45–65 ms | Needs a shared grant, which is unsafe until fiberd isolates fibers within a grant |
-| Faster provisioning and release than Substrate | Measured, but about 6 s of Core's own pipeline hides the start gain |
+| Provisioning about 1 s and release about 5 s sooner than Substrate | Measured; Task to Succeeded is about the same, since about 6 s of Core's own pipeline dominates |
 | Small fixed footprint and simple operation | Real, but offset by 22 MiB per finished workspace for a day |
 | No Pod, IP or scheduling per workspace | Not measured; might help high churn at scale |
 | Memory-preserving park and resume | Conflicts with Orka's fresh-process rule; a parked supervisor's checkpoint contains its credentials |
@@ -268,9 +293,9 @@ Sampled from the kind node's cgroups during one Task, twice per provider:
 
 ## Code review findings
 
-Automated review on the PR raised 13 comments covering 11 issues. All were
+Automated review on the PR raised 18 comments covering 16 issues. All were
 assessed against the code. Unit tests cover the lifecycle and validation fixes,
-and the shim fix was verified on the live cluster.
+and the shim and harness fixes were verified on the live cluster.
 
 | Finding | Resolution |
 | --- | --- |
@@ -283,6 +308,11 @@ and the shim fix was verified on the live cluster.
 | A wildcard supervisor listener could collide with a URL forwarder on the same port | The supervisor listens only on the bridge's loopback address. Verified live. |
 | Capability drops were accepted but never applied | The effective set is computed; a drop the sandbox cannot honor is rejected. Core's drop-ALL-then-add shape is still admitted. |
 | A Clone in flight when retirement began could start a fiber after retirement saw none | The Clone deadline is journaled before each Clone, and fiberd enforces it. Retirement waits until the deadline plus grace before trusting absence. Test added; it fails with the fence disabled. |
+| Ensure could create the bootstrap Service after retirement had found none, leaving it after the workspace was deleted | When Ensure's journal update conflicts after it creates the Service, Ensure deletes that Service by UID. Test added; it fails without the fix. |
+| A container working directory was admitted but never applied | Any working directory other than `/` is rejected. Core sets none. |
+| `HTTP_PROXY` pointed plain HTTP clients at a CONNECT-only proxy | Only `HTTPS_PROXY` is set. |
+| The timed proof's blocking challenge read biased fiberd's timings | The read is opt-in and off for timed runs. The comparison was rerun, which reversed two earlier conclusions. |
+| A host-load sentence overstated the Stage 1 control | Qualified by mode. |
 | Stage 1 passed when a released supervisor still served | A still-healthy endpoint now counts as a failure. |
 | Stage 2 exited 0 when its conformance Job failed | The wait status propagates after the logs print. |
 
@@ -338,7 +368,8 @@ Expected Sandbox results:
 
 - Provisioning within about a second of fiberd, since a plain Pod start was
   0.90–0.98 s against fiberd's 0.6 s per-workspace clone.
-- Faster Serving and prompt than fiberd, since no bridges are involved.
+- Possibly about 1 s sooner from startup evidence to Serving, since no bridges
+  are involved. The prompt itself ran at the same speed on fiberd and Substrate.
 
 The comparison is not like-for-like unless the Pod runs under a gVisor
 RuntimeClass.
