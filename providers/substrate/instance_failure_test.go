@@ -415,3 +415,58 @@ func TestFailedInstanceWithMissingJournalStaysFailedWithoutCleanup(t *testing.T)
 		t.Fatalf("missing journal left %s %+v: %v", workspace.Status.State, workspace.Status.Allocation, err)
 	}
 }
+
+func TestActorLossDuringSuspendCaptureFailsAndRetiresByStop(t *testing.T) {
+	c, native, request := fixture(t, true)
+	first := ready(t, c, native, request)
+	control := &suspensionReviewControl{nativeFixture: native, submit: func(request *pb.SuspendActorRequest) (*pb.SuspendActorResponse, error) {
+		native.actors[refKey(request.Actor)].Status.State = pb.ActorState_ACTOR_STATE_SUSPENDING
+		return &pb.SuspendActorResponse{}, nil
+	}}
+	d := driver(c, native)
+	d.control = control
+	if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity); err != nil {
+		t.Fatal(err)
+	}
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil || record.Pending == nil || !record.Pending.SuspendIssued {
+		t.Fatalf("capture did not start: %v", err)
+	}
+	delete(native.actors, record.Atespace+"/"+record.Actor.Name)
+
+	workspace := &api.ExecutionWorkspace{}
+	if err := c.Get(t.Context(), clientKey(request.Key), workspace); err != nil {
+		t.Fatal(err)
+	}
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: first.Identity, Action: api.WorkloadRetirementSuspend}
+	updateFailureWorkspace(t, c, workspace)
+	workspace = reconcileFailureFixture(t, c, native, request)
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("Actor loss during capture reported %s", workspace.Status.State)
+	}
+	for range 20 {
+		workspace = reconcileFailureFixture(t, c, native, request)
+		if workspace.Status.Allocation.State == sdk.AllocationStopped {
+			break
+		}
+	}
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed || workspace.Status.Allocation.State != sdk.AllocationStopped || workspace.Status.Allocation.RetainedData != nil {
+		t.Fatalf("failed capture did not retire by Stop without retained data: %s %+v", workspace.Status.State, workspace.Status.Allocation)
+	}
+	if len(privateWorkerPools(t, c)) != 0 || native.suspends != 0 || len(native.tags) != 0 {
+		t.Fatal("failed capture left compute or replayed the capture")
+	}
+
+	workspace.Spec.DesiredState = api.ExecutionWorkspaceDesiredDeleted
+	workspace.Spec.Retirement.Action = api.WorkloadRetirementDelete
+	updateFailureWorkspace(t, c, workspace)
+	for range 25 {
+		workspace = reconcileFailureFixture(t, c, native, request)
+		if workspace.Status.State == api.ExecutionWorkspaceStateDeleted {
+			break
+		}
+	}
+	if workspace.Status.State != api.ExecutionWorkspaceStateDeleted {
+		t.Fatalf("failed capture deletion did not finish: %s", workspace.Status.State)
+	}
+}

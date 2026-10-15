@@ -3,6 +3,7 @@ package substrate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 
@@ -380,7 +381,14 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
-			if err := d.capture(ctx, cm, record); err != nil {
+			err := d.capture(ctx, cm, record)
+			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
+				// The capture source is gone, so this capture can never finish.
+				// The failed instance retires through the exact Stop path.
+				observed, err = d.fail(ctx, cm, record, lost.reason)
+				return err
+			}
+			if err != nil {
 				return err
 			}
 			if record.Pending != nil {
@@ -402,6 +410,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	actor, err := d.actor(ctx, record)
 	if err != nil {
 		return err
+	}
+	if actor == nil && record.Actor.UID != "" {
+		return lostInstance(record, nativeActorDisappeared)
 	}
 	if actor == nil || record.Worker == nil || actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
 		return fmt.Errorf("native checkpoint lost its source lifetime or template")
