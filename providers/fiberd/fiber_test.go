@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -210,6 +211,47 @@ func TestRetirementRemovesAServiceCreatedAfterIt(t *testing.T) {
 	}
 	if len(services.Items) != 0 {
 		t.Fatalf("a Service created after retirement remains: %s", services.Items[0].Name)
+	}
+}
+
+// Two Ensure calls can both find a recorded fiber without a Service and
+// race to save the same Service. The one that loses must not delete it.
+func TestConcurrentEnsuresKeepTheirSharedService(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	request, err := RuntimeConformanceFixture(ctx, c, ConformanceImage, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := New(c, NewMemoryFibers(ConformanceImage))
+	arrived := make(chan struct{}, 2)
+	release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var calls atomic.Int32
+	driver.beforeServiceCreate = func() {
+		i := calls.Add(1) - 1
+		if i > 1 {
+			return
+		}
+		arrived <- struct{}{}
+		<-release[i]
+	}
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := driver.EnsureAllocation(ctx, request); first <- err }()
+	<-arrived
+	go func() { _, err := driver.EnsureAllocation(ctx, request); second <- err }()
+	<-arrived
+	close(release[0])
+	if err := <-first; err != nil {
+		t.Fatalf("first ensure: %v", err)
+	}
+	close(release[1])
+	if err := <-second; err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	ready, err := driver.Observe(ctx, request.Key)
+	if err != nil || ready.State != workspaceprovider.AllocationReady {
+		t.Fatalf("after concurrent ensures: %v %v", ready.State, err)
 	}
 }
 

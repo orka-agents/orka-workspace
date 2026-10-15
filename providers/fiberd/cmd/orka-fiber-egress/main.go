@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -115,15 +116,28 @@ func serve(ln net.Listener, grant string, allowed map[string]bool) {
 	}
 }
 
+// maxHeaderBytes bounds a CONNECT request. One home serves every grant, so
+// a fiber must not make it allocate without bound before the allowlist runs.
+const maxHeaderBytes = 16 << 10
+
 func handle(c net.Conn, grant string, allowed map[string]bool) {
 	defer func() { _ = c.Close() }()
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
-	br := bufio.NewReader(c)
+	header := &io.LimitedReader{R: c, N: maxHeaderBytes}
+	br := bufio.NewReader(header)
 	req, err := http.ReadRequest(br)
 	if err != nil {
+		if header.N == 0 {
+			log.Printf("grant %s: refused a request header over %d bytes", grant, maxHeaderBytes)
+			_, _ = fmt.Fprint(c, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n")
+		}
 		return
 	}
 	_ = c.SetReadDeadline(time.Time{})
+	// Tunnel bytes sent with the request are already buffered; the rest of
+	// the tunnel is not bounded by the header limit.
+	buffered, _ := br.Peek(br.Buffered())
+	in := io.MultiReader(bytes.NewReader(bytes.Clone(buffered)), c)
 	if req.Method != http.MethodConnect {
 		log.Printf("grant %s: refused %s %s", grant, req.Method, req.URL)
 		_, _ = fmt.Fprint(c, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
@@ -150,7 +164,7 @@ func handle(c net.Conn, grant string, allowed map[string]bool) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(u, br)
+		_, _ = io.Copy(u, in)
 		if tc, ok := u.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}

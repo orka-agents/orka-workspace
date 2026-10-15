@@ -296,7 +296,7 @@ Sampled from the kind node's cgroups during one Task, twice per provider:
 
 ## Code review findings
 
-Automated review on the PR raised 19 comments covering 17 issues. All were
+Automated review on the PR raised 22 comments covering 20 issues. All were
 assessed against the code. Unit tests cover the lifecycle and validation fixes,
 and the shim and harness fixes were verified on the live cluster.
 
@@ -311,7 +311,10 @@ and the shim and harness fixes were verified on the live cluster.
 | A wildcard supervisor listener could collide with a URL forwarder on the same port | The supervisor listens only on the bridge's loopback address. Verified live. |
 | Capability drops were accepted but never applied | The effective set is computed; a drop the sandbox cannot honor is rejected. Core's drop-ALL-then-add shape is still admitted. |
 | A Clone in flight when retirement began could start a fiber after retirement saw none | The Clone deadline is journaled before each Clone, and fiberd enforces it. Retirement waits until the deadline plus grace before trusting absence. Test added; it fails with the fence disabled. |
-| Ensure could create the bootstrap Service after retirement had found none, leaving it after the workspace was deleted | When Ensure's journal update conflicts after it creates the Service, Ensure deletes that Service by UID. Test added; it fails without the fix. |
+| Ensure could create the bootstrap Service after retirement had found none, leaving it after the workspace was deleted | When Ensure's journal update conflicts after it creates the Service, it re-reads the journal. It deletes the Service by UID unless the journal still ensures that instance. Test added; it fails without the fix. |
+| That cleanup first deleted the Service on any conflict, including two concurrent Ensures sharing it | The journal check above keeps a Service an active ensure still uses. Concurrent-ensure test added; it fails without the check. |
+| The egress proxy read CONNECT headers without a size limit, so a fiber could exhaust the home's memory | Headers are capped at 16 KiB, answered with 431. Tunnel bytes sent with the request are still forwarded. Tests cover both; verified live. |
+| Release had no deadline, so a stalled home could hold the serial workspace controller | Release times out after 10 s and returns the error, never claiming termination. |
 | A container working directory was admitted but never applied | Any working directory other than `/` is rejected. Core sets none. |
 | `HTTP_PROXY` pointed plain HTTP clients at a CONNECT-only proxy | Only `HTTPS_PROXY` is set. |
 | The timed proof's blocking challenge read biased fiberd's timings | The read is opt-in and off for timed runs. The comparison was rerun, which reversed two earlier conclusions. |

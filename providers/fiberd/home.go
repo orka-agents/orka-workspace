@@ -155,6 +155,10 @@ func (h *Home) Clone(ctx context.Context, g FiberGrant, launch []byte, deadline 
 }
 
 func (h *Home) Release(ctx context.Context, fiberID string) error {
+	// A home that accepts the call and never answers must not hold the
+	// workspace controller; a timeout is an error, never a termination.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	api, err := h.client(ctx)
 	if err != nil {
 		return err

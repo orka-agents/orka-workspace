@@ -328,12 +328,8 @@ func (d *Lifecycle) ensureFiber(ctx context.Context, record *journalRecord, save
 		}
 		f.Service = service
 		if err := save(); err != nil {
-			// Retirement may have run since the fiber was recorded and found no
-			// Service; one it never saw must not outlive the instance.
 			if apierrors.IsConflict(err) {
-				uid := service.UID
-				_ = d.client.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: service.Namespace, Name: service.Name}},
-					&client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
+				d.dropLateService(ctx, record.Request.Key, f.Grant, service)
 			}
 			return workspaceprovider.AllocationObservation{}, err
 		}
@@ -555,6 +551,25 @@ func (d *Lifecycle) ensureService(ctx context.Context, record *journalRecord) (*
 		return nil, err
 	}
 	return &workspaceprovider.PodReference{Namespace: actual.Namespace, Name: actual.Name, UID: actual.UID}, nil
+}
+
+// dropLateService deletes a Service whose journal update lost a race.
+// Retirement may have run since the fiber was recorded and found no Service;
+// one it never saw must not outlive the instance. A concurrent ensure of the
+// same instance may have saved this very Service, so it is kept while the
+// journal still ensures that instance, and when the journal cannot be read.
+func (d *Lifecycle) dropLateService(ctx context.Context, key workspaceprovider.AllocationKey, grant string, service *workspaceprovider.PodReference) {
+	_, current, err := d.read(ctx, key)
+	if err != nil && !errors.Is(err, workspaceprovider.ErrNotFound) {
+		return
+	}
+	if err == nil && current.Operation == "ensure" && current.Fiber != nil && current.Fiber.Grant == grant &&
+		current.Observation.State != workspaceprovider.AllocationStopped && current.Observation.State != workspaceprovider.AllocationDeleted {
+		return
+	}
+	uid := service.UID
+	_ = d.client.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: service.Namespace, Name: service.Name}},
+		&client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}})
 }
 
 // checkService reports whether service routes the instance's bootstrap port
