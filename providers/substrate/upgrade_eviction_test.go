@@ -524,3 +524,49 @@ func TestRegisterCheckpointRecoversUnstampedCatalog(t *testing.T) {
 		t.Fatalf("a differing runtime stamp did not conflict: %v", err)
 	}
 }
+
+// A catalog published before operator labels were recorded keeps restoring
+// under its original rule, an identical pool specification, but cannot
+// prove its labels across a worker image transition.
+func TestCheckpointRestoreOfCatalogWithoutRecordedLabels(t *testing.T) {
+	for _, transition := range []bool{false, true} {
+		name := "same image"
+		if transition {
+			name = "pinned image transition"
+		}
+		t.Run(name, func(t *testing.T) {
+			c, native, source, _ := suspendedSource(t)
+			cp := exportReady(t, c, native, newCheckpoint(t, c, source, false))
+			request := restoreRequest(t, c, source, cp)
+			d := driver(c, native)
+			_, sourceRecord, err := d.read(t.Context(), source.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalogCM, artifact, err := d.readCatalog(t.Context(), catalogKey(source.Key.Namespace, sourceRecord.Checkpoint.Tag.UID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			artifact.RuntimePoolOperatorLabels = nil
+			if err := d.saveCatalog(t.Context(), catalogCM, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if !transition {
+				ready(t, c, native, request)
+				return
+			}
+			mutateSourcePool(t, c, setSourceWorkerImage(pinnedWorkerImageB))
+			if _, err := d.EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), "recorded operator worker pool labels") {
+				t.Fatalf("restore without recorded labels accepted an image transition: %v", err)
+			}
+			if native.boots != 1 {
+				t.Fatal("rejected restore reached native execution")
+			}
+		})
+	}
+	// An unlabeled operator pool records an explicit empty set, never nil.
+	data, err := json.Marshal(checkpointArtifact{RuntimePoolOperatorLabels: map[string]string{}})
+	if err != nil || !strings.Contains(string(data), `"runtimePoolOperatorLabels":{}`) {
+		t.Fatalf("empty operator labels were not recorded explicitly: %s, %v", data, err)
+	}
+}

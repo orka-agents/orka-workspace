@@ -43,8 +43,10 @@ type checkpointArtifact struct {
 	TemplateSpec    *pb.ActorTemplate `json:"templateSpec"`
 	RuntimePoolSpec json.RawMessage   `json:"runtimePoolSpec"`
 	// RuntimePoolOperatorLabels are the operator WorkerPool's own labels the
-	// checkpoint was taken under; a restore requires them unchanged.
-	RuntimePoolOperatorLabels map[string]string           `json:"runtimePoolOperatorLabels,omitempty"`
+	// checkpoint was taken under; a restore requires them unchanged. An empty
+	// set is recorded explicitly, so nil identifies a catalog published before
+	// labels were recorded.
+	RuntimePoolOperatorLabels map[string]string           `json:"runtimePoolOperatorLabels"`
 	Placement                 api.PodReference            `json:"placement"`
 	SourceWorkspace           api.ObjectIdentityReference `json:"sourceWorkspace"`
 	ClassBinding              api.ImmutableObjectBinding  `json:"classBinding"`

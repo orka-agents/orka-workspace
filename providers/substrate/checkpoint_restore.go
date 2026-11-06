@@ -112,7 +112,13 @@ func (d *Lifecycle) importCheckpoint(ctx context.Context, cm *corev1.ConfigMap, 
 	if err != nil {
 		return fmt.Errorf("checkpoint restore changed worker infrastructure: %w", err)
 	}
-	if !maps.Equal(artifact.RuntimePoolOperatorLabels, operatorPoolLabels(record)) {
+	switch {
+	case artifact.RuntimePoolOperatorLabels == nil && transition != nil:
+		// A catalog published before labels were recorded cannot prove its
+		// labels survived an image transition. Without one, it keeps the
+		// rule it was published under: an identical pool specification.
+		return fmt.Errorf("checkpoint restore onto a new worker image requires recorded operator worker pool labels")
+	case artifact.RuntimePoolOperatorLabels != nil && !maps.Equal(artifact.RuntimePoolOperatorLabels, operatorPoolLabels(record)):
 		return fmt.Errorf("checkpoint restore changed the operator worker pool labels")
 	}
 	if err := d.acquireCatalog(ctx, record.Request.Key.Namespace, reference, publicOwner, owner); err != nil {

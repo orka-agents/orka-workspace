@@ -286,7 +286,8 @@ pool's own labels must remain identical; anything else fails closed. Each such
 transition is appended to the journal's `workerImageProvenance` (from, to,
 the previous private pool digest, time), bounded at 16 per lineage. A
 `RestoreFrom` import applies the same rule against the checkpoint's recorded
-pool specification and source pool labels. Do not patch the private `-workers` pools during an upgrade;
+pool specification and source pool labels (a catalog published before labels
+were recorded restores only onto an identical pool specification). Do not patch the private `-workers` pools during an upgrade;
 patch the operator pools, then let running workspaces move by eviction.
 It creates a fresh Actor from the Tag under that original template (v1 seeds an
 Actor only under the Tag's template), checks the Actor holds exactly the Tag's
