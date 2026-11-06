@@ -244,19 +244,19 @@ func (d *Lifecycle) revokeWithdrawnEgressCredentials(ctx context.Context, key sd
 	return d.denyAllEgressPolicy(ctx, cm, record, cause)
 }
 
-// revokeLiveEgressCredentials covers live Actors whose successful observation
-// verifies no egress: a failed instance, which is not stopped until cleanup is
-// authorized (a boot timeout records failure without stopping the Actor), and
-// a retiring one, whose Stop, Suspend or Delete may stall. While such an Actor
-// still exists, withdrawn credential effects become deny-all; revocation never
-// re-applies compiled rules. A suspended Actor runs no process, and an absent
-// one has nothing left to revoke. The reconciler calls this after any cleanup
-// it issued, so revocation never delays that request, and an error here is
-// reported only while the Actor still exists, never over a completed
-// termination.
+// revokeLiveEgressCredentials covers every live Actor whose withdrawn
+// credential configuration no other path revokes in this pass: one whose
+// observation verifies no egress (failed, retiring, or still booting before
+// its readiness challenge), one under a Disabled provider, where
+// EnsureAllocation does not run, and one whose cleanup request failed. While
+// such an Actor exists and is not suspended, withdrawn credential effects
+// become deny-all; revocation never re-applies compiled rules and is a no-op
+// while the configuration still admits and compiles. The reconciler calls
+// this after any cleanup it issued, so revocation never delays that request,
+// and for a retiring Actor an applied deny-all is not an error.
 func (d *Lifecycle) revokeLiveEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
 	_, record, err := d.readForEgressRevocation(ctx, key)
-	if err != nil || record.Failure == "" && record.Operation == "ensure" || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
+	if err != nil || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
 		return nil
 	}
 	actor, err := d.actor(ctx, record)

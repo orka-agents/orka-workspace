@@ -165,12 +165,15 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			// EnsureAllocation can record the failure during this pass.
 			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
-		if operationErr == nil && !missing {
-			// Failed and retiring instances verify no egress when observed,
-			// and their termination can stall. After any cleanup this pass
-			// issued, revoke withdrawn credential effects of such an Actor
-			// while it still exists.
-			operationErr = driver.revokeLiveEgressCredentials(ctx, key)
+		if !missing {
+			// Failed, retiring and still-booting instances verify no egress
+			// when observed, a Disabled provider never reaches
+			// EnsureAllocation, and cleanup can fail or stall. After any
+			// operation this pass issued - even a failed one - revoke withdrawn
+			// credential effects of such an Actor while it still exists.
+			if revokeErr := driver.revokeLiveEgressCredentials(ctx, key); revokeErr != nil {
+				operationErr = errors.Join(operationErr, revokeErr)
+			}
 		}
 		if (workloadErr != nil || disabled) && observed.State == workspaceprovider.AllocationReady {
 			observed.State = workspaceprovider.AllocationPending

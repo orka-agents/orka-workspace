@@ -500,3 +500,101 @@ func TestStalledRetirementRevokesWithdrawnCredentials(t *testing.T) {
 		t.Fatalf("stalled stop never completed: %v, %v", err, record.Observation.State)
 	}
 }
+
+// bootingCredentialAllocation boots a credential-bearing allocation that has
+// not completed its readiness challenge.
+func bootingCredentialAllocation(t *testing.T) (client.Client, *nativeFixture, sdk.WorkloadRequest, *Lifecycle, string) {
+	t.Helper()
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	native.challengeUnavailable = true
+	for range 12 {
+		_, _ = d.EnsureAllocation(t.Context(), request)
+		if _, record, err := d.read(t.Context(), request.Key); err == nil && record.BootRequested {
+			break
+		}
+	}
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil || !record.BootRequested || record.Observation.State == sdk.AllocationReady {
+		t.Fatalf("fixture did not leave a booted, unchallenged allocation: %v", err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	if len(native.egress[actor].GetRules()) == 0 || record.EgressDenyAll {
+		t.Fatal("fixture did not apply credential effects")
+	}
+	return c, native, request, d, actor
+}
+
+func disableBindingProvider(t *testing.T, c client.Client, workspace *api.ExecutionWorkspace) {
+	t.Helper()
+	provider := &api.ExecutionWorkspaceProvider{}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: workspace.Spec.ProviderBinding.Name}, provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.LifecycleState = api.ExecutionWorkspaceProviderDisabled
+	if err := c.Update(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Under a Disabled provider EnsureAllocation does not run, and observing an
+// Actor that has not completed its readiness challenge verifies no egress, so
+// withdrawn credential configuration must still become deny-all.
+func TestDisabledReconcilerRevokesWithdrawnCredentialsOfBootingActor(t *testing.T) {
+	c, native, request, d, actor := bootingCredentialAllocation(t)
+	workspace := bindingWorkspace(t, c, request.Key)
+	disableBindingProvider(t, c, workspace)
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	for range 3 {
+		_, _ = withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("a booting Actor kept gateway credential effects under a Disabled provider: %v", rules)
+	}
+	if _, record, err := d.readForEgressRevocation(t.Context(), request.Key); err != nil || !record.EgressDenyAll {
+		t.Fatalf("revocation of the booting Actor was not journaled: %v", err)
+	}
+}
+
+// A retiring Actor whose cleanup request fails is still live; its withdrawn
+// credential effects must become deny-all even though cleanup reported an error.
+func TestFailingRetirementRevokesWithdrawnCredentials(t *testing.T) {
+	c, native, request, d, actor := readyCredentialAllocation(t)
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := bindingWorkspace(t, c, request.Key)
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: record.Observation.Identity, Action: api.WorkloadRetirementStop}
+	status := workspace.Status.DeepCopy()
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	workspace.Status = *status
+	if err := c.Status().Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	native.stallDelete = true
+	configured := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: credentialConfig()}
+	for range 3 {
+		_, _ = configured.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})
+	}
+	if _, record, err = d.read(t.Context(), request.Key); err != nil || record.Operation != "stop" || len(native.egress[actor].GetRules()) == 0 {
+		t.Fatalf("fixture did not leave a retiring Actor with credential effects: %v", err)
+	}
+	native.stallDelete, native.failDelete = false, true
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	for range 3 {
+		if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err == nil {
+			t.Fatal("a failing cleanup request was not reported")
+		}
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("a retiring Actor whose cleanup fails kept gateway credential effects: %v", rules)
+	}
+}
