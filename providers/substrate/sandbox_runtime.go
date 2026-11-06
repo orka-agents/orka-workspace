@@ -70,9 +70,15 @@ func (d *Lifecycle) restoreRuntimeMismatch(ctx context.Context, record *journalR
 	if assigned := actor.GetStatus().GetWorkerAssignment().GetSandboxRuntime(); assigned != nil {
 		got, _ = stampSandboxRuntime(assigned.GetSandboxClass(), assigned.GetVersion())
 	}
-	if got == nil && record.Worker != nil {
+	if got == nil && record.Worker != nil && record.Worker.Epoch != 0 {
+		// A CRASHED Actor has no worker assignment, so read the runtime from
+		// the Worker that restored it. A restarted worker process keeps its
+		// UID but registers a new epoch and may run another runtime, so only
+		// the exact registration that performed the restore is trusted;
+		// otherwise the runtime is unknown.
 		worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: record.Worker.Name}})
-		if err == nil && worker.GetMetadata().GetUid() == record.Worker.UID {
+		if err == nil && worker.GetMetadata().GetUid() == record.Worker.UID &&
+			worker.GetStatus().GetRegisteredEpoch() == record.Worker.Epoch {
 			for _, class := range worker.GetStatus().GetSandboxClasses() {
 				if class.GetSandboxClass() == want.Class {
 					got, _ = stampSandboxRuntime(class.GetSandboxClass(), class.GetDefaultRuntime().GetVersion())

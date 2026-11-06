@@ -50,6 +50,7 @@ type nativeFixture struct {
 	runtime *pb.VersionedSandboxCompat
 	// crashOnResume crashes the next resumed Actor before its process boots.
 	crashOnResume bool
+	afterCrash    func(*pb.Worker)
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -233,6 +234,12 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	if f.crashOnResume {
 		f.crashOnResume = false
 		v.Status.State = pb.ActorState_ACTOR_STATE_CRASHED
+		// The native protocol leaves a CRASHED Actor without a worker
+		// assignment, so the crash must be classified from the Worker.
+		f.releaseWorker(v)
+		if f.afterCrash != nil {
+			f.afterCrash(w)
+		}
 	}
 	return &pb.ResumeActorResponse{Actor: proto.Clone(v).(*pb.Actor), Resumed: true}, f.effect("resume")
 }

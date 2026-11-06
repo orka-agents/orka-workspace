@@ -1,6 +1,7 @@
 package substrate
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -267,6 +268,36 @@ func TestCheckpointSandboxRuntimeRejectsAnotherSandboxClass(t *testing.T) {
 	}
 	if _, err := checkpointSandboxRuntime(&pb.Snapshot{SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "microvm", Version: &pb.VersionedSandboxCompat{SchemaVersion: "v1"}}}); err == nil {
 		t.Fatal("a microVM snapshot was accepted as a gVisor data checkpoint")
+	}
+}
+
+// A worker process that restarted after the crash keeps its UID but registers
+// a new epoch and may run another runtime, so its current default runtime
+// says nothing about the one that performed the restore.
+func TestRestoreCrashOnARestartedWorkerIsNotClassifiedByItsNewRuntime(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	native.crashOnResume = true
+	native.beforeResume = func(context.Context, *pb.Actor) error {
+		native.beforeResume = nil
+		// The restore runs under the original runtime; afterwards the worker
+		// restarts with an upgraded one under a new registration.
+		native.afterCrash = func(worker *pb.Worker) {
+			worker.Status.RegisteredEpoch++
+			worker.Status.SandboxClasses[0].DefaultRuntime.Version = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
+		}
+		return nil
+	}
+	var workspace *api.ExecutionWorkspace
+	for range 12 {
+		workspace = reconcileFailureFixture(t, c, native, next)
+		if workspace.Status.State == api.ExecutionWorkspaceStateFailed {
+			break
+		}
+	}
+	provisioned := sdk.FindCondition(workspace.Status.Conditions, string(api.ConditionWorkspaceProvisioned))
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed || provisioned == nil || provisioned.Reason != instanceFailedReason {
+		t.Fatalf("restore crash on a restarted worker = %s %+v; want %s without runtime classification", workspace.Status.State, provisioned, instanceFailedReason)
 	}
 }
 
