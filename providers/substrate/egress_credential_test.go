@@ -444,3 +444,59 @@ func TestFailedInstanceCleanupProceedsUnderWithdrawnCredentials(t *testing.T) {
 		t.Fatalf("authorized cleanup did not stop the failed instance: %v, %v", err, record.Observation.State)
 	}
 }
+
+// A healthy instance's authorized Stop can be accepted while its Actor keeps
+// running. A retiring record's observation verifies no egress, so credential
+// configuration withdrawn after the Stop was issued must still replace the
+// policy with deny-all while that Actor exists, without re-applying compiled
+// rules, and the Stop must still complete.
+func TestStalledRetirementRevokesWithdrawnCredentials(t *testing.T) {
+	c, native, request, d, actor := readyCredentialAllocation(t)
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := bindingWorkspace(t, c, request.Key)
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: record.Observation.Identity, Action: api.WorkloadRetirementStop}
+	status := workspace.Status.DeepCopy()
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	workspace.Status = *status
+	if err := c.Status().Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	native.stallDelete = true
+	configured := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: credentialConfig()}
+	for range 3 {
+		_, _ = configured.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})
+	}
+	if _, record, err = d.read(t.Context(), request.Key); err != nil || record.Operation != "stop" || len(native.egress[actor].GetRules()) == 0 {
+		t.Fatalf("fixture did not leave a stalled stop with credential effects: %v, %+v", err, record)
+	}
+
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	for range 3 {
+		_, _ = withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("an Actor whose termination stalled kept gateway credential effects: %v", rules)
+	}
+	_, record, err = d.readForEgressRevocation(t.Context(), request.Key)
+	if err != nil || !record.EgressDenyAll || record.Operation != "stop" {
+		t.Fatalf("revocation of the retiring Actor was not journaled: %v, %+v", err, record)
+	}
+	if live, err := d.actor(t.Context(), record); err != nil || live == nil {
+		t.Fatalf("fixture Actor must still exist: %v", err)
+	}
+	// Once the stall clears, the stop completes under deny-all.
+	native.stallDelete = false
+	for range 6 {
+		if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err != nil {
+			t.Fatalf("cleanup after a revoked stall failed: %v", err)
+		}
+	}
+	if _, record, err = d.read(t.Context(), request.Key); err != nil || record.Observation.State != sdk.AllocationStopped {
+		t.Fatalf("stalled stop never completed: %v, %v", err, record.Observation.State)
+	}
+}
