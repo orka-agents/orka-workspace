@@ -199,7 +199,9 @@ and omits unsupported security settings from new native-process intent before
 admission.
 
 The provider advertises ACP allocation, `runtime.native-process`, verified
-data-only suspension, `checkpoint.data`, and `restore.cold`. Pooled capacity, MCP
+data-only suspension, `checkpoint.data`, `restore.cold`, and
+`runtime.egress-allowlist` (it accepts only `RuntimeWorkload.Egress`, never a
+NetworkPolicy). Pooled capacity, MCP
 Service workloads, exec, files, and full-memory restore remain unsupported.
 The `runtime.native-process` capability lets Core publish intent for a fresh
 writable container filesystem with no Kubernetes scratch mounts and require exact

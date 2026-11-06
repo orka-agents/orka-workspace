@@ -36,7 +36,8 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 	if err := c.Get(t.Context(), req.NamespacedName, provider); err != nil {
 		t.Fatal(err)
 	}
-	if provider.Status.ObservedGeneration != provider.Generation || provider.Status.PinnedParametersUID != string(config.UID) || provider.Status.Backend == nil || provider.Status.Backend.Version != UpstreamCommit || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureNativeProcess) || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureACPRuntime) {
+	if provider.Status.ObservedGeneration != provider.Generation || provider.Status.PinnedParametersUID != string(config.UID) || provider.Status.Backend == nil || provider.Status.Backend.Version != UpstreamCommit || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureNativeProcess) || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureACPRuntime) ||
+		!slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureEgressAllowlist) {
 		t.Fatal("configured provider did not publish its exact native-process capability")
 	}
 	// Without router-based Actor routing, the native-process capability must

@@ -99,6 +99,11 @@ const (
 	WorkspaceFeatureServicePorts  ExecutionWorkspaceFeature = "service-ports"
 	WorkspaceFeaturePools         ExecutionWorkspaceFeature = "pools"
 	WorkspaceFeatureTLS           ExecutionWorkspaceFeature = "tls"
+	// WorkspaceFeatureEgressAllowlist declares that runtime workloads carry their
+	// egress as a host-name RuntimeEgressPolicy in RuntimeWorkload.Egress. A
+	// provider advertising it rejects RuntimeWorkload.NetworkPolicy; one without
+	// it receives the Kubernetes NetworkPolicy shape.
+	WorkspaceFeatureEgressAllowlist ExecutionWorkspaceFeature = "runtime.egress-allowlist"
 )
 
 // ExecutionWorkspaceMode distinguishes task-attached workspaces from persistent service workspaces.
