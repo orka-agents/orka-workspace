@@ -3,6 +3,7 @@
 package substrate
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +11,8 @@ import (
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/protobuf/proto"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func credentialEgress() *api.RuntimeEgressPolicy {
@@ -138,6 +141,129 @@ func TestNativeAppliesCredentialEffectsBeforeResume(t *testing.T) {
 		t.Fatalf("withdrawn credential configuration left gateway effects applied: %v", rules)
 	}
 	if _, revoked, err := d.read(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
+		t.Fatalf("revocation was not journaled: %v", err)
+	}
+}
+
+// Observation of a ready Actor fails once its credential configuration is
+// withdrawn, so the reconciler must revoke on that failure rather than rely on
+// EnsureAllocation, which a failed observation never reaches.
+func TestReconcilerRevokesWithdrawnCredentialInjectionWhenObservationFails(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	for range 12 {
+		observed, err := d.EnsureAllocation(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	if len(native.egress[actor].GetRules()) == 0 || record.EgressDenyAll {
+		t.Fatal("fixture did not apply credential effects")
+	}
+	workspace := bindingWorkspace(t, c, request.Key)
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	_, _ = withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("reconciliation after withdrawal left gateway credential effects: %v", rules)
+	}
+	if _, revoked, err := d.read(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
+		t.Fatalf("revocation was not journaled: %v", err)
+	}
+}
+
+// An Actor journaled before a header became reserved no longer compiles even
+// though the provider is still configured; reconciliation must still replace
+// its credential-bearing gateway policy with deny-all.
+func TestReconcilerRevokesCredentialsInvalidatedByReservedHeaders(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	for range 12 {
+		observed, err := d.EnsureAllocation(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	cm, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	if len(native.egress[actor].GetRules()) == 0 {
+		t.Fatal("fixture did not apply credential effects")
+	}
+	record.Request.Runtime.Egress.Rules[1].ReplaceHeaders[0].Header = "X-Forwarded-Port"
+	if err := d.save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: credentialConfig()}
+	_, _ = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(bindingWorkspace(t, c, request.Key))})
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("a now-reserved credential header kept gateway effects applied: %v", rules)
+	}
+}
+
+// A journal that fails admission while still compiling - here, credential
+// rules without the required feature - must be revoked to deny-all, never
+// re-applied.
+func TestRevocationNeverReappliesCredentialRules(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	for range 12 {
+		observed, err := d.EnsureAllocation(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	cm, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	record.Request.Runtime.RequiredFeatures = slices.DeleteFunc(record.Request.Runtime.RequiredFeatures, func(feature api.ExecutionWorkspaceFeature) bool {
+		return feature == api.WorkspaceFeatureEgressCredentialInjection
+	})
+	if _, compileErr := compileEgressPolicy(record.Atespace, request.Key.Namespace, record.Request.Runtime.Egress, credentialConfig()); compileErr != nil {
+		t.Fatalf("fixture must still compile: %v", compileErr)
+	}
+	if err := d.save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.revokeWithdrawnEgressCredentials(t.Context(), request.Key); err == nil {
+		t.Fatal("revocation reported success without denying egress")
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("revocation re-applied credential rules: %v", rules)
+	}
+	if _, revoked, err := d.readForEgressRevocation(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
 		t.Fatalf("revocation was not journaled: %v", err)
 	}
 }

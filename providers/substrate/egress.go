@@ -136,6 +136,17 @@ func egressRulesDigest(rules []*pb.EgressRule) (string, error) {
 // boot. Writes carry the observed policy's metadata as preconditions.
 func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	desired, compileErr := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
+	return d.applyEgressPolicy(ctx, cm, record, desired, compileErr)
+}
+
+// denyAllEgressPolicy installs the empty policy unconditionally. Revocation
+// never re-applies compiled rules: a journal that fails admission for any
+// reason must not keep or change credential-bearing effects.
+func (d *Lifecycle) denyAllEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, cause error) error {
+	return d.applyEgressPolicy(ctx, cm, record, nil, cause)
+}
+
+func (d *Lifecycle) applyEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, desired *pb.EgressPolicy, compileErr error) error {
 	if compileErr != nil {
 		desired = &pb.EgressPolicy{Metadata: &pb.ResourceMetadata{Atespace: record.Atespace, Name: egressPolicyName}}
 	}
@@ -203,22 +214,30 @@ func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap
 	return nil
 }
 
-// revokeEgressCredentials re-applies an existing allocation's journaled
-// allowlist after its credential configuration was withdrawn. Compilation
-// then fails, so the Actor's policy becomes deny-all instead of keeping
-// gateway effects this provider no longer permits.
-func (d *Lifecycle) revokeEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
-	cm, record, err := d.read(ctx, key)
-	if errors.Is(err, sdk.ErrNotFound) {
+// revokeWithdrawnEgressCredentials runs when observation or workload
+// validation fails. Either can stop reconciliation before EnsureAllocation's
+// revocation, so a journaled allowlist that no longer admits or compiles -
+// withdrawn provider configuration or a header this provider now reserves -
+// would otherwise keep credential-bearing gateway effects applied. The journal
+// is read without re-validating its request, which may be what became invalid;
+// compilation then fails and the Actor's policy becomes deny-all.
+func (d *Lifecycle) revokeWithdrawnEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
+	// An unreadable journal is already the reported error; only a revocation
+	// that was actually attempted can add a distinct failure.
+	cm, record, err := d.readForEgressRevocation(ctx, key)
+	if err != nil || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() {
 		return nil
-	}
-	if err != nil {
-		return err
 	}
 	if record.EgressPolicy.UID == "" || record.EgressDenyAll {
 		return nil
 	}
-	return d.ensureEgressPolicy(ctx, cm, record)
+	cause := d.config.admitEgressCredentials(record.Request)
+	if cause == nil {
+		if _, cause = compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config); cause == nil {
+			return nil
+		}
+	}
+	return d.denyAllEgressPolicy(ctx, cm, record, cause)
 }
 
 // verifyEgressPolicy read-only checks the exact applied allowlist.

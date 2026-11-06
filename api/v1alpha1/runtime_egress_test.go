@@ -157,6 +157,8 @@ func TestRuntimeEgressCredentialHeadersAreBoundedAndReferenceOnly(t *testing.T) 
 		{"host", rule(RuntimeEgressHTTPS, "api.example.com", header("Host")), false},
 		{"router target", rule(RuntimeEgressHTTPS, "api.example.com", header("ate-target-actor")), false},
 		{"envoy internal", rule(RuntimeEgressHTTPS, "api.example.com", header("x-envoy-original-path")), false},
+		{"forwarded port", rule(RuntimeEgressHTTPS, "api.example.com", header("X-Forwarded-Port")), false},
+		{"forwarded prefix", rule(RuntimeEgressHTTPS, "api.example.com", header("x-forwarded-prefix")), false},
 		{"pseudo header", rule(RuntimeEgressHTTPS, "api.example.com", header(":authority")), false},
 		{"empty header", rule(RuntimeEgressHTTPS, "api.example.com", header("")), false},
 		{"space in header", rule(RuntimeEgressHTTPS, "api.example.com", header("X Api")), false},
