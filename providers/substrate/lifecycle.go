@@ -366,6 +366,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if err != nil || !ready {
 			return err
 		}
+		record.PreResumeRuntime = d.fencedWorkerRuntime(ctx, record)
 		record.BootRequested = true
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
@@ -390,7 +391,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		return err
 	}
 	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED || record.ChallengeSHA256 != "" && actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
-		if reason := d.restoreRuntimeMismatch(record, actor); reason != "" {
+		if reason := d.restoreRuntimeMismatch(ctx, record, actor); reason != "" {
 			return lostInstance(record, reason)
 		}
 		return lostInstance(record, nativeActorStopped)

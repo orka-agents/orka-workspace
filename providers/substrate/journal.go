@@ -131,7 +131,13 @@ type journalRecord struct {
 	// assignment during this instance's single boot. It is the only evidence
 	// of which runtime performed a restore: a CRASHED Actor has no assignment,
 	// and a Worker's default runtime can change without a new epoch.
-	RestoreRuntime    *sandboxRuntimeStamp `json:"restoreRuntime,omitempty"`
+	RestoreRuntime *sandboxRuntimeStamp `json:"restoreRuntime,omitempty"`
+	// PreResumeRuntime is the fenced Worker's default runtime for the
+	// checkpoint's class, read just before Resume. Agent Substrate restores
+	// a data-only gVisor snapshot under that default and clears the Actor's
+	// assignment when a restore crashes synchronously, so this, revalidated
+	// against an unchanged Worker after the crash, is the remaining evidence.
+	PreResumeRuntime  *sandboxRuntimeStamp `json:"preResumeRuntime,omitempty"`
 	CheckpointCatalog *catalogReference    `json:"checkpointCatalog,omitempty"`
 	InheritedCatalog  *catalogReference    `json:"inheritedCatalog,omitempty"`
 	DeleteIssued      bool                 `json:"deleteIssued,omitempty"`

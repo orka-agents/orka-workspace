@@ -51,7 +51,8 @@ type nativeFixture struct {
 	// crashOnResume crashes the next resumed Actor before its process boots.
 	crashOnResume bool
 	afterCrash    func(*pb.Worker)
-	// crashBeforeAssignment returns the crashed Actor from Resume itself.
+	// crashBeforeAssignment crashes the restore synchronously: Resume fails
+	// after the Actor is CRASHED and its assignment cleared.
 	crashBeforeAssignment bool
 }
 
@@ -244,8 +245,9 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 			f.afterCrash(w)
 		}
 		if f.crashBeforeAssignment {
-			// The restore died before any assignment was reported.
-			response = proto.Clone(v).(*pb.Actor)
+			// A synchronous restore failure: the API crashes the Actor,
+			// clearing its assignment, before the RPC returns an error.
+			return nil, status.Errorf(codes.FailedPrecondition, "actor %s is CRASHED: restore failed", refKey(req.Actor))
 		}
 	}
 	return &pb.ResumeActorResponse{Actor: response, Resumed: true}, f.effect("resume")

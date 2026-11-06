@@ -321,9 +321,13 @@ worker assignment during that boot differs from the checkpoint's, the failure is
 recorded with the distinct `Provisioned` reason `SandboxRuntimeRestoreFailed`
 instead of `InstanceFailed`; the checkpoint stays available to explicit recovery
 and nothing is replayed. The provider journals that assignment stamp when it
-first observes it and never infers the runtime from the Worker's current
-default, which can change within a registration epoch; without the stamp the
-crash is reported as `InstanceFailed`. Explicit core Retirement.Suspend is honored
+first observes it. A restore that fails synchronously is crashed, and its
+assignment cleared, before `ResumeActor` returns, so the provider also journals
+the fenced Worker's default runtime for the class just before Resume and uses it
+only if the same Worker registration still reports that same default after the
+crash. It never infers the runtime from a Worker default that may have changed
+within a registration epoch; without such evidence the crash is reported as
+`InstanceFailed`. Explicit core Retirement.Suspend is honored
 also while desiredState remains Ready during epoch rotation.
 Actor creation intent is also journaled before its RPC. An issued create recovers
 only by observing the Actor; absence without a recorded UID blocks allocation

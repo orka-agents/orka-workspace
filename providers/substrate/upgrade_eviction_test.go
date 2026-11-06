@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"google.golang.org/protobuf/proto"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"strings"
 	"testing"
 
@@ -303,9 +305,15 @@ func TestRestoreCrashOnARestartedWorkerIsNotClassifiedByItsNewRuntime(t *testing
 
 func restoreCrashCondition(t *testing.T, c client.Client, native *nativeFixture, next sdk.WorkloadRequest) *metav1.Condition {
 	t.Helper()
-	var workspace *api.ExecutionWorkspace
+	// A synchronous crash fails the Resume RPC once; the next pass observes
+	// the CRASHED Actor.
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	workspace := &api.ExecutionWorkspace{}
 	for range 12 {
-		workspace = reconcileFailureFixture(t, c, native, next)
+		_, _ = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(next.Key)})
+		if err := c.Get(t.Context(), clientKey(next.Key), workspace); err != nil {
+			t.Fatal(err)
+		}
 		if workspace.Status.State == api.ExecutionWorkspaceStateFailed {
 			break
 		}
@@ -332,16 +340,37 @@ func TestRestoreCrashIgnoresASameEpochDefaultRuntimeChange(t *testing.T) {
 	}
 }
 
-// Without an assignment observed for the restore, the runtime is unknown and
-// the crash is not classified, even if the Worker now runs another runtime.
-func TestRestoreCrashWithoutRestoreEvidenceIsNotClassified(t *testing.T) {
+// A synchronous restore crash clears the assignment before ResumeActor
+// returns, so the fenced Worker's default runtime read before Resume is the
+// evidence, accepted only while that Worker still reports the same default.
+func TestSynchronousRestoreCrashIsClassifiedFromTheFencedWorker(t *testing.T) {
 	c, native, request := fixture(t, true)
 	next := suspendedSuccessor(t, c, native, request)
 	native.runtime = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
 	native.crashOnResume = true
 	native.crashBeforeAssignment = true
+	if provisioned := restoreCrashCondition(t, c, native, next); provisioned.Reason != sandboxRuntimeRestoreFailedReason {
+		t.Fatalf("synchronous cross-runtime restore crash = %+v; want %s", provisioned, sandboxRuntimeRestoreFailedReason)
+	}
+	if native.boots != 2 {
+		t.Fatalf("crashed restore was replayed: %d boots", native.boots)
+	}
+}
+
+// If the fenced Worker's default changes between Resume and classification,
+// the pre-Resume reading no longer proves the restore's runtime.
+func TestSynchronousRestoreCrashAfterADefaultChangeIsNotClassified(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	original := proto.Clone(native.runtimeVersion()).(*pb.VersionedSandboxCompat)
+	native.runtime = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
+	native.crashOnResume = true
+	native.crashBeforeAssignment = true
+	native.afterCrash = func(worker *pb.Worker) {
+		worker.Status.SandboxClasses[0].DefaultRuntime.Version = proto.Clone(original).(*pb.VersionedSandboxCompat)
+	}
 	if provisioned := restoreCrashCondition(t, c, native, next); provisioned.Reason != instanceFailedReason {
-		t.Fatalf("restore crash without restore evidence = %+v; want %s", provisioned, instanceFailedReason)
+		t.Fatalf("restore crash after a default change = %+v; want %s", provisioned, instanceFailedReason)
 	}
 }
 

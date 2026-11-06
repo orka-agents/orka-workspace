@@ -80,12 +80,39 @@ func (d *Lifecycle) recordRestoreRuntime(ctx context.Context, cm *corev1.ConfigM
 	return true, d.save(ctx, cm, record)
 }
 
+// fencedWorkerRuntime reads the default runtime that the fenced Worker runs
+// the checkpoint's sandbox class under. It returns nil when there is no
+// restore, no fence, or the Worker does not match the fence exactly.
+func (d *Lifecycle) fencedWorkerRuntime(ctx context.Context, record *journalRecord) *sandboxRuntimeStamp {
+	if record.InheritedCheckpoint == nil || record.InheritedCheckpoint.SandboxRuntime == nil || record.Worker == nil || record.Worker.Epoch == 0 {
+		return nil
+	}
+	worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: record.Worker.Name}})
+	if err != nil || worker.GetMetadata().GetUid() != record.Worker.UID || worker.GetStatus().GetRegisteredEpoch() != record.Worker.Epoch {
+		return nil
+	}
+	class := record.InheritedCheckpoint.SandboxRuntime.Class
+	for _, entry := range worker.GetStatus().GetSandboxClasses() {
+		if entry.GetSandboxClass() == class {
+			stamp, err := stampSandboxRuntime(class, entry.GetDefaultRuntime().GetVersion())
+			if err != nil {
+				return nil
+			}
+			return stamp
+		}
+	}
+	return nil
+}
+
 // restoreRuntimeMismatch classifies a crashed restore from evidence of the
-// restore attempt itself: the Actor's current assignment, or the assignment
-// recorded while it booted. It never consults the Worker's current default
-// runtime, which can change within a registration epoch. It returns the
-// failure to record, or "" when the runtimes match or either is unknown.
-func (d *Lifecycle) restoreRuntimeMismatch(record *journalRecord, actor *pb.Actor) string {
+// restore attempt itself, in order: the Actor's current assignment, the
+// assignment recorded while it booted, or - when the restore crashed before
+// any assignment was observed - the fenced Worker's default runtime read just
+// before Resume, but only if the same Worker registration still reports that
+// same default now, so it cannot have changed during the restore. Otherwise
+// the runtime is unknown. It returns the failure to record, or "" when the
+// runtimes match or either is unknown.
+func (d *Lifecycle) restoreRuntimeMismatch(ctx context.Context, record *journalRecord, actor *pb.Actor) string {
 	if record.InheritedCheckpoint == nil || record.InheritedCheckpoint.SandboxRuntime == nil || record.ChallengeSHA256 != "" {
 		return ""
 	}
@@ -94,6 +121,11 @@ func (d *Lifecycle) restoreRuntimeMismatch(record *journalRecord, actor *pb.Acto
 	if assigned := actor.GetStatus().GetWorkerAssignment().GetSandboxRuntime(); assigned != nil {
 		if current, _ := stampSandboxRuntime(assigned.GetSandboxClass(), assigned.GetVersion()); current != nil {
 			got = current
+		}
+	}
+	if got == nil && record.PreResumeRuntime != nil {
+		if now := d.fencedWorkerRuntime(ctx, record); now != nil && *now == *record.PreResumeRuntime {
+			got = record.PreResumeRuntime
 		}
 	}
 	if got == nil || *got == *want {
