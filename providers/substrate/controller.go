@@ -60,6 +60,9 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		provider.Status.Backend = &workspacev1alpha1.ExecutionWorkspaceBackendStatus{Version: UpstreamCommit, APIVersions: []string{BackendAPIVersion}}
 		provider.Status.SupportedContracts = []string{workspacev1alpha1.ContractVersionV1, workspaceprovider.LifecycleContractV1}
 		provider.Status.SupportedFeatures = []workspacev1alpha1.ExecutionWorkspaceFeature{workspacev1alpha1.WorkspaceFeatureACPRuntime, workspacev1alpha1.WorkspaceFeatureNativeProcess, workspacev1alpha1.WorkspaceFeatureSuspend, workspacev1alpha1.WorkspaceFeatureCheckpoint, workspacev1alpha1.WorkspaceFeatureRestore, workspacev1alpha1.WorkspaceFeatureEgressAllowlist}
+		if r.Config.EgressCredentialInjectionEnabled() {
+			provider.Status.SupportedFeatures = append(provider.Status.SupportedFeatures, workspacev1alpha1.WorkspaceFeatureEgressCredentialInjection)
+		}
 		now := metav1.Now()
 		provider.Status.LastHeartbeat = &now
 	}

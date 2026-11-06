@@ -39,10 +39,18 @@ type nativeFixture struct {
 	egress                   map[string]*pb.EgressPolicy
 	boots, suspends, deletes int
 	failAfter                string
-	foreignAssignment        bool
-	challengeSuffix          string
-	beforeResume             func(context.Context, *pb.Actor) error
-	uids                     int
+	// stallDelete accepts DeleteActor but leaves the Actor in place, as a
+	// termination that is slow to complete.
+	stallDelete bool
+	// failDelete makes DeleteActor fail without deleting the Actor.
+	failDelete        bool
+	foreignAssignment bool
+	challengeSuffix   string
+	// challengeUnavailable keeps the readiness challenge from answering, as a
+	// supervisor that has not started yet.
+	challengeUnavailable bool
+	beforeResume         func(context.Context, *pb.Actor) error
+	uids                 int
 	// suspendFidelity overrides the recorded fidelity of a new snapshot.
 	suspendFidelity pb.SnapshotFidelity
 }
@@ -254,6 +262,13 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
 	key := refKey(req.Actor)
+	if f.failDelete {
+		return nil, status.Error(codes.Unavailable, "delete failed")
+	}
+	if f.stallDelete && f.actors[key] != nil {
+		// Accepted, but the Actor lingers while its termination is slow.
+		return proto.Clone(f.actors[key]).(*pb.Actor), nil
+	}
 	v := f.actors[key]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -424,6 +439,9 @@ func (f *nativeFixture) DeleteTag(_ context.Context, req *pb.DeleteTagRequest, _
 }
 func (f *nativeFixture) Get(_ context.Context, endpoint, target string) (bootstrapChallenge, error) {
 	var out bootstrapChallenge
+	if f.challengeUnavailable {
+		return out, fmt.Errorf("supervisor is not serving yet")
+	}
 	if endpoint != fixtureRouter {
 		return out, fmt.Errorf("challenge bypassed the router")
 	}

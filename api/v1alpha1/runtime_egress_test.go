@@ -128,3 +128,73 @@ func TestRoutedNativeStartupBindsRouterTargetToExactProcess(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeEgressCredentialHeadersAreBoundedAndReferenceOnly(t *testing.T) {
+	ref := RuntimeEgressSecretKeyReference{Name: "provider-token", Key: "token"}
+	header := func(name string) RuntimeEgressCredentialHeader {
+		return RuntimeEgressCredentialHeader{Header: name, Prefix: "Bearer ", SecretKeyRef: ref}
+	}
+	rule := func(protocol RuntimeEgressProtocol, host string, headers ...RuntimeEgressCredentialHeader) RuntimeEgressPolicy {
+		return RuntimeEgressPolicy{Rules: []RuntimeEgressRule{{Protocol: protocol, Host: host, Ports: []int32{8080}, ReplaceHeaders: headers}}}
+	}
+	many := make([]RuntimeEgressCredentialHeader, 0, MaxRuntimeEgressCredentialHeaders+1)
+	for i := range MaxRuntimeEgressCredentialHeaders + 1 {
+		many = append(many, header("X-Api-Key-"+string(rune('a'+i))))
+	}
+	for _, tc := range []struct {
+		name   string
+		policy RuntimeEgressPolicy
+		ok     bool
+	}{
+		{"HTTP authorization", rule(RuntimeEgressHTTP, "proxy.orka-system.svc.cluster.local", header("Authorization")), true},
+		{"HTTPS api key", rule(RuntimeEgressHTTPS, "api.example.com", header("x-api-key")), true},
+		{"other namespace", rule(RuntimeEgressHTTP, "proxy.orka-system.svc", RuntimeEgressCredentialHeader{Header: "Authorization", SecretKeyRef: RuntimeEgressSecretKeyReference{Namespace: "orka-runtimes", Name: "p", Key: "token"}}), true},
+		{"TLS passthrough", rule(RuntimeEgressTLSPassthrough, "api.example.com", header("Authorization")), false},
+		{"wildcard host", rule(RuntimeEgressHTTPS, "*.example.com", header("Authorization")), false},
+		{"cookie", rule(RuntimeEgressHTTPS, "api.example.com", header("Cookie")), false},
+		{"hop-by-hop", rule(RuntimeEgressHTTPS, "api.example.com", header("Proxy-Authorization")), false},
+		{"connection", rule(RuntimeEgressHTTPS, "api.example.com", header("connection")), false},
+		{"host", rule(RuntimeEgressHTTPS, "api.example.com", header("Host")), false},
+		{"router target", rule(RuntimeEgressHTTPS, "api.example.com", header("ate-target-actor")), false},
+		{"envoy internal", rule(RuntimeEgressHTTPS, "api.example.com", header("x-envoy-original-path")), false},
+		{"forwarded port", rule(RuntimeEgressHTTPS, "api.example.com", header("X-Forwarded-Port")), false},
+		{"forwarded prefix", rule(RuntimeEgressHTTPS, "api.example.com", header("x-forwarded-prefix")), false},
+		{"pseudo header", rule(RuntimeEgressHTTPS, "api.example.com", header(":authority")), false},
+		{"empty header", rule(RuntimeEgressHTTPS, "api.example.com", header("")), false},
+		{"space in header", rule(RuntimeEgressHTTPS, "api.example.com", header("X Api")), false},
+		{"case-insensitive duplicate", rule(RuntimeEgressHTTPS, "api.example.com", header("Authorization"), header("authorization")), false},
+		{"too many", rule(RuntimeEgressHTTPS, "api.example.com", many...), false},
+		{"control prefix", rule(RuntimeEgressHTTPS, "api.example.com", RuntimeEgressCredentialHeader{Header: "Authorization", Prefix: "Bearer\r\n", SecretKeyRef: ref}), false},
+		{"long prefix", rule(RuntimeEgressHTTPS, "api.example.com", RuntimeEgressCredentialHeader{Header: "Authorization", Prefix: strings.Repeat("a", 65), SecretKeyRef: ref}), false},
+		{"missing secret", rule(RuntimeEgressHTTPS, "api.example.com", RuntimeEgressCredentialHeader{Header: "Authorization"}), false},
+		{"invalid secret key", rule(RuntimeEgressHTTPS, "api.example.com", RuntimeEgressCredentialHeader{Header: "Authorization", SecretKeyRef: RuntimeEgressSecretKeyReference{Name: "p", Key: "a/b"}}), false},
+		{"invalid namespace", rule(RuntimeEgressHTTPS, "api.example.com", RuntimeEgressCredentialHeader{Header: "Authorization", SecretKeyRef: RuntimeEgressSecretKeyReference{Namespace: "Bad_NS", Name: "p", Key: "k"}}), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.policy.Validate(); (err == nil) != tc.ok {
+				t.Fatalf("accepted=%v, want %v: %v", err == nil, tc.ok, err)
+			}
+			if got := tc.policy.HasCredentialInjection(); !got {
+				t.Fatal("did not report credential injection")
+			}
+		})
+	}
+	if (*RuntimeEgressPolicy)(nil).HasCredentialInjection() || (&RuntimeEgressPolicy{Rules: []RuntimeEgressRule{{Protocol: RuntimeEgressHTTP, Host: "a.example.com", Ports: []int32{80}}}}).HasCredentialInjection() {
+		t.Fatal("reported credential injection without replacements")
+	}
+}
+
+func TestRuntimeRequestCredentialInjectionRequiresFeature(t *testing.T) {
+	request := validationRuntimeRequest(t)
+	request.Runtime.Egress = &RuntimeEgressPolicy{Rules: []RuntimeEgressRule{{Protocol: RuntimeEgressHTTP, Host: "proxy.orka-system.svc", Ports: []int32{8080},
+		ReplaceHeaders: []RuntimeEgressCredentialHeader{{Header: "Authorization", Prefix: "Bearer ", SecretKeyRef: RuntimeEgressSecretKeyReference{Name: "provider", Key: "token"}}}}}}
+	setValidationRevision(t, &request)
+	if err := request.Validate(); err == nil {
+		t.Fatal("accepted credential replacement without requiring the provider feature")
+	}
+	request.Runtime.RequiredFeatures = append(request.Runtime.RequiredFeatures, WorkspaceFeatureEgressCredentialInjection)
+	setValidationRevision(t, &request)
+	if err := request.Validate(); err != nil {
+		t.Fatalf("rejected credential replacement with the provider feature: %v", err)
+	}
+}

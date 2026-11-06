@@ -43,6 +43,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		maintenance := deleted || quarantined || revoking || current.Spec.Retirement != nil || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || disabled
 		if !maintenance && !admitted {
 			pending = true
+			// Stale or withdrawn admission authorizes no allocation or startup,
+			// but must not keep a running Actor's credential-bearing gateway
+			// effects applied once their configuration stops admitting. The
+			// revocation reads only this workspace's own journal fence.
+			key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
+			operationErr = New(r.Client, r.Control, r.Config).revokeWithdrawnEgressCredentials(ctx, key)
 			return nil
 		}
 		// Acknowledge the attachment before Pod startup. This signal lets core
@@ -68,10 +74,20 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation
 		err := workloadErr
+		if workloadErr != nil {
+			// An invalid launch intent must not leave an existing Actor's
+			// credential-bearing gateway effects applied.
+			err = errors.Join(err, driver.revokeWithdrawnEgressCredentials(ctx, key))
+		}
 		if workloadErr == nil {
 			observed, err = driver.Observe(ctx, key)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				observed, err = driver.recordFailure(ctx, key, lost)
+			} else if err != nil && !errors.Is(err, workspaceprovider.ErrNotFound) {
+				// Withdrawn credential injection makes a ready Actor's
+				// observation fail, which would keep reconciliation from
+				// reaching EnsureAllocation's revocation. Revoke here.
+				err = errors.Join(err, driver.revokeWithdrawnEgressCredentials(ctx, key))
 			}
 		}
 		if (workloadErr != nil && maintenance) || deleted || quarantined || current.Spec.Retirement != nil {
@@ -148,6 +164,16 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		if failure == "" && operationErr == nil && !missing {
 			// EnsureAllocation can record the failure during this pass.
 			failure, operationErr = driver.failure(ctx, key, observed.Identity)
+		}
+		if !missing {
+			// Failed, retiring and still-booting instances verify no egress
+			// when observed, a Disabled provider never reaches
+			// EnsureAllocation, and cleanup can fail or stall. After any
+			// operation this pass issued - even a failed one - revoke withdrawn
+			// credential effects of such an Actor while it still exists.
+			if revokeErr := driver.revokeLiveEgressCredentials(ctx, key); revokeErr != nil {
+				operationErr = errors.Join(operationErr, revokeErr)
+			}
 		}
 		if (workloadErr != nil || disabled) && observed.State == workspaceprovider.AllocationReady {
 			observed.State = workspaceprovider.AllocationPending

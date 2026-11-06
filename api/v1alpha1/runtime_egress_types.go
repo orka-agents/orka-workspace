@@ -49,6 +49,139 @@ type RuntimeEgressRule struct {
 	// +kubebuilder:validation:items:Maximum=65535
 	// +listType=set
 	Ports []int32 `json:"ports"`
+	// ReplaceHeaders asks the backend gateway to replace the value of each
+	// named request header with a credential it resolves from a Kubernetes
+	// Secret, so the runtime never holds that credential. A header is replaced
+	// only when the runtime's request carries it (with any placeholder value);
+	// requests without it are forwarded unchanged. Only exact-host HTTP and
+	// HTTPS rules may carry replacements, and only providers advertising
+	// runtime.egress-credential-injection enforce them. On HTTP the credential
+	// leaves the gateway in cleartext, so use it only for in-cluster origins.
+	// +kubebuilder:validation:MaxItems=4
+	// +listType=map
+	// +listMapKey=header
+	// +optional
+	ReplaceHeaders []RuntimeEgressCredentialHeader `json:"replaceHeaders,omitempty"`
+}
+
+// MaxRuntimeEgressCredentialHeaders bounds header replacements on one rule.
+const MaxRuntimeEgressCredentialHeaders = 4
+
+// maxRuntimeEgressCredentialPrefixBytes bounds a credential header prefix.
+const maxRuntimeEgressCredentialPrefixBytes = 64
+
+// RuntimeEgressCredentialHeader replaces one HTTP request header with a
+// credential. The credential is referenced, never embedded.
+type RuntimeEgressCredentialHeader struct {
+	// Header is the case-insensitive HTTP request header to replace when the
+	// request carries it. Hop-by-hop, routing, framing and cookie headers are
+	// rejected.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	Header string `json:"header"`
+	// Prefix is prepended verbatim to the credential value, including any
+	// separator, for example "Bearer " for Authorization.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+	// SecretKeyRef names the Kubernetes Secret key holding the credential.
+	SecretKeyRef RuntimeEgressSecretKeyReference `json:"secretKeyRef"`
+}
+
+// RuntimeEgressSecretKeyReference names one key of a Kubernetes Secret. The
+// backend's credential provider reads it at request time; the value never
+// enters the workload request, provider journal or runtime.
+type RuntimeEgressSecretKeyReference struct {
+	// Namespace defaults to the workload's namespace. Only the workspace
+	// intent writer (Orka core) sets another namespace, such as its private
+	// runtime namespace; providers accept it only when configured to.
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Key string `json:"key"`
+}
+
+// HasCredentialInjection reports whether any rule asks the gateway to
+// replace a request header with a credential.
+func (p *RuntimeEgressPolicy) HasCredentialInjection() bool {
+	if p == nil {
+		return false
+	}
+	return slices.ContainsFunc(p.Rules, func(rule RuntimeEgressRule) bool { return len(rule.ReplaceHeaders) != 0 })
+}
+
+// reservedRuntimeEgressCredentialHeaders cannot carry an injected credential:
+// they are hop-by-hop, select routing or message framing, or carry cookies
+// whose value a destination may reflect into responses or other origins.
+var reservedRuntimeEgressCredentialHeaders = map[string]bool{
+	"connection": true, "keep-alive": true, "proxy-connection": true, "proxy-authenticate": true,
+	"proxy-authorization": true, "te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
+	"host": true, "content-length": true, "content-type": true, "content-encoding": true, "expect": true,
+	"cookie": true, "set-cookie": true, "forwarded": true, "via": true, "x-forwarded-for": true,
+	"x-forwarded-host": true, "x-forwarded-proto": true, "x-real-ip": true, "ate-target-actor": true,
+}
+
+// ValidateRuntimeEgressCredentialHeaders checks one rule's header
+// replacements against the protocol and host that carry them.
+func ValidateRuntimeEgressCredentialHeaders(protocol RuntimeEgressProtocol, host string, headers []RuntimeEgressCredentialHeader) error {
+	if len(headers) == 0 {
+		return nil
+	}
+	if protocol != RuntimeEgressHTTP && protocol != RuntimeEgressHTTPS {
+		return fmt.Errorf("credential header replacement requires an HTTP or HTTPS rule; the gateway cannot read %s traffic", protocol)
+	}
+	if strings.HasPrefix(host, "*") {
+		return fmt.Errorf("credential header replacement requires an exact host, not %q", host)
+	}
+	if len(headers) > MaxRuntimeEgressCredentialHeaders {
+		return fmt.Errorf("credential header replacement allows at most %d headers per rule", MaxRuntimeEgressCredentialHeaders)
+	}
+	seen := map[string]bool{}
+	for i, header := range headers {
+		name := strings.ToLower(header.Header)
+		if !validRuntimeEgressHeaderName(header.Header) || len(header.Header) > 128 {
+			return fmt.Errorf("credential header %d must be an HTTP header name", i)
+		}
+		if reservedRuntimeEgressCredentialHeaders[name] || strings.HasPrefix(name, "x-forwarded-") || strings.HasPrefix(name, "x-envoy-") || strings.HasPrefix(name, "x-ate-") {
+			return fmt.Errorf("credential header %q is reserved", header.Header)
+		}
+		if seen[name] {
+			return fmt.Errorf("credential header %q is replaced more than once", header.Header)
+		}
+		seen[name] = true
+		if len(header.Prefix) > maxRuntimeEgressCredentialPrefixBytes || strings.IndexFunc(header.Prefix, func(r rune) bool { return r != ' ' && (r < '!' || r > '~') }) >= 0 {
+			return fmt.Errorf("credential header %q prefix must be at most %d printable ASCII bytes", header.Header, maxRuntimeEgressCredentialPrefixBytes)
+		}
+		ref := header.SecretKeyRef
+		if ref.Namespace != "" && len(validation.IsDNS1123Label(ref.Namespace)) != 0 {
+			return fmt.Errorf("credential header %q Secret namespace is invalid", header.Header)
+		}
+		if len(validation.IsDNS1123Subdomain(ref.Name)) != 0 {
+			return fmt.Errorf("credential header %q Secret name is invalid", header.Header)
+		}
+		if len(validation.IsConfigMapKey(ref.Key)) != 0 {
+			return fmt.Errorf("credential header %q Secret key is invalid", header.Header)
+		}
+	}
+	return nil
+}
+
+// validRuntimeEgressHeaderName accepts an RFC 9110 field-name token.
+func validRuntimeEgressHeaderName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, c := range []byte(value) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // RuntimeEgressPolicy is the admitted default-deny host-name allowlist for a
@@ -82,6 +215,9 @@ func (p RuntimeEgressPolicy) Validate() error {
 			return fmt.Errorf("runtime egress rule %d has unsupported protocol %q", i, rule.Protocol)
 		}
 		if err := ValidateRuntimeEgressHost(rule.Host); err != nil {
+			return fmt.Errorf("runtime egress rule %d: %w", i, err)
+		}
+		if err := ValidateRuntimeEgressCredentialHeaders(rule.Protocol, rule.Host, rule.ReplaceHeaders); err != nil {
 			return fmt.Errorf("runtime egress rule %d: %w", i, err)
 		}
 		if len(rule.Ports) == 0 || len(rule.Ports) > 16 {
