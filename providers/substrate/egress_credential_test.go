@@ -3,6 +3,7 @@
 package substrate
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/protobuf/proto"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -265,5 +267,66 @@ func TestRevocationNeverReappliesCredentialRules(t *testing.T) {
 	}
 	if _, revoked, err := d.readForEgressRevocation(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
 		t.Fatalf("revocation was not journaled: %v", err)
+	}
+}
+
+// A running workspace whose Core admission is stale or withdrawn takes the
+// reconciler's not-admitted early return. That path authorizes no allocation
+// or startup, but withdrawn credential configuration must still replace the
+// Actor's credential-bearing gateway policy with deny-all.
+func TestReconcilerRevokesWithdrawnCredentialInjectionWithoutAdmission(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	for range 12 {
+		observed, err := d.EnsureAllocation(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	if len(native.egress[actor].GetRules()) == 0 || record.EgressDenyAll {
+		t.Fatal("fixture did not apply credential effects")
+	}
+	workspace := bindingWorkspace(t, c, request.Key)
+	if workspace.Spec.DesiredState != api.ExecutionWorkspaceDesiredReady || workspace.Spec.Retirement != nil || workspaceHasMaintenanceIntent(workspace) {
+		t.Fatal("fixture must have no maintenance intent")
+	}
+	sdk.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(api.ConditionWorkspaceAdmitted), Status: metav1.ConditionFalse, Reason: string(api.ReasonProgressing), ObservedGeneration: workspace.Generation})
+	if err := c.Status().Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	if workspaceCurrentlyAdmittedByCore(bindingWorkspace(t, c, request.Key)) {
+		t.Fatal("fixture must not be admitted")
+	}
+	before := bindingWorkspace(t, c, request.Key)
+	boots := native.boots
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("revocation without admission was not reported: %v", err)
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("not-admitted reconciliation left gateway credential effects: %v", rules)
+	}
+	if _, revoked, err := d.readForEgressRevocation(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
+		t.Fatalf("revocation was not journaled: %v", err)
+	}
+	if native.boots != boots || !reflect.DeepEqual(bindingWorkspace(t, c, request.Key).Status, before.Status) {
+		t.Fatal("not-admitted reconciliation started the Actor or published lifecycle status")
+	}
+	// Once revoked, the not-admitted path is idempotent and quiet.
+	if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err != nil {
+		t.Fatalf("repeat revocation failed: %v", err)
 	}
 }

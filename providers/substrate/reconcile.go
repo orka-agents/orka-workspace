@@ -43,6 +43,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		maintenance := deleted || quarantined || revoking || current.Spec.Retirement != nil || current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || disabled
 		if !maintenance && !admitted {
 			pending = true
+			// Stale or withdrawn admission authorizes no allocation or startup,
+			// but must not keep a running Actor's credential-bearing gateway
+			// effects applied once their configuration stops admitting. The
+			// revocation reads only this workspace's own journal fence.
+			key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
+			operationErr = New(r.Client, r.Control, r.Config).revokeWithdrawnEgressCredentials(ctx, key)
 			return nil
 		}
 		// Acknowledge the attachment before Pod startup. This signal lets core
