@@ -45,6 +45,18 @@ type nativeFixture struct {
 	uids                     int
 	// suspendFidelity overrides the recorded fidelity of a new snapshot.
 	suspendFidelity pb.SnapshotFidelity
+	// runtime is the gVisor compatibility version workers run by default; it
+	// stamps assignments and new snapshots.
+	runtime *pb.VersionedSandboxCompat
+	// crashOnResume crashes the next resumed Actor before its process boots.
+	crashOnResume bool
+}
+
+func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
+	if f.runtime == nil {
+		return &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-1"}}}
+	}
+	return f.runtime
 }
 
 func (f *nativeFixture) effect(name string) error {
@@ -217,7 +229,11 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: limits.GetCpuMillicores(), MemoryBytes: limits.GetMemoryBytes(), Actors: 1}
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_RUNNING
-	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor"}}
+	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}
+	if f.crashOnResume {
+		f.crashOnResume = false
+		v.Status.State = pb.ActorState_ACTOR_STATE_CRASHED
+	}
 	return &pb.ResumeActorResponse{Actor: proto.Clone(v).(*pb.Actor), Resumed: true}, f.effect("resume")
 }
 func (f *nativeFixture) releaseWorker(v *pb.Actor) {
@@ -249,7 +265,7 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 	generation := v.Status.LastAssignedGeneration + 1
 	v.Status.LastAssignedGeneration = generation
 	uuid := fmt.Sprintf("snap-%s-%d", v.Metadata.Uid, generation)
-	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor"}}}
+	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
@@ -353,7 +369,7 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		if err := f.client.Create(ctx, pod); err != nil {
 			return nil, err
 		}
-		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor"}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
+		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor", DefaultRuntime: &pb.WorkerSandboxRuntime{Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
 	}
 	out := &pb.ListWorkersResponse{}
 	for _, worker := range f.workers {
@@ -458,6 +474,10 @@ func fixtureEgress() *api.RuntimeEgressPolicy {
 	return &api.RuntimeEgressPolicy{Rules: []api.RuntimeEgressRule{{Protocol: api.RuntimeEgressHTTP, Host: "auth-proxy.orka-system.svc.cluster.local", Ports: []int32{8080}}, {Protocol: api.RuntimeEgressHTTPS, Host: "api.example.com", Ports: []int32{443}}}}
 }
 
+// fixtureSandboxConfig is the class-default SandboxConfig the operator pool
+// reports as resolved.
+const fixtureSandboxConfig = "gvisor-default"
+
 func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.WorkloadRequest) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -499,7 +519,7 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}}, Egress: fixtureEgress()}}
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
-	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}}}
+	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}, "status": map[string]any{"sandboxClasses": []any{map[string]any{"name": "gvisor", "configRef": map[string]any{"name": fixtureSandboxConfig}}}}}}
 	uid := 0
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider, workspace, parameter, pool).WithStatusSubresource(workspace, provider, &api.ExecutionWorkspaceCheckpoint{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if obj.GetUID() == "" {

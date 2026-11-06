@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"time"
@@ -125,8 +126,23 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			if err := d.resolveProfile(ctx, fresh); err != nil {
 				return err
 			}
-			if record.SuspendEnabled && (!fresh.SuspendEnabled || !compatibleRestore(record.TemplateSpec, fresh.TemplateSpec) || record.Placement != fresh.Placement || !compatibleRuntimePool(record.RuntimePoolSpec, fresh.RuntimePoolSpec)) {
+			if record.SuspendEnabled && (!fresh.SuspendEnabled || !compatibleRestore(record.TemplateSpec, fresh.TemplateSpec) || record.Placement != fresh.Placement) {
 				return fmt.Errorf("native resume changed immutable infrastructure or durable layout")
+			}
+			if record.SuspendEnabled {
+				// A data-only cold boot may follow the operator pool's current,
+				// digest-pinned worker image; nothing else about the worker may
+				// change, and the transition is recorded on the lineage.
+				transition, err := dataResumeRuntimePool(record.RuntimePoolSpec, fresh.RuntimePoolSpec, metav1.Now())
+				if err != nil {
+					return err
+				}
+				if transition != nil && !maps.Equal(operatorPoolLabels(record), operatorPoolLabels(fresh)) {
+					return fmt.Errorf("native resume changed the operator worker pool labels")
+				}
+				if fresh.WorkerImageProvenance, err = inheritWorkerImageProvenance(record.WorkerImageProvenance, transition); err != nil {
+					return err
+				}
 			}
 			fresh.InheritedCheckpoint = record.Checkpoint
 			fresh.InheritedCatalog = record.CheckpointCatalog
@@ -364,6 +380,9 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		return err
 	}
 	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED || record.ChallengeSHA256 != "" && actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+		if reason := d.restoreRuntimeMismatch(ctx, record, actor); reason != "" {
+			return lostInstance(record, reason)
+		}
 		return lostInstance(record, nativeActorStopped)
 	}
 	return nil

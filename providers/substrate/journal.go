@@ -81,6 +81,9 @@ type checkpointRecord struct {
 	// SnapshotURI is the Tag's own durable data-only snapshot location.
 	SnapshotURI string      `json:"snapshotURI"`
 	CreatedAt   metav1.Time `json:"createdAt"`
+	// SandboxRuntime is the runtime the snapshot was taken under, when
+	// Agent Substrate stamps it.
+	SandboxRuntime *sandboxRuntimeStamp `json:"sandboxRuntime,omitempty"`
 }
 
 type catalogReference struct {
@@ -102,7 +105,10 @@ type journalRecord struct {
 	RuntimePoolSpec     json.RawMessage           `json:"runtimePoolSpec"`
 	RuntimePoolLabels   map[string]string         `json:"runtimePoolLabels"`
 	RuntimePoolDeleting bool                      `json:"runtimePoolDeleting,omitempty"`
-	Anchor              nativeReference           `json:"anchor"`
+	// WorkerImageProvenance records each data-only resume or restore of this
+	// lineage that followed the operator pool to a new worker image.
+	WorkerImageProvenance []workerImageTransition `json:"workerImageProvenance,omitempty"`
+	Anchor                nativeReference         `json:"anchor"`
 	// EgressPolicy is the Actor's nested native egress policy. Digest pins the
 	// compiled rules; deny-all is recorded with DenyAll.
 	EgressPolicy        nativeReference   `json:"egressPolicy"`

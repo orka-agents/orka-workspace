@@ -102,8 +102,14 @@ func (d *Lifecycle) importCheckpoint(ctx context.Context, cm *corev1.ConfigMap, 
 	if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
 		return err
 	}
-	if workspace.UID != record.Request.Key.WorkspaceUID || artifact.SourceWorkspace.UID == workspace.UID || artifact.Digest != ref.Digest || artifact.ClassBinding != record.Request.Runtime.ClassBinding || artifact.ProviderBinding != workspace.Spec.ProviderBinding || artifact.Checkpoint.Atespace != record.Atespace || artifact.Placement != record.Placement || !compatibleRestore(artifact.TemplateSpec, record.TemplateSpec) || !compatibleRuntimePool(artifact.RuntimePoolSpec, record.RuntimePoolSpec) {
+	if workspace.UID != record.Request.Key.WorkspaceUID || artifact.SourceWorkspace.UID == workspace.UID || artifact.Digest != ref.Digest || artifact.ClassBinding != record.Request.Runtime.ClassBinding || artifact.ProviderBinding != workspace.Spec.ProviderBinding || artifact.Checkpoint.Atespace != record.Atespace || artifact.Placement != record.Placement || !compatibleRestore(artifact.TemplateSpec, record.TemplateSpec) {
 		return fmt.Errorf("checkpoint restore changed source identity, namespace, class, provider, infrastructure or durable layout")
+	}
+	// The same data-only rule as a resume: only the operator pool's current,
+	// digest-pinned worker image may differ from the checkpoint's.
+	transition, err := dataResumeRuntimePool(artifact.RuntimePoolSpec, record.RuntimePoolSpec, metav1.Now())
+	if err != nil {
+		return fmt.Errorf("checkpoint restore changed worker infrastructure: %w", err)
 	}
 	if err := d.acquireCatalog(ctx, record.Request.Key.Namespace, reference, publicOwner, owner); err != nil {
 		return err
@@ -124,5 +130,8 @@ func (d *Lifecycle) importCheckpoint(ctx context.Context, cm *corev1.ConfigMap, 
 	record.InheritedCheckpoint = &checkpoint
 	record.InheritedCatalog = reference
 	record.CreateTemplate = checkpoint.Template
+	if record.WorkerImageProvenance, err = inheritWorkerImageProvenance(nil, transition); err != nil {
+		return err
+	}
 	return d.save(ctx, cm, record)
 }

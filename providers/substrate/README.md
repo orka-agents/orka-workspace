@@ -127,7 +127,11 @@ list), must not use the removed v1alpha1 `sandboxClass` field, and must leave
 `template.resources` unset; it may run zero replicas. The provider pins the
 source pool UID and selector, then copies its worker image, sandbox class
 configuration, scheduling, labels and annotations into a private single-replica
-WorkerPool for each instance. Its Pod template carries private allocation and
+WorkerPool for each instance. The private pool always names its SandboxConfig:
+an omitted `configRef` is pinned to the source pool's resolved
+`status.sandboxClasses[].configRef`, because the class default can move during an
+upgrade. A source pool whose config is unresolved, switching
+(`pendingConfigRef`), or declared differently from what it resolved is refused. Its Pod template carries private allocation and
 instance labels from birth, and the derived template's `workerSelector` adds
 those labels. v1 workers report `--max-actors` (default 1000) as their Actor
 count, so the provider instead sizes the private worker for exactly one Actor:
@@ -269,9 +273,19 @@ private-pool ownership is verified; foreign labels, foreign assignments, or
 changed placement block mutation.
 
 Resume verifies the retained Tag, original template and immutable infrastructure,
-including the frozen private worker specification. Only generated allocation
-and instance labels may rotate; worker image, sandbox class, scheduling, size,
-and operator labels must remain identical.
+including the frozen private worker specification. Generated allocation and
+instance labels rotate. The worker image follows the source pool's current
+image, because an Agent Substrate minor upgrade rolls WorkerPools to a new worker
+image and the API server must never be newer than a worker: a data-only
+(`VOLUMES`) resume cold boots anyway, so no process state crosses the change.
+The new image must be pinned by digest (`repo@sha256:<64 hex>`), and sandbox
+class, pinned SandboxConfig, scheduling, size, template labels, and the source
+pool's own labels must remain identical; anything else fails closed. Each such
+transition is appended to the journal's `workerImageProvenance` (from, to,
+the previous private pool digest, time), bounded at 16 per lineage. A
+`RestoreFrom` import applies the same rule against the checkpoint's recorded
+pool specification. Do not patch the private `-workers` pools during an upgrade;
+patch the operator pools, then let running workspaces move by eviction.
 It creates a fresh Actor from the Tag under that original template (v1 seeds an
 Actor only under the Tag's template), checks the Actor holds exactly the Tag's
 completed `VOLUMES` snapshot, then uses native `UpdateActor` UID/version CAS to
@@ -280,7 +294,27 @@ restores durable volumes and cold-boots. It applies the egress allowlist,
 resumes once, checks a new worker and process challenge, and leaves credential
 rotation and authenticated admission to Orka.
 A lost boot or suspension response is recovered by observation; a possibly
-accepted mutation is never replayed. Explicit core Retirement.Suspend is honored
+accepted mutation is never replayed.
+
+**Worker eviction.** When the exact fenced worker Pod begins graceful termination
+(an upgrade roll, node drain, or Spot reclaim), Observe keeps reporting the
+running instance with its unchanged startup evidence instead of withdrawing it,
+so Orka core can close admission, drain the supervisor, and authorize a
+synchronous `Retirement.Suspend` within the worker's 30-minute window. A worker
+that is not already fenced is never adopted while terminating, and the suspend
+path tolerates a Pod that is already deleting. An instance that is not suspended
+in time crashes and fails as described below; its last checkpoint stays
+retained.
+
+**Runtime provenance.** Each data checkpoint records the Tag snapshot's
+`sandbox_runtime` (class, schema version, attribute digest); a stamp from another
+sandbox class fails the capture, and verification rejects a mismatching record.
+Agent Substrate runs every gVisor restore without memory under the worker's
+default `runsc` and does not check cross-version compatibility. When a restore
+crashes before its supervisor boots and the worker's runtime differs from the
+checkpoint's, the failure is recorded with the distinct `Provisioned` reason
+`SandboxRuntimeRestoreFailed` instead of `InstanceFailed`; the checkpoint stays
+available to explicit recovery and nothing is replayed. Explicit core Retirement.Suspend is honored
 also while desiredState remains Ready during epoch rotation.
 Actor creation intent is also journaled before its RPC. An issued create recovers
 only by observing the Actor; absence without a recorded UID blocks allocation
