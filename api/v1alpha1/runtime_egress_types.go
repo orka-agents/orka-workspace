@@ -5,6 +5,7 @@ package v1alpha1
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -99,6 +100,31 @@ func (p RuntimeEgressPolicy) Validate() error {
 			seen[key] = true
 		}
 	}
+	return validateRuntimeEgressOverlaps(p.Rules)
+}
+
+// validateRuntimeEgressOverlaps rejects an exact host that a wildcard rule on
+// the same port also matches, when the two use different protocols. Gateways
+// prefer the exact rule, so the overlap would silently replace the wildcard's
+// protocol for that host instead of only adding permissions.
+func validateRuntimeEgressOverlaps(rules []RuntimeEgressRule) error {
+	for _, wildcard := range rules {
+		suffix, ok := strings.CutPrefix(wildcard.Host, "*")
+		if !ok {
+			continue
+		}
+		for _, exact := range rules {
+			label, matches := strings.CutSuffix(exact.Host, suffix)
+			if exact.Protocol == wildcard.Protocol || !matches || label == "" || strings.ContainsAny(label, ".*") {
+				continue
+			}
+			for _, port := range exact.Ports {
+				if slices.Contains(wildcard.Ports, port) {
+					return fmt.Errorf("runtime egress grants %s port %d as %s, which overrides %s from %s", exact.Host, port, exact.Protocol, wildcard.Protocol, wildcard.Host)
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -118,6 +144,10 @@ func ValidateRuntimeEgressHost(host string) error {
 	}
 	if len(validation.IsDNS1123Subdomain(name)) != 0 || !strings.Contains(name, ".") {
 		return fmt.Errorf("egress host %q must be a fully qualified DNS name", host)
+	}
+	// Gateways reject an all-numeric final label, which only an address uses.
+	if strings.Trim(name[strings.LastIndexByte(name, '.')+1:], "0123456789") == "" {
+		return fmt.Errorf("egress host %q must not end in an all-numeric label", host)
 	}
 	return nil
 }

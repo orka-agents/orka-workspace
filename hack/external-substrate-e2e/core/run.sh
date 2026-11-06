@@ -45,8 +45,16 @@ if kubectl -n orka-workspace-system get deployment/orka-workspace-substrate >/de
   exit 1
 fi
 run_id="$(date -u +%Y%m%d%H%M%S)"
-namespace="external-substrate-core-${run_id}"
-run_dir="${PWD}/bin/${namespace}"
+# Core reaches routed runtimes only through atenet-router, whose ingress
+# allowlist is fixed at install time (install-backend.sh). The Core manager's
+# pod-certificate SPIFFE ID therefore needs a stable namespace; runs are already
+# serialized by the deployment guard above.
+namespace="external-substrate-core"
+if kubectl get namespace "${namespace}" >/dev/null 2>&1 || kubectl -n "${client_namespace}" get job "${namespace}" >/dev/null 2>&1; then
+  printf 'A retained native Core proof (%s) requires explicit review before another run.\n' "${namespace}" >&2
+  exit 1
+fi
+run_dir="${PWD}/bin/${namespace}-${run_id}"
 mkdir -p "${run_dir}"
 chmod 700 "${run_dir}"
 shared_snapshot="${run_dir}/orka-workspace"
@@ -119,6 +127,8 @@ openssl rand 32 >"${run_dir}/private/key"
 openssl rand -hex 32 >"${run_dir}/private/token"
 chmod 600 "${run_dir}/private/"*
 kubectl create namespace "${namespace}"
+# ate-system's NetworkPolicy admits Substrate clients only from labeled namespaces.
+kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
 kubectl -n "${namespace}" create secret tls external-substrate-core-tls --key="${run_dir}/private/tls.key" --cert="${run_dir}/private/tls.crt"
 kubectl create --dry-run=client -f "${core_snapshot}/config/rbac/role.yaml" -o json >"${run_dir}/core-role.json"

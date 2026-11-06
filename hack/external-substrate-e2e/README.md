@@ -36,12 +36,16 @@ Authorization is always enforced. Setup makes only the two proof client
 identities bootstrap owners:
 `spiffe://cluster.local/ns/external-substrate-e2e/sa/native-data-proof` and
 `.../sa/native-core-proof`. Proof Jobs therefore run in the fixed
-`external-substrate-e2e` namespace and operate on the per-run namespace. The
+`external-substrate-e2e` namespace and operate on the run namespace. The
 router (`--ingress-allowed-spiffe-ids`) admits those identities and the
 deployed provider's
-`spiffe://cluster.local/ns/orka-workspace-system/sa/orka-workspace-substrate`;
-`SUBSTRATE_E2E_EXTRA_INGRESS_SPIFFE_IDS` appends more, such as the Orka core
-manager's identity. The Core proof grants the deployed provider only `editor`
+`spiffe://cluster.local/ns/orka-workspace-system/sa/orka-workspace-substrate`,
+plus the Core proof's Orka manager,
+`spiffe://cluster.local/ns/external-substrate-core/sa/orka-controller-manager`.
+That manager runs in the fixed `external-substrate-core` namespace with a
+projected pod certificate and routes sealed bootstrap, probes, and drain through
+atenet-router; a retained earlier run must be reviewed and removed first.
+`SUBSTRATE_E2E_EXTRA_INGRESS_SPIFFE_IDS` appends more identities. The Core proof grants the deployed provider only `editor`
 on the run Atespace and global `viewer`.
 
 No DNS or installation setting is patched. Actor ingress goes through

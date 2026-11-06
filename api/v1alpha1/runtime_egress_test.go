@@ -38,6 +38,22 @@ func TestRuntimeEgressAcceptsOnlyExplicitHostNameRules(t *testing.T) {
 		{"unknown protocol", valid(RuntimeEgressRule{Protocol: "TCP", Host: "api.example.com", Ports: []int32{443}}), false},
 		{"empty protocol", valid(RuntimeEgressRule{Host: "api.example.com", Ports: []int32{443}}), false},
 		{"overlapping protocols", valid(RuntimeEgressRule{Protocol: RuntimeEgressHTTP, Host: "a.example.com", Ports: []int32{443}}, RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "a.example.com", Ports: []int32{443}}), false},
+		{"all-numeric final label", valid(RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "api.123", Ports: []int32{443}}), false},
+		{"dotted numeric name", valid(RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "01.2.3.4", Ports: []int32{443}}), false},
+		{"numeric wildcard suffix", valid(RuntimeEgressRule{Protocol: RuntimeEgressTLSPassthrough, Host: "*.example.123", Ports: []int32{443}}), false},
+		{"numeric inner label", valid(RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "123.example.com", Ports: []int32{443}}), true},
+		{"wildcard overridden by exact protocol", valid(
+			RuntimeEgressRule{Protocol: RuntimeEgressTLSPassthrough, Host: "*.example.com", Ports: []int32{443}},
+			RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "api.example.com", Ports: []int32{443}}), false},
+		{"wildcard and exact same protocol", valid(
+			RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "*.example.com", Ports: []int32{443}},
+			RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "api.example.com", Ports: []int32{443}}), true},
+		{"wildcard and exact other port", valid(
+			RuntimeEgressRule{Protocol: RuntimeEgressTLSPassthrough, Host: "*.example.com", Ports: []int32{8443}},
+			RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "api.example.com", Ports: []int32{443}}), true},
+		{"wildcard does not cover deeper names", valid(
+			RuntimeEgressRule{Protocol: RuntimeEgressTLSPassthrough, Host: "*.example.com", Ports: []int32{443}},
+			RuntimeEgressRule{Protocol: RuntimeEgressHTTPS, Host: "a.b.example.com", Ports: []int32{443}}), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.policy.Validate(); (err == nil) != tc.ok {

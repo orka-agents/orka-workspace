@@ -53,9 +53,11 @@ client_namespace=external-substrate-e2e
 proof_id="spiffe://cluster.local/ns/${client_namespace}/sa/native-data-proof"
 core_proof_id="spiffe://cluster.local/ns/${client_namespace}/sa/native-core-proof"
 provider_id="spiffe://cluster.local/ns/orka-workspace-system/sa/orka-workspace-substrate"
-ingress_ids="${proof_id},${core_proof_id},${provider_id}"
+# The Orka core manager of the Core Task proof seeds credentials and probes
+# routed runtimes through atenet-router (fixed namespace, see core/run.sh).
+core_manager_id="spiffe://cluster.local/ns/external-substrate-core/sa/orka-controller-manager"
+ingress_ids="${proof_id},${core_proof_id},${provider_id},${core_manager_id}"
 if [[ -n "${SUBSTRATE_E2E_EXTRA_INGRESS_SPIFFE_IDS:-}" ]]; then
-  # For example the Orka core manager identity once core routes through atenet-router.
   ingress_ids="${ingress_ids},${SUBSTRATE_E2E_EXTRA_INGRESS_SPIFFE_IDS}"
 fi
 

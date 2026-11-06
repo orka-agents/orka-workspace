@@ -33,7 +33,28 @@ for obj in objects:
                            "resources": ["substrateproviderconfigs", "substrateworkspaceprofiles"],
                            "verbs": ["get", "list", "watch"]}
     if obj["kind"] == "Deployment":
-        obj["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = "IfNotPresent"
+        pod_spec = obj["spec"]["template"]["spec"]
+        manager = pod_spec["containers"][0]
+        manager["imagePullPolicy"] = "IfNotPresent"
+        # Core reaches routed native runtimes only through atenet-router with
+        # its allowlisted pod certificate (install-backend.sh) and verifies the
+        # router against the Substrate service trust bundle.
+        manager.setdefault("args", []).extend([
+            "--substrate-api-cert-file=/run/substrate-client/credential-bundle.pem",
+            "--substrate-api-key-file=/run/substrate-client/credential-bundle.pem",
+            "--substrate-api-ca-file=/run/substrate-server/trust-bundle.pem",
+            "--substrate-router-url=https://atenet-router.ate-system.svc:443"])
+        manager.setdefault("volumeMounts", []).extend([
+            {"name": "substrate-client", "mountPath": "/run/substrate-client", "readOnly": True},
+            {"name": "substrate-server", "mountPath": "/run/substrate-server", "readOnly": True}])
+        pod_spec.setdefault("volumes", []).extend([
+            {"name": "substrate-client", "projected": {"sources": [{"podCertificate": {
+                "signerName": "podidentity.podcert.ate.dev/identity", "keyType": "ECDSAP256",
+                "credentialBundlePath": "credential-bundle.pem"}}]}},
+            {"name": "substrate-server", "projected": {"sources": [{"clusterTrustBundle": {
+                "signerName": "servicedns.podcert.ate.dev/identity",
+                "labelSelector": {"matchLabels": {"podcert.ate.dev/canarying": "live"}},
+                "path": "trust-bundle.pem"}}]}}])
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
