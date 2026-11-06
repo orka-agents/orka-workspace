@@ -330,3 +330,117 @@ func TestReconcilerRevokesWithdrawnCredentialInjectionWithoutAdmission(t *testin
 		t.Fatalf("repeat revocation failed: %v", err)
 	}
 }
+
+// readyCredentialAllocation runs a credential-injecting allocation to Ready
+// and returns its driver and the Actor's egress policy key.
+func readyCredentialAllocation(t *testing.T) (client.Client, *nativeFixture, sdk.WorkloadRequest, *Lifecycle, string) {
+	t.Helper()
+	c, native, request := fixture(t, false)
+	request = credentialRequest(t, request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	d := New(c, native, credentialConfig())
+	d.challengeClient = native
+	for range 12 {
+		observed, err := d.EnsureAllocation(t.Context(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := record.Atespace + "/" + record.Actor.Name
+	if len(native.egress[actor].GetRules()) == 0 || record.EgressDenyAll {
+		t.Fatal("fixture did not apply credential effects")
+	}
+	return c, native, request, d, actor
+}
+
+// timeOutBoot records the boot-timeout failure exactly as EnsureAllocation
+// does: the Actor keeps running and its operation stays ensure.
+func timeOutBoot(t *testing.T, d *Lifecycle, key sdk.AllocationKey) {
+	t.Helper()
+	cm, record, err := d.read(t.Context(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.fail(t.Context(), cm, record, "native allocation produced no process evidence within 6m0s"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A timed-out Actor stays running with its gateway policy, and observing a
+// failed record verifies no egress. Under a Disabled provider - maintenance,
+// so neither the not-admitted nor the observation-error hook runs, and the
+// failure branch never reaches EnsureAllocation - withdrawn credential
+// configuration must still replace the policy with deny-all.
+func TestDisabledReconcilerRevokesWithdrawnCredentialsOfTimedOutActor(t *testing.T) {
+	c, native, request, d, actor := readyCredentialAllocation(t)
+	timeOutBoot(t, d, request.Key)
+	workspace := bindingWorkspace(t, c, request.Key)
+	provider := &api.ExecutionWorkspaceProvider{}
+	if err := c.Get(t.Context(), client.ObjectKey{Name: workspace.Spec.ProviderBinding.Name}, provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.LifecycleState = api.ExecutionWorkspaceProviderDisabled
+	if err := c.Update(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("revocation of the timed-out Actor was not reported: %v", err)
+	}
+	if rules := native.egress[actor].GetRules(); len(rules) != 0 {
+		t.Fatalf("a timed-out Actor kept gateway credential effects: %v", rules)
+	}
+	_, record, err := d.readForEgressRevocation(t.Context(), request.Key)
+	if err != nil || !record.EgressDenyAll || record.Operation != "ensure" {
+		t.Fatalf("revocation was not journaled or changed the failed operation: %v", err)
+	}
+	if live, err := d.actor(t.Context(), record); err != nil || live == nil {
+		t.Fatalf("fixture Actor must still exist: %v", err)
+	}
+	if got := bindingWorkspace(t, c, request.Key).Status.State; got != api.ExecutionWorkspaceStateFailed {
+		t.Fatalf("workspace state = %q, want Failed", got)
+	}
+	// Once revoked, the failed instance reconciles quietly.
+	if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err != nil {
+		t.Fatalf("repeat reconciliation failed: %v", err)
+	}
+}
+
+// Authorized cleanup of a failed instance proceeds under withdrawn
+// credential configuration; the revocation never blocks its stop.
+func TestFailedInstanceCleanupProceedsUnderWithdrawnCredentials(t *testing.T) {
+	c, native, request, d, _ := readyCredentialAllocation(t)
+	timeOutBoot(t, d, request.Key)
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := bindingWorkspace(t, c, request.Key)
+	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: record.Observation.Identity, Action: api.WorkloadRetirementStop}
+	status := workspace.Status.DeepCopy()
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	workspace.Status = *status
+	if err := c.Status().Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	withdrawn := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+	for range 6 {
+		if _, err := withdrawn.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err != nil {
+			t.Fatalf("withdrawn credentials blocked authorized cleanup: %v", err)
+		}
+	}
+	if _, record, err = d.read(t.Context(), request.Key); err != nil || record.Operation != "stop" || record.Observation.State != sdk.AllocationStopped {
+		t.Fatalf("authorized cleanup did not stop the failed instance: %v, %v", err, record.Observation.State)
+	}
+}
