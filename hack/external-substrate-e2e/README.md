@@ -100,9 +100,12 @@ Tag/template collection; the installation and namespace remain inspectable.
 
 ## Assertions and limits
 
-The proof has been ported to v1.0.0 but has not yet been run against an
-installed v1.0.0 backend. The last installed run, against v0.1.0 on
-2026-10-05, is retained at `bin/external-substrate-proof-20261006010553/`.
+The installed run against v1.0.0 on 2026-11-06 (amd64, dedicated kindctl
+cluster) passed all assertions below. Its report and log are retained at
+`bin/external-substrate-proof-20261106065356/`, recording exact process and
+worker identities, router targets, challenge hashes, checkpoint UID/digest,
+runtime/proof/worker image digests, and the native commit. The earlier v0.1.0
+run is retained at `bin/external-substrate-proof-20261006010553/`.
 
 The runtime writes a random marker only in the original process. Its imported
 incarnation cannot initialize that marker. The proof checks:

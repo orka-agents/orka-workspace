@@ -72,6 +72,8 @@ ATE_INSTALL_KIND=true KIND_CLUSTER_NAME="${context#kind-}" KUBECTL_CONTEXT="${co
 test -z "$(git status --porcelain --untracked-files=all)"
 cd - >/dev/null
 kubectl create namespace "${client_namespace}" --dry-run=client -o yaml | kubectl apply -f -
+# ate-system's NetworkPolicy admits ate-api clients only from labeled namespaces.
+kubectl label namespace "${client_namespace}" ate.dev/api-access=true --overwrite
 for account in native-data-proof native-core-proof; do
   kubectl -n "${client_namespace}" create serviceaccount "${account}" --dry-run=client -o yaml | kubectl apply -f -
 done

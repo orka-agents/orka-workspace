@@ -2,6 +2,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: orka-workspace-system
+  labels:
+    # Agent Substrate's ate-system NetworkPolicy admits ate-api clients only
+    # from namespaces carrying this label.
+    ate.dev/api-access: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount

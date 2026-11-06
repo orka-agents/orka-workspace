@@ -45,6 +45,8 @@ is `system:serviceaccount:orka-workspace-system:orka-workspace-substrate`. It
 verifies ate-api with the `servicedns.podcert.ate.dev/identity`
 ClusterTrustBundle. A client certificate/key pair (`--native-cert-file`,
 `--native-key-file`) may replace the token; its principal is then its SPIFFE ID.
+Agent Substrate's `ate-system` NetworkPolicy admits ate-api clients only from
+namespaces labeled `ate.dev/api-access=true`; the shipped Namespace carries it.
 Control always uses authenticated TLS. Credential values never enter workspace
 requests, provider status, templates, journals, or logs. The binary reloads
 bearer identity for every request and client certificates for every handshake.
@@ -337,10 +339,14 @@ rollover, checkpoint ownership transfers, source/public-reference deletion,
 explicit failed-source recovery, private catalog loss, and separate selectors in
 a shared WorkerPool. Unit tests cover simulated control operations only.
 
-The installed native proofs in `hack/external-substrate-e2e` were last run
-against v0.1.0 on 2026-10-05 (real arm64 gVisor Data capture, export, cold
-import and a Core Task through the deployed provider). They have been ported to
-v1.0.0 (ate-setup install, router reads, egress allowlist, v1 WorkerPools) but
-have not yet been rerun against an installed v1.0.0 backend; the Core Task proof
-additionally needs an Orka core that admits `RuntimeWorkload.Egress` and routes
-through `atenet-router`.
+The installed native Data proof in `hack/external-substrate-e2e` passed against
+an unmodified Agent Substrate v1.0.0 installation on 2026-11-06 (amd64 gVisor,
+official `ate-setup` install): a private single-Actor gVisor worker, the
+data-only golden-disabled template and the admitted egress allowlist existed
+before every Resume; routed challenges, Actor UID/version and worker epoch
+matched; synchronous `VOLUMES` capture preceded exact worker Pod and Actor
+termination; an independent checkpoint survived source deletion; a cold import
+into a fresh Actor read the original marker; and final owner deletion collected
+native Tags and templates. The Core Task proof (last passed against v0.1.0 on
+2026-10-05) is ported but needs an Orka core that admits `RuntimeWorkload.Egress`
+and routes through `atenet-router`.

@@ -109,7 +109,7 @@ workload contract.
 | Kubernetes | v1.37.0 with CEL admission authorization | Scoped live fixtures; other versions unverified |
 | Fake provider | Separate Pod runtime; `orka.harness.v2` | Two-replica ownership, actual Core Task/RuntimeSession, and exact credential/Pod retirement |
 | Agent Sandbox | Unmodified upstream v1.0.3; dynamic PVC with Delete reclaim | Installed filesystem persistence and exact Pod/PVC/PV deletion |
-| Agent Substrate | Native v1.0.0 at `b34fbee742906494b5eb4f1f36987176bf8770a4`; gVisor; `VOLUMES` snapshots with golden snapshots disabled; router-routed, gateway-egress | Simulated v1 control conformance and recovery tests. The installed proofs passed against v0.1.0 and are ported to v1.0.0 but not yet rerun; the Core Task proof needs an Orka core that admits `RuntimeWorkload.Egress` and routes through `atenet-router`. v0.1.0 state must be retired first. |
+| Agent Substrate | Native v1.0.0 at `b34fbee742906494b5eb4f1f36987176bf8770a4`; gVisor; `VOLUMES` snapshots with golden snapshots disabled; router-routed, gateway-egress | Simulated v1 control conformance and recovery tests; installed v1.0.0 Data capture/export/import and native artifact collection (2026-11-06). The Core Task proof passed against v0.1.0 and needs an Orka core that admits `RuntimeWorkload.Egress` and routes through `atenet-router` before rerunning. v0.1.0 state must be retired first. |
 | Legacy allocations | Original in-tree owner only | Stock upgrade gate rejects all retained states before and after schema pruning; fresh startup follows exact cleanup |
 | Pooled Substrate MCP Tools | Existing in-tree implementation | Retained migration boundary |
 | Fiberd | No external provider yet | Upstream prerequisites remain unsatisfied |
