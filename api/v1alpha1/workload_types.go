@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -286,6 +287,9 @@ func (r WorkloadRequest) validateRuntime() error {
 		if err := runtime.Egress.Validate(); err != nil {
 			return err
 		}
+	}
+	if runtime.Egress.HasCredentialInjection() && !slices.Contains(runtime.RequiredFeatures, WorkspaceFeatureEgressCredentialInjection) {
+		return fmt.Errorf("runtime egress credential replacement requires the %s feature", WorkspaceFeatureEgressCredentialInjection)
 	}
 	pod := runtime.Template.Spec
 	if len(pod.ImagePullSecrets) != 0 {

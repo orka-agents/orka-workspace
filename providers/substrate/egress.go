@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // egressPolicyName is the singleton name of an Actor's nested egress policy.
@@ -33,7 +34,12 @@ func validateNativeEgress(runtime *sdk.RuntimeWorkload) error {
 
 // compileEgressPolicy translates the admitted allowlist into one native rule
 // per host pattern. Everything else stays denied, including DNS resolution.
-func compileEgressPolicy(atespace string, egress *api.RuntimeEgressPolicy) (*pb.EgressPolicy, error) {
+// Credential header replacements compile into gateway header effects that
+// name Kubernetes Secret keys; the credential value never passes through this
+// provider. Without a configured credential provider any replacement fails
+// compilation, so the Actor is never resumed with a rule the gateway would
+// forward without its credential.
+func compileEgressPolicy(atespace, workloadNamespace string, egress *api.RuntimeEgressPolicy, config Config) (*pb.EgressPolicy, error) {
 	if egress == nil {
 		return nil, fmt.Errorf("native runtime has no admitted egress allowlist")
 	}
@@ -44,18 +50,80 @@ func compileEgressPolicy(atespace string, egress *api.RuntimeEgressPolicy) (*pb.
 	for _, rule := range egress.Rules {
 		ports := &pb.Ports{Numbers: slices.Sorted(slices.Values(rule.Ports))}
 		hosts := []string{rule.Host}
+		effects, err := compileCredentialHeaders(workloadNamespace, rule.ReplaceHeaders, config)
+		if err != nil {
+			return nil, err
+		}
 		switch rule.Protocol {
 		case api.RuntimeEgressHTTP:
-			policy.Rules = append(policy.Rules, &pb.EgressRule{Http: &pb.HttpRule{Hostnames: hosts, Ports: ports}})
+			policy.Rules = append(policy.Rules, &pb.EgressRule{Http: &pb.HttpRule{Hostnames: hosts, Ports: ports, Effects: effects}})
 		case api.RuntimeEgressHTTPS:
-			policy.Rules = append(policy.Rules, &pb.EgressRule{Https: &pb.HttpsRule{Hostnames: hosts, Ports: ports}})
+			policy.Rules = append(policy.Rules, &pb.EgressRule{Https: &pb.HttpsRule{Hostnames: hosts, Ports: ports, Effects: effects}})
 		case api.RuntimeEgressTLSPassthrough:
+			if effects != nil {
+				return nil, fmt.Errorf("native TLS passthrough cannot replace credential headers")
+			}
 			policy.Rules = append(policy.Rules, &pb.EgressRule{TlsPassthrough: &pb.TlsPassthroughRule{Hostnames: hosts, Ports: ports}})
 		default:
 			return nil, fmt.Errorf("native egress protocol %q is unsupported", rule.Protocol)
 		}
 	}
 	return policy, nil
+}
+
+// compileCredentialHeaders maps header replacements to the upstream
+// ate-secret://k8s.io/default/<namespace>/<secret>/<key> references served by
+// the Kubernetes Secrets credential provider.
+func compileCredentialHeaders(workloadNamespace string, headers []api.RuntimeEgressCredentialHeader, config Config) (*pb.HttpRuleEffects, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	if !config.EgressCredentialInjectionEnabled() {
+		return nil, fmt.Errorf("native egress credential injection is not configured for this provider")
+	}
+	effects := &pb.HttpRuleEffects{}
+	for _, header := range headers {
+		namespace, err := config.credentialNamespace(workloadNamespace, header.SecretKeyRef)
+		if err != nil {
+			return nil, err
+		}
+		uri := fmt.Sprintf("ate-secret://%s/default/%s/%s/%s", config.EgressCredentialProvider, namespace, header.SecretKeyRef.Name, header.SecretKeyRef.Key)
+		effects.ReplaceHeaders = append(effects.ReplaceHeaders, &pb.CredentialHeader{Header: header.Header, Prefix: header.Prefix, CredentialUri: uri})
+	}
+	return effects, nil
+}
+
+// credentialNamespace resolves a Secret reference's namespace: the workload's
+// own, or one the operator explicitly listed for this provider.
+func (c Config) credentialNamespace(workloadNamespace string, ref api.RuntimeEgressSecretKeyReference) (string, error) {
+	namespace := ref.Namespace
+	if namespace == "" || namespace == workloadNamespace {
+		if len(validation.IsDNS1123Label(workloadNamespace)) != 0 {
+			return "", fmt.Errorf("native egress credential requires a workload namespace")
+		}
+		return workloadNamespace, nil
+	}
+	if !slices.Contains(c.EgressCredentialNamespaces, namespace) {
+		return "", fmt.Errorf("native egress credential namespace %q is not permitted for this provider", namespace)
+	}
+	return namespace, nil
+}
+
+// admitEgressCredentials refuses a workload whose credential replacements this
+// installation cannot enforce, before any native object is created.
+func (c Config) admitEgressCredentials(request sdk.WorkloadRequest) error {
+	if request.Runtime == nil || !request.Runtime.Egress.HasCredentialInjection() {
+		return nil
+	}
+	if !slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		return fmt.Errorf("native egress credential replacement requires the %s feature", api.WorkspaceFeatureEgressCredentialInjection)
+	}
+	for _, rule := range request.Runtime.Egress.Rules {
+		if _, err := compileCredentialHeaders(request.Key.Namespace, rule.ReplaceHeaders, c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func egressRulesDigest(rules []*pb.EgressRule) (string, error) {
@@ -67,7 +135,7 @@ func egressRulesDigest(rules []*pb.EgressRule) (string, error) {
 // before every Resume. A compilation failure installs deny-all and refuses to
 // boot. Writes carry the observed policy's metadata as preconditions.
 func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
-	desired, compileErr := compileEgressPolicy(record.Atespace, record.Request.Runtime.Egress)
+	desired, compileErr := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
 	if compileErr != nil {
 		desired = &pb.EgressPolicy{Metadata: &pb.ResourceMetadata{Atespace: record.Atespace, Name: egressPolicyName}}
 	}
@@ -140,7 +208,7 @@ func (d *Lifecycle) verifyEgressPolicy(ctx context.Context, record *journalRecor
 	if record.EgressPolicy.UID == "" || record.EgressPolicy.Digest == "" || record.EgressDenyAll {
 		return fmt.Errorf("native Actor has no applied admitted egress allowlist")
 	}
-	desired, err := compileEgressPolicy(record.Atespace, record.Request.Runtime.Egress)
+	desired, err := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
 	if err != nil {
 		return err
 	}

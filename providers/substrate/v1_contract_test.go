@@ -30,7 +30,7 @@ func TestNativeEgressCompilesExplicitHostAllowlist(t *testing.T) {
 		{Protocol: api.RuntimeEgressHTTPS, Host: "*.example.com", Ports: []int32{8443, 443}},
 		{Protocol: api.RuntimeEgressTLSPassthrough, Host: "git.example.org", Ports: []int32{443}},
 	}}
-	policy, err := compileEgressPolicy("native", egress)
+	policy, err := compileEgressPolicy("native", "tenant", egress, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,11 +43,11 @@ func TestNativeEgressCompilesExplicitHostAllowlist(t *testing.T) {
 		t.Fatalf("compiled egress differs:\n got %v\nwant %v", policy, want)
 	}
 	for _, invalid := range []*api.RuntimeEgressPolicy{nil, {Rules: []api.RuntimeEgressRule{{Protocol: api.RuntimeEgressHTTPS, Host: "*", Ports: []int32{443}}}}} {
-		if _, err := compileEgressPolicy("native", invalid); err == nil {
+		if _, err := compileEgressPolicy("native", "tenant", invalid, Config{}); err == nil {
 			t.Fatal("invalid egress compiled")
 		}
 	}
-	empty, err := compileEgressPolicy("native", &api.RuntimeEgressPolicy{})
+	empty, err := compileEgressPolicy("native", "tenant", &api.RuntimeEgressPolicy{}, Config{})
 	if err != nil || len(empty.Rules) != 0 {
 		t.Fatal("empty allowlist did not compile to deny-all")
 	}
@@ -77,7 +77,7 @@ func TestNativeEgressIsAppliedBeforeResumeAndDeniesAllWhenCompilationFails(t *te
 	cm, record := holdBeforeBoot(t, c, native, request)
 	key := record.Atespace + "/" + record.Actor.Name
 	applied := native.egress[key]
-	want, err := compileEgressPolicy(record.Atespace, request.Runtime.Egress)
+	want, err := compileEgressPolicy(record.Atespace, request.Key.Namespace, request.Runtime.Egress, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

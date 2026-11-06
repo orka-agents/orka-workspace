@@ -117,6 +117,60 @@ child's environment explicitly, so intercepted HTTPS egress for agent children
 also requires the supervisor to pass the trust variables through; until it does,
 core admits only HTTP and TLS passthrough rules.
 
+**Egress credential injection.** An `HTTP` or `HTTPS` rule may carry
+`replaceHeaders`: each entry names a request header, an optional verbatim
+prefix, and a Kubernetes Secret key (`secretKeyRef`). The provider compiles
+them into the rule's gateway `effects.replaceHeaders` with
+`ate-secret://k8s.io/default/<namespace>/<secret>/<key>` URIs, so the
+credential is resolved by the egress gateway at request time and never enters
+the workload request, journal, Actor template or Actor. The runtime sends the
+header with any placeholder value; the gateway replaces it only when present
+and fails closed (403/503, or 500 on Envoy without a provider) when it cannot
+resolve the credential. The feature is off by default. To enable it:
+
+1. Install the Substrate egress gateway with
+   `--credential-provider='{"name":"k8s.io"}'`, which deploys the reference
+   Kubernetes Secrets credential provider in `ate-system`.
+2. Grant each profile Atespace exactly the namespaces whose Secrets it may
+   resolve in the `k8s-credential-provider-namespace-policy` ConfigMap, and
+   narrow the grant with `secretSelector` (Orka core labels its provider-proxy
+   Secrets `orka.ai/runtime-pool-provider-credential: "true"`). The provider
+   loads this policy only at startup; restart it after editing:
+
+   ```yaml
+   namespace-policy.yaml: |
+     policies:
+     - atespace: <profile-atespace>
+       allowedNamespaces: [orka-runtimes]
+       secretSelector:
+         matchLabels:
+           orka.ai/runtime-pool-provider-credential: "true"
+   ```
+
+3. Scope the credential provider's RBAC. The upstream manifest binds a
+   ClusterRole that can `get` every Secret in the cluster; the provider only
+   issues `get` on the named Secret, so replace that ClusterRoleBinding with a
+   RoleBinding in each granted namespace.
+4. Start this provider with `--egress-credential-provider=k8s.io` and, for
+   each namespace other than the workload's own that rules may name, an
+   `--egress-credential-namespace` (Orka core keeps its provider-proxy token
+   in its runtime namespace, `orka-runtimes` by default).
+
+Only then does the provider advertise `runtime.egress-credential-injection`.
+Without it, a request carrying `replaceHeaders` is refused before any native
+object is created, and a journaled request whose credential configuration
+disappears fails verification and installs deny-all instead of resuming.
+Replacements require exact hosts (no wildcards), reject reserved headers
+(hop-by-hop, `Host`, framing, `Cookie`, `Forwarded`, `ate-target-actor`,
+`x-envoy-*`), allow at most four headers per rule, and require the request to
+list the feature. `HTTPS` re-originates TLS to the destination trusting only
+public roots, so in-cluster origins can be injected only over `HTTP`, where the
+credential crosses the cluster network in cleartext after the gateway. Limits:
+any process in the Actor can send the placeholder and so use (not read) the
+credential against the allowlisted host; a destination that echoes request
+headers reveals it; grants are per Atespace, so any principal that can write
+an EgressPolicy in that Atespace can name every Secret the Atespace is granted.
+
 **Infrastructure.** The profile's infrastructure ActorTemplate must exist in
 the profile Atespace, carry `resources.limits` (both CPU and memory; v1 requires
 them), and select exactly one operator-owned `ate.dev/v1` WorkerPool by label.
