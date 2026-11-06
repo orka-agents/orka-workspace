@@ -104,12 +104,18 @@ request still carrying the Kubernetes `NetworkPolicy` shape, compiles the
 allowlist into the Actor's `default` EgressPolicy before every Resume (updates
 carry the observed policy's UID/version), re-verifies it on every Ready
 observation, and installs deny-all and refuses to boot if compilation fails.
-`HTTPS` rules are intercepted by the gateway, so each derived template projects
-the `egress-mitm.ate.dev` and `system-roots.ate.dev` trust bundles to
-`/run/orka-substrate-egress-trust/trust-bundle.pem` and points `SSL_CERT_FILE`,
+`HTTPS` rules are intercepted by the gateway. Only when an allowlist contains
+one does the derived template project the `egress-mitm.ate.dev` and
+`system-roots.ate.dev` trust bundles to
+`/run/orka-substrate-egress-trust/trust-bundle.pem` and point `SSL_CERT_FILE`,
 `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
-`CURL_CA_BUNDLE` and `GIT_SSL_CAINFO` at it. Admitted runtimes cannot set those
-variables.
+`CURL_CA_BUNDLE` and `GIT_SSL_CAINFO` at it; `HTTP` and `TLSPassthrough` need no
+gateway CA. Upstream allows at most 32 environment variables per container, so a
+runtime environment that cannot also hold those seven is refused. Admitted
+runtimes cannot set those variables. The Orka supervisor builds each agent
+child's environment explicitly, so intercepted HTTPS egress for agent children
+also requires the supervisor to pass the trust variables through; until it does,
+core admits only HTTP and TLS passthrough rules.
 
 **Infrastructure.** The profile's infrastructure ActorTemplate must exist in
 the profile Atespace, carry `resources.limits` (both CPU and memory; v1 requires
@@ -141,7 +147,8 @@ adapter-owned resources.
 
 Orka supplies the immutable public supervisor request. The provider compiles it
 into an immutable ActorTemplate with a native SystemInfo identity projection,
-the egress trust bundle, a `/v2/health` wakeup probe on port 80 (120s), and the
+the egress trust bundle when the allowlist has HTTPS rules, a `/v2/health`
+wakeup probe on port 80 (120s), and the
 listen address adapted to port 80. Every server-defaulted field is set
 explicitly (`preferredFidelity: VOLUMES`, golden snapshots `DISABLED`, the probe
 timeout) so the stored template's digest equals the compiled digest. Actor size

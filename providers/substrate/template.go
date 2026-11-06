@@ -136,9 +136,13 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: identityVolumeName, SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{ActorMetadata: &pb.ActorMetadataDataSource{Items: []*pb.ActorMetadataItem{
 		{Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_ATESPACE, Path: "atespace"}, {Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME, Path: "name"}, {Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_UID, Path: "uid"},
 	}}}}}})
-	// All Actor egress traverses the native gateway. HTTPS rules are
-	// intercepted, so TLS clients must trust its CA alongside public roots.
-	compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: egressTrustVolumeName, SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{TrustBundle: &pb.TrustBundleDataSource{Names: slices.Clone(egressTrustBundles), Path: egressTrustFile}}}}})
+	// All Actor egress traverses the native gateway. Only HTTPS rules are
+	// intercepted; HTTP and TLS passthrough need no gateway CA. The trust
+	// bundle and its environment are added only when interception is
+	// admitted, keeping the runtime within the upstream environment limit.
+	if egressInterceptsTLS(record) {
+		compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: egressTrustVolumeName, SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{TrustBundle: &pb.TrustBundleDataSource{Names: slices.Clone(egressTrustBundles), Path: egressTrustFile}}}}})
+	}
 	compiled.Containers = []*pb.Container{container}
 	if err := validateDataOnlyTemplate(compiled); err != nil {
 		return err
@@ -251,14 +255,20 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		}
 		compiled.Env = append(compiled.Env, &pb.EnvVar{Name: env.Name, Value: value})
 	}
-	for _, name := range egressTrustEnvironment {
-		value := egressTrustMountPath + "/" + egressTrustFile
-		if name == "SSL_CERT_DIR" {
-			value = egressTrustMountPath
+	intercepts := egressInterceptsTLS(record)
+	if intercepts {
+		for _, name := range egressTrustEnvironment {
+			value := egressTrustMountPath + "/" + egressTrustFile
+			if name == "SSL_CERT_DIR" {
+				value = egressTrustMountPath
+			}
+			compiled.Env = append(compiled.Env, &pb.EnvVar{Name: name, Value: value})
 		}
-		compiled.Env = append(compiled.Env, &pb.EnvVar{Name: name, Value: value})
 	}
-	if len(compiled.Env) > 32 {
+	if len(compiled.Env) > maxNativeEnvironment {
+		if intercepts {
+			return nil, fmt.Errorf("native environment exceeds the upstream limit of %d with the egress trust variables HTTPS interception requires", maxNativeEnvironment)
+		}
 		return nil, fmt.Errorf("native environment exceeds upstream limit")
 	}
 	if record.SuspendEnabled {
@@ -284,8 +294,26 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		compiled.Args[0] = strings.TrimSuffix(compiled.Args[0], `exec "$@"`) + `cd "$1" || exit "$?"; shift; exec "$@"`
 		compiled.Args = slices.Insert(compiled.Args, 2, container.WorkingDir)
 	}
-	compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: identityVolumeName, MountPath: identityMountPath}, &pb.VolumeMount{Name: egressTrustVolumeName, MountPath: egressTrustMountPath})
+	compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: identityVolumeName, MountPath: identityMountPath})
+	if intercepts {
+		compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: egressTrustVolumeName, MountPath: egressTrustMountPath})
+	}
 	return compiled, nil
+}
+
+// maxNativeEnvironment is the upstream bound on one container's environment.
+const maxNativeEnvironment = 32
+
+// egressInterceptsTLS reports whether the admitted allowlist contains an HTTPS
+// rule, which the gateway terminates with its own CA.
+func egressInterceptsTLS(record *journalRecord) bool {
+	runtime := record.Request.Runtime
+	if runtime == nil || runtime.Egress == nil {
+		return false
+	}
+	return slices.ContainsFunc(runtime.Egress.Rules, func(rule api.RuntimeEgressRule) bool {
+		return rule.Protocol == api.RuntimeEgressHTTPS
+	})
 }
 
 func hasKubernetesExpansion(value string) bool {
