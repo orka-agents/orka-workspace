@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"reflect"
-	"slices"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -20,15 +19,16 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// gvisorSandboxClass is the only native isolation this provider admits.
+const gvisorSandboxClass = "gvisor"
+
+// routerTargetHeader selects an Actor at the native ingress router.
+const routerTargetHeader = "ate-target-actor"
 
 func actorRef(record *journalRecord) *pb.ObjectRef {
 	return &pb.ObjectRef{Atespace: record.Atespace, Name: record.Actor.Name}
@@ -43,11 +43,14 @@ func (d *Lifecycle) actor(ctx context.Context, record *journalRecord) (*pb.Actor
 	}
 	meta := actor.GetMetadata()
 	ref := actor.GetActorTemplate()
-	if meta.GetAtespace() != record.Atespace || meta.GetName() != record.Actor.Name || meta.GetUid() == "" || record.Actor.UID != "" && record.Actor.UID != meta.GetUid() || ref.GetAtespace() != record.Atespace || (ref.GetName() != record.Template.Name && ref.GetName() != record.CreateTemplate.Name) {
+	if meta.GetAtespace() != record.Atespace || meta.GetName() != record.Actor.Name || meta.GetUid() == "" || record.Actor.UID != "" && record.Actor.UID != meta.GetUid() || ref.GetAtespace() != record.Atespace || (ref.GetName() != record.Template.Name && ref.GetName() != record.CreateTemplate.Name) || len(actor.GetWorkerSelector().GetMatchLabels()) != 0 {
 		return nil, sdk.ErrStaleIdentity
 	}
 	return actor, nil
 }
+
+// verifyTemplate re-reads the immutable template by name and pins its UID,
+// digest and the data-only, golden-disabled snapshot invariants.
 func (d *Lifecycle) verifyTemplate(ctx context.Context, atespace string, ref nativeReference) error {
 	template, err := d.control.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: atespace, Name: ref.Name}})
 	if err != nil {
@@ -57,9 +60,22 @@ func (d *Lifecycle) verifyTemplate(ctx context.Context, atespace string, ref nat
 	if err != nil {
 		return err
 	}
-	config := template.GetSnapshotsConfig()
-	if template.GetMetadata().GetUid() != ref.UID || ref.UID == "" || hash != ref.Digest || config.GetOnPause() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || config.GetOnCommit() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || config.GetOnResume().GetFromData() != pb.ResumeSource_RESUME_SOURCE_COLD_BOOT {
-		return fmt.Errorf("native template identity or Data/Data/ColdBoot policy changed")
+	if template.GetMetadata().GetUid() != ref.UID || ref.UID == "" || hash != ref.Digest || validateDataOnlyTemplate(template) != nil {
+		return fmt.Errorf("native template identity or data-only golden-disabled snapshot policy changed")
+	}
+	return nil
+}
+
+// validateDataOnlyTemplate checks the snapshot invariants that make every
+// suspension data-only and every fresh Actor a cold boot.
+func validateDataOnlyTemplate(template *pb.ActorTemplate) error {
+	config := template.GetSnapshotConfig()
+	if config.GetPreferredFidelity() != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES || config.GetGoldenSnapshotConfig().GetMode() != pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED || template.GetGoldenEgressPolicy() != nil {
+		return fmt.Errorf("native template must use VOLUMES snapshots with golden snapshots disabled")
+	}
+	limits := template.GetResources().GetLimits()
+	if limits.GetCpuMillicores() <= 0 || limits.GetMemoryBytes() <= 0 {
+		return fmt.Errorf("native template must size the Actor with CPU and memory limits")
 	}
 	return nil
 }
@@ -97,36 +113,6 @@ func (d *Lifecycle) ensureInfrastructure(ctx context.Context, cm *corev1.ConfigM
 			return err
 		}
 	}
-	policy := &networkingv1.NetworkPolicy{}
-	key.Name = record.NetworkPolicy.Name
-	err = d.client.Get(ctx, key, policy)
-	desired := nativeNetworkPolicy(record)
-	if apierrors.IsNotFound(err) {
-		if record.NetworkPolicy.UID != "" {
-			return sdk.ErrStaleIdentity
-		}
-		if !record.NetworkPolicy.CreateIssued {
-			record.NetworkPolicy.CreateIssued = true
-			if err := d.save(ctx, cm, record); err != nil {
-				return err
-			}
-		}
-		policy = &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Labels: labels(record), OwnerReferences: []metav1.OwnerReference{anchorOwner(record)}}, Spec: desired}
-		if err := d.client.Create(ctx, policy); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return err
-	}
-	if policy.UID == "" || record.NetworkPolicy.UID != "" && record.NetworkPolicy.UID != string(policy.UID) || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(policy.Spec), desired) {
-		return fmt.Errorf("native network policy differs from admitted rules")
-	}
-	if record.NetworkPolicy.UID == "" {
-		record.NetworkPolicy.UID = string(policy.UID)
-		if err := d.save(ctx, cm, record); err != nil {
-			return err
-		}
-	}
 	return d.ensureRuntimePool(ctx, cm, record)
 }
 
@@ -143,189 +129,71 @@ func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *jo
 	if record.Anchor.UID == "" || string(anchor.UID) != record.Anchor.UID || anchor.DeletionTimestamp != nil || !reflect.DeepEqual(anchor.Labels, labels(record)) || anchor.Data["journalName"] != journal.Name || anchor.Data["journalNamespace"] != journal.Namespace || anchor.Data["journalUID"] != string(journal.UID) {
 		return sdk.ErrStaleIdentity
 	}
-	policy := &networkingv1.NetworkPolicy{}
-	key.Name = record.NetworkPolicy.Name
-	if err := d.client.Get(ctx, key, policy); err != nil {
-		return err
-	}
-	desired := nativeNetworkPolicy(record)
-	if record.NetworkPolicy.UID == "" || string(policy.UID) != record.NetworkPolicy.UID || policy.DeletionTimestamp != nil || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(policy.Spec), desired) {
-		return fmt.Errorf("native network confinement identity or admitted rules changed")
-	}
 	return d.verifyRuntimePool(ctx, record)
-}
-
-func validateNativeNetworkPolicy(runtime *sdk.RuntimeWorkload) error {
-	policy := runtime.NetworkPolicy
-	// Kubernetes defaults omitted policyTypes to Ingress, adding Egress when
-	// egress rules are present. Worker management ingress is operator-owned.
-	ingress := len(policy.PolicyTypes) == 0 || slices.Contains(policy.PolicyTypes, networkingv1.PolicyTypeIngress)
-	egress := slices.Contains(policy.PolicyTypes, networkingv1.PolicyTypeEgress) || len(policy.PolicyTypes) == 0 && len(policy.Egress) != 0
-	if !egress && len(policy.Egress) != 0 {
-		return fmt.Errorf("native network policy cannot activate inactive egress rules")
-	}
-	if ingress || len(policy.Ingress) != 0 {
-		return fmt.Errorf("native runtime ingress policy is unsupported")
-	}
-	if !egress || len(policy.PolicyTypes) != 1 {
-		return fmt.Errorf("native network policy requires only effective Egress")
-	}
-	for _, rule := range policy.Egress {
-		for _, peer := range rule.To {
-			if peer.PodSelector != nil && peer.NamespaceSelector == nil && runtime.Template.Namespace == "" {
-				return fmt.Errorf("native namespace-relative egress requires a frozen runtime namespace")
-			}
-		}
-	}
-	return nil
-}
-
-func nativeNetworkPolicy(record *journalRecord) networkingv1.NetworkPolicySpec {
-	desired := *record.Request.Runtime.NetworkPolicy.DeepCopy()
-	desired.PodSelector = metav1.LabelSelector{MatchLabels: workerLabels(record)}
-	desired.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}
-	desired.Ingress = nil
-	namespace := record.Request.Runtime.Template.Namespace
-	if namespace == "" {
-		namespace = record.Request.Key.Namespace
-	}
-	qualifyNativeEgressPeers(&desired, namespace)
-	return sdk.NormalizedNetworkPolicySpec(desired)
-}
-
-func qualifyNativeEgressPeers(policy *networkingv1.NetworkPolicySpec, namespace string) {
-	for i := range policy.Egress {
-		for j := range policy.Egress[i].To {
-			peer := &policy.Egress[i].To[j]
-			if peer.PodSelector != nil && peer.NamespaceSelector == nil {
-				// Resolve Pod-only peers in the namespace of the original policy
-				// before comparing policies from different namespaces.
-				peer.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{corev1.LabelMetadataName: namespace}}
-			}
-		}
-	}
-}
-
-// NetworkPolicies add permissions. Inherited operator labels may select more
-// policies than the recorded confinement policy, so inspect their complete
-// egress union on the exact worker before Resume and every Ready observation.
-// Ingress remains operator-owned; this object check does not prove CNI packet
-// enforcement or replace the installation's direct-egress acknowledgement.
-func (d *Lifecycle) verifyWorkerNetworkPolicies(ctx context.Context, record *journalRecord, pod *corev1.Pod) error {
-	policies := &networkingv1.NetworkPolicyList{}
-	if err := d.client.List(ctx, policies, client.InNamespace(pod.Namespace)); err != nil {
-		return fmt.Errorf("read native worker NetworkPolicies: %w", err)
-	}
-	admitted := nativeNetworkPolicy(record)
-	found, isolated := false, false
-	for _, policy := range policies.Items {
-		actual := sdk.NormalizedNetworkPolicySpec(policy.Spec)
-		if policy.Name == record.NetworkPolicy.Name {
-			if record.NetworkPolicy.UID == "" || string(policy.UID) != record.NetworkPolicy.UID || policy.DeletionTimestamp != nil || !reflect.DeepEqual(policy.Labels, labels(record)) || !reflect.DeepEqual(policy.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(actual, admitted) {
-				return fmt.Errorf("native network confinement identity or admitted rules changed")
-			}
-			found = true
-		}
-		selector, err := metav1.LabelSelectorAsSelector(&actual.PodSelector)
-		if err != nil {
-			return fmt.Errorf("native NetworkPolicy %q selector is invalid: %w", policy.Name, err)
-		}
-		if !selector.Matches(klabels.Set(pod.Labels)) {
-			continue
-		}
-		if policy.DeletionTimestamp != nil {
-			return fmt.Errorf("native worker NetworkPolicy %q is being deleted", policy.Name)
-		}
-		for _, direction := range actual.PolicyTypes {
-			if direction != networkingv1.PolicyTypeIngress && direction != networkingv1.PolicyTypeEgress {
-				return fmt.Errorf("native worker NetworkPolicy %q has unsupported direction %q", policy.Name, direction)
-			}
-		}
-		if !slices.Contains(actual.PolicyTypes, networkingv1.PolicyTypeEgress) {
-			continue
-		}
-		isolated = true
-		// Extra Pod-only peers refer to the worker's namespace, whereas the
-		// admitted request's peers were translated from the runtime namespace.
-		qualifyNativeEgressPeers(&actual, pod.Namespace)
-		for _, rule := range actual.Egress {
-			if !slices.ContainsFunc(admitted.Egress, func(allowed networkingv1.NetworkPolicyEgressRule) bool {
-				return nativePeersWithin(rule.To, allowed.To) && nativePortsWithin(rule.Ports, allowed.Ports)
-			}) {
-				return fmt.Errorf("native worker labels select unadmitted egress permissions in NetworkPolicy %q", policy.Name)
-			}
-		}
-	}
-	if !found || !isolated {
-		return fmt.Errorf("native worker is missing its admitted egress isolation")
-	}
-	return nil
-}
-
-// Within a rule, peers and ports form independent OR lists combined with AND.
-// Keep both subsets in one admitted rule to avoid cross-grants between rules.
-// Selector implication and IP-block exclusions remain conservatively exact.
-func nativePeersWithin(actual, allowed []networkingv1.NetworkPolicyPeer) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	if len(actual) == 0 {
-		return false
-	}
-	for _, peer := range actual {
-		if !slices.ContainsFunc(allowed, func(candidate networkingv1.NetworkPolicyPeer) bool { return reflect.DeepEqual(peer, candidate) }) {
-			return false
-		}
-	}
-	return true
-}
-
-func nativePortsWithin(actual, allowed []networkingv1.NetworkPolicyPort) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	if len(actual) == 0 {
-		return false
-	}
-	for _, port := range actual {
-		if !slices.ContainsFunc(allowed, func(candidate networkingv1.NetworkPolicyPort) bool { return nativePortWithin(port, candidate) }) {
-			return false
-		}
-	}
-	return true
-}
-
-func nativePortWithin(actual, allowed networkingv1.NetworkPolicyPort) bool {
-	if !reflect.DeepEqual(actual.Protocol, allowed.Protocol) {
-		return false
-	}
-	if allowed.Port == nil {
-		return allowed.EndPort == nil
-	}
-	if actual.Port == nil {
-		return false
-	}
-	if actual.Port.Type != intstr.Int || allowed.Port.Type != intstr.Int {
-		return reflect.DeepEqual(actual, allowed)
-	}
-	start, end := actual.Port.IntVal, actual.Port.IntVal
-	if actual.EndPort != nil {
-		end = *actual.EndPort
-	}
-	allowedStart, allowedEnd := allowed.Port.IntVal, allowed.Port.IntVal
-	if allowed.EndPort != nil {
-		allowedEnd = *allowed.EndPort
-	}
-	return start > 0 && end >= start && end <= 65535 && allowedStart > 0 && allowedEnd >= allowedStart && allowedEnd <= 65535 && start >= allowedStart && end <= allowedEnd
 }
 
 func workerLabels(record *journalRecord) map[string]string {
 	return map[string]string{workerAllocationLabel: record.Observation.Identity.AllocationID, workerInstanceLabel: record.Observation.Identity.InstanceID}
 }
 
+// expectedWorkerCapacity is the capacity a private worker sized for exactly
+// one template-sized Actor reports.
+func expectedWorkerCapacity(record *journalRecord) (cpu, memory int64) {
+	limits := record.TemplateSpec.GetResources().GetLimits()
+	return limits.GetCpuMillicores(), limits.GetMemoryBytes()
+}
+
+// verifySingleActorWorker checks the native worker is gVisor and sized so the
+// template-sized Actor is the only one that fits.
+func verifySingleActorWorker(record *journalRecord, worker *pb.Worker) error {
+	classes := worker.GetStatus().GetSandboxClasses()
+	if len(classes) != 1 || classes[0].GetSandboxClass() != gvisorSandboxClass {
+		return fmt.Errorf("native worker must run only the gVisor sandbox class")
+	}
+	cpu, memory := expectedWorkerCapacity(record)
+	capacity := worker.GetStatus().GetCapacity()
+	if cpu <= 0 || memory <= 0 || capacity.GetCpuMillicores() != cpu || capacity.GetMemoryBytes() != memory || capacity.GetActors() < 1 {
+		return fmt.Errorf("native worker capacity must fit exactly one template-sized Actor")
+	}
+	return nil
+}
+
+// verifyWorkerExclusive lists the worker's assignments and fails closed when
+// any Actor other than this record's exact lifetime is placed there.
+func (d *Lifecycle) verifyWorkerExclusive(ctx context.Context, record *journalRecord, workerName string, requireAssigned bool) error {
+	ref := &pb.ObjectRef{Name: workerName}
+	page := ""
+	seen := map[string]bool{}
+	assigned := false
+	for {
+		assignments, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: ref, Options: &pb.ListOptions{PageSize: 1000, PageToken: page}})
+		if err != nil {
+			return err
+		}
+		for _, assignment := range assignments.GetActorAssignments() {
+			if record.Actor.UID == "" || assignment.GetActorUid() != record.Actor.UID || !proto.Equal(assignment.GetActor(), actorRef(record)) {
+				return fmt.Errorf("native worker hosts another Actor; shared placement is refused")
+			}
+			assigned = true
+		}
+		page = assignments.GetNextPageToken()
+		if page == "" {
+			break
+		}
+		if seen[page] || len(seen) >= 100 {
+			return fmt.Errorf("native assignment pagination repeated a token or exceeded its bound")
+		}
+		seen[page] = true
+	}
+	if requireAssigned && !assigned {
+		return fmt.Errorf("native worker does not report the recorded Actor assignment")
+	}
+	return nil
+}
+
 func (d *Lifecycle) bindWorker(ctx context.Context, record *journalRecord) error {
 	if record.Worker == nil {
-		return fmt.Errorf("native worker identity is missing before network binding")
+		return fmt.Errorf("native worker identity is missing before binding")
 	}
 	worker := record.Worker
 	pod := &corev1.Pod{}
@@ -336,17 +204,16 @@ func (d *Lifecycle) bindWorker(ctx context.Context, record *journalRecord) error
 	if string(pod.UID) != worker.PodUID || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != worker.Pool {
 		return sdk.ErrStaleIdentity
 	}
-	labels := workerLabels(record)
-	for key, expected := range labels {
+	for key, expected := range workerLabels(record) {
 		if value := pod.Labels[key]; value != expected {
 			return fmt.Errorf("native worker has a foreign allocation label: %w", sdk.ErrStaleIdentity)
 		}
 	}
-	return d.verifyWorkerNetworkPolicies(ctx, record, pod)
+	return nil
 }
 
-// Worker identity lookup also supports exact retirement recovery. Confinement
-// is checked separately on startup paths so policy drift cannot prevent Stop.
+// Worker identity lookup also supports exact retirement recovery. Running
+// Actors must run under the worker process epoch registered for the fence.
 func (d *Lifecycle) worker(ctx context.Context, record *journalRecord, actor *pb.Actor) (*workerFence, error) {
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	if assignment.GetWorker().GetName() == "" || assignment.GetWorkerPodUid() == "" {
@@ -356,8 +223,15 @@ func (d *Lifecycle) worker(ctx context.Context, record *journalRecord, actor *pb
 	if err != nil {
 		return nil, err
 	}
-	if worker.GetMetadata().GetUid() == "" || worker.GetMetadata().GetName() != assignment.GetWorker().GetName() || worker.GetWorkerNamespace() != record.Placement.Namespace || worker.GetWorkerPool() != record.RuntimePool.Name || worker.GetWorkerPodUid() != assignment.GetWorkerPodUid() || worker.GetWorkerPod() != assignment.GetWorkerPod() || worker.GetStatus().GetCapacity().GetActors() != 1 || assignment.GetWorkerNamespace() != record.Placement.Namespace || assignment.GetWorkerPool() != record.RuntimePool.Name {
-		return nil, fmt.Errorf("native runtime requires a single-Actor worker in the admitted WorkerPool")
+	if worker.GetMetadata().GetUid() == "" || worker.GetMetadata().GetName() != assignment.GetWorker().GetName() || worker.GetWorkerNamespace() != record.Placement.Namespace || worker.GetWorkerPool() != record.RuntimePool.Name || worker.GetWorkerPodUid() != assignment.GetWorkerPodUid() || worker.GetWorkerPod() != assignment.GetWorkerPod() || assignment.GetWorkerNamespace() != record.Placement.Namespace || assignment.GetWorkerPool() != record.RuntimePool.Name {
+		return nil, fmt.Errorf("native runtime requires a worker in the admitted private WorkerPool")
+	}
+	if err := verifySingleActorWorker(record, worker); err != nil {
+		return nil, err
+	}
+	epoch := worker.GetStatus().GetRegisteredEpoch()
+	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_RUNNING && (epoch <= 0 || assignment.GetWorkerEpoch() != epoch || assignment.GetSandboxRuntime().GetSandboxClass() != gvisorSandboxClass) {
+		return nil, fmt.Errorf("native Actor does not run under the worker's registered gVisor process epoch: %w", sdk.ErrStaleIdentity)
 	}
 	pod := &corev1.Pod{}
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: worker.GetWorkerNamespace(), Name: worker.GetWorkerPod()}, pod); err != nil {
@@ -371,11 +245,20 @@ func (d *Lifecycle) worker(ctx context.Context, record *journalRecord, actor *pb
 			return nil, sdk.ErrStaleIdentity
 		}
 	}
-	return &workerFence{Name: worker.GetMetadata().GetName(), UID: worker.GetMetadata().GetUid(), Namespace: pod.Namespace, Pool: record.RuntimePool.Name, Pod: pod.Name, PodUID: string(pod.UID), AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID}, nil
+	return &workerFence{Name: worker.GetMetadata().GetName(), UID: worker.GetMetadata().GetUid(), Namespace: pod.Namespace, Pool: record.RuntimePool.Name, Pod: pod.Name, PodUID: string(pod.UID), AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID, Epoch: epoch}, nil
 }
 
-func (d *Lifecycle) endpoint(record *journalRecord) string {
-	return "http://" + record.Actor.Name + "." + record.Atespace + "." + d.config.ActorDNSSuffix + ":80"
+// endpoint is the native router origin; the target header selects the Actor.
+func (d *Lifecycle) endpoint() string {
+	base, err := routerBaseURL(d.config.RouterEndpoint)
+	if err != nil {
+		return ""
+	}
+	return base.String()
+}
+
+func routerTarget(record *journalRecord) string {
+	return record.Atespace + "/" + record.Actor.Name
 }
 
 // This read-only DTO mirrors the existing public sealed bootstrap challenge.
@@ -392,18 +275,26 @@ type bootstrapChallenge struct {
 	} `json:"actor"`
 }
 type challengeGetter interface {
-	Get(context.Context, string) (bootstrapChallenge, error)
+	Get(ctx context.Context, endpoint, target string) (bootstrapChallenge, error)
 }
-type httpChallengeGetter struct{}
+
+// routerChallengeGetter reads the public challenge through the native router
+// over mTLS, presenting the provider's allowlisted client identity.
+type routerChallengeGetter struct{ config Config }
 
 var errChallengeClosed = errors.New("native bootstrap listener closed")
 
-func (httpChallengeGetter) Get(ctx context.Context, endpoint string) (bootstrapChallenge, error) {
+func (g routerChallengeGetter) Get(ctx context.Context, endpoint, target string) (bootstrapChallenge, error) {
+	tlsConfig, err := routerTLSConfig(g.config)
+	if err != nil {
+		return bootstrapChallenge{}, err
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/v2/credential-bootstrap", nil)
 	if err != nil {
 		return bootstrapChallenge{}, err
 	}
-	transport := &http.Transport{Proxy: nil}
+	request.Header.Set(routerTargetHeader, target)
+	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true}
 	defer transport.CloseIdleConnections()
 	c := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := c.Do(request)
@@ -439,9 +330,13 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor 
 	}
 	getter := d.challengeClient
 	if getter == nil {
-		getter = httpChallengeGetter{}
+		getter = routerChallengeGetter{config: d.config}
 	}
-	challenge, err := getter.Get(ctx, d.endpoint(record))
+	endpoint := d.endpoint()
+	if endpoint == "" {
+		return "", fmt.Errorf("native router endpoint is not configured")
+	}
+	challenge, err := getter.Get(ctx, endpoint, routerTarget(record))
 	closed := errors.Is(err, errChallengeClosed) && record.ChallengeSHA256 != ""
 	if err != nil && !closed {
 		return "", err
@@ -513,11 +408,16 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
+	// The Actor names its template; the immutable template UID is pinned by
+	// re-reading it, since v1 reports no running template UID on the Actor.
+	if actor.GetActorTemplate().GetName() != record.Template.Name {
+		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
+	}
 	if err := d.verifyTemplate(ctx, record.Atespace, record.Template); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
-	if actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
-		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
+	if err := d.verifyEgressPolicy(ctx, record); err != nil {
+		return sdk.AllocationObservation{}, err
 	}
 	worker, err := d.worker(ctx, record, actor)
 	if err != nil {
@@ -529,6 +429,9 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	if err := d.bindWorker(ctx, record); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
+	if err := d.verifyWorkerExclusive(ctx, record, worker.Name, true); err != nil {
+		return sdk.AllocationObservation{}, err
+	}
 	hash, err := d.challenge(ctx, record, actor)
 	if err != nil {
 		return sdk.AllocationObservation{}, err
@@ -538,6 +441,6 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	}
 	observed := record.Observation
 	observed.State = sdk.AllocationReady
-	observed.Startup = &sdk.StartupEvidence{ContractVersion: sdk.LifecycleContractV1, Identity: observed.Identity, Endpoint: d.endpoint(record), Process: &api.NativeProcessEvidence{Namespace: record.Atespace, Name: record.Actor.Name, UID: record.Actor.UID, Version: actor.GetMetadata().GetVersion(), Worker: api.PodReference{Namespace: worker.Namespace, Name: worker.Pod, UID: types.UID(worker.PodUID)}, ChallengeSHA256: hash}}
+	observed.Startup = &sdk.StartupEvidence{ContractVersion: sdk.LifecycleContractV1, Identity: observed.Identity, Endpoint: d.endpoint(), Process: &api.NativeProcessEvidence{Namespace: record.Atespace, Name: record.Actor.Name, UID: record.Actor.UID, Version: actor.GetMetadata().GetVersion(), Worker: api.PodReference{Namespace: worker.Namespace, Name: worker.Pod, UID: types.UID(worker.PodUID)}, ChallengeSHA256: hash, RouterTarget: routerTarget(record)}}
 	return observed, nil
 }

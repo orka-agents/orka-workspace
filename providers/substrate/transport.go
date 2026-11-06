@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -12,17 +13,31 @@ import (
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
-const UpstreamCommit = "fa6d949685a6318940a9a0195c867c864009b820"
+// UpstreamCommit pins Agent Substrate v1.0.0 for provider, protocol, and
+// conformance. BackendAPIVersion is the exact native control API it speaks.
+const (
+	UpstreamCommit    = "b34fbee742906494b5eb4f1f36987176bf8770a4"
+	BackendAPIVersion = "ateapi.v1.0.0"
+)
 
-// Config is installation-owned control transport. Workload credentials remain
-// exclusively in core; these files authenticate the adapter to native control.
+// Config is installation-owned control and routing transport. Workload
+// credentials remain exclusively in core; these files authenticate the adapter
+// to native control and to the native ingress router.
 type Config struct {
 	APIEndpoint, CAFile, CertFile, KeyFile, BearerTokenFile string
-	ActorDNSSuffix                                          string
-	DirectEgressEnabled                                     bool
+	// RouterEndpoint is the native ingress router's HTTPS base URL. Every
+	// request to an Actor is routed by an explicit target header, never DNS.
+	RouterEndpoint string
+	// RouterCAFile verifies the router's serving certificate.
+	RouterCAFile string
+	// RouterCertFile and RouterKeyFile hold the provider's rotating client
+	// identity, which the router must allowlist. They may name one bundle.
+	RouterCertFile, RouterKeyFile string
+	// RouterServerName overrides the TLS server name; it defaults to the
+	// router endpoint's host.
+	RouterServerName string
 	// BootTimeout bounds native creation and boot before first process
 	// evidence. Zero selects defaultNativeBootTimeout.
 	BootTimeout time.Duration
@@ -35,16 +50,27 @@ func (c Config) Validate() error {
 	if (c.CertFile == "") != (c.KeyFile == "") || (c.CertFile != "") == (c.BearerTokenFile != "") {
 		return fmt.Errorf("native control requires either client certificate/key files or a bearer token file")
 	}
-	if len(validation.IsDNS1123Subdomain(c.ActorDNSSuffix)) != 0 {
-		return fmt.Errorf("native Actor DNS suffix is invalid")
+	if _, err := routerBaseURL(c.RouterEndpoint); err != nil {
+		return err
 	}
-	if !c.DirectEgressEnabled {
-		return fmt.Errorf("native ACP requires operator-configured direct egress")
+	if c.RouterCAFile == "" || c.RouterCertFile == "" || c.RouterKeyFile == "" {
+		return fmt.Errorf("native routing requires a router CA file and a client certificate/key")
 	}
 	if c.BootTimeout < 0 {
 		return fmt.Errorf("native boot timeout must not be negative")
 	}
 	return nil
+}
+
+// routerBaseURL accepts only an HTTPS origin without credentials, path, query
+// or fragment, so the target header is the sole Actor selector.
+func routerBaseURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || strings.HasSuffix(u.Host, ":") {
+		return nil, fmt.Errorf("native router endpoint must be an HTTPS origin without credentials, path, query or fragment")
+	}
+	u.Path = ""
+	return u, nil
 }
 
 func Dial(c Config) (*grpc.ClientConn, error) {
@@ -61,13 +87,7 @@ func Dial(c Config) (*grpc.ClientConn, error) {
 	}
 	config := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
 	if c.CertFile != "" {
-		load := func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			pair, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("cannot load native client certificate/key pair")
-			}
-			return &pair, nil
-		}
+		load := rotatingClientCertificate(c.CertFile, c.KeyFile, "native client")
 		if _, err := load(nil); err != nil {
 			return nil, err
 		}
@@ -82,6 +102,44 @@ func Dial(c Config) (*grpc.ClientConn, error) {
 		options = append(options, grpc.WithPerRPCCredentials(creds))
 	}
 	return grpc.NewClient(c.APIEndpoint, options...)
+}
+
+// rotatingClientCertificate rereads a projected certificate on every
+// handshake. A pod-certificate credential bundle may supply both paths.
+func rotatingClientCertificate(certFile, keyFile, purpose string) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("cannot load %s certificate/key pair", purpose)
+		}
+		return &pair, nil
+	}
+}
+
+// routerTLSConfig authenticates the router by its configured CA and presents
+// the provider's rotating client identity, which the router allowlists.
+func routerTLSConfig(c Config) (*tls.Config, error) {
+	base, err := routerBaseURL(c.RouterEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(c.RouterCAFile)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read native router CA file")
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("native router CA file contains no certificates")
+	}
+	serverName := c.RouterServerName
+	if serverName == "" {
+		serverName = base.Hostname()
+	}
+	load := rotatingClientCertificate(c.RouterCertFile, c.RouterKeyFile, "native router client")
+	if _, err := load(nil); err != nil {
+		return nil, err
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName, GetClientCertificate: load}, nil
 }
 
 func rpcDeadline(ctx context.Context, method string, req, reply any, conn *grpc.ClientConn, invoke grpc.UnaryInvoker, opts ...grpc.CallOption) error {

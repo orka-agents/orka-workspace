@@ -3,7 +3,6 @@ package substrate
 import (
 	"testing"
 
-	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -26,11 +25,11 @@ func TestGVisorActorTemplateUsesSandboxResourceLimits(t *testing.T) {
 		if name == "native/base" {
 			continue
 		}
-		if template.GetSandboxConfig().GetSandboxClass() != pb.SandboxClass_SANDBOX_CLASS_GVISOR || template.Containers[0].Resources != nil {
+		if template.Containers[0].Resources != nil {
 			t.Fatal("gVisor template contains unsupported per-container limits")
 		}
 		limits := template.GetResources().GetLimits()
-		if len(limits) != 2 || limits[0].Name != "cpu" || limits[0].Quantity != "1500m" || limits[1].Name != "memory" || limits[1].Quantity != "512Mi" {
+		if limits.GetCpuMillicores() != 1500 || limits.GetMemoryBytes() != 512<<20 {
 			t.Fatalf("admitted sandbox limits were lost: %v", limits)
 		}
 	}

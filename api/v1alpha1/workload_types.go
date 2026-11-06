@@ -97,6 +97,12 @@ type RuntimeWorkload struct {
 	// these rules.
 	// +optional
 	NetworkPolicy *networkingv1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
+	// Egress carries the admitted host-name egress allowlist for backends that
+	// enforce egress at a gateway instead of with Kubernetes NetworkPolicy. It
+	// is mutually exclusive with NetworkPolicy; providers reject the shape they
+	// cannot enforce.
+	// +optional
+	Egress *RuntimeEgressPolicy `json:"egress,omitempty"`
 	// BootstrapPort is the public one-time listener port on the reported instance.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
@@ -273,6 +279,14 @@ func (r WorkloadRequest) validateRuntime() error {
 	if !validBinding(runtime.PoolBinding) || !validBinding(runtime.ClassBinding) || runtime.Protocol != "orka.harness.v2" {
 		return fmt.Errorf("runtime requires immutable pool/class bindings and orka.harness.v2")
 	}
+	if runtime.NetworkPolicy != nil && runtime.Egress != nil {
+		return fmt.Errorf("runtime network permissions use either a NetworkPolicy or a host-name egress allowlist, not both")
+	}
+	if runtime.Egress != nil {
+		if err := runtime.Egress.Validate(); err != nil {
+			return err
+		}
+	}
 	pod := runtime.Template.Spec
 	if len(pod.ImagePullSecrets) != 0 {
 		return fmt.Errorf("runtime cannot reference image-pull credential Secrets before bootstrap")
@@ -394,7 +408,19 @@ type NativeProcessEvidence struct {
 	// ChallengeSHA256 pins the process's public, one-time encryption challenge.
 	// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
 	ChallengeSHA256 string `json:"challengeSHA256"`
+	// RouterTarget, when set, selects this process behind a backend router
+	// that dispatches on an explicit target rather than the endpoint authority.
+	// It must equal "<namespace>/<name>". The startup Endpoint is then the
+	// router's HTTPS URL, every request carries this target, and the admitted
+	// bootstrap port is the process's default port 80 rather than the router's.
+	// +kubebuilder:validation:MaxLength=507
+	// +optional
+	RouterTarget string `json:"routerTarget,omitempty"`
 }
+
+// NativeRouterTargetPort is the process port a router target reaches without
+// a tunnel. A routed bootstrap listener must use it.
+const NativeRouterTargetPort = 80
 
 // PersistentVolumeEvidence pins the claim and backing volume used by one Pod mount.
 type PersistentVolumeEvidence struct {
@@ -485,7 +511,21 @@ func ValidateStartup(request WorkloadRequest, observed AllocationObservation) er
 		}
 		port = number
 	}
-	if request.Runtime != nil && int(request.Runtime.BootstrapPort) != port {
+	routed := evidence.Process != nil && evidence.Process.RouterTarget != ""
+	if routed {
+		// The router authority is not the process listener. Its target reaches
+		// the process's default port, which must be the admitted listener.
+		p := evidence.Process
+		if u.Scheme != "https" {
+			return fmt.Errorf("routed startup endpoint must use HTTPS")
+		}
+		if p.RouterTarget != p.Namespace+"/"+p.Name || strings.Count(p.RouterTarget, "/") != 1 {
+			return fmt.Errorf("native router target must equal the exact process namespace and name")
+		}
+		if request.Runtime != nil && request.Runtime.BootstrapPort != NativeRouterTargetPort {
+			return fmt.Errorf("routed native startup requires the admitted bootstrap port %d", NativeRouterTargetPort)
+		}
+	} else if request.Runtime != nil && int(request.Runtime.BootstrapPort) != port {
 		return fmt.Errorf("startup endpoint port differs from the admitted bootstrap port")
 	}
 	if request.Runtime != nil && evidence.Pod == nil && evidence.Process == nil {

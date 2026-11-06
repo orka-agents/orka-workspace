@@ -248,8 +248,8 @@ func TestNativeSupportsMatchingRuntimeDefaultsAndExactDurableMount(t *testing.T)
 		t.Fatal(err)
 	}
 	compiled := record.TemplateSpec.Containers[0]
-	if compiled.Readyz.GetHttpGet().GetPath() != "/v2/health" || compiled.Readyz.GetHttpGet().GetPort() != 80 || len(compiled.VolumeMounts) != 2 {
-		t.Fatal("native health gate or exact durable/identity mounts changed")
+	if compiled.WakeupProbe.GetHttpGet().GetPath() != "/v2/health" || compiled.WakeupProbe.GetHttpGet().GetPort() != 80 || compiled.WakeupProbe.GetTimeoutSeconds() != 120 || len(compiled.VolumeMounts) != 3 {
+		t.Fatal("native health gate or exact durable/identity/egress-trust mounts changed")
 	}
 	if record.Request.Runtime.Template.Spec.Containers[0].Ports[0].Protocol != "" || record.Request.Runtime.Template.Spec.Containers[0].ReadinessProbe != nil {
 		t.Fatal("compiler rewrote the admitted runtime defaults")

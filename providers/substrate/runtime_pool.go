@@ -11,6 +11,7 @@ import (
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -19,13 +20,15 @@ import (
 
 func poolObject() *unstructured.Unstructured {
 	pool := &unstructured.Unstructured{}
-	pool.SetAPIVersion("ate.dev/v1alpha1")
+	pool.SetAPIVersion(workerPoolAPIVersion())
 	pool.SetKind("WorkerPool")
 	return pool
 }
 
 // The source pool is operator infrastructure. Each request gets a separate
-// single-replica pool whose workers are born with their confinement labels.
+// single-replica gVisor pool whose workers are born with unique labels and
+// sized so exactly one template-sized Actor fits. v1 workers report a large
+// Actor count, so capacity, not count, is what keeps the worker private.
 func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecord) error {
 	source := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, source); err != nil {
@@ -51,12 +54,29 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 		return fmt.Errorf("operator WorkerPool has no worker image")
 	}
 	spec["replicas"] = int64(1)
-	if spec["sandboxClass"] == nil {
-		spec["sandboxClass"] = "gvisor"
+	if _, legacy := spec["sandboxClass"]; legacy {
+		return fmt.Errorf("operator WorkerPool uses the removed v1alpha1 sandboxClass field")
 	}
-	if spec["sandboxClass"] != "gvisor" {
+	classes, found, err := unstructured.NestedSlice(spec, "sandboxClasses")
+	if err != nil {
+		return fmt.Errorf("operator WorkerPool sandbox classes are invalid")
+	}
+	if !found || len(classes) == 0 {
+		classes = []any{map[string]any{"name": gvisorSandboxClass}}
+	}
+	if len(classes) != 1 {
+		return fmt.Errorf("operator WorkerPool must use exactly one sandbox class, gVisor")
+	}
+	class, ok := classes[0].(map[string]any)
+	if !ok || class["name"] != gvisorSandboxClass {
 		return fmt.Errorf("operator WorkerPool must use gVisor")
 	}
+	for key := range class {
+		if key != "name" && key != "configRef" {
+			return fmt.Errorf("operator WorkerPool sandbox class has an unsupported field")
+		}
+	}
+	spec["sandboxClasses"] = classes
 	template, _, err := unstructured.NestedMap(spec, "template")
 	if err != nil {
 		return err
@@ -64,6 +84,20 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 	if template == nil {
 		template = map[string]any{}
 	}
+	if _, set := template["resources"]; set {
+		return fmt.Errorf("operator WorkerPool template resources are provider-owned; the private worker is sized for exactly one Actor")
+	}
+	// The worker reports its Pod limits, less the gVisor reservation, as
+	// capacity. Pin both so the template-sized Actor exactly fills it.
+	cpu, memory := expectedWorkerCapacity(record)
+	if cpu <= 0 || memory <= 0 {
+		return fmt.Errorf("native template has no Actor size for its private worker")
+	}
+	quantities := map[string]any{
+		"cpu":    resource.NewMilliQuantity(cpu, resource.DecimalSI).String(),
+		"memory": resource.NewQuantity(memory+gvisorReservedMemoryBytes, resource.BinarySI).String(),
+	}
+	template["resources"] = map[string]any{"limits": quantities, "requests": maps.Clone(quantities)}
 	podLabels, _, err := unstructured.NestedStringMap(template, "labels")
 	if err != nil {
 		return err
@@ -125,8 +159,15 @@ func runtimePoolRestoreDigest(data json.RawMessage) (string, error) {
 		return "", fmt.Errorf("private worker infrastructure provenance is missing")
 	}
 	image, _, err := unstructured.NestedString(spec, "workerImage")
-	if err != nil || image == "" || spec["sandboxClass"] != "gvisor" || spec["replicas"] != float64(1) {
+	classes, _, classErr := unstructured.NestedSlice(spec, "sandboxClasses")
+	if err != nil || classErr != nil || image == "" || spec["replicas"] != float64(1) || len(classes) != 1 {
 		return "", fmt.Errorf("private worker infrastructure provenance is invalid")
+	}
+	if class, ok := classes[0].(map[string]any); !ok || class["name"] != gvisorSandboxClass {
+		return "", fmt.Errorf("private worker infrastructure must use gVisor")
+	}
+	if limits, _, err := unstructured.NestedStringMap(spec, "template", "resources", "limits"); err != nil || limits["cpu"] == "" || limits["memory"] == "" {
+		return "", fmt.Errorf("private worker infrastructure has no single-Actor size")
 	}
 	labels, found, err := unstructured.NestedStringMap(spec, "template", "labels")
 	if err != nil || !found || labels[workerAllocationLabel] == "" || labels[workerInstanceLabel] == "" {
@@ -197,16 +238,21 @@ func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord
 	return nil
 }
 
-// NetworkPolicy and labels exist before this worker is eligible to execute.
-// Pin the exact ready, empty worker before issuing the one-time native Resume.
+// Labels and size exist before this worker is eligible to execute. Pin the
+// exact ready, empty, single-Actor worker and its process epoch before issuing
+// the one-time native Resume.
 func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
 	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
 		return false, err
 	}
 	var selected *pb.Worker
 	token := ""
-	for pages := 0; pages < 100; pages++ {
-		workers, err := d.control.ListWorkers(ctx, &pb.ListWorkersRequest{PageSize: 1000, PageToken: token})
+	seen := map[string]bool{}
+	for pages := 0; ; pages++ {
+		if pages == 100 {
+			return false, fmt.Errorf("native worker listing exceeded bound")
+		}
+		workers, err := d.control.ListWorkers(ctx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1000, PageToken: token}})
 		if err != nil {
 			return false, err
 		}
@@ -223,33 +269,38 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 		if token == "" {
 			break
 		}
-		if pages == 99 {
-			return false, fmt.Errorf("native worker listing exceeded bound")
+		if seen[token] {
+			return false, fmt.Errorf("native worker pagination repeated a token")
 		}
+		seen[token] = true
 	}
 	if selected == nil {
 		return false, nil
 	}
-	if selected.GetMetadata().GetUid() == "" || selected.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE || selected.GetStatus().GetCapacity().GetActors() != 1 || selected.GetStatus().GetAllocated().GetActors() != 0 {
-		return false, fmt.Errorf("private native worker must be active, empty and single-capacity")
+	allocated := selected.GetStatus().GetAllocated()
+	if selected.GetStatus().GetState() == pb.WorkerState_WORKER_STATE_UNAVAILABLE || len(selected.GetStatus().GetSandboxClasses()) == 0 || selected.GetStatus().GetRegisteredEpoch() <= 0 {
+		// Registration and readiness are still in progress.
+		return false, nil
+	}
+	if selected.GetMetadata().GetUid() == "" || selected.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE || allocated.GetActors() != 0 || allocated.GetCpuMillicores() != 0 || allocated.GetMemoryBytes() != 0 {
+		return false, fmt.Errorf("private native worker must be active and empty")
+	}
+	if err := verifySingleActorWorker(record, selected); err != nil {
+		return false, err
 	}
 	for key, value := range record.TemplateSpec.GetWorkerSelector().GetMatchLabels() {
 		if selected.GetLabels()[key] != value {
 			return false, sdk.ErrStaleIdentity
 		}
 	}
-	assignments, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: &pb.ObjectRef{Name: selected.GetMetadata().GetName()}, PageSize: 1000})
-	if err != nil {
+	if err := d.verifyWorkerExclusive(ctx, record, selected.GetMetadata().GetName(), false); err != nil {
 		return false, err
-	}
-	if len(assignments.GetActorAssignments()) != 0 || assignments.GetNextPageToken() != "" {
-		return false, fmt.Errorf("private worker has another Actor assignment")
 	}
 	pod := &corev1.Pod{}
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: selected.WorkerNamespace, Name: selected.WorkerPod}, pod); err != nil {
 		return false, err
 	}
-	fence := &workerFence{Name: selected.Metadata.Name, UID: selected.Metadata.Uid, Namespace: selected.WorkerNamespace, Pool: selected.WorkerPool, Pod: selected.WorkerPod, PodUID: selected.WorkerPodUid, AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID}
+	fence := &workerFence{Name: selected.Metadata.Name, UID: selected.Metadata.Uid, Namespace: selected.WorkerNamespace, Pool: selected.WorkerPool, Pod: selected.WorkerPod, PodUID: selected.WorkerPodUid, AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID, Epoch: selected.GetStatus().GetRegisteredEpoch()}
 	if string(pod.UID) != fence.PodUID || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != fence.Pool {
 		return false, sdk.ErrStaleIdentity
 	}
@@ -260,9 +311,6 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	}
 	if record.Worker != nil && *record.Worker != *fence {
 		return false, sdk.ErrStaleIdentity
-	}
-	if err := d.verifyWorkerNetworkPolicies(ctx, record, pod); err != nil {
-		return false, err
 	}
 	if record.Worker == nil {
 		record.Worker = fence

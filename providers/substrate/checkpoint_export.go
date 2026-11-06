@@ -33,6 +33,9 @@ func exportRecord(cm *corev1.ConfigMap) (*checkpointExport, error) {
 	if err := json.Unmarshal([]byte(raw), index); err != nil {
 		return nil, fmt.Errorf("checkpoint export index is unreadable")
 	}
+	if index.Version == legacyCatalogVersion {
+		return nil, errLegacyNativeState
+	}
 	owner := metav1.OwnerReference{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspaceCheckpoint", Name: index.Checkpoint.Name, UID: index.Checkpoint.UID}
 	if cm.UID == "" || cm.Namespace == "" || index.Version != catalogVersion || index.Checkpoint.Name == "" || index.Checkpoint.UID == "" ||
 		index.SourceWorkspace.Name == "" || index.SourceWorkspace.UID == "" || index.ProviderUID == "" ||

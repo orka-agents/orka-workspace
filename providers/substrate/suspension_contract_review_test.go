@@ -53,7 +53,7 @@ func TestSuspensionRejectionAndUnknownDeliveryRemainActionableAfterRestart(t *te
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !record.WorkerDrained || record.Pending == nil || !record.Pending.SuspendIssued || record.Checkpoint != nil || control.calls != 1 || native.suspends != 0 || native.boots != 1 || len(native.tags) != 0 {
+			if record.Pending == nil || !record.Pending.SuspendIssued || record.Checkpoint != nil || control.calls != 1 || native.suspends != 0 || native.boots != 1 || len(native.tags) != 0 {
 				t.Fatal("failed suspension lost its exact fence or replayed an effect")
 			}
 			// Explicit exact-instance Stop remains available when retaining data
@@ -94,7 +94,7 @@ func TestSuspensionLostResponseRecoversExactDataWithoutDuplicateRPC(t *testing.T
 	}
 	// Complete the original outstanding backend operation after the response
 	// was lost. The provider must recover by observation, without resubmitting.
-	if _, err := native.SuspendActor(t.Context(), &pb.SuspendActorRequest{Actor: actorRef(record)}); err != nil {
+	if _, err := native.SuspendActor(t.Context(), &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}}); err != nil {
 		t.Fatal(err)
 	}
 	var stopped sdk.AllocationObservation
@@ -126,9 +126,8 @@ func TestLegacyIssuedSuspensionUsesExactBackendStateWithoutReplay(t *testing.T) 
 			}
 			actor := native.actors[metaKey(&pb.ResourceMetadata{Atespace: record.Atespace, Name: record.Actor.Name})]
 			record.Operation = "suspend"
-			record.Pending = &checkpointIntent{Name: "legacy-checkpoint", SuspendIssued: true, PriorSnapshotDigest: snapshotDigest(actor.Status.ExternalSnapshot)}
+			record.Pending = &checkpointIntent{Name: "legacy-checkpoint", SuspendIssued: true, PriorGeneration: actor.Status.LastAssignedGeneration, PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
 			record.Observation = pendingObservation(record)
-			record.WorkerDrained = true
 			actor.Status.State = state
 			native.workers[record.Worker.Name].Status.State = pb.WorkerState_WORKER_STATE_DRAINING
 			if err := d.save(t.Context(), cm, record); err != nil {

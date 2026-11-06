@@ -19,7 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,11 +36,15 @@ type nativeFixture struct {
 	actors                   map[string]*pb.Actor
 	workers                  map[string]*pb.Worker
 	tags                     map[string]*pb.Tag
+	egress                   map[string]*pb.EgressPolicy
 	boots, suspends, deletes int
 	failAfter                string
 	foreignAssignment        bool
 	challengeSuffix          string
 	beforeResume             func(context.Context, *pb.Actor) error
+	uids                     int
+	// suspendFidelity overrides the recorded fidelity of a new snapshot.
+	suspendFidelity pb.SnapshotFidelity
 }
 
 func (f *nativeFixture) effect(name string) error {
@@ -50,11 +54,36 @@ func (f *nativeFixture) effect(name string) error {
 	}
 	return nil
 }
+func (f *nativeFixture) uid(prefix string) string {
+	f.uids++
+	return fmt.Sprintf("%s-%d", prefix, f.uids)
+}
 func cloneTemplate(in *pb.ActorTemplate) *pb.ActorTemplate {
 	return proto.Clone(in).(*pb.ActorTemplate)
 }
 func refKey(ref *pb.ObjectRef) string          { return ref.GetAtespace() + "/" + ref.GetName() }
 func metaKey(meta *pb.ResourceMetadata) string { return meta.GetAtespace() + "/" + meta.GetName() }
+
+// applyNativeTemplateDefaults mirrors upstream cmd/ateapi/internal/defaults.
+func applyNativeTemplateDefaults(t *pb.ActorTemplate) {
+	if t.SnapshotConfig == nil {
+		t.SnapshotConfig = &pb.SnapshotConfig{}
+	}
+	if t.SnapshotConfig.PreferredFidelity == pb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
+		t.SnapshotConfig.PreferredFidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	}
+	if t.SnapshotConfig.GoldenSnapshotConfig == nil {
+		t.SnapshotConfig.GoldenSnapshotConfig = &pb.GoldenSnapshotConfig{}
+	}
+	if t.SnapshotConfig.GoldenSnapshotConfig.Mode == pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_UNSPECIFIED {
+		t.SnapshotConfig.GoldenSnapshotConfig.Mode = pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED
+	}
+	for _, c := range t.Containers {
+		if c.WakeupProbe != nil && c.WakeupProbe.TimeoutSeconds == 0 {
+			c.WakeupProbe.TimeoutSeconds = 30
+		}
+	}
+}
 func (f *nativeFixture) GetActorTemplate(_ context.Context, req *pb.GetActorTemplateRequest, _ ...grpc.CallOption) (*pb.ActorTemplate, error) {
 	v := f.templates[refKey(req.ActorTemplate)]
 	if v == nil {
@@ -67,7 +96,11 @@ func (f *nativeFixture) CreateActorTemplate(_ context.Context, req *pb.CreateAct
 	if f.templates[key] != nil {
 		return nil, status.Error(codes.AlreadyExists, "template exists")
 	}
+	if l := req.ActorTemplate.GetResources().GetLimits(); l.GetCpuMillicores() <= 0 || l.GetMemoryBytes() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "resources required")
+	}
 	v := cloneTemplate(req.ActorTemplate)
+	applyNativeTemplateDefaults(v)
 	v.Metadata.Uid = "template-" + v.Metadata.Name
 	v.Metadata.Version = 1
 	f.templates[key] = v
@@ -78,6 +111,9 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	v := f.templates[key]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
+	}
+	if uid := req.GetOptions().GetUid(); uid == "" || uid != v.Metadata.Uid {
+		return nil, status.Error(codes.FailedPrecondition, "uid precondition")
 	}
 	delete(f.templates, key)
 	return cloneTemplate(v), f.effect("deleteTemplate")
@@ -94,17 +130,32 @@ func (f *nativeFixture) CreateActor(_ context.Context, req *pb.CreateActorReques
 	if f.actors[key] != nil {
 		return nil, status.Error(codes.AlreadyExists, "exists")
 	}
+	template := f.templates[refKey(req.Actor.ActorTemplate)]
+	if template == nil {
+		return nil, status.Error(codes.FailedPrecondition, "template absent")
+	}
 	v := proto.Clone(req.Actor).(*pb.Actor)
 	v.Metadata.Uid = "actor-" + v.Metadata.Name
 	v.Metadata.Version = 1
 	v.Status = &pb.ActorStatus{State: pb.ActorState_ACTOR_STATE_SUSPENDED}
-	if v.SourceTag != nil {
-		tag := f.tags[refKey(v.SourceTag)]
+	tagRef := v.SourceTag
+	if tagRef == nil {
+		tagRef = template.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag()
+	}
+	if tagRef != nil {
+		tag := f.tags[refKey(tagRef)]
 		if tag == nil {
 			return nil, status.Error(codes.FailedPrecondition, "tag absent")
 		}
-		v.Status.CurrentActorTemplateUid = tag.Status.ActorTemplateUid
-		v.Status.ExternalSnapshot = proto.Clone(tag.Status.Snapshot).(*pb.ExternalSnapshot)
+		if tag.Status.ActorTemplateUid != template.Metadata.Uid {
+			return nil, status.Error(codes.FailedPrecondition, "tag template mismatch")
+		}
+		snapshot := proto.Clone(tag.Status.Snapshot).(*pb.Snapshot)
+		snapshot.Generation = 1
+		snapshot.Owner = pb.SnapshotOwner_SNAPSHOT_OWNER_TAG
+		snapshot.ActorTemplateUid = tag.Status.ActorTemplateUid
+		v.Status.Snapshots = []*pb.Snapshot{snapshot}
+		v.Status.LastAssignedGeneration = 1
 	}
 	f.actors[key] = v
 	return proto.Clone(v).(*pb.Actor), f.effect("actor")
@@ -118,10 +169,15 @@ func (f *nativeFixture) UpdateActor(_ context.Context, req *pb.UpdateActorReques
 	if v.Metadata.Uid != req.Actor.Metadata.Uid || v.Metadata.Version != req.Actor.Metadata.Version {
 		return nil, status.Error(codes.Aborted, "CAS failed")
 	}
-	v = proto.Clone(req.Actor).(*pb.Actor)
-	v.Metadata.Version++
-	f.actors[key] = v
-	return proto.Clone(v).(*pb.Actor), f.effect("update")
+	if !proto.Equal(v.ActorTemplate, req.Actor.ActorTemplate) && v.Status.State != pb.ActorState_ACTOR_STATE_SUSPENDED {
+		return nil, status.Error(codes.FailedPrecondition, "template change requires SUSPENDED")
+	}
+	updated := proto.Clone(req.Actor).(*pb.Actor)
+	updated.Status = v.Status
+	updated.Metadata = v.Metadata
+	updated.Metadata.Version++
+	f.actors[key] = updated
+	return proto.Clone(updated).(*pb.Actor), f.effect("update")
 }
 func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequest, _ ...grpc.CallOption) (*pb.ResumeActorResponse, error) {
 	v := f.actors[refKey(req.Actor)]
@@ -137,13 +193,14 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 		}
 	}
 	f.boots++
+	template := f.templates[refKey(v.ActorTemplate)]
 	var w *pb.Worker
 	for _, candidate := range f.workers {
 		if candidate.Status.State != pb.WorkerState_WORKER_STATE_ACTIVE {
 			continue
 		}
 		matches := true
-		for key, value := range f.templates[refKey(v.ActorTemplate)].WorkerSelector.MatchLabels {
+		for key, value := range template.WorkerSelector.MatchLabels {
 			if candidate.Labels[key] != value {
 				matches = false
 			}
@@ -156,22 +213,43 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	if w == nil {
 		return nil, status.Error(codes.Unavailable, "private worker not prepared")
 	}
+	limits := template.GetResources().GetLimits()
+	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: limits.GetCpuMillicores(), MemoryBytes: limits.GetMemoryBytes(), Actors: 1}
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_RUNNING
-	v.Status.CurrentActorTemplateUid = f.templates[refKey(v.ActorTemplate)].Metadata.Uid
-	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid}
-	return &pb.ResumeActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("resume")
+	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor"}}
+	return &pb.ResumeActorResponse{Actor: proto.Clone(v).(*pb.Actor), Resumed: true}, f.effect("resume")
+}
+func (f *nativeFixture) releaseWorker(v *pb.Actor) {
+	if w := f.workers[v.Status.GetWorkerAssignment().GetWorker().GetName()]; w != nil {
+		w.Status.Allocated = &pb.WorkerResources{}
+	}
+	v.Status.WorkerAssignment = nil
 }
 func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
 	}
+	if req.GetOptions().GetMode() != pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		return nil, status.Error(codes.InvalidArgument, "fixture requires synchronous durability")
+	}
+	if v.Status.State == pb.ActorState_ACTOR_STATE_SUSPENDED {
+		return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, nil
+	}
+	template := f.templates[refKey(v.ActorTemplate)]
+	fidelity := template.GetSnapshotConfig().GetPreferredFidelity()
+	if f.suspendFidelity != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
+		fidelity = f.suspendFidelity
+	}
 	f.suspends++
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDED
-	v.Status.WorkerAssignment = nil
-	v.Status.ExternalSnapshot = &pb.ExternalSnapshot{SnapshotUri: fmt.Sprintf("gs://native/data/%s/%d", v.Metadata.Uid, f.suspends), ContentScope: pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA}
+	f.releaseWorker(v)
+	generation := v.Status.LastAssignedGeneration + 1
+	v.Status.LastAssignedGeneration = generation
+	uuid := fmt.Sprintf("snap-%s-%d", v.Metadata.Uid, generation)
+	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor"}}}
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
@@ -180,9 +258,48 @@ func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorReques
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
 	}
+	if uid := req.GetOptions().GetUid(); uid == "" || uid != v.Metadata.Uid {
+		return nil, status.Error(codes.FailedPrecondition, "uid precondition")
+	}
+	f.releaseWorker(v)
 	delete(f.actors, key)
+	delete(f.egress, key)
 	f.deletes++
 	return proto.Clone(v).(*pb.Actor), f.effect("deleteActor")
+}
+func (f *nativeFixture) GetActorEgressPolicy(_ context.Context, req *pb.GetActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	v := f.egress[refKey(req.Actor)]
+	if v == nil || req.Name != "default" {
+		return nil, status.Error(codes.NotFound, "absent")
+	}
+	return proto.Clone(v).(*pb.EgressPolicy), nil
+}
+func (f *nativeFixture) CreateActorEgressPolicy(_ context.Context, req *pb.CreateActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	key := refKey(req.Actor)
+	if f.actors[key] == nil {
+		return nil, status.Error(codes.NotFound, "actor absent")
+	}
+	if f.egress[key] != nil {
+		return nil, status.Error(codes.AlreadyExists, "exists")
+	}
+	v := proto.Clone(req.EgressPolicy).(*pb.EgressPolicy)
+	v.Metadata.Uid = f.uid("egress")
+	v.Metadata.Version = 1
+	f.egress[key] = v
+	return proto.Clone(v).(*pb.EgressPolicy), f.effect("egress")
+}
+func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.UpdateActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	key := refKey(req.Actor)
+	v := f.egress[key]
+	if v == nil {
+		return nil, status.Error(codes.NotFound, "absent")
+	}
+	if req.EgressPolicy.GetMetadata().GetUid() != v.Metadata.Uid || req.EgressPolicy.GetMetadata().GetVersion() != v.Metadata.Version {
+		return nil, status.Error(codes.Aborted, "CAS failed")
+	}
+	v.Rules = proto.Clone(req.EgressPolicy).(*pb.EgressPolicy).Rules
+	v.Metadata.Version++
+	return proto.Clone(v).(*pb.EgressPolicy), f.effect("updateEgress")
 }
 func (f *nativeFixture) GetWorker(_ context.Context, req *pb.GetWorkerRequest, _ ...grpc.CallOption) (*pb.Worker, error) {
 	v := f.workers[req.Worker.Name]
@@ -191,9 +308,26 @@ func (f *nativeFixture) GetWorker(_ context.Context, req *pb.GetWorkerRequest, _
 	}
 	return proto.Clone(v).(*pb.Worker), nil
 }
+
+// nativeWorkerCapacity mirrors the gVisor worker: Pod limits less 64Mi.
+func nativeWorkerCapacity(pool unstructured.Unstructured) (*pb.WorkerResources, error) {
+	limits, _, err := unstructured.NestedStringMap(pool.Object, "spec", "template", "resources", "limits")
+	if err != nil {
+		return nil, err
+	}
+	cpu, err := resource.ParseQuantity(limits["cpu"])
+	if err != nil {
+		return nil, err
+	}
+	memory, err := resource.ParseQuantity(limits["memory"])
+	if err != nil {
+		return nil, err
+	}
+	return &pb.WorkerResources{CpuMillicores: cpu.MilliValue(), MemoryBytes: memory.Value() - 64<<20, Actors: 1000}, nil
+}
 func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersRequest, _ ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
 	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion("ate.dev/v1alpha1")
+	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
 	if err := f.client.List(ctx, pools); err != nil {
 		return nil, err
@@ -210,12 +344,16 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		if err != nil {
 			return nil, err
 		}
+		capacity, err := nativeWorkerCapacity(pool)
+		if err != nil {
+			return nil, err
+		}
 		labels[workerPoolLabel] = pool.GetName()
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: pool.GetNamespace(), Name: name, UID: types.UID(name + "-uid"), Labels: labels}}
 		if err := f.client.Create(ctx, pod); err != nil {
 			return nil, err
 		}
-		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: &pb.WorkerResources{Actors: 1}}}
+		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor"}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
 	}
 	out := &pb.ListWorkersResponse{}
 	for _, worker := range f.workers {
@@ -223,15 +361,11 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 	}
 	return out, nil
 }
-func (f *nativeFixture) DrainWorker(_ context.Context, req *pb.DrainWorkerRequest, _ ...grpc.CallOption) (*pb.Worker, error) {
-	v := f.workers[req.Worker.Name]
-	if v == nil {
-		return nil, status.Error(codes.NotFound, "absent")
-	}
-	v.Status.State = pb.WorkerState_WORKER_STATE_DRAINING
-	return proto.Clone(v).(*pb.Worker), f.effect("drain")
-}
 func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+	if f.failAfter == "assignments" {
+		f.failAfter = ""
+		return nil, status.Error(codes.Unavailable, "assignment listing unavailable")
+	}
 	out := &pb.ListWorkerActorAssignmentsResponse{}
 	for _, v := range f.actors {
 		if v.Status.GetWorkerAssignment().GetWorker().GetName() == req.Worker.Name {
@@ -252,9 +386,20 @@ func (f *nativeFixture) CreateTag(_ context.Context, req *pb.CreateTagRequest, _
 	if actor == nil {
 		return nil, status.Error(codes.NotFound, "actor absent")
 	}
+	if actor.Status.State != pb.ActorState_ACTOR_STATE_SUSPENDED || len(actor.Status.Snapshots) == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "actor holds no snapshot")
+	}
+	source := actor.Status.Snapshots[len(actor.Status.Snapshots)-1]
 	v := proto.Clone(req.Tag).(*pb.Tag)
 	v.Metadata.Uid = "tag-" + v.Metadata.Name
-	v.Status = &pb.TagStatus{Snapshot: proto.Clone(actor.Status.ExternalSnapshot).(*pb.ExternalSnapshot), SourceActorUid: actor.Metadata.Uid, ActorTemplateUid: actor.Status.CurrentActorTemplateUid}
+	snapshot := proto.Clone(source).(*pb.Snapshot)
+	snapshot.Generation = 1
+	snapshot.Owner = pb.SnapshotOwner_SNAPSHOT_OWNER_TAG
+	snapshot.ActorTemplateUid = ""
+	snapshot.Locality = ""
+	snapshot.Uuid = "tag-snap-" + v.Metadata.Name
+	snapshot.DurableSnapshot = &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/tags/" + v.Metadata.Uid}}
+	v.Status = &pb.TagStatus{Snapshot: snapshot, ActorTemplateUid: source.ActorTemplateUid}
 	f.tags[key] = v
 	return proto.Clone(v).(*pb.Tag), f.effect("tag")
 }
@@ -271,14 +416,20 @@ func (f *nativeFixture) DeleteTag(_ context.Context, req *pb.DeleteTagRequest, _
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
 	}
+	if uid := req.GetOptions().GetUid(); uid == "" || uid != v.Metadata.Uid {
+		return nil, status.Error(codes.FailedPrecondition, "uid precondition")
+	}
 	delete(f.tags, key)
 	return proto.Clone(v).(*pb.Tag), f.effect("deleteTag")
 }
-func (f *nativeFixture) Get(_ context.Context, endpoint string) (bootstrapChallenge, error) {
-	actorName := strings.Split(strings.TrimPrefix(endpoint, "http://"), ".")[0]
+func (f *nativeFixture) Get(_ context.Context, endpoint, target string) (bootstrapChallenge, error) {
 	var out bootstrapChallenge
+	if endpoint != fixtureRouter {
+		return out, fmt.Errorf("challenge bypassed the router")
+	}
+	atespace, actorName, _ := strings.Cut(target, "/")
 	for _, actor := range f.actors {
-		if actor.Metadata.Name != actorName {
+		if actor.Metadata.Name != actorName || actor.Metadata.Atespace != atespace {
 			continue
 		}
 		out.Schema = "orka.harness.v2/sealed-bootstrap/v1"
@@ -300,10 +451,17 @@ func (f *nativeFixture) Get(_ context.Context, endpoint string) (bootstrapChalle
 	return out, fmt.Errorf("no process")
 }
 
+// fixtureRouter is the test router origin; fixtureEgress is admitted egress.
+const fixtureRouter = "https://router.test"
+
+func fixtureEgress() *api.RuntimeEgressPolicy {
+	return &api.RuntimeEgressPolicy{Rules: []api.RuntimeEgressRule{{Protocol: api.RuntimeEgressHTTP, Host: "auth-proxy.orka-system.svc.cluster.local", Ports: []int32{8080}}, {Protocol: api.RuntimeEgressHTTPS, Host: "api.example.com", Ports: []int32{443}}}}
+}
+
 func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.WorkloadRequest) {
 	t.Helper()
 	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
+	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
 		if err := register(scheme); err != nil {
 			t.Fatal(err)
 		}
@@ -338,10 +496,10 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 		container.Env = append(container.Env, corev1.EnvVar{Name: "ORKA_ACP_DURABLE_WORKSPACE_DIR", Value: durableMountPath}, corev1.EnvVar{Name: "ORKA_ACP_DURABLE_WORKSPACE_KEY", Value: "shared"})
 		container.VolumeMounts = []corev1.VolumeMount{{Name: durableVolumeName, MountPath: durableMountPath}}
 	}
-	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}}, NetworkPolicy: &networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}}}}
+	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}}, Egress: fixtureEgress()}}
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
-	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1alpha1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClass": "gvisor"}}}
+	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}}}
 	uid := 0
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider, workspace, parameter, pool).WithStatusSubresource(workspace, provider, &api.ExecutionWorkspaceCheckpoint{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if obj.GetUID() == "" {
@@ -350,11 +508,13 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 		}
 		return c.Create(ctx, obj, opts...)
 	}}).Build()
-	native := &nativeFixture{client: c, templates: map[string]*pb.ActorTemplate{"native/base": {Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "base", Uid: "base-uid"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"selected": "native"}}, SandboxConfig: &pb.SandboxConfig{SandboxClass: pb.SandboxClass_SANDBOX_CLASS_GVISOR, ConfigName: "gvisor"}, SnapshotsConfig: &pb.SnapshotsConfig{StorageLocation: "gs://native/snapshots"}}}, actors: map[string]*pb.Actor{}, workers: map[string]*pb.Worker{}, tags: map[string]*pb.Tag{}}
+	base := &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "base", Uid: "base-uid"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"selected": "native"}}, SnapshotConfig: &pb.SnapshotConfig{StorageLocation: "gs://native/snapshots", GoldenSnapshotConfig: &pb.GoldenSnapshotConfig{Mode: pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED}}, Resources: &pb.ResourceRequirements{Limits: &pb.Resources{CpuMillicores: 1000, MemoryBytes: 512 << 20}}}
+	applyNativeTemplateDefaults(base)
+	native := &nativeFixture{client: c, templates: map[string]*pb.ActorTemplate{"native/base": base}, actors: map[string]*pb.Actor{}, workers: map[string]*pb.Worker{}, tags: map[string]*pb.Tag{}, egress: map[string]*pb.EgressPolicy{}}
 	return c, native, request
 }
 func driver(c client.Client, native *nativeFixture) *Lifecycle {
-	d := New(c, native, Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true})
+	d := New(c, native, Config{RouterEndpoint: fixtureRouter})
 	d.challengeClient = native
 	return d
 }
@@ -505,7 +665,7 @@ func TestNativeJournalLossStopsAdmissionAndCleanup(t *testing.T) {
 	if err := c.Status().Update(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.reconcileLifecycle(t.Context(), w); err == nil {
 		t.Fatal("journal loss authorized deletion")
 	}
@@ -515,7 +675,7 @@ func TestNativeJournalLossStopsAdmissionAndCleanup(t *testing.T) {
 }
 
 func TestStartupRejectsReplacedWorkerActorTemplateAndProcess(t *testing.T) {
-	for _, change := range []string{"actorUID", "workerUID", "workerPodUID", "workerCapacity", "templateUID", "memoryPolicy", "process", "version", "networkPolicy"} {
+	for _, change := range []string{"actorUID", "workerUID", "workerPodUID", "workerCapacity", "workerEpoch", "workerClass", "foreignAssignment", "templateUID", "memoryPolicy", "goldenPolicy", "process", "version", "egressPolicy", "egressPolicyUID"} {
 		t.Run(change, func(t *testing.T) {
 			c, native, request := fixture(t, false)
 			ready(t, c, native, request)
@@ -534,32 +694,31 @@ func TestStartupRejectsReplacedWorkerActorTemplateAndProcess(t *testing.T) {
 			case "workerPodUID":
 				worker.WorkerPodUid += "foreign"
 			case "workerCapacity":
-				worker.Status.Capacity.Actors = 2
+				worker.Status.Capacity.CpuMillicores *= 2
+			case "workerEpoch":
+				// A restarted worker process lost the sandbox.
+				worker.Status.RegisteredEpoch++
+			case "workerClass":
+				worker.Status.SandboxClasses[0].SandboxClass = "microvm"
+			case "foreignAssignment":
+				native.foreignAssignment = true
 			case "templateUID":
 				template.Metadata.Uid += "foreign"
 			case "memoryPolicy":
-				template.SnapshotsConfig.OnPause = pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+				template.SnapshotConfig.PreferredFidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+			case "goldenPolicy":
+				template.SnapshotConfig.GoldenSnapshotConfig.Mode = pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_ENABLED
 			case "process":
 				native.challengeSuffix = "another-process"
 			case "version":
 				actor.Metadata.Version++
-			case "networkPolicy":
-				policy := &networkingv1.NetworkPolicy{}
-				if err := c.Get(t.Context(), types.NamespacedName{Namespace: record.Placement.Namespace, Name: record.NetworkPolicy.Name}, policy); err != nil {
-					t.Fatal(err)
-				}
-				policy.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
-				if err := c.Update(t.Context(), policy); err != nil {
-					t.Fatal(err)
-				}
+			case "egressPolicy":
+				policy := native.egress[record.Atespace+"/"+record.Actor.Name]
+				policy.Rules = append(policy.Rules, &pb.EgressRule{TlsPassthrough: &pb.TlsPassthroughRule{Hostnames: []string{"*"}, Ports: &pb.Ports{All: &pb.AllPorts{}}}})
+			case "egressPolicyUID":
+				native.egress[record.Atespace+"/"+record.Actor.Name].Metadata.Uid += "foreign"
 			}
-			var errObserve error
-			if change == "networkPolicy" {
-				_, errObserve = driver(c, native).EnsureAllocation(t.Context(), request)
-			} else {
-				_, errObserve = driver(c, native).Observe(t.Context(), request.Key)
-			}
-			if errObserve == nil {
+			if _, errObserve := driver(c, native).Observe(t.Context(), request.Key); errObserve == nil {
 				t.Fatal("changed exact instance passed attestation")
 			}
 		})
@@ -593,7 +752,7 @@ func TestSuspensionRequiresExactWorkerAbsenceAndNoForeignAssignment(t *testing.T
 }
 
 func TestColdResumeRequiresTagProvenanceAndFreshBoot(t *testing.T) {
-	for _, change := range []string{"tagUID", "sourceUID", "templateUID", "scope", "snapshotScope", "valid"} {
+	for _, change := range []string{"tagUID", "sourceName", "templateUID", "scope", "snapshotFidelity", "snapshotPending", "snapshotURI", "valid"} {
 		t.Run(change, func(t *testing.T) {
 			c, native, request := fixture(t, true)
 			first := ready(t, c, native, request)
@@ -615,14 +774,18 @@ func TestColdResumeRequiresTagProvenanceAndFreshBoot(t *testing.T) {
 			switch change {
 			case "tagUID":
 				tag.Metadata.Uid += "foreign"
-			case "sourceUID":
-				tag.Status.SourceActorUid += "foreign"
+			case "sourceName":
+				tag.SourceActor.Name += "foreign"
 			case "templateUID":
 				tag.Status.ActorTemplateUid += "foreign"
 			case "scope":
 				tag.Scope = pb.TagScope_TAG_SCOPE_PUBLISHED
-			case "snapshotScope":
-				tag.Status.Snapshot.ContentScope = pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+			case "snapshotFidelity":
+				tag.Status.Snapshot.Fidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+			case "snapshotPending":
+				tag.Status.Snapshot.DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+			case "snapshotURI":
+				tag.Status.Snapshot.DurableSnapshot.Object.SnapshotUri += "-foreign"
 			}
 			if change == "valid" {
 				second := ready(t, c, native, next)
@@ -659,7 +822,7 @@ func TestRetirementRequiresCoreExactAuthorization(t *testing.T) {
 	if err := c.Status().Update(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	for _, auth := range []*api.WorkloadRetirement{nil, {Sequence: 1, Identity: sdk.InstanceIdentity{AllocationID: "foreign", InstanceID: first.Identity.InstanceID, RequestRevision: first.Identity.RequestRevision}, Action: api.WorkloadRetirementDelete}} {
 		if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
 			t.Fatal(err)
@@ -692,7 +855,7 @@ func TestReadyWorkspaceRetiresThroughSuspensionBeforeRollover(t *testing.T) {
 	if err := c.Status().Update(t.Context(), w); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	for range 12 {
 		if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
 			t.Fatal(err)
@@ -748,7 +911,7 @@ func TestClosedBootstrapUsesOnlyPersistedExactLifetime(t *testing.T) {
 
 type closedChallengeGetter struct{}
 
-func (closedChallengeGetter) Get(context.Context, string) (bootstrapChallenge, error) {
+func (closedChallengeGetter) Get(context.Context, string, string) (bootstrapChallenge, error) {
 	return bootstrapChallenge{}, errChallengeClosed
 }
 
@@ -830,27 +993,6 @@ func TestSuspendedQuotaLossAndZeroCapacityFailBeforeMutation(t *testing.T) {
 		})
 	}
 }
-func TestNativeWorkerPolicyTranslatesOnlyAdmittedEgress(t *testing.T) {
-	c, native, request := fixture(t, false)
-	request.Runtime.NetworkPolicy.Egress = []networkingv1.NetworkPolicyEgressRule{{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "192.0.2.0/24"}}}}}
-	request.Revision, _ = sdk.WorkloadRevision(request)
-	if err := admit(c)(t.Context(), request); err != nil {
-		t.Fatal(err)
-	}
-	ready(t, c, native, request)
-	_, record, err := driver(c, native).read(t.Context(), request.Key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	policy := &networkingv1.NetworkPolicy{}
-	if err := c.Get(t.Context(), types.NamespacedName{Namespace: record.Placement.Namespace, Name: record.NetworkPolicy.Name}, policy); err != nil {
-		t.Fatal(err)
-	}
-	if len(policy.Spec.Ingress) != 0 || len(policy.Spec.PolicyTypes) != 1 || policy.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress || len(policy.Spec.Egress) != 1 || policy.Spec.Egress[0].To[0].IPBlock.CIDR != "192.0.2.0/24" || policy.Spec.PodSelector.MatchLabels[workerAllocationLabel] != record.Observation.Identity.AllocationID || policy.Spec.PodSelector.MatchLabels[workerInstanceLabel] != record.Observation.Identity.InstanceID || policy.Spec.PodSelector.MatchLabels[workerPoolLabel] != "" {
-		t.Fatalf("worker policy changed admitted egress or applied runtime ingress: %#v", policy.Spec)
-	}
-}
-
 func TestSuspensionRejectsUnstableDurableKeyBeforeMaterialization(t *testing.T) {
 	for _, value := range []string{"", "session-uid"} {
 		t.Run(value, func(t *testing.T) {

@@ -4,7 +4,6 @@ package substrate
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 
 	sdk "github.com/orka-agents/orka-workspace/sdk"
@@ -64,14 +63,14 @@ func TestNativeExplicitRootIdentityAndUndeclaredPortsPreserveStartup(t *testing.
 				created := ready(t, c, native, request)
 				observed, err := driver(c, native).Observe(t.Context(), request.Key)
 				if err != nil || observed.State != sdk.AllocationReady || observed.Startup == nil || observed.Startup.Process == nil || created.Startup.Process == nil ||
-					*observed.Startup.Process != *created.Startup.Process || observed.Identity != created.Identity || !strings.HasSuffix(observed.Startup.Endpoint, ":80") {
+					*observed.Startup.Process != *created.Startup.Process || observed.Identity != created.Identity || observed.Startup.Endpoint != fixtureRouter || observed.Startup.Process.RouterTarget != observed.Startup.Process.Namespace+"/"+observed.Startup.Process.Name {
 					t.Fatalf("undeclared port80 lost exact native startup: %+v, %v", observed, err)
 				}
 				if err := sdk.ValidateStartup(request, observed); err != nil {
 					t.Fatal(err)
 				}
 				_, record, err := driver(c, native).read(t.Context(), request.Key)
-				if err != nil || record.TemplateSpec.Containers[0].Readyz.HttpGet.Port != 80 || native.boots != 1 || !reflect.DeepEqual(&request, before) {
+				if err != nil || record.TemplateSpec.Containers[0].WakeupProbe.HttpGet.Port != 80 || native.boots != 1 || !reflect.DeepEqual(&request, before) {
 					t.Fatalf("native identity/listener compilation changed admitted intent or replayed: %v", err)
 				}
 			})

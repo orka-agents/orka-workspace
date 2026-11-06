@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-func TestNativeAuthenticationSelectionAndDirectEgressGate(t *testing.T) {
-	config := Config{APIEndpoint: "api.native.svc:443", CAFile: "ca.crt", BearerTokenFile: "token", ActorDNSSuffix: "actors.native.local", DirectEgressEnabled: true}
+func TestNativeAuthenticationSelectionAndRouterConfiguration(t *testing.T) {
+	config := Config{APIEndpoint: "api.native.svc:443", CAFile: "ca.crt", BearerTokenFile: "token", RouterEndpoint: "https://atenet-router.ate-system.svc:443", RouterCAFile: "router-ca.pem", RouterCertFile: "identity.pem", RouterKeyFile: "identity.pem"}
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, change := range []string{"plaintext", "noIdentity", "bothIdentities", "halfPair", "badRoute", "egressGateway"} {
+	for _, change := range []string{"plaintext", "noIdentity", "bothIdentities", "halfPair", "cleartextRouter", "routerPath", "routerCredentials", "routerQuery", "noRouter", "noRouterCA", "noRouterIdentity", "negativeBoot"} {
 		t.Run(change, func(t *testing.T) {
 			c := config
 			switch change {
@@ -24,10 +24,22 @@ func TestNativeAuthenticationSelectionAndDirectEgressGate(t *testing.T) {
 				c.KeyFile = "client.key"
 			case "halfPair":
 				c.CertFile = "client.crt"
-			case "badRoute":
-				c.ActorDNSSuffix = "http://actors.native.local"
-			case "egressGateway":
-				c.DirectEgressEnabled = false
+			case "cleartextRouter":
+				c.RouterEndpoint = "http://atenet-router.ate-system.svc"
+			case "routerPath":
+				c.RouterEndpoint = "https://atenet-router.ate-system.svc/actors"
+			case "routerCredentials":
+				c.RouterEndpoint = "https://user:secret@atenet-router.ate-system.svc"
+			case "routerQuery":
+				c.RouterEndpoint = "https://atenet-router.ate-system.svc?actor=x"
+			case "noRouter":
+				c.RouterEndpoint = ""
+			case "noRouterCA":
+				c.RouterCAFile = ""
+			case "noRouterIdentity":
+				c.RouterKeyFile = ""
+			case "negativeBoot":
+				c.BootTimeout = -1
 			}
 			if c.Validate() == nil {
 				t.Fatal("unsafe native transport admitted")

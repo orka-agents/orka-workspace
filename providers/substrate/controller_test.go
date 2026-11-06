@@ -28,7 +28,7 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 	if err := c.Update(t.Context(), provider); err != nil {
 		t.Fatal(err)
 	}
-	r := &ProviderReconciler{Client: c, Config: Config{APIEndpoint: "native-control:443", CAFile: "/installation/ca.crt", BearerTokenFile: "/installation/token", ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ProviderReconciler{Client: c, Config: Config{APIEndpoint: "native-control:443", CAFile: "/installation/ca.crt", BearerTokenFile: "/installation/token", RouterEndpoint: "https://atenet-router.ate-system.svc:443", RouterCAFile: "/installation/router-ca.pem", RouterCertFile: "/installation/identity.pem", RouterKeyFile: "/installation/identity.pem"}}
 	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
 	if _, err := r.Reconcile(t.Context(), req); err != nil {
 		t.Fatal(err)
@@ -39,9 +39,10 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 	if provider.Status.ObservedGeneration != provider.Generation || provider.Status.PinnedParametersUID != string(config.UID) || provider.Status.Backend == nil || provider.Status.Backend.Version != UpstreamCommit || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureNativeProcess) || !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureACPRuntime) {
 		t.Fatal("configured provider did not publish its exact native-process capability")
 	}
-	// Without the installation's confinement prerequisite, the native-process
-	// filesystem capability must not choose a weaker Core workload layout.
-	r.Config.DirectEgressEnabled = false
+	// Without router-based Actor routing, the native-process capability must
+	// not be advertised.
+	routerCA := r.Config.RouterCAFile
+	r.Config.RouterCAFile = ""
 	if _, err := r.Reconcile(t.Context(), req); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 	if provider.Status.ObservedGeneration != 0 || len(provider.Status.SupportedFeatures) != 0 {
 		t.Fatal("unconfigured provider retained its native-process advertisement")
 	}
-	r.Config.DirectEgressEnabled = true
+	r.Config.RouterCAFile = routerCA
 	if err := c.Delete(t.Context(), config, client.Preconditions{UID: &config.UID}); err != nil {
 		t.Fatal(err)
 	}

@@ -25,15 +25,15 @@ func newRecord(request sdk.WorkloadRequest) (*journalRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", StartedAt: metav1.Now(), Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, NetworkPolicy: nativeReference{Name: id + "-network"}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
+	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", StartedAt: metav1.Now(), Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, EgressPolicy: nativeReference{Name: egressPolicyName}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
 }
 
 func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRequest) (sdk.AllocationObservation, error) {
 	if err := validateRequest(request); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
-	if d.control == nil || d.config.ActorDNSSuffix == "" || !d.config.DirectEgressEnabled {
-		return sdk.AllocationObservation{}, fmt.Errorf("native control, Actor routing, and direct egress are required")
+	if d.control == nil || d.endpoint() == "" {
+		return sdk.AllocationObservation{}, fmt.Errorf("native control and router-based Actor routing are required")
 	}
 	var observed sdk.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -308,8 +308,8 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if actor.GetMetadata().GetUid() == "" || actor.GetMetadata().GetAtespace() != record.Atespace || actor.GetMetadata().GetName() != record.Actor.Name || actor.GetActorTemplate().GetName() != record.CreateTemplate.Name {
 			return sdk.ErrStaleIdentity
 		}
-		if record.InheritedCheckpoint != nil && (!proto.Equal(actor.GetSourceTag(), &pb.ObjectRef{Atespace: record.InheritedCheckpoint.Atespace, Name: record.InheritedCheckpoint.Tag.Name}) || actor.GetStatus().GetCurrentActorTemplateUid() != record.CreateTemplate.UID || actor.GetStatus().GetExternalSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA) {
-			return fmt.Errorf("native restore does not identify the expected Data Tag and template")
+		if err := verifyCreatedActorSnapshots(record, actor); err != nil {
+			return err
 		}
 		record.Actor.UID = actor.GetMetadata().GetUid()
 		if err := d.save(ctx, cm, record); err != nil {
@@ -333,6 +333,17 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED {
 			return fmt.Errorf("native Actor boot changed outside the recorded intent")
 		}
+		// The resume source is fixed by the Actor's snapshots: none for a cold
+		// boot, or only the inherited data-only Tag snapshot. v1 has no boot
+		// flag, so recheck that before every Resume.
+		if err := verifyCreatedActorSnapshots(record, actor); err != nil {
+			return err
+		}
+		// The allowlist is applied before the process can run; DNS and
+		// connections for any other name are denied from the first instruction.
+		if err := d.ensureEgressPolicy(ctx, cm, record); err != nil {
+			return err
+		}
 		ready, err := d.prepareWorker(ctx, cm, record)
 		if err != nil || !ready {
 			return err
@@ -341,7 +352,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
-		_, err = d.control.ResumeActor(ctx, &pb.ResumeActorRequest{Actor: actorRef(record), Boot: record.InheritedCheckpoint == nil})
+		_, err = d.control.ResumeActor(ctx, &pb.ResumeActorRequest{Actor: actorRef(record)})
 		if nativeBootRejected(err) {
 			// The API refused this request before applying it, so the Actor is
 			// still suspended and a later request cannot replay a boot.
@@ -354,6 +365,29 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 	}
 	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED || record.ChallengeSHA256 != "" && actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
 		return lostInstance(record, nativeActorStopped)
+	}
+	return nil
+}
+
+// verifyCreatedActorSnapshots proves the resume source of a not-yet-booted
+// Actor. A fresh Actor must hold no snapshot, so its Resume is a cold boot; a
+// restored Actor holds exactly the inherited Tag's data-only snapshot, captured
+// under the checkpoint's template.
+func verifyCreatedActorSnapshots(record *journalRecord, actor *pb.Actor) error {
+	snapshots := actor.GetStatus().GetSnapshots()
+	if record.InheritedCheckpoint == nil {
+		if actor.GetSourceTag() != nil || len(snapshots) != 0 || actor.GetStatus().GetLastAssignedGeneration() != 0 {
+			return fmt.Errorf("fresh native Actor holds a snapshot; a cold boot cannot be proven")
+		}
+		return nil
+	}
+	checkpoint := record.InheritedCheckpoint
+	if !proto.Equal(actor.GetSourceTag(), &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Tag.Name}) || len(snapshots) != 1 {
+		return fmt.Errorf("native restore does not identify the expected data-only Tag")
+	}
+	snapshot := snapshots[0]
+	if snapshot.GetOwner() != pb.SnapshotOwner_SNAPSHOT_OWNER_TAG || snapshot.GetFidelity() != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES || snapshot.GetActorTemplateUid() != record.CreateTemplate.UID || snapshot.GetActorTemplateUid() != checkpoint.Template.UID || snapshot.GetDurableSnapshot().GetState() != pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED || snapshot.GetDurableSnapshot().GetObject().GetSnapshotUri() == "" || checkpoint.SnapshotURI == "" || snapshot.GetDurableSnapshot().GetObject().GetSnapshotUri() != checkpoint.SnapshotURI {
+		return fmt.Errorf("native restore snapshot is not the expected completed data-only Tag snapshot")
 	}
 	return nil
 }
