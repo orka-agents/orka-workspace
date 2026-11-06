@@ -203,6 +203,24 @@ func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap
 	return nil
 }
 
+// revokeEgressCredentials re-applies an existing allocation's journaled
+// allowlist after its credential configuration was withdrawn. Compilation
+// then fails, so the Actor's policy becomes deny-all instead of keeping
+// gateway effects this provider no longer permits.
+func (d *Lifecycle) revokeEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
+	cm, record, err := d.read(ctx, key)
+	if errors.Is(err, sdk.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if record.EgressPolicy.UID == "" || record.EgressDenyAll {
+		return nil
+	}
+	return d.ensureEgressPolicy(ctx, cm, record)
+}
+
 // verifyEgressPolicy read-only checks the exact applied allowlist.
 func (d *Lifecycle) verifyEgressPolicy(ctx context.Context, record *journalRecord) error {
 	if record.EgressPolicy.UID == "" || record.EgressPolicy.Digest == "" || record.EgressDenyAll {
