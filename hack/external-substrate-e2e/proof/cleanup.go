@@ -89,7 +89,7 @@ func (p *proof) cleanup(ctx context.Context) error {
 		}
 	}
 	catalogs := &corev1.ConfigMapList{}
-	if err := p.c.List(ctx, catalogs, client.InNamespace(p.namespace), client.MatchingLabels{"substrate.workspace.orka.ai/checkpoint-catalog": "substrate.workspace.checkpoint.v1"}); err != nil {
+	if err := p.c.List(ctx, catalogs, client.InNamespace(p.namespace), client.MatchingLabels{"substrate.workspace.orka.ai/checkpoint-catalog": "substrate.workspace.checkpoint.v2"}); err != nil {
 		return err
 	}
 	for _, cm := range catalogs.Items {
@@ -97,15 +97,15 @@ func (p *proof) cleanup(ctx context.Context) error {
 			return err
 		}
 	}
-	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, PageSize: 1000})
+	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(actors.GetActors()) != 0 || actors.GetNextPageToken() != "" {
 		return fmt.Errorf("cleanup retains native Actors: %v", err)
 	}
-	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, PageSize: 1000})
+	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(tags.GetTags()) != 0 || tags.GetNextPageToken() != "" {
 		return fmt.Errorf("cleanup retains native Data Tags: %v", err)
 	}
-	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, PageSize: 1000})
+	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || templates.GetNextPageToken() != "" {
 		return fmt.Errorf("cleanup template inventory failed: %v", err)
 	}
@@ -118,7 +118,7 @@ func (p *proof) cleanup(ctx context.Context) error {
 		if err != nil || again.GetMetadata().GetUid() != template.GetMetadata().GetUid() || again.GetMetadata().GetVersion() != template.GetMetadata().GetVersion() {
 			return fmt.Errorf("cleanup infrastructure template lifetime changed: %v", err)
 		}
-		if _, err := p.native.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: ref}); err != nil {
+		if _, err := p.native.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: ref, Options: &pb.DeleteOptions{Uid: again.GetMetadata().GetUid()}}); err != nil {
 			return err
 		}
 		if _, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: ref}); status.Code(err) != codes.NotFound {
@@ -129,7 +129,7 @@ func (p *proof) cleanup(ctx context.Context) error {
 	if err != nil || space.GetMetadata().GetUid() == "" || space.GetMetadata().GetName() != p.namespace {
 		return fmt.Errorf("cleanup native Atespace identity missing: %v", err)
 	}
-	if _, err := p.native.DeleteAtespace(ctx, &pb.DeleteAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}}); err != nil {
+	if _, err := p.native.DeleteAtespace(ctx, &pb.DeleteAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}, Options: &pb.DeleteOptions{Uid: space.GetMetadata().GetUid()}}); err != nil {
 		return err
 	}
 	if _, err := p.native.GetAtespace(ctx, &pb.GetAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}}); status.Code(err) != codes.NotFound {

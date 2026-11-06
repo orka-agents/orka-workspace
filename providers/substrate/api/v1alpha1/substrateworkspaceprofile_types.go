@@ -10,7 +10,8 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // SubstrateTemplateReference names the operator-owned native infrastructure
 // ActorTemplate. The provider derives its runtime template from this object's
-// placement, runsc, and snapshot storage; its containers do not execute ACP work.
+// worker placement, default Actor size, and snapshot storage; its containers do
+// not execute ACP work.
 type SubstrateTemplateReference struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
@@ -26,13 +27,14 @@ type SubstrateTemplateReference struct {
 type SubstrateSuspendMode string
 
 // SubstrateSuspendModeDataOnly captures only workspace DurableDir data. Native
-// Tags retain verified Data snapshots; a fresh Actor and supervisor boot perform
-// cold continuation. Full-memory restore remains prohibited by ADR 0030.
+// Tags retain verified VOLUMES snapshots; a fresh Actor and supervisor boot
+// perform cold continuation. Full-memory restore remains prohibited by ADR 0030.
 const SubstrateSuspendModeDataOnly SubstrateSuspendMode = "DataOnly"
 
-// SubstrateSuspendPolicy requires Data/Data/ColdBoot snapshot settings in the
-// derived ActorTemplate. The provider must verify native Tag provenance and
-// confirm source termination before reporting suspension, as defined by ADR 0031.
+// SubstrateSuspendPolicy requires VOLUMES-fidelity snapshots with golden
+// snapshots disabled in the derived ActorTemplate. The provider must verify
+// native Tag provenance and confirm source termination before reporting
+// suspension, as defined by ADR 0031.
 type SubstrateSuspendPolicy struct {
 	Mode SubstrateSuspendMode `json:"mode"`
 }

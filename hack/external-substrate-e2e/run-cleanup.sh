@@ -9,16 +9,20 @@ case "$(kubectl config current-context)" in
 esac
 [[ "${namespace}" =~ ^external-substrate-proof-[0-9]{14}$ ]]
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${expected_namespace_uid}"
-kubectl -n "${namespace}" get job native-data-proof -o json |
+# Proof Jobs run in the fixed client namespace allowlisted at install.
+client_namespace=external-substrate-e2e
+kubectl -n "${client_namespace}" get job "${namespace}" -o json |
   jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "Complete") and .status == "True")' >/dev/null
 workspace_uids="$(kubectl -n "${namespace}" get executionworkspaces -o json | jq -ce '.items | map({key:.metadata.name,value:.metadata.uid}) | from_entries')"
-runtime_image="$(kubectl -n "${namespace}" get job native-data-proof -o json | jq -er '.spec.template.spec.containers[0].env[] | select(.name == "RUNTIME_IMAGE") | .value')"
+runtime_image="$(kubectl -n "${client_namespace}" get job "${namespace}" -o json | jq -er '.spec.template.spec.containers[0].env[] | select(.name == "RUNTIME_IMAGE") | .value')"
 run_id="$(date -u +%Y%m%d%H%M%S)"
 job_name="native-data-cleanup-${run_id}"
 run_dir="${PWD}/bin/${namespace}/cleanup-${run_id}"
 mkdir -p "${run_dir}"
 chmod 700 "${run_dir}"
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
 docker build -f hack/external-substrate-e2e/proof.Dockerfile -t "localhost:5002/orka/native-data-proof:cleanup-${run_id}" "${run_dir}"
 docker push "localhost:5002/orka/native-data-proof:cleanup-${run_id}"
 proof_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-data-proof:cleanup-${run_id}")"
@@ -35,11 +39,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata: {name: ${job_name}}
-subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${namespace}}]
+subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${client_namespace}}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ${job_name}}
 YAML
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${expected_namespace_uid}"
-kubectl -n "${namespace}" get job native-data-proof -o json |
+kubectl -n "${client_namespace}" get job "${namespace}" -o json |
   jq --arg name "${job_name}" --arg image "${proof_image}" --arg namespaceUID "${expected_namespace_uid}" --arg workspaces "${workspace_uids}" '
     {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace},spec:{
       backoffLimit:0,activeDeadlineSeconds:1260,template:.spec.template}} |
@@ -52,13 +56,13 @@ kubectl -n "${namespace}" get job native-data-proof -o json |
   kubectl create -f -
 start="$(date +%s)"
 while true; do
-  job="$(kubectl -n "${namespace}" --request-timeout=15s get job "${job_name}" -o json)"
+  job="$(kubectl -n "${client_namespace}" --request-timeout=15s get job "${job_name}" -o json)"
   if jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs "job/${job_name}" | tee "${run_dir}/cleanup.log"
+    kubectl -n "${client_namespace}" logs "job/${job_name}" | tee "${run_dir}/cleanup.log"
     exit 1
   fi
   if jq -e 'any(.status.conditions[]?; .type == "Complete" and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs "job/${job_name}" | tee "${run_dir}/cleanup.log"
+    kubectl -n "${client_namespace}" logs "job/${job_name}" | tee "${run_dir}/cleanup.log"
     break
   fi
   (( $(date +%s) - start <= 1260 )) || exit 1
@@ -88,4 +92,5 @@ kubectl delete --raw "/api/v1/namespaces/${namespace}" -f "${run_dir}/delete-opt
 kubectl wait --for=delete "namespace/${namespace}" --timeout=2m
 kubectl delete clusterrolebinding "${job_name}" "${namespace}" --ignore-not-found
 kubectl delete clusterrole "${job_name}" "${namespace}" --ignore-not-found
+kubectl -n "${client_namespace}" delete job "${namespace}" "${job_name}" --ignore-not-found
 printf 'Verified failed-run cleanup report: %s\n' "${run_dir}/report.json"

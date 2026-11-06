@@ -10,7 +10,9 @@ command -v "${kindctl}" >/dev/null 2>&1 || {
 }
 tag=external-substrate
 upstream=https://github.com/agent-substrate/substrate.git
-pin=fa6d949685a6318940a9a0195c867c864009b820
+# Agent Substrate v1.0.0; providers/substrate/nativepb/upstream.env is the pin.
+pin="$(sed -n 's/^SUBSTRATE_UPSTREAM_COMMIT=//p' providers/substrate/nativepb/upstream.env)"
+test "${pin}" = b34fbee742906494b5eb4f1f36987176bf8770a4
 source_dir="${SUBSTRATE_SOURCE_DIR:-/tmp/orka-external-substrate-native-pin-${pin}}"
 
 case "${1:-preflight}" in
@@ -33,6 +35,8 @@ case "${1:-preflight}" in
     test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
     # Only kindctl creates the cluster. The upstream cluster creator can delete
     # an existing cluster and replace its shared registry, so it is not invoked.
+    # Agent Substrate v1.0.0 cannot upgrade a v0.1.0 install in place: a
+    # cluster that ran the previous pin must be retired, not reused.
     if "${kindctl}" ctx --tag "${tag}" >/dev/null 2>&1; then
       test "${SUBSTRATE_REUSE_CLUSTER:-0}" = 1 || {
         printf 'Dedicated cluster already exists; inspect it, then set SUBSTRATE_REUSE_CLUSTER=1.\n' >&2

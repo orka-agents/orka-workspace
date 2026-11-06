@@ -15,7 +15,7 @@ requires. #572 is included and does not block this implementation.
 | Phase 1 Orka consumer | Separate task branch replaces the old shared packages and sources generated workspace CRDs from the shared module; resolver regression checks use unchanged baseline hashes |
 | Phase 2 | #572 is implemented and pushed. Shared workload sequences, generic class/API resolution, exact startup verification, ordered retirement, and upgrade gate are implemented. The two-replica ownership proof and actual core Task/RuntimeSession execution and retirement proof passed. |
 | Phase 3 | Separate Sandbox controller and parameter schemas implemented. Lifecycle, suspension, storage-retention, identity, recovery, and race tests pass. Installed unmodified v1.0.3 passed all six filesystem persistence and deletion checks. |
-| Phase 4 | Separate native ACP controller and independent checkpoint export/import implemented; lifecycle/suspension conformance and native recovery tests pass. Installed unchanged native v0.1.0 passed real Data capture, independent export, cold import after source deletion, and final native artifact collection. An actual Core Task through the deployed native provider passed authenticated Serving, RuntimeSession execution, persisted result, and exact compute/credential retirement. Pooled MCP Tools remain an explicit in-tree boundary. Full-memory restoration remains closed. |
+| Phase 4 | Separate native ACP controller and independent checkpoint export/import implemented; lifecycle/suspension conformance and native recovery tests pass. Installed unchanged native v0.1.0 passed real Data capture, independent export, cold import after source deletion, and final native artifact collection. An actual Core Task through the deployed native provider passed authenticated Serving, RuntimeSession execution, persisted result, and exact compute/credential retirement. The provider has since been ported to Agent Substrate v1.0.0 ([ADR 0006](adr/0006-agent-substrate-v1.md)); its simulated-control suites pass, and the installed proofs are ported but not yet rerun against v1.0.0. Pooled MCP Tools remain an explicit in-tree boundary. Full-memory restoration remains closed. |
 | Phase 5 | Still gated. Upstream HEAD remains `6e58535`, verified 2026-10-05. Its [production-readiness document](https://github.com/helayoty/fiberd/blob/6e58535675df5eb0b55ab12f813892f0577c6bbf/docs/production-readiness.md) still lists unauthenticated control calls, unsafe cleanup failure handling, and persisted revocation/deletion gaps; selected-image launch and credential-bearing pressure-parking controls are also required. |
 | Phase 6 | In-tree ACP Sandbox, native Substrate, and fake implementations, parameter APIs, schemas, and flags removed. Native MCP Tools remain behind `--substrate-mcp-tools-enabled`. Installation, compatibility, drain, upgrade, and uninstall procedures published. Stock Core passes fresh execution and rejects retained legacy resources before and after schema pruning without adopting or mutating them. |
 
@@ -46,13 +46,16 @@ fresh Pod UID with a rotated public nonce, unchanged PVC/PV identities, and
 independently verified Pod/PVC/PV deletion. It uses standalone fixture admission,
 so it does not prove real-core credential bootstrap or RuntimeSession behavior.
 
+The installed native Substrate proofs below ran against Agent Substrate v0.1.0.
+They are ported to v1.0.0 but not yet rerun; see [ADR 0006](adr/0006-agent-substrate-v1.md).
+
 The installed native Substrate proof captured a random durable marker, terminated
 the exact source Actor and worker Pod, exported an independent checkpoint, and
 deleted the source public workspace. A fresh Actor and worker read that marker
 without initializing it. The worker UID and public challenge rotated. Deleting
 the public checkpoint preserved the inheriting workspace data; deleting its last
 owner collected all native Tags and runtime templates. Templates remained
-Data/Data/ColdBoot. This proof invokes the public reconciler with fixture core
+data-only with cold boot (v0.1.0 Data/Data/ColdBoot). This proof invokes the public reconciler with fixture core
 admission and a deterministic native runtime. It does not claim authenticated ACP
 or RuntimeSession execution. Exact preboot worker selection and policy ordering
 were verified; packet-level enforcement remains outside the default kind CNI.

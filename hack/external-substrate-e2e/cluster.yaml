@@ -1,5 +1,6 @@
-# Requirements copied from the unmodified official Substrate cluster installer
-# at fa6d949685a6318940a9a0195c867c864009b820. This is a dedicated kindctl
+# Requirements copied from the unmodified official Substrate kind cluster
+# creator (hack/create-kind-cluster.sh) at v1.0.0,
+# b34fbee742906494b5eb4f1f36987176bf8770a4. This is a dedicated kindctl
 # --tag external-substrate cluster; never apply these settings to another cluster.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
