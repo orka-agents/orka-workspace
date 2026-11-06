@@ -13,6 +13,7 @@ import (
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // UpstreamCommit pins Agent Substrate v1.0.0 for provider, protocol, and
@@ -41,6 +42,43 @@ type Config struct {
 	// BootTimeout bounds native creation and boot before first process
 	// evidence. Zero selects defaultNativeBootTimeout.
 	BootTimeout time.Duration
+	// EgressCredentialProvider is the credential provider class the Agent
+	// Substrate egress gateway was installed with (its --credential-provider
+	// name). Only the bundled Kubernetes Secrets provider, "k8s.io", is
+	// supported. Empty disables egress credential injection: the provider does
+	// not advertise it and refuses workloads that request it.
+	EgressCredentialProvider string
+	// EgressCredentialNamespaces lists namespaces, besides each workload's own,
+	// whose Secrets a workload's egress rules may name. Orka core keeps its
+	// provider-proxy token in its private runtime namespace, which must be
+	// listed here for core to inject it.
+	EgressCredentialNamespaces []string
+}
+
+// KubernetesSecretsCredentialProvider is the upstream credential provider
+// class that resolves ate-secret://k8s.io/default/<namespace>/<secret>/<key>.
+const KubernetesSecretsCredentialProvider = "k8s.io"
+
+// EgressCredentialInjectionEnabled reports whether this installation declared
+// a gateway credential provider.
+func (c Config) EgressCredentialInjectionEnabled() bool {
+	return c.EgressCredentialProvider != ""
+}
+
+// ValidateEgressCredentials checks the declared gateway credential provider.
+func (c Config) ValidateEgressCredentials() error {
+	if c.EgressCredentialProvider != "" && c.EgressCredentialProvider != KubernetesSecretsCredentialProvider {
+		return fmt.Errorf("egress credential provider %q is unsupported; only %q is", c.EgressCredentialProvider, KubernetesSecretsCredentialProvider)
+	}
+	if c.EgressCredentialProvider == "" && len(c.EgressCredentialNamespaces) != 0 {
+		return fmt.Errorf("egress credential namespaces require an egress credential provider")
+	}
+	for _, namespace := range c.EgressCredentialNamespaces {
+		if len(validation.IsDNS1123Label(namespace)) != 0 {
+			return fmt.Errorf("egress credential namespace %q is invalid", namespace)
+		}
+	}
+	return nil
 }
 
 func (c Config) Validate() error {
@@ -59,7 +97,7 @@ func (c Config) Validate() error {
 	if c.BootTimeout < 0 {
 		return fmt.Errorf("native boot timeout must not be negative")
 	}
-	return nil
+	return c.ValidateEgressCredentials()
 }
 
 // routerBaseURL accepts only an HTTPS origin without credentials, path, query

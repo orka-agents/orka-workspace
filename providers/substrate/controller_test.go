@@ -40,6 +40,30 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 		!slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureEgressAllowlist) {
 		t.Fatal("configured provider did not publish its exact native-process capability")
 	}
+	if slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		t.Fatal("provider advertised egress credential injection without a configured credential provider")
+	}
+	r.Config.EgressCredentialProvider = KubernetesSecretsCredentialProvider
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), req.NamespacedName, provider); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(provider.Status.SupportedFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		t.Fatal("provider did not advertise configured egress credential injection")
+	}
+	r.Config.EgressCredentialProvider = "vault.example.com"
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), req.NamespacedName, provider); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.Status.SupportedFeatures) != 0 {
+		t.Fatal("provider with an unsupported credential provider stayed advertised")
+	}
+	r.Config.EgressCredentialProvider = ""
 	// Without router-based Actor routing, the native-process capability must
 	// not be advertised.
 	routerCA := r.Config.RouterCAFile

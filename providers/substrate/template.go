@@ -61,7 +61,7 @@ func validateRequest(request sdk.WorkloadRequest) error {
 		return err
 	}
 	for _, feature := range request.Runtime.RequiredFeatures {
-		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore && feature != api.WorkspaceFeatureEgressAllowlist {
+		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore && feature != api.WorkspaceFeatureEgressAllowlist && feature != api.WorkspaceFeatureEgressCredentialInjection {
 			return fmt.Errorf("native runtime feature %s is unsupported", feature)
 		}
 	}
