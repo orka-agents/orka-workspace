@@ -39,10 +39,13 @@ type nativeFixture struct {
 	egress                   map[string]*pb.EgressPolicy
 	boots, suspends, deletes int
 	failAfter                string
-	foreignAssignment        bool
-	challengeSuffix          string
-	beforeResume             func(context.Context, *pb.Actor) error
-	uids                     int
+	// stallDelete accepts DeleteActor but leaves the Actor in place, as a
+	// termination that is slow to complete.
+	stallDelete       bool
+	foreignAssignment bool
+	challengeSuffix   string
+	beforeResume      func(context.Context, *pb.Actor) error
+	uids              int
 	// suspendFidelity overrides the recorded fidelity of a new snapshot.
 	suspendFidelity pb.SnapshotFidelity
 }
@@ -254,6 +257,10 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
 	key := refKey(req.Actor)
+	if f.stallDelete && f.actors[key] != nil {
+		// Accepted, but the Actor lingers while its termination is slow.
+		return proto.Clone(f.actors[key]).(*pb.Actor), nil
+	}
 	v := f.actors[key]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")

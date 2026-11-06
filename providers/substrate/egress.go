@@ -209,10 +209,14 @@ func (d *Lifecycle) applyEgressPolicy(ctx context.Context, cm *corev1.ConfigMap,
 		}
 	}
 	if compileErr != nil {
-		return fmt.Errorf("native egress allowlist did not compile; the Actor denies all egress and is not resumed: %w", compileErr)
+		return fmt.Errorf("%w: %w", errEgressDeniedAll, compileErr)
 	}
 	return nil
 }
+
+// errEgressDeniedAll reports that the Actor's policy is now deny-all because
+// its allowlist no longer admits or compiles. The deny-all policy is applied.
+var errEgressDeniedAll = errors.New("native egress allowlist did not compile; the Actor denies all egress and is not resumed")
 
 // revokeWithdrawnEgressCredentials runs when observation or workload
 // validation fails. Either can stop reconciliation before EnsureAllocation's
@@ -240,23 +244,32 @@ func (d *Lifecycle) revokeWithdrawnEgressCredentials(ctx context.Context, key sd
 	return d.denyAllEgressPolicy(ctx, cm, record, cause)
 }
 
-// revokeFailedEgressCredentials covers a failed instance that is still live.
-// A recorded failure, such as a boot timeout, does not stop the Actor, and
-// Observe returns a failed record's journaled observation without verifying
-// its egress, so neither error-path hook runs and the failure branch never
-// reaches EnsureAllocation. Until authorized cleanup issues a stop, a
-// still-present Actor's withdrawn credential effects become deny-all. A
-// retiring or retired record (its operation is no longer ensure) or an absent
-// Actor has nothing left to revoke, so cleanup is never blocked here.
-func (d *Lifecycle) revokeFailedEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
+// revokeLiveEgressCredentials covers live Actors whose successful observation
+// verifies no egress: a failed instance, which is not stopped until cleanup is
+// authorized (a boot timeout records failure without stopping the Actor), and
+// a retiring one, whose Stop, Suspend or Delete may stall. While such an Actor
+// still exists, withdrawn credential effects become deny-all; revocation never
+// re-applies compiled rules. A suspended Actor runs no process, and an absent
+// one has nothing left to revoke. The reconciler calls this after any cleanup
+// it issued, so revocation never delays that request, and an error here is
+// reported only while the Actor still exists, never over a completed
+// termination.
+func (d *Lifecycle) revokeLiveEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
 	_, record, err := d.readForEgressRevocation(ctx, key)
-	if err != nil || record.Failure == "" || record.Operation != "ensure" || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
+	if err != nil || record.Failure == "" && record.Operation == "ensure" || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
 		return nil
 	}
-	if actor, err := d.actor(ctx, record); err != nil || actor == nil {
+	actor, err := d.actor(ctx, record)
+	if err != nil || actor == nil || actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_SUSPENDED {
 		return err
 	}
-	return d.revokeWithdrawnEgressCredentials(ctx, key)
+	err = d.revokeWithdrawnEgressCredentials(ctx, key)
+	if record.Operation != "ensure" && errors.Is(err, errEgressDeniedAll) {
+		// A retiring Actor has no allocation to report as failed; deny-all
+		// is in place, so its cleanup proceeds unobstructed.
+		return nil
+	}
+	return err
 }
 
 // verifyEgressPolicy read-only checks the exact applied allowlist.
