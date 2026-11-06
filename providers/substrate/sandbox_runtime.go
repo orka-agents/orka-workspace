@@ -81,14 +81,18 @@ func (d *Lifecycle) recordRestoreRuntime(ctx context.Context, cm *corev1.ConfigM
 }
 
 // fencedWorkerRuntime reads the default runtime that the fenced Worker runs
-// the checkpoint's sandbox class under. It returns nil when there is no
-// restore, no fence, or the Worker does not match the fence exactly.
+// the checkpoint's sandbox class under. ResumeActor places by selector, not by
+// Worker, so the reading counts only while the private pool holds exactly one
+// Worker and it is the fenced, active registration: then no other Worker could
+// have performed the restore. It returns nil otherwise, or when there is no
+// restore or fence.
 func (d *Lifecycle) fencedWorkerRuntime(ctx context.Context, record *journalRecord) *sandboxRuntimeStamp {
 	if record.InheritedCheckpoint == nil || record.InheritedCheckpoint.SandboxRuntime == nil || record.Worker == nil || record.Worker.Epoch == 0 {
 		return nil
 	}
-	worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: record.Worker.Name}})
-	if err != nil || worker.GetMetadata().GetUid() != record.Worker.UID || worker.GetStatus().GetRegisteredEpoch() != record.Worker.Epoch {
+	worker, err := d.privatePoolWorker(ctx, record)
+	if err != nil || worker == nil || worker.GetMetadata().GetName() != record.Worker.Name || worker.GetMetadata().GetUid() != record.Worker.UID ||
+		worker.GetStatus().GetRegisteredEpoch() != record.Worker.Epoch || worker.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
 		return nil
 	}
 	class := record.InheritedCheckpoint.SandboxRuntime.Class

@@ -324,8 +324,10 @@ and nothing is replayed. The provider journals that assignment stamp when it
 first observes it. A restore that fails synchronously is crashed, and its
 assignment cleared, before `ResumeActor` returns, so the provider also journals
 the fenced Worker's default runtime for the class just before Resume and uses it
-only if the same Worker registration still reports that same default after the
-crash. It never infers the runtime from a Worker default that may have changed
+only if, after the crash, that Worker is still the private pool's only, active
+Worker under the same registration and reports that same default; `ResumeActor`
+places by selector, so a replacement Worker in the pool makes the runtime
+unknown. It never infers the runtime from a Worker default that may have changed
 within a registration epoch; without such evidence the crash is reported as
 `InstanceFailed`. Explicit core Retirement.Suspend is honored
 also while desiredState remains Ready during epoch rotation.

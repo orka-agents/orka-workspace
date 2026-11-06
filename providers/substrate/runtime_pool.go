@@ -386,38 +386,47 @@ func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord
 // Labels and size exist before this worker is eligible to execute. Pin the
 // exact ready, empty, single-Actor worker and its process epoch before issuing
 // the one-time native Resume.
-func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
-	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
-		return false, err
-	}
+// privatePoolWorker returns the private pool's only Worker, nil when it has
+// none, and an error when it has more than one.
+func (d *Lifecycle) privatePoolWorker(ctx context.Context, record *journalRecord) (*pb.Worker, error) {
 	var selected *pb.Worker
 	token := ""
 	seen := map[string]bool{}
 	for pages := 0; ; pages++ {
 		if pages == 100 {
-			return false, fmt.Errorf("native worker listing exceeded bound")
+			return nil, fmt.Errorf("native worker listing exceeded bound")
 		}
 		workers, err := d.control.ListWorkers(ctx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1000, PageToken: token}})
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		for _, worker := range workers.GetWorkers() {
 			if worker.GetWorkerNamespace() != record.Placement.Namespace || worker.GetWorkerPool() != record.RuntimePool.Name {
 				continue
 			}
 			if selected != nil {
-				return false, fmt.Errorf("private native pool has multiple workers")
+				return nil, fmt.Errorf("private native pool has multiple workers")
 			}
 			selected = worker
 		}
 		token = workers.GetNextPageToken()
 		if token == "" {
-			break
+			return selected, nil
 		}
 		if seen[token] {
-			return false, fmt.Errorf("native worker pagination repeated a token")
+			return nil, fmt.Errorf("native worker pagination repeated a token")
 		}
 		seen[token] = true
+	}
+}
+
+func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
+		return false, err
+	}
+	selected, err := d.privatePoolWorker(ctx, record)
+	if err != nil {
+		return false, err
 	}
 	if selected == nil {
 		return false, nil

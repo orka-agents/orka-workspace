@@ -374,6 +374,25 @@ func TestSynchronousRestoreCrashAfterADefaultChangeIsNotClassified(t *testing.T)
 	}
 }
 
+// ResumeActor places by selector, so once the private pool holds another
+// Worker the fenced Worker's reading no longer proves which one restored.
+func TestSynchronousRestoreCrashWithAReplacementWorkerIsNotClassified(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	native.runtime = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
+	native.crashOnResume = true
+	native.crashBeforeAssignment = true
+	native.afterCrash = func(worker *pb.Worker) {
+		replacement := proto.Clone(worker).(*pb.Worker)
+		replacement.Metadata.Name += "-replacement"
+		replacement.Metadata.Uid += "-replacement"
+		native.workers[replacement.Metadata.Name] = replacement
+	}
+	if provisioned := restoreCrashCondition(t, c, native, next); provisioned.Reason != instanceFailedReason {
+		t.Fatalf("restore crash with a replacement Worker in the pool = %+v; want %s", provisioned, instanceFailedReason)
+	}
+}
+
 func TestRestoreCrashUnderAnotherSandboxRuntimeIsClassified(t *testing.T) {
 	for _, upgraded := range []bool{true, false} {
 		name := "same runtime"
