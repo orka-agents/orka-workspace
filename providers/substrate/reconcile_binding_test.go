@@ -43,7 +43,7 @@ func TestReconcileRejectsAnotherWorkspaceWorkload(t *testing.T) {
 	if err := c.Status().Update(t.Context(), current); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)}); !errors.Is(err, sdk.ErrStaleIdentity) {
 		t.Fatalf("foreign request accepted: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestReconcileInvalidWorkloadPreservesExactOwnedCleanup(t *testing.T) {
 	if err := c.Status().Update(t.Context(), current); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestReconcileDoesNotAcknowledgeMismatchedAttachmentEpoch(t *testing.T) {
 	if err := c.Update(t.Context(), current); err != nil {
 		t.Fatal(err)
 	}
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
 		t.Fatal(err)
 	}

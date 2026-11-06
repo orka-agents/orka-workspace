@@ -11,7 +11,6 @@ import (
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,8 +30,11 @@ func main() {
 	flag.StringVar(&config.CertFile, "native-cert-file", "", "rotating control client certificate file")
 	flag.StringVar(&config.KeyFile, "native-key-file", "", "rotating control client key file")
 	flag.StringVar(&config.BearerTokenFile, "native-token-file", "", "rotating control bearer token file")
-	flag.StringVar(&config.ActorDNSSuffix, "actor-dns-suffix", "actors.resources.substrate.ate.dev", "DNS suffix routed directly to native actor router")
-	flag.BoolVar(&config.DirectEgressEnabled, "native-direct-egress", false, "acknowledge provider egress gateway disabled and WorkerPool NetworkPolicy enforcement")
+	flag.StringVar(&config.RouterEndpoint, "native-router-endpoint", "https://atenet-router.ate-system.svc:443", "native ingress router HTTPS origin; Actors are selected by the ate-target-actor header")
+	flag.StringVar(&config.RouterCAFile, "native-router-ca-file", "", "trusted native router serving CA file")
+	flag.StringVar(&config.RouterCertFile, "native-router-cert-file", "", "rotating router client certificate file; its SPIFFE ID must be in the router ingress allowlist")
+	flag.StringVar(&config.RouterKeyFile, "native-router-key-file", "", "rotating router client key file; may equal --native-router-cert-file for a credential bundle")
+	flag.StringVar(&config.RouterServerName, "native-router-server-name", "", "router TLS server name; defaults to the endpoint host")
 	flag.DurationVar(&config.BootTimeout, "native-boot-timeout", 6*time.Minute, "fail a native allocation that has no process evidence after this long")
 	options := zap.Options{}
 	options.BindFlags(flag.CommandLine)
@@ -58,7 +60,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 		native = pb.NewControlClient(conn)
 	}
 	scheme := runtime.NewScheme()
-	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
+	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
 		if err := register(scheme); err != nil {
 			return err
 		}

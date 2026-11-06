@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -27,9 +28,13 @@ import (
 )
 
 const (
-	ControllerName            = "v1.substrate.workspace.orka.ai"
-	AdapterVersion            = "0.1.0-dev"
-	journalVersion            = "substrate.workspace.journal.v1"
+	ControllerName = "v1.substrate.workspace.orka.ai"
+	AdapterVersion = "0.1.0-dev"
+	journalVersion = "substrate.workspace.journal.v2"
+	// legacyJournalVersion journals were written for Agent Substrate v0.1.0.
+	// Upstream cannot upgrade that installation in place, so they are never
+	// adopted; operators retire them before reinstalling the backend.
+	legacyJournalVersion      = "substrate.workspace.journal.v1"
 	journalDataKey            = "record.json"
 	MaxJournalBytes           = 256 << 10
 	ownershipLabel            = "substrate.workspace.orka.ai/workspace-uid"
@@ -49,10 +54,19 @@ type nativeReference struct {
 type workerFence struct {
 	Name, UID, Namespace, Pool, Pod, PodUID string
 	AllocationID, InstanceID                string
+	// Epoch is the worker process epoch registered before Resume. A restarted
+	// worker process registers a higher epoch and loses its sandboxes.
+	Epoch int64 `json:",omitempty"`
 }
+
+// errLegacyNativeState marks provider state written for Agent Substrate
+// v0.1.0. It is never adopted, migrated, or cleaned up by this provider.
+var errLegacyNativeState = errors.New("provider state was written for Agent Substrate v0.1.0 and cannot be adopted by the v1.0.0 provider; retire every v0.1.0 workspace and checkpoint with the previous provider release, reinstall Agent Substrate v1.0.0, then upgrade the provider")
+
 type checkpointIntent struct {
 	Name                 string          `json:"name"`
 	SuspendIssued        bool            `json:"suspendIssued,omitempty"`
+	PriorGeneration      int32           `json:"priorGeneration,omitempty"`
 	PriorSnapshotDigest  string          `json:"priorSnapshotDigest,omitempty"`
 	SourceVersion        int64           `json:"sourceVersion,omitempty"`
 	SourceSnapshotDigest string          `json:"sourceSnapshotDigest,omitempty"`
@@ -64,7 +78,9 @@ type checkpointRecord struct {
 	SourceName string          `json:"sourceName"`
 	SourceUID  string          `json:"sourceUID"`
 	Template   nativeReference `json:"template"`
-	CreatedAt  metav1.Time     `json:"createdAt"`
+	// SnapshotURI is the Tag's own durable data-only snapshot location.
+	SnapshotURI string      `json:"snapshotURI"`
+	CreatedAt   metav1.Time `json:"createdAt"`
 }
 
 type catalogReference struct {
@@ -87,24 +103,27 @@ type journalRecord struct {
 	RuntimePoolLabels   map[string]string         `json:"runtimePoolLabels"`
 	RuntimePoolDeleting bool                      `json:"runtimePoolDeleting,omitempty"`
 	Anchor              nativeReference           `json:"anchor"`
-	NetworkPolicy       nativeReference           `json:"networkPolicy"`
-	Template            nativeReference           `json:"template"`
-	TemplateSpec        *pb.ActorTemplate         `json:"templateSpec"`
-	CreateTemplate      nativeReference           `json:"createTemplate"`
-	Actor               nativeReference           `json:"actor"`
-	BootRequested       bool                      `json:"bootRequested,omitempty"`
-	Worker              *workerFence              `json:"worker,omitempty"`
-	RetirementWorkers   []workerFence             `json:"retirementWorkers,omitempty"`
-	WorkerDrained       bool                      `json:"workerDrained,omitempty"`
-	WorkloadAbsent      bool                      `json:"workloadAbsent,omitempty"`
-	ChallengeSHA256     string                    `json:"challengeSHA256,omitempty"`
-	ChallengeVersion    int64                     `json:"challengeVersion,omitempty"`
-	Pending             *checkpointIntent         `json:"pending,omitempty"`
-	Checkpoint          *checkpointRecord         `json:"checkpoint,omitempty"`
-	InheritedCheckpoint *checkpointRecord         `json:"inheritedCheckpoint,omitempty"`
-	CheckpointCatalog   *catalogReference         `json:"checkpointCatalog,omitempty"`
-	InheritedCatalog    *catalogReference         `json:"inheritedCatalog,omitempty"`
-	DeleteIssued        bool                      `json:"deleteIssued,omitempty"`
+	// EgressPolicy is the Actor's nested native egress policy. Digest pins the
+	// compiled rules; deny-all is recorded with DenyAll.
+	EgressPolicy        nativeReference   `json:"egressPolicy"`
+	EgressDenyAll       bool              `json:"egressDenyAll,omitempty"`
+	Template            nativeReference   `json:"template"`
+	TemplateSpec        *pb.ActorTemplate `json:"templateSpec"`
+	CreateTemplate      nativeReference   `json:"createTemplate"`
+	Actor               nativeReference   `json:"actor"`
+	BootRequested       bool              `json:"bootRequested,omitempty"`
+	Worker              *workerFence      `json:"worker,omitempty"`
+	RetirementWorkers   []workerFence     `json:"retirementWorkers,omitempty"`
+	WorkerRetiring      bool              `json:"workerRetiring,omitempty"`
+	WorkloadAbsent      bool              `json:"workloadAbsent,omitempty"`
+	ChallengeSHA256     string            `json:"challengeSHA256,omitempty"`
+	ChallengeVersion    int64             `json:"challengeVersion,omitempty"`
+	Pending             *checkpointIntent `json:"pending,omitempty"`
+	Checkpoint          *checkpointRecord `json:"checkpoint,omitempty"`
+	InheritedCheckpoint *checkpointRecord `json:"inheritedCheckpoint,omitempty"`
+	CheckpointCatalog   *catalogReference `json:"checkpointCatalog,omitempty"`
+	InheritedCatalog    *catalogReference `json:"inheritedCatalog,omitempty"`
+	DeleteIssued        bool              `json:"deleteIssued,omitempty"`
 	// StartedAt bounds creation and boot until first process evidence.
 	StartedAt metav1.Time `json:"startedAt,omitempty"`
 	// Failure records an exact-instance loss. The instance never restarts;
@@ -175,6 +194,15 @@ func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name type
 	if len(raw) == 0 || len(raw) > MaxJournalBytes {
 		return nil, nil, fmt.Errorf("native journal size is invalid")
 	}
+	var header struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(raw), &header); err != nil {
+		return nil, nil, fmt.Errorf("native journal is unreadable")
+	}
+	if header.Version == legacyJournalVersion {
+		return nil, nil, errLegacyNativeState
+	}
 	record := &journalRecord{}
 	if err := json.Unmarshal([]byte(raw), record); err != nil {
 		return nil, nil, fmt.Errorf("native journal is unreadable")
@@ -190,7 +218,7 @@ func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name type
 
 // validateJournalRecord is shared by read-only lifecycle recovery and GC release.
 func validateJournalRecord(record *journalRecord) error {
-	if record.TemplateSpec == nil || record.Template.Name == "" || record.Actor.Name == "" || record.Atespace == "" || record.Placement.UID == "" || record.Anchor.Name == "" || record.NetworkPolicy.Name == "" {
+	if record.TemplateSpec == nil || record.Template.Name == "" || record.Actor.Name == "" || record.Atespace == "" || record.Placement.UID == "" || record.Anchor.Name == "" || record.EgressPolicy.Name != egressPolicyName {
 		return fmt.Errorf("native journal has incomplete infrastructure intent")
 	}
 	if err := validateRequest(record.Request); err != nil {

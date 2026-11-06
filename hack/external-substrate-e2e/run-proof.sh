@@ -19,28 +19,17 @@ test "$(docker inspect -f '{{index .Config.Labels "orka.workspace.e2e"}}' "${reg
 registry_ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "${registry}")"
 test -n "${registry_ip}"
 
-# The upstream DNS controller configures GKE kube-dns automatically. kind uses
-# CoreDNS; its documented integration requires this isolated-cluster stub rule.
-bash hack/external-substrate-e2e/configure-kind-dns.sh
+# Agent Substrate v1.0.0 routes Actors by the ate-target-actor header through
+# atenet-router and sends all Actor egress through its gateway, so no DNS or
+# installation patch is applied. The proof Job runs in the fixed client
+# namespace whose identity install-backend.sh allowlisted.
+client_namespace=external-substrate-e2e
+kubectl -n "${client_namespace}" get serviceaccount native-data-proof >/dev/null
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
 
-# The pinned backend supports direct egress as an installation setting. Only
-# the isolated native API deployment is changed, with exact UID/version tests.
-patch="$(kubectl -n ate-system get deployment ate-api-server -o json | jq -ce '
-  [.spec.template.spec.containers | to_entries[] | select(.value.name == "ate-api-server")] as $containers |
-  if ($containers | length) != 1 then error("expected one native API container") else
-    $containers[0] as $container |
-    [$container.value.args | to_entries[] | select(.value | startswith("--egress-gateway-address="))] as $args |
-    if ($args | length) != 1 then error("expected one native gateway argument") else
-      [{op:"test",path:"/metadata/uid",value:.metadata.uid},
-       {op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},
-       {op:"replace",path:("/spec/template/spec/containers/"+($container.key|tostring)+"/args/"+($args[0].key|tostring)),value:"--egress-gateway-address="}]
-    end
-  end')"
-kubectl -n ate-system patch deployment ate-api-server --type=json -p "${patch}" >/dev/null
-kubectl -n ate-system rollout status deployment/ate-api-server --timeout=5m
-
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-runtime" ./runtime
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-runtime" ./runtime
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
 docker build -f hack/external-substrate-e2e/runtime.Dockerfile -t "localhost:5002/orka/native-data-runtime:${run_id}" "${run_dir}"
 docker build -f hack/external-substrate-e2e/proof.Dockerfile -t "localhost:5002/orka/native-data-proof:${run_id}" "${run_dir}"
 docker push "localhost:5002/orka/native-data-runtime:${run_id}"
@@ -48,34 +37,31 @@ docker push "localhost:5002/orka/native-data-proof:${run_id}"
 runtime_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-data-runtime:${run_id}")"
 proof_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-data-proof:${run_id}")"
 runtime_image="${runtime_image/localhost:5002/${registry_ip}:5000}"
-worker_image="$(cd "${source_dir}" && KO_DOCKER_REPO=localhost:5002 bash hack/run-tool.sh ko build --platform=linux/arm64 ./cmd/ateom-gvisor)"
+worker_image="$(cd "${source_dir}" && KO_DOCKER_REPO=localhost:5002 bash hack/run-tool.sh ko build --platform="linux/${arch}" ./cmd/ateworker-gvisor)"
 test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
 
 kubectl apply --server-side -f config/crd/bases
 kubectl apply --server-side -f providers/substrate/config/crd
 kubectl apply -f providers/substrate/config/registration.yaml
 kubectl create namespace "${namespace}"
-kubectl -n "${namespace}" apply -f - <<YAML
-apiVersion: ate.dev/v1alpha1
+# Namespaced objects name their namespace: the Job runs in the client namespace.
+kubectl apply -f - <<YAML
+# Operator source pool. It runs no workers itself; each allocation copies it
+# into a private single-replica pool whose size the provider owns.
+apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
   name: native-data
+  namespace: ${namespace}
   labels: {orka.workspace.e2e/pool: ${namespace}}
 spec:
-  replicas: 1
+  replicas: 0
   workerImage: ${worker_image}
-  template:
-    resources:
-      requests: {cpu: 250m, memory: 512Mi}
-      limits: {cpu: "2", memory: 2Gi}
----
-apiVersion: v1
-kind: ServiceAccount
-metadata: {name: native-data-proof}
+  sandboxClasses: [{name: gvisor}]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
-metadata: {name: native-data-proof}
+metadata: {name: native-data-proof, namespace: ${namespace}}
 rules:
   - apiGroups: [workspace.orka.ai]
     resources: [executionworkspaces, executionworkspaces/status, executionworkspacecheckpoints, executionworkspacecheckpoints/status]
@@ -92,14 +78,11 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, delete]
-  - apiGroups: [networking.k8s.io]
-    resources: [networkpolicies]
-    verbs: [get, list, create, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
-metadata: {name: native-data-proof}
-subjects: [{kind: ServiceAccount, name: native-data-proof}]
+metadata: {name: native-data-proof, namespace: ${namespace}}
+subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${client_namespace}}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: native-data-proof}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -117,12 +100,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata: {name: ${namespace}}
-subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${namespace}}]
+subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${client_namespace}}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ${namespace}}
 ---
 apiVersion: batch/v1
 kind: Job
-metadata: {name: native-data-proof}
+metadata: {name: ${namespace}, namespace: ${client_namespace}, labels: {orka.workspace.e2e/proof-namespace: ${namespace}}}
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: 1260
@@ -136,8 +119,7 @@ spec:
         - name: proof
           image: ${proof_image}
           env:
-            - name: POD_NAMESPACE
-              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: PROOF_NAMESPACE, value: '${namespace}'}
             - {name: RUNTIME_IMAGE, value: '${runtime_image}'}
             - {name: PROOF_IMAGE, value: '${proof_image}'}
             - {name: WORKER_IMAGE, value: '${worker_image}'}
@@ -165,15 +147,15 @@ printf '%s\n' "${namespace}" >"${repo_root}/bin/external-substrate-proof-namespa
 printf 'Native Data proof namespace: %s\n' "${namespace}"
 start="$(date +%s)"
 while true; do
-  job="$(kubectl -n "${namespace}" --request-timeout=15s get job native-data-proof -o json)"
+  job="$(kubectl -n "${client_namespace}" --request-timeout=15s get job "${namespace}" -o json)"
   if jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs job/native-data-proof >"${run_dir}/proof.log" 2>&1 || true
+    kubectl -n "${client_namespace}" logs "job/${namespace}" >"${run_dir}/proof.log" 2>&1 || true
     cat "${run_dir}/proof.log"
     printf 'Native Data proof failed. Resources are retained in %s.\n' "${namespace}" >&2
     exit 1
   fi
   if jq -e 'any(.status.conditions[]?; .type == "Complete" and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs job/native-data-proof | tee "${run_dir}/proof.log"
+    kubectl -n "${client_namespace}" logs "job/${namespace}" | tee "${run_dir}/proof.log"
     python3 - "${run_dir}/proof.log" "${run_dir}/report.json" <<'PY'
 import json, pathlib, sys
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():

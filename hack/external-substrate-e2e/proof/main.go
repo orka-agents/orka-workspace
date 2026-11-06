@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	"github.com/orka-agents/orka-workspace/native-data-proof/nativee2e"
 	provider "github.com/orka-agents/orka-workspace/providers/substrate"
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -65,9 +64,9 @@ type proof struct {
 	basePool                              *unstructured.Unstructured
 }
 
-// Check actual Kubernetes confinement immediately before forwarding each real
-// native Resume. This observes installed objects independently of the provider
-// journal, including policy-before-Pod creation and immutable source placement.
+// Check the private worker and the Actor's egress allowlist immediately before
+// forwarding each real native Resume. This observes installed objects
+// independently of the provider journal, including immutable source placement.
 type guardedControl struct {
 	pb.ControlClient
 	proof *proof
@@ -104,15 +103,15 @@ func (p *proof) verifyBeforeResume(ctx context.Context, ref *pb.ObjectRef) error
 		return fmt.Errorf("pre-Resume requires one real private worker Pod")
 	}
 	pod := &pods.Items[0]
-	pool := &unstructured.Unstructured{}
-	pool.SetAPIVersion("ate.dev/v1alpha1")
-	pool.SetKind("WorkerPool")
+	pool := workerPool()
 	if err := p.c.Get(ctx, client.ObjectKey{Namespace: p.namespace, Name: pod.Labels["ate.dev/worker-pool"]}, pool); err != nil {
 		return err
 	}
 	replicas, _, err := unstructured.NestedInt64(pool.Object, "spec", "replicas")
-	if err != nil || replicas != 1 || pool.GetUID() == p.basePool.GetUID() {
-		return fmt.Errorf("pre-Resume worker is not in a private single-replica pool")
+	classes, _, classErr := unstructured.NestedSlice(pool.Object, "spec", "sandboxClasses")
+	limits, _, limitErr := unstructured.NestedStringMap(pool.Object, "spec", "template", "resources", "limits")
+	if err != nil || classErr != nil || limitErr != nil || replicas != 1 || pool.GetUID() == p.basePool.GetUID() || len(classes) != 1 || classes[0].(map[string]any)["name"] != "gvisor" || limits["cpu"] == "" || limits["memory"] == "" {
+		return fmt.Errorf("pre-Resume worker is not in a private single-replica gVisor pool sized for one Actor")
 	}
 	birthLabels, _, err := unstructured.NestedStringMap(pool.Object, "spec", "template", "labels")
 	if err != nil {
@@ -123,25 +122,20 @@ func (p *proof) verifyBeforeResume(ctx context.Context, ref *pb.ObjectRef) error
 			return fmt.Errorf("pre-Resume private labels absent from worker birth template or pool")
 		}
 	}
-	policies := &networkingv1.NetworkPolicyList{}
-	if err := p.c.List(ctx, policies, client.InNamespace(p.namespace)); err != nil {
+	if err := nativee2e.VerifyDataOnlyTemplate(template); err != nil {
 		return err
 	}
-	confined := false
-	for _, policy := range policies.Items {
-		if policy.Spec.PodSelector.MatchLabels["substrate.workspace.orka.ai/allocation-id"] == selector["substrate.workspace.orka.ai/allocation-id"] &&
-			policy.Spec.PodSelector.MatchLabels["substrate.workspace.orka.ai/instance-id"] == selector["substrate.workspace.orka.ai/instance-id"] &&
-			policy.DeletionTimestamp == nil && !policy.CreationTimestamp.After(pod.CreationTimestamp.Time) &&
-			len(policy.Spec.PolicyTypes) == 1 && policy.Spec.PolicyTypes[0] == networkingv1.PolicyTypeEgress && len(policy.Spec.Egress) == 1 {
-			confined = true
-		}
+	if len(actor.GetStatus().GetSnapshots()) != 0 && actor.GetSourceTag() == nil {
+		return fmt.Errorf("pre-Resume fresh Actor holds a snapshot; cold boot is not proven")
 	}
-	if !confined {
-		return fmt.Errorf("pre-Resume admitted egress policy did not precede worker Pod birth")
+	policy, err := nativee2e.VerifyEgressPolicy(ctx, p.native, ref)
+	if err != nil {
+		return err
 	}
-	base := &unstructured.Unstructured{}
-	base.SetAPIVersion("ate.dev/v1alpha1")
-	base.SetKind("WorkerPool")
+	if len(policy.GetRules()) != 0 {
+		return fmt.Errorf("pre-Resume fixture egress is not the admitted deny-all allowlist")
+	}
+	base := workerPool()
 	if err := p.c.Get(ctx, client.ObjectKeyFromObject(p.basePool), base); err != nil {
 		return err
 	}
@@ -150,7 +144,7 @@ func (p *proof) verifyBeforeResume(ctx context.Context, ref *pb.ObjectRef) error
 	if base.GetUID() != p.basePool.GetUID() || string(baseSpec) != string(originalSpec) {
 		return fmt.Errorf("operator source WorkerPool identity or spec changed")
 	}
-	p.passed("real private single-replica worker was born with admitted egress selector; policy existed before Pod and native Resume; source pool unchanged")
+	p.passed("real private single-replica gVisor worker was born with private labels; data-only golden-disabled template and admitted egress allowlist existed before native Resume; source pool unchanged")
 	return nil
 }
 
@@ -184,39 +178,31 @@ func poll(ctx context.Context, check func() (bool, error)) error {
 	}
 }
 
-func getJSON(ctx context.Context, url string, out any) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	transport := &http.Transport{Proxy: nil}
-	defer transport.CloseIdleConnections()
-	response, err := (&http.Client{Transport: transport, Timeout: 15 * time.Second}).Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("fixture HTTP status %d", response.StatusCode)
-	}
-	return json.NewDecoder(io.LimitReader(response.Body, 65536)).Decode(out)
-}
-
-func getJSONWithDNSRetry(ctx context.Context, url string, out any) error {
+// getRouted reads an Actor path through atenet-router, retrying while the
+// router or Actor route becomes available.
+func getRouted(ctx context.Context, endpoint, target, path string, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	var lastErr error
 	if err := poll(ctx, func() (bool, error) {
-		lastErr = getJSON(ctx, url, out)
-		var dnsErr *net.DNSError
-		if errors.As(lastErr, &dnsErr) {
+		var code int
+		code, lastErr = nativee2e.RouterGetJSON(ctx, endpoint, target, path, out)
+		var netErr net.Error
+		if errors.As(lastErr, &netErr) || code == http.StatusServiceUnavailable || code == http.StatusBadGateway {
 			return false, nil
 		}
 		return true, lastErr
 	}); err != nil {
-		return fmt.Errorf("public read failed: %w (last DNS error %v)", err, lastErr)
+		return fmt.Errorf("routed read failed: %w (last error %v)", err, lastErr)
 	}
 	return nil
+}
+
+func workerPool() *unstructured.Unstructured {
+	pool := &unstructured.Unstructured{}
+	pool.SetAPIVersion("ate.dev/v1")
+	pool.SetKind("WorkerPool")
+	return pool
 }
 
 func (p *proof) reconcileWorkspace(ctx context.Context, w *api.ExecutionWorkspace, target api.AllocationState) error {
@@ -275,8 +261,9 @@ func (p *proof) newWorkspace(ctx context.Context, name string, initialize bool, 
 		ParametersBinding: &api.ImmutableObjectBinding{Name: p.profile.Name, UID: p.profile.UID, Generation: p.profile.Generation, ProfileHash: hash},
 		Runtime: &api.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: name + "-pool", UID: types.UID(name + "-pool-fixture"), Generation: 1, ProfileHash: p.class.ProfileHash},
 			ClassBinding: p.class, Protocol: "orka.harness.v2", ContainerName: container.Name, RequiredFeatures: []api.ExecutionWorkspaceFeature{api.WorkspaceFeatureSuspend, api.WorkspaceFeatureCheckpoint, api.WorkspaceFeatureRestore},
-			Template:      corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: p.namespace}, Spec: corev1.PodSpec{AutomountServiceAccountToken: new(false), RestartPolicy: corev1.RestartPolicyNever, SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}},
-			NetworkPolicy: &networkingv1.NetworkPolicySpec{PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress}, Egress: []networkingv1.NetworkPolicyEgressRule{{}}}}}
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: p.namespace}, Spec: corev1.PodSpec{AutomountServiceAccountToken: new(false), RestartPolicy: corev1.RestartPolicyNever, SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}},
+			// The fixture needs no egress: an empty allowlist denies all.
+			Egress: &api.RuntimeEgressPolicy{}}}
 	if cp != nil {
 		request.RestoreFrom = &api.WorkloadCheckpointReference{Name: cp.Name, UID: cp.UID, Digest: cp.Status.Digest}
 	}
@@ -320,8 +307,18 @@ func (p *proof) verifyReady(ctx context.Context, w *api.ExecutionWorkspace) (cha
 	if err != nil {
 		return public, err
 	}
-	if worker.WorkerNamespace != process.Worker.Namespace || worker.WorkerPod != process.Worker.Name || worker.WorkerPodUid != string(process.Worker.UID) || worker.Status.Capacity.Actors != 1 {
-		return public, fmt.Errorf("native exact worker/capacity fence differs")
+	template, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
+	if err != nil {
+		return public, err
+	}
+	if worker.WorkerNamespace != process.Worker.Namespace || worker.WorkerPod != process.Worker.Name || worker.WorkerPodUid != string(process.Worker.UID) {
+		return public, fmt.Errorf("native exact worker fence differs")
+	}
+	if err := nativee2e.VerifySingleActorWorker(worker, template, actor); err != nil {
+		return public, err
+	}
+	if process.RouterTarget != process.Namespace+"/"+process.Name || observed.Startup.Endpoint != nativee2e.RouterEndpoint {
+		return public, fmt.Errorf("startup evidence is not routed to the exact Actor")
 	}
 	pod := &corev1.Pod{}
 	if err := p.c.Get(ctx, client.ObjectKey{Namespace: process.Worker.Namespace, Name: process.Worker.Name}, pod); err != nil {
@@ -330,7 +327,7 @@ func (p *proof) verifyReady(ctx context.Context, w *api.ExecutionWorkspace) (cha
 	if pod.UID != process.Worker.UID || pod.Labels["substrate.workspace.orka.ai/allocation-id"] != observed.Identity.AllocationID || pod.Labels["substrate.workspace.orka.ai/instance-id"] != observed.Identity.InstanceID {
 		return public, fmt.Errorf("real worker Pod UID/private labels differ")
 	}
-	if err := getJSONWithDNSRetry(ctx, observed.Startup.Endpoint+"/v2/credential-bootstrap", &public); err != nil {
+	if err := getRouted(ctx, observed.Startup.Endpoint, process.RouterTarget, "/v2/credential-bootstrap", &public); err != nil {
 		return public, err
 	}
 	canonical, err := json.Marshal(public)
@@ -338,24 +335,24 @@ func (p *proof) verifyReady(ctx context.Context, w *api.ExecutionWorkspace) (cha
 		return public, err
 	}
 	if public.Actor.UID != process.UID || public.Actor.Name != process.Name || public.Actor.Atespace != process.Namespace || digest(canonical) != process.ChallengeSHA256 {
-		return public, fmt.Errorf("direct public challenge differs from provider evidence")
+		return public, fmt.Errorf("routed public challenge differs from provider evidence")
 	}
 	again, err := p.native.GetActor(ctx, &pb.GetActorRequest{Actor: actorRef(actor)})
 	if err != nil || again.GetMetadata().GetUid() != actor.Metadata.Uid || again.GetMetadata().GetVersion() != actor.Metadata.Version || !proto.Equal(again.GetStatus().GetWorkerAssignment(), actor.Status.WorkerAssignment) {
-		return public, fmt.Errorf("native fence changed after direct challenge: %v", err)
+		return public, fmt.Errorf("native fence changed after routed challenge: %v", err)
 	}
-	template, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
-	if err != nil {
+	again2, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
+	if err != nil || again2.GetMetadata().GetUid() != template.GetMetadata().GetUid() || nativee2e.VerifyDataOnlyTemplate(again2) != nil {
+		return public, fmt.Errorf("full-memory gate or exact template fence differs: %v", err)
+	}
+	if _, err := nativee2e.VerifyEgressPolicy(ctx, p.native, actorRef(actor)); err != nil {
 		return public, err
-	}
-	if template.Metadata.Uid != actor.Status.CurrentActorTemplateUid || template.SnapshotsConfig.OnPause != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || template.SnapshotsConfig.OnCommit != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || template.SnapshotsConfig.OnResume.FromData != pb.ResumeSource_RESUME_SOURCE_COLD_BOOT {
-		return public, fmt.Errorf("full-memory gate or exact template fence differs")
 	}
 	var data struct {
 		Marker    string `json:"marker"`
 		BootNonce string `json:"bootNonce"`
 	}
-	if err := getJSONWithDNSRetry(ctx, observed.Startup.Endpoint+"/proof/data", &data); err != nil {
+	if err := getRouted(ctx, observed.Startup.Endpoint, process.RouterTarget, "/proof/data", &data); err != nil {
 		return public, err
 	}
 	if data.Marker != p.marker || data.BootNonce != public.BootNonce {
@@ -385,9 +382,7 @@ func (p *proof) retire(ctx context.Context, w *api.ExecutionWorkspace, action ap
 }
 
 func (p *proof) run(ctx context.Context) error {
-	p.basePool = &unstructured.Unstructured{}
-	p.basePool.SetAPIVersion("ate.dev/v1alpha1")
-	p.basePool.SetKind("WorkerPool")
+	p.basePool = workerPool()
 	if err := p.c.Get(ctx, client.ObjectKey{Namespace: p.namespace, Name: "native-data"}, p.basePool); err != nil {
 		return err
 	}
@@ -399,11 +394,7 @@ func (p *proof) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: p.namespace, Name: "infrastructure"},
-		Containers:      []*pb.Container{{Name: "runtime", Image: p.image}},
-		WorkerSelector:  &pb.Selector{MatchLabels: map[string]string{"orka.workspace.e2e/pool": p.namespace}},
-		SandboxConfig:   &pb.SandboxConfig{SandboxClass: pb.SandboxClass_SANDBOX_CLASS_GVISOR, ConfigName: "gvisor-default"},
-		SnapshotsConfig: &pb.SnapshotsConfig{StorageLocation: "s3://ate-snapshots/" + p.namespace + "/"}}})
+	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
 	if err != nil {
 		return err
 	}
@@ -423,7 +414,7 @@ func (p *proof) run(ctx context.Context) error {
 		return err
 	}
 	firstProcess := source.Status.Allocation.Startup.Process.DeepCopy()
-	p.passed("native Actor wrote durable marker; exact Actor version, single-capacity worker Pod and public challenge verified")
+	p.passed("native Actor wrote durable marker; exact Actor version, single-Actor gVisor worker Pod, worker epoch and routed public challenge verified")
 	if err := p.retire(ctx, source, api.WorkloadRetirementSuspend); err != nil {
 		return err
 	}
@@ -504,14 +495,14 @@ func (p *proof) run(ctx context.Context) error {
 	if err := p.retire(ctx, fork, api.WorkloadRetirementDelete); err != nil {
 		return err
 	}
-	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, PageSize: 1000})
+	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil {
 		return err
 	}
 	if len(tags.Tags) != 0 {
 		return fmt.Errorf("last owner retains %d native Tags", len(tags.Tags))
 	}
-	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, PageSize: 1000})
+	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil {
 		return err
 	}
@@ -524,7 +515,7 @@ func (p *proof) run(ctx context.Context) error {
 		"sourceProcess": firstProcess, "importedProcess": secondProcess, "checkpointUID": cp.UID, "checkpointDigest": cp.Status.Digest,
 		"runtime":       "deterministic native Data/process challenge fixture; no authenticated ACP execution claim",
 		"coreAdmission": "constructed fixture; core integration and ownership admission verified separately",
-		"networkPolicy": "exact worker selection verified; kind CNI does not prove packet enforcement"}
+		"egress":        "deny-all native egress allowlist applied before Resume; gateway enforcement is the installed Agent Substrate egress path"}
 	encoded, err := json.Marshal(report)
 	if err != nil {
 		return err
@@ -538,7 +529,7 @@ func main() {
 	defer cancel()
 	config, err := rest.InClusterConfig()
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
 		if err == nil {
 			err = add(scheme)
 		}
@@ -547,13 +538,15 @@ func main() {
 	if err == nil {
 		c, err = client.New(config, client.Options{Scheme: scheme})
 	}
-	transport := provider.Config{APIEndpoint: "api.ate-system.svc:443", CAFile: "/native/server/trust-bundle.pem", CertFile: "/native/client/credential-bundle.pem", KeyFile: "/native/client/credential-bundle.pem", ActorDNSSuffix: "actors.resources.substrate.ate.dev", DirectEgressEnabled: true}
+	transport := nativee2e.ProofTransport()
 	if err == nil {
 		conn, dialErr := provider.Dial(transport)
 		err = dialErr
 		if err == nil {
 			defer conn.Close()
-			p := &proof{c: c, native: pb.NewControlClient(conn), config: transport, namespace: os.Getenv("POD_NAMESPACE"), image: os.Getenv("RUNTIME_IMAGE"), marker: randomValue(), sourceNonce: randomValue(),
+			// The Job runs in a fixed client namespace whose identity the
+			// installation allowlists; it proves this run's namespace.
+			p := &proof{c: c, native: pb.NewControlClient(conn), config: transport, namespace: os.Getenv("PROOF_NAMESPACE"), image: os.Getenv("RUNTIME_IMAGE"), marker: randomValue(), sourceNonce: randomValue(),
 				class: api.ImmutableObjectBinding{Name: "native-data-class", UID: "native-data-class-fixture", Generation: 1, ProfileHash: "sha256:" + strings.Repeat("a", 64)}}
 			p.native = &guardedControl{ControlClient: p.native, proof: p}
 			if os.Getenv("SUBSTRATE_E2E_CATALOG_NAMESPACE") != "" {

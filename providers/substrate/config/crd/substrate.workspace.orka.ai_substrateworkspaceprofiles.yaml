@@ -78,7 +78,8 @@ spec:
                 description: |-
                   SubstrateTemplateReference names the operator-owned native infrastructure
                   ActorTemplate. The provider derives its runtime template from this object's
-                  placement, runsc, and snapshot storage; its containers do not execute ACP work.
+                  worker placement, default Actor size, and snapshot storage; its containers do
+                  not execute ACP work.
                 properties:
                   name:
                     minLength: 1

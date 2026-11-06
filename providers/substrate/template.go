@@ -3,6 +3,7 @@ package substrate
 import (
 	"context"
 	"fmt"
+	"math"
 	"path"
 	"reflect"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -25,6 +27,28 @@ const durableMountPath = "/durable/orka-workspace"
 const identityVolumeName = "orka-substrate-identity"
 const identityMountPath = "/run/orka-substrate-identity"
 const bootstrapNonceEnv = "ORKA_ACP_CREDENTIAL_BOOTSTRAP_NONCE"
+const egressTrustVolumeName = "orka-substrate-egress-trust"
+const egressTrustMountPath = "/run/orka-substrate-egress-trust"
+const egressTrustFile = "trust-bundle.pem"
+
+// gvisorReservedMemoryBytes is what an Agent Substrate v1.0.0 gVisor worker
+// keeps from its Pod memory limit for itself and checkpoint page cache
+// (cmd/ateworker-gvisor/memory.go: 32Mi + 2*16Mi). Its reported capacity is
+// the limit minus this, and gVisor books no per-Actor overhead.
+const gvisorReservedMemoryBytes = 64 << 20
+
+// maxNativeCPUMillicores mirrors the native Resources.cpu_millicores bound.
+const maxNativeCPUMillicores = 999999
+
+// egressTrustBundles are projected into one file. The interception CA serves
+// HTTPS rules; public roots serve TLS passthrough rules.
+var egressTrustBundles = []string{"egress-mitm.ate.dev", "system-roots.ate.dev"}
+
+// egressTrustEnvironment points common TLS clients at the projected bundle.
+// Admitted runtimes cannot override these names.
+var egressTrustEnvironment = []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "AWS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "SSL_CERT_DIR"}
+
+func workerPoolAPIVersion() string { return "ate.dev/v1" }
 
 func validateRequest(request sdk.WorkloadRequest) error {
 	if err := request.Validate(); err != nil {
@@ -33,14 +57,11 @@ func validateRequest(request sdk.WorkloadRequest) error {
 	if request.Runtime == nil || len(request.Runtime.Template.Spec.Containers) != 1 || len(request.Runtime.Template.Spec.InitContainers) != 0 || request.Runtime.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		return fmt.Errorf("native runtime requires one supervisor and restartPolicy Never")
 	}
-	if request.Runtime.NetworkPolicy == nil {
-		return fmt.Errorf("native runtime requires admitted network rules")
-	}
-	if err := validateNativeNetworkPolicy(request.Runtime); err != nil {
+	if err := validateNativeEgress(request.Runtime); err != nil {
 		return err
 	}
 	for _, feature := range request.Runtime.RequiredFeatures {
-		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore {
+		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore && feature != api.WorkspaceFeatureEgressAllowlist {
 			return fmt.Errorf("native runtime feature %s is unsupported", feature)
 		}
 	}
@@ -60,15 +81,15 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	if err != nil {
 		return err
 	}
-	if base.GetMetadata().GetUid() == "" || base.GetSandboxConfig().GetSandboxClass() != pb.SandboxClass_SANDBOX_CLASS_GVISOR || base.GetSandboxConfig().GetConfigName() == "" || base.GetSnapshotsConfig().GetStorageLocation() == "" {
-		return fmt.Errorf("native infrastructure requires exact template identity, explicit gVisor, and snapshot storage")
+	if base.GetMetadata().GetUid() == "" {
+		return fmt.Errorf("native infrastructure requires an exact template identity")
 	}
 	match := base.GetWorkerSelector().GetMatchLabels()
 	if len(match) == 0 {
 		return fmt.Errorf("native template must select exactly one WorkerPool")
 	}
 	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion("ate.dev/v1alpha1")
+	pools.SetAPIVersion(workerPoolAPIVersion())
 	pools.SetKind("WorkerPoolList")
 	if err := d.client.List(ctx, pools, client.MatchingLabels(match)); err != nil {
 		return err
@@ -85,11 +106,17 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	compiled := proto.Clone(base).(*pb.ActorTemplate)
 	compiled.Metadata = &pb.ResourceMetadata{Atespace: record.Atespace, Name: record.Template.Name}
 	compiled.Status = nil
-	compiled.SnapshotsConfig.OnPause = pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA
-	compiled.SnapshotsConfig.OnCommit = pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA
-	compiled.SnapshotsConfig.OnResume = &pb.OnResumeConfig{FromData: pb.ResumeSource_RESUME_SOURCE_COLD_BOOT}
+	// Every server-defaulted field is explicit so the immutable template digest
+	// survives server defaulting. Snapshots hold only durable volumes, and no
+	// golden snapshot can seed a fresh Actor: every new Actor cold boots.
+	compiled.SnapshotConfig = &pb.SnapshotConfig{
+		StorageLocation:      base.GetSnapshotConfig().GetStorageLocation(),
+		PreferredFidelity:    pb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+		GoldenSnapshotConfig: &pb.GoldenSnapshotConfig{Mode: pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED},
+	}
+	compiled.GoldenEgressPolicy = nil
 	for _, volume := range compiled.Volumes {
-		if volume.GetName() == durableVolumeName || volume.GetName() == identityVolumeName {
+		if volume.GetName() == durableVolumeName || volume.GetName() == identityVolumeName || volume.GetName() == egressTrustVolumeName {
 			return fmt.Errorf("native infrastructure uses a reserved runtime volume")
 		}
 	}
@@ -97,21 +124,29 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	if err != nil {
 		return err
 	}
-	resources, err := compileResources(record.Request.Runtime.Template.Spec.Containers[0].Resources)
+	// gVisor applies limits to the entire Actor, not its individual containers.
+	resources, err := compileResources(base.GetResources(), record.Request.Runtime.Template.Spec.Containers[0].Resources)
 	if err != nil {
 		return err
 	}
-	// gVisor applies limits to the entire Actor, not its individual containers.
-	if resources != nil {
-		compiled.Resources = resources
-	}
+	compiled.Resources = resources
 	if record.SuspendEnabled {
 		compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: durableVolumeName, DurableDir: &pb.DurableDirVolumeSource{}})
 	}
 	compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: identityVolumeName, SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{ActorMetadata: &pb.ActorMetadataDataSource{Items: []*pb.ActorMetadataItem{
 		{Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_ATESPACE, Path: "atespace"}, {Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_NAME, Path: "name"}, {Field: pb.ActorMetadataField_ACTOR_METADATA_FIELD_UID, Path: "uid"},
 	}}}}}})
+	// All Actor egress traverses the native gateway. Only HTTPS rules are
+	// intercepted; HTTP and TLS passthrough need no gateway CA. The trust
+	// bundle and its environment are added only when interception is
+	// admitted, keeping the runtime within the upstream environment limit.
+	if egressInterceptsTLS(record) {
+		compiled.Volumes = append(compiled.Volumes, &pb.Volume{Name: egressTrustVolumeName, SystemInfo: &pb.SystemInfoVolumeSource{DataSources: []*pb.SystemInfoDataSource{{TrustBundle: &pb.TrustBundleDataSource{Names: slices.Clone(egressTrustBundles), Path: egressTrustFile}}}}})
+	}
 	compiled.Containers = []*pb.Container{container}
+	if err := validateDataOnlyTemplate(compiled); err != nil {
+		return err
+	}
 	record.TemplateSpec = compiled
 	record.Template.Digest, err = templateDigest(compiled)
 	return err
@@ -170,7 +205,7 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 	args := []string{`chmod 0755 /; exec "$@"`, "orka-substrate-init"}
 	args = append(args, container.Command...)
 	args = append(args, container.Args...)
-	compiled := &pb.Container{Name: container.Name, Image: container.Image, Command: []string{"/bin/sh", "-ec"}, Args: args, Readyz: &pb.ContainerReadyz{HttpGet: &pb.HTTPGetAction{Path: "/v2/health", Port: 80}, TimeoutSeconds: 120}, SecurityContext: securityContext}
+	compiled := &pb.Container{Name: container.Name, Image: container.Image, Command: []string{"/bin/sh", "-ec"}, Args: args, WakeupProbe: &pb.WakeupProbe{HttpGet: &pb.HttpGetAction{Path: "/v2/health", Port: 80}, TimeoutSeconds: 120}, SecurityContext: securityContext}
 	seen := map[string]bool{}
 	for _, env := range container.Env {
 		// The native DTO treats values literally. Kubernetes expands $(NAME)
@@ -183,6 +218,9 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		// SystemInfo. These Pod/Core overrides cannot be silently discarded.
 		if env.Name == "ORKA_ACP_SESSION_BASE_DIR" || env.Name == "ORKA_ACP_MCP_BROKER_URL" || env.Name == "ORKA_ACP_POD_NAMESPACE" {
 			return nil, fmt.Errorf("native runtime environment %s is unsupported", env.Name)
+		}
+		if slices.Contains(egressTrustEnvironment, env.Name) {
+			return nil, fmt.Errorf("native runtime environment %s conflicts with egress gateway trust", env.Name)
 		}
 		if env.Name == "ORKA_ACP_LISTEN_ADDRESS" && (env.Value != ":80" || env.ValueFrom != nil) {
 			return nil, fmt.Errorf("native runtime listener must be literal :80")
@@ -217,7 +255,20 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		}
 		compiled.Env = append(compiled.Env, &pb.EnvVar{Name: env.Name, Value: value})
 	}
-	if len(compiled.Env) > 32 {
+	intercepts := egressInterceptsTLS(record)
+	if intercepts {
+		for _, name := range egressTrustEnvironment {
+			value := egressTrustMountPath + "/" + egressTrustFile
+			if name == "SSL_CERT_DIR" {
+				value = egressTrustMountPath
+			}
+			compiled.Env = append(compiled.Env, &pb.EnvVar{Name: name, Value: value})
+		}
+	}
+	if len(compiled.Env) > maxNativeEnvironment {
+		if intercepts {
+			return nil, fmt.Errorf("native environment exceeds the upstream limit of %d with the egress trust variables HTTPS interception requires", maxNativeEnvironment)
+		}
 		return nil, fmt.Errorf("native environment exceeds upstream limit")
 	}
 	if record.SuspendEnabled {
@@ -244,7 +295,25 @@ func compileContainer(record *journalRecord) (*pb.Container, error) {
 		compiled.Args = slices.Insert(compiled.Args, 2, container.WorkingDir)
 	}
 	compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: identityVolumeName, MountPath: identityMountPath})
+	if intercepts {
+		compiled.VolumeMounts = append(compiled.VolumeMounts, &pb.VolumeMount{Name: egressTrustVolumeName, MountPath: egressTrustMountPath})
+	}
 	return compiled, nil
+}
+
+// maxNativeEnvironment is the upstream bound on one container's environment.
+const maxNativeEnvironment = 32
+
+// egressInterceptsTLS reports whether the admitted allowlist contains an HTTPS
+// rule, which the gateway terminates with its own CA.
+func egressInterceptsTLS(record *journalRecord) bool {
+	runtime := record.Request.Runtime
+	if runtime == nil || runtime.Egress == nil {
+		return false
+	}
+	return slices.ContainsFunc(runtime.Egress.Rules, func(rule api.RuntimeEgressRule) bool {
+		return rule.Protocol == api.RuntimeEgressHTTPS
+	})
 }
 
 func hasKubernetesExpansion(value string) bool {
@@ -407,7 +476,11 @@ func compileSecurityContext(podContext *corev1.PodSecurityContext, containerCont
 
 var nativeCapabilityName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 
-func compileResources(requirements corev1.ResourceRequirements) (*pb.Resources, error) {
+// compileResources sizes the whole Actor. The admitted container limits
+// override the operator template's; both CPU and memory must end positive and
+// exactly representable, because the native scheduler books them against a
+// worker sized for exactly this Actor.
+func compileResources(base *pb.ResourceRequirements, requirements corev1.ResourceRequirements) (*pb.ResourceRequirements, error) {
 	for name, quantity := range requirements.Requests {
 		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {
 			return nil, fmt.Errorf("native resource request %s is unsupported", name)
@@ -426,27 +499,38 @@ func compileResources(requirements corev1.ResourceRequirements) (*pb.Resources, 
 			return nil, fmt.Errorf("native resource request %s requires an admitted limit at least as large", name)
 		}
 	}
-	var resources *pb.Resources
+	limits := &pb.Resources{CpuMillicores: base.GetLimits().GetCpuMillicores(), MemoryBytes: base.GetLimits().GetMemoryBytes()}
 	for name, quantity := range requirements.Limits {
-		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {
-			return nil, fmt.Errorf("native resource %s is unsupported", name)
-		}
 		if quantity.Sign() <= 0 {
 			return nil, fmt.Errorf("native resource must be positive")
 		}
-		if resources == nil {
-			resources = &pb.Resources{}
+		switch name {
+		case corev1.ResourceCPU:
+			millicores := quantity.MilliValue()
+			if resource.NewMilliQuantity(millicores, resource.DecimalSI).Cmp(quantity) != 0 {
+				return nil, fmt.Errorf("native CPU limit must be a whole number of millicores")
+			}
+			limits.CpuMillicores = millicores
+		case corev1.ResourceMemory:
+			// Value rounds up, so an exact integral byte count is the only
+			// value that compares equal; fractional or overflowing limits fail.
+			bytes := quantity.Value()
+			if resource.NewQuantity(bytes, resource.BinarySI).Cmp(quantity) != 0 {
+				return nil, fmt.Errorf("native memory limit must be a whole number of bytes")
+			}
+			limits.MemoryBytes = bytes
+		default:
+			return nil, fmt.Errorf("native resource %s is unsupported", name)
 		}
-		resources.Limits = append(resources.Limits, &pb.Limits{Name: string(name), Quantity: quantity.String()})
 	}
-	slices.SortFunc(resources.GetLimits(), func(a, b *pb.Limits) int { return strings.Compare(a.Name, b.Name) })
-	return resources, nil
+	if limits.CpuMillicores <= 0 || limits.CpuMillicores > maxNativeCPUMillicores || limits.MemoryBytes <= 0 || limits.MemoryBytes > math.MaxInt64-gvisorReservedMemoryBytes {
+		return nil, fmt.Errorf("native Actor requires positive CPU and memory limits from the admitted runtime or the operator template")
+	}
+	return &pb.ResourceRequirements{Limits: limits}, nil
 }
 
 func (d *Lifecycle) verifyPlacement(ctx context.Context, record *journalRecord) error {
-	pool := &unstructured.Unstructured{}
-	pool.SetAPIVersion("ate.dev/v1alpha1")
-	pool.SetKind("WorkerPool")
+	pool := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, pool); err != nil {
 		return err
 	}

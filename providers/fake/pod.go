@@ -65,6 +65,11 @@ func validatePodFeatures(request workspaceprovider.WorkloadRequest) error {
 	if request.Runtime == nil {
 		return nil
 	}
+	// Pods enforce egress only through a Kubernetes NetworkPolicy; running a
+	// host-name allowlist request without it would drop the requested isolation.
+	if request.Runtime.Egress != nil {
+		return fmt.Errorf("fake Pod runtime does not support required feature %q", workspacev1alpha1.WorkspaceFeatureEgressAllowlist)
+	}
 	for _, feature := range request.Runtime.RequiredFeatures {
 		switch feature {
 		case workspacev1alpha1.WorkspaceFeatureACPRuntime, workspacev1alpha1.WorkspaceFeaturePools:

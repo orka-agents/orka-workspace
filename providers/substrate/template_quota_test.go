@@ -40,7 +40,7 @@ func TestNativeRejectsAdmittedEmptyDirQuotaBeforeCompute(t *testing.T) {
 				t.Fatal("unsupported quota created native compute or a derived template")
 			}
 			pools := &unstructured.UnstructuredList{}
-			pools.SetAPIVersion("ate.dev/v1alpha1")
+			pools.SetAPIVersion("ate.dev/v1")
 			pools.SetKind("WorkerPoolList")
 			if err := c.List(t.Context(), pools); err != nil || len(pools.Items) != 1 {
 				t.Fatalf("unsupported quota created a private worker pool: count=%d err=%v", len(pools.Items), err)

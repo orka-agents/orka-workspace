@@ -11,7 +11,6 @@ import (
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,8 +27,8 @@ func TestPrivateWorkerIsConfinedBeforeNativeResumeIncludingLostResponse(t *testi
 				if err != nil {
 					return err
 				}
-				if record.Worker == nil || record.RuntimePool.UID == "" || record.NetworkPolicy.UID == "" || !record.BootRequested {
-					return fmt.Errorf("native Resume preceded durable worker/pool/policy ownership")
+				if record.Worker == nil || record.RuntimePool.UID == "" || record.EgressPolicy.UID == "" || record.EgressDenyAll || !record.BootRequested {
+					return fmt.Errorf("native Resume preceded durable worker/pool/egress ownership")
 				}
 				pool := poolObject()
 				if err := c.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.RuntimePool.Name}, pool); err != nil {
@@ -48,14 +47,13 @@ func TestPrivateWorkerIsConfinedBeforeNativeResumeIncludingLostResponse(t *testi
 				if err := c.Get(ctx, client.ObjectKey{Namespace: record.Worker.Namespace, Name: record.Worker.Pod}, pod); err != nil {
 					return err
 				}
-				policy := &networkingv1.NetworkPolicy{}
-				if err := c.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: record.NetworkPolicy.Name}, policy); err != nil {
-					return err
-				}
-				for key, value := range policy.Spec.PodSelector.MatchLabels {
+				for key, value := range workerLabels(record) {
 					if pod.Labels[key] != value {
-						return fmt.Errorf("worker lacked confinement labels at birth")
+						return fmt.Errorf("worker lacked its unique labels at birth")
 					}
+				}
+				if native.egress[record.Atespace+"/"+record.Actor.Name] == nil {
+					return fmt.Errorf("native Resume preceded the Actor egress allowlist")
 				}
 				checked++
 				return nil

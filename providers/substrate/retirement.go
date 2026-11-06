@@ -14,8 +14,6 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,27 +25,31 @@ func clientKey(key sdk.AllocationKey) types.NamespacedName {
 	return types.NamespacedName{Namespace: key.Namespace, Name: key.Name}
 }
 
-func (d *Lifecycle) drainWorker(ctx context.Context, record *journalRecord) error {
+// verifyRetiringWorker proves a live fenced worker is this instance's private,
+// single-Actor worker and hosts no other Actor before its Pod is terminated.
+// DrainWorker needs global ownership and is not used: deleting the exact
+// private Pod and pool terminates the sandbox, and exact Pod UID absence is
+// the termination proof.
+func (d *Lifecycle) verifyRetiringWorker(ctx context.Context, record *journalRecord) error {
 	f := record.Worker
 	if f == nil {
 		return fmt.Errorf("native worker fence is missing")
 	}
-	ref := &pb.ObjectRef{Name: f.Name}
-	worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: ref})
+	worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
 	if err != nil {
 		return err
 	}
-	verify := func(w *pb.Worker) bool {
-		return w.GetMetadata().GetName() == f.Name && w.GetMetadata().GetUid() == f.UID && w.GetWorkerPodUid() == f.PodUID && w.GetWorkerNamespace() == f.Namespace && w.GetWorkerPool() == f.Pool && w.GetWorkerPod() == f.Pod && w.GetStatus().GetCapacity().GetActors() == 1
-	}
-	if !verify(worker) {
+	if worker.GetMetadata().GetName() != f.Name || worker.GetMetadata().GetUid() != f.UID || worker.GetWorkerPodUid() != f.PodUID || worker.GetWorkerNamespace() != f.Namespace || worker.GetWorkerPool() != f.Pool || worker.GetWorkerPod() != f.Pod {
 		return sdk.ErrStaleIdentity
+	}
+	if err := verifySingleActorWorkerShape(record, worker, true); err != nil {
+		return err
 	}
 	pod := &corev1.Pod{}
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: f.Pod}, pod); err != nil {
 		return err
 	}
-	if string(pod.UID) != f.PodUID || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != f.Pool {
+	if string(pod.UID) != f.PodUID || pod.Labels[workerPoolLabel] != f.Pool {
 		return sdk.ErrStaleIdentity
 	}
 	for key, expected := range workerLabels(record) {
@@ -55,36 +57,7 @@ func (d *Lifecycle) drainWorker(ctx context.Context, record *journalRecord) erro
 			return sdk.ErrStaleIdentity
 		}
 	}
-	if worker.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_DRAINING {
-		worker, err = d.control.DrainWorker(ctx, &pb.DrainWorkerRequest{Worker: ref})
-		if err != nil {
-			return err
-		}
-	}
-	if !verify(worker) || worker.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_DRAINING {
-		return sdk.ErrStaleIdentity
-	}
-	page := ""
-	seen := map[string]bool{}
-	for {
-		assignments, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: ref, PageSize: 1000, PageToken: page})
-		if err != nil {
-			return err
-		}
-		for _, assignment := range assignments.GetActorAssignments() {
-			if assignment.GetActorUid() != record.Actor.UID || !proto.Equal(assignment.GetActor(), actorRef(record)) {
-				return fmt.Errorf("native worker has another Actor assignment; shared teardown refused")
-			}
-		}
-		page = assignments.GetNextPageToken()
-		if page == "" {
-			return nil
-		}
-		if seen[page] {
-			return fmt.Errorf("native assignment pagination repeated a token")
-		}
-		seen[page] = true
-	}
+	return d.verifyWorkerExclusive(ctx, record, f.Name, false)
 }
 
 func (d *Lifecycle) workerAbsent(ctx context.Context, record *journalRecord) (bool, error) {
@@ -202,7 +175,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 			allAbsent = false
 			retiring := *record
 			retiring.Worker = &fences[i]
-			if err := d.drainWorker(ctx, &retiring); err != nil {
+			if err := d.verifyRetiringWorker(ctx, &retiring); err != nil {
 				return err
 			}
 		}
@@ -212,8 +185,8 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	if !allAbsent {
-		if !record.WorkerDrained {
-			record.WorkerDrained = true
+		if !record.WorkerRetiring {
+			record.WorkerRetiring = true
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
 			}
@@ -268,7 +241,9 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 				return err
 			}
 		}
-		_, err := d.control.DeleteActor(ctx, &pb.DeleteActorRequest{Actor: actorRef(record), AnyState: true})
+		// v1 deletes an Actor in every state; the UID precondition keeps a
+		// recreated Actor under the same name out of reach.
+		_, err := d.control.DeleteActor(ctx, &pb.DeleteActorRequest{Actor: actorRef(record), Options: &pb.DeleteOptions{Uid: actor.GetMetadata().GetUid()}})
 		if err != nil && status.Code(err) != codes.NotFound {
 			return err
 		}
@@ -292,23 +267,52 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 	return d.save(ctx, cm, record)
 }
 
-func snapshotDigest(snapshot *pb.ExternalSnapshot) string {
+// latestSnapshot returns the Actor's highest-generation snapshot.
+func latestSnapshot(actor *pb.Actor) *pb.Snapshot {
+	var latest *pb.Snapshot
+	for _, snapshot := range actor.GetStatus().GetSnapshots() {
+		if latest == nil || snapshot.GetGeneration() > latest.GetGeneration() {
+			latest = snapshot
+		}
+	}
+	return latest
+}
+
+// snapshotDigest pins a snapshot's immutable identity. Locality is a node
+// cache binding that detach or revert clears, so it is excluded.
+func snapshotDigest(snapshot *pb.Snapshot) string {
 	if snapshot == nil {
 		return ""
 	}
-	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(snapshot)
+	stable := proto.Clone(snapshot).(*pb.Snapshot)
+	stable.Locality = ""
+	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(stable)
 	if err != nil {
 		return ""
 	}
 	return digest(data)
 }
-func tagDigest(tag *pb.Tag) (string, error) {
-	if tag.GetMetadata().GetUid() == "" || tag.GetStatus().GetSnapshot().GetSnapshotUri() == "" || tag.GetStatus().GetSnapshot().GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || tag.GetStatus().GetSourceActorUid() == "" || tag.GetStatus().GetActorTemplateUid() == "" {
-		return "", fmt.Errorf("native Tag has no complete immutable Data provenance")
+
+// verifyDataSnapshot accepts only a completed, durable, data-only snapshot.
+func verifyDataSnapshot(snapshot *pb.Snapshot, owner pb.SnapshotOwner) error {
+	if snapshot.GetUuid() == "" || snapshot.GetGeneration() < 1 || snapshot.GetOwner() != owner || snapshot.GetFidelity() != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES || snapshot.GetDurableSnapshot().GetState() != pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED || snapshot.GetDurableSnapshot().GetObject().GetSnapshotUri() == "" {
+		return fmt.Errorf("native snapshot is not a completed durable data-only snapshot")
 	}
-	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&pb.Tag{Metadata: &pb.ResourceMetadata{Atespace: tag.GetMetadata().GetAtespace(), Name: tag.GetMetadata().GetName(), Uid: tag.GetMetadata().GetUid()}, SourceActor: tag.GetSourceActor(), Status: tag.GetStatus()})
+	return nil
+}
+
+// tagDigest pins a completed data-only Tag. v1 Tags report the template the
+// snapshot was captured under but not their source Actor UID.
+func tagDigest(tag *pb.Tag) (string, error) {
+	if tag.GetMetadata().GetUid() == "" || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || tag.GetStatus().GetActorTemplateUid() == "" || verifyDataSnapshot(tag.GetStatus().GetSnapshot(), pb.SnapshotOwner_SNAPSHOT_OWNER_TAG) != nil {
+		return "", fmt.Errorf("native Tag has no complete immutable data-only provenance")
+	}
+	status := proto.Clone(tag.GetStatus()).(*pb.TagStatus)
+	status.Snapshot.Locality = ""
+	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&pb.Tag{Metadata: &pb.ResourceMetadata{Atespace: tag.GetMetadata().GetAtespace(), Name: tag.GetMetadata().GetName(), Uid: tag.GetMetadata().GetUid()}, Scope: tag.GetScope(), SourceActor: tag.GetSourceActor(), Status: status})
 	return digest(data), err
 }
+
 func (d *Lifecycle) verifyCheckpoint(ctx context.Context, checkpoint *checkpointRecord) error {
 	if checkpoint == nil || checkpoint.Tag.UID == "" || checkpoint.Tag.Digest == "" {
 		return fmt.Errorf("native checkpoint record is incomplete")
@@ -321,7 +325,7 @@ func (d *Lifecycle) verifyCheckpoint(ctx context.Context, checkpoint *checkpoint
 	if err != nil {
 		return err
 	}
-	if tag.GetMetadata().GetUid() != checkpoint.Tag.UID || tag.GetMetadata().GetAtespace() != checkpoint.Atespace || tag.GetMetadata().GetName() != checkpoint.Tag.Name || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || tag.GetSourceActor().GetAtespace() != checkpoint.Atespace || tag.GetSourceActor().GetName() != checkpoint.SourceName || tag.GetStatus().GetSourceActorUid() != checkpoint.SourceUID || tag.GetStatus().GetActorTemplateUid() != checkpoint.Template.UID || hash != checkpoint.Tag.Digest {
+	if tag.GetMetadata().GetUid() != checkpoint.Tag.UID || tag.GetMetadata().GetAtespace() != checkpoint.Atespace || tag.GetMetadata().GetName() != checkpoint.Tag.Name || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || tag.GetSourceActor().GetAtespace() != checkpoint.Atespace || tag.GetSourceActor().GetName() != checkpoint.SourceName || checkpoint.SourceUID == "" || tag.GetStatus().GetActorTemplateUid() != checkpoint.Template.UID || checkpoint.SnapshotURI == "" || tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri() != checkpoint.SnapshotURI || hash != checkpoint.Tag.Digest {
 		return sdk.ErrStaleIdentity
 	}
 	return d.verifyTemplate(ctx, checkpoint.Atespace, checkpoint.Template)
@@ -373,7 +377,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			if err := d.reserveSuspended(ctx, record); err != nil {
 				return err
 			}
-			record.Pending = &checkpointIntent{Name: name, Tag: nativeReference{Name: name}, PriorSnapshotDigest: snapshotDigest(actor.GetStatus().GetExternalSnapshot())}
+			record.Pending = &checkpointIntent{Name: name, Tag: nativeReference{Name: name}, PriorGeneration: actor.GetStatus().GetLastAssignedGeneration(), PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
 			record.Operation = "suspend"
 			record.Observation = pendingObservation(record)
 			if err := d.save(ctx, cm, record); err != nil {
@@ -417,30 +421,27 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_CRASHED {
 		return lostInstance(record, nativeActorStopped)
 	}
-	if actor == nil || record.Worker == nil || actor.GetStatus().GetCurrentActorTemplateUid() != record.Template.UID {
+	if actor == nil || record.Worker == nil || actor.GetActorTemplate().GetName() != record.Template.Name {
 		return fmt.Errorf("native checkpoint lost its source lifetime or template")
 	}
+	// The template is immutable and pinned by UID; its snapshots are data-only.
 	if err := d.verifyTemplate(ctx, record.Atespace, record.Template); err != nil {
 		return err
-	}
-	if !record.WorkerDrained {
-		if err := d.drainWorker(ctx, record); err != nil {
-			return err
-		}
-		record.WorkerDrained = true
-		if err := d.save(ctx, cm, record); err != nil {
-			return err
-		}
 	}
 	if !operation.SuspendIssued {
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
 			return fmt.Errorf("native Actor stopped before checkpoint intent was issued")
 		}
+		if err := d.verifyRetiringWorker(ctx, record); err != nil {
+			return err
+		}
 		operation.SuspendIssued = true
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
-		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record)})
+		// Synchronous durability returns only after the snapshot is uploaded,
+		// so CreateTag copies it without changing the Actor.
+		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
 		return err
 	}
 	state := actor.GetStatus().GetState()
@@ -450,10 +451,10 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
 		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
 	}
-	snapshot := actor.GetStatus().GetExternalSnapshot()
+	snapshot := latestSnapshot(actor)
 	hash := snapshotDigest(snapshot)
-	if snapshot.GetContentScope() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || snapshot.GetSnapshotUri() == "" || hash == operation.PriorSnapshotDigest {
-		return fmt.Errorf("native suspension exposed no new complete Data snapshot")
+	if verifyDataSnapshot(snapshot, pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR) != nil || snapshot.GetActorTemplateUid() != record.Template.UID || snapshot.GetGeneration() <= operation.PriorGeneration || hash == operation.PriorSnapshotDigest {
+		return fmt.Errorf("native suspension exposed no new completed data-only snapshot under the recorded template")
 	}
 	if operation.SourceSnapshotDigest == "" {
 		operation.SourceSnapshotDigest = hash
@@ -496,11 +497,11 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	} else if operation.Tag.UID != tag.GetMetadata().GetUid() {
 		return sdk.ErrStaleIdentity
 	}
-	if tag.GetStatus().GetSnapshot() == nil {
+	if tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState() != pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
 		return nil
 	}
-	if tag.GetStatus().GetSourceActorUid() != record.Actor.UID || tag.GetStatus().GetActorTemplateUid() != record.Template.UID {
-		return fmt.Errorf("native Tag has incorrect source provenance")
+	if tag.GetStatus().GetActorTemplateUid() != record.Template.UID {
+		return fmt.Errorf("native Tag has incorrect template provenance")
 	}
 	tagHash, err := tagDigest(tag)
 	if err != nil {
@@ -510,11 +511,13 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if err != nil {
 		return err
 	}
-	if current == nil || current.GetMetadata().GetVersion() != operation.SourceVersion || current.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED || snapshotDigest(current.GetStatus().GetExternalSnapshot()) != operation.SourceSnapshotDigest {
+	// Before/after fence: the same Actor UID at the same version still holds
+	// the same snapshot, so the Tag copied exactly this capture.
+	if current == nil || current.GetMetadata().GetUid() != record.Actor.UID || current.GetMetadata().GetVersion() != operation.SourceVersion || current.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED || snapshotDigest(latestSnapshot(current)) != operation.SourceSnapshotDigest {
 		return fmt.Errorf("native source changed during immutable Tag copy")
 	}
 	operation.Tag.Digest = tagHash
-	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, CreatedAt: metav1.Now()}
+	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Now()}
 	reference, err := d.registerCheckpoint(ctx, record, checkpoint)
 	if err != nil {
 		return err
@@ -634,7 +637,7 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		if tag.GetMetadata().GetUid() != checkpoint.Tag.UID {
 			return false, sdk.ErrStaleIdentity
 		}
-		if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Tag.Name}}); err != nil && status.Code(err) != codes.NotFound {
+		if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Tag.Name}, Options: &pb.DeleteOptions{Uid: checkpoint.Tag.UID}}); err != nil && status.Code(err) != codes.NotFound {
 			return false, err
 		}
 		return false, nil
@@ -657,7 +660,7 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 			if tag.GetMetadata().GetUid() != record.Pending.Tag.UID {
 				return false, sdk.ErrStaleIdentity
 			}
-			if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: record.Atespace, Name: record.Pending.Name}}); err != nil {
+			if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: record.Atespace, Name: record.Pending.Name}, Options: &pb.DeleteOptions{Uid: record.Pending.Tag.UID}}); err != nil {
 				return false, err
 			}
 			return false, nil
@@ -703,7 +706,7 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 				if template.GetMetadata().GetUid() != record.Template.UID {
 					return false, sdk.ErrStaleIdentity
 				}
-				if _, err := d.control.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name}}); err != nil {
+				if _, err := d.control.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name}, Options: &pb.DeleteOptions{Uid: record.Template.UID}}); err != nil {
 					return false, err
 				}
 				return false, nil
@@ -713,7 +716,7 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 	for _, entry := range []struct {
 		ref    *nativeReference
 		object client.Object
-	}{{&record.NetworkPolicy, &networkingv1.NetworkPolicy{}}, {&record.Anchor, &corev1.ConfigMap{}}} {
+	}{{&record.Anchor, &corev1.ConfigMap{}}} {
 		if !entry.ref.CreateIssued {
 			continue
 		}
@@ -732,10 +735,6 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		}
 		if entry.ref.UID == "" {
 			switch object := entry.object.(type) {
-			case *networkingv1.NetworkPolicy:
-				if !reflect.DeepEqual(object.OwnerReferences, []metav1.OwnerReference{anchorOwner(record)}) || !apiequality.Semantic.DeepEqual(sdk.NormalizedNetworkPolicySpec(object.Spec), nativeNetworkPolicy(record)) {
-					return false, sdk.ErrStaleIdentity
-				}
 			case *corev1.ConfigMap:
 				expected := map[string]string{"journalName": cm.Name, "journalNamespace": cm.Namespace, "journalUID": string(cm.UID)}
 				if !reflect.DeepEqual(object.Data, expected) || len(object.BinaryData) != 0 || len(object.OwnerReferences) != 0 {

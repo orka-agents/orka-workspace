@@ -148,3 +148,17 @@ func TestLegacyUnadvertisedSandboxFeatureWithdrawsStartupButStillCleansUp(t *tes
 	}
 	t.Fatal("unsupported legacy feature blocked exact delete")
 }
+
+func TestSandboxRejectsEgressAllowlistBeforeEffects(t *testing.T) {
+	c, request := fixture(t, false)
+	request.Runtime.NetworkPolicy = nil
+	request.Runtime.Egress = &workspacev1alpha1.RuntimeEgressPolicy{}
+	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
+	if err := admit(t, c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := New(c).EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), "required feature") || observed.Startup != nil {
+		t.Fatalf("egress allowlist request produced allocation without NetworkPolicy isolation: %+v, %v", observed, err)
+	}
+	requireNoSandboxAllocation(t, c, request)
+}

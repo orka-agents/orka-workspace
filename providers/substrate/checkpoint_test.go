@@ -49,7 +49,7 @@ func newCheckpoint(t *testing.T, c client.Client, request sdk.WorkloadRequest, r
 	return cp
 }
 func checkpointController(c client.Client, native *nativeFixture) *CheckpointReconciler {
-	return &CheckpointReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	return &CheckpointReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 }
 func exportReady(t *testing.T, c client.Client, native *nativeFixture, cp *api.ExecutionWorkspaceCheckpoint) *api.ExecutionWorkspaceCheckpoint {
 	t.Helper()
@@ -235,7 +235,7 @@ func TestCheckpointImportRejectsChangedPublicOrNativeIdentityBeforeBoot(t *testi
 				}
 			case "fullMemory":
 				for _, tag := range native.tags {
-					tag.Status.Snapshot.ContentScope = pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL
+					tag.Status.Snapshot.Fidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
 				}
 			case "templateUID":
 				for key, template := range native.templates {
@@ -247,7 +247,7 @@ func TestCheckpointImportRejectsChangedPublicOrNativeIdentityBeforeBoot(t *testi
 				request.Runtime.Template.Spec.Containers[0].Image = "fixture.invalid/changed@sha256:" + strings.Repeat("1", 64)
 			case "workerPoolUID":
 				pool := &unstructured.Unstructured{}
-				pool.SetAPIVersion("ate.dev/v1alpha1")
+				pool.SetAPIVersion("ate.dev/v1")
 				pool.SetKind("WorkerPool")
 				if err := c.Get(t.Context(), types.NamespacedName{Namespace: "native-workers", Name: "native-workers"}, pool); err != nil {
 					t.Fatal(err)
@@ -397,13 +397,13 @@ func TestNativeWorkerSelectorsDoNotUnionAcrossSharedPool(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		selector := nativeNetworkPolicy(record).PodSelector.MatchLabels
+		selector := record.TemplateSpec.GetWorkerSelector().GetMatchLabels()
 		pod := &corev1.Pod{}
 		if err := c.Get(t.Context(), types.NamespacedName{Namespace: record.Worker.Namespace, Name: record.Worker.Pod}, pod); err != nil {
 			t.Fatal(err)
 		}
 		if selector[workerAllocationLabel] != item.identity.AllocationID || selector[workerInstanceLabel] != item.identity.InstanceID || pod.Labels[workerInstanceLabel] != item.identity.InstanceID || selector[workerInstanceLabel] == item.foreign.InstanceID || selector[workerPoolLabel] != "" {
-			t.Fatal("worker egress selectors include another instance in the shared WorkerPool")
+			t.Fatal("worker selectors include another instance in the shared WorkerPool")
 		}
 	}
 }
@@ -427,7 +427,8 @@ func TestNativeWorkerForeignLabelsAndCapacityBlockReadinessAndTeardown(t *testin
 					t.Fatal(err)
 				}
 			} else {
-				native.workers[record.Worker.Name].Status.Capacity.Actors = 2
+				// A larger worker could host a second template-sized Actor.
+				native.workers[record.Worker.Name].Status.Capacity.MemoryBytes *= 2
 			}
 			if _, err := driver(c, native).Observe(t.Context(), request.Key); err == nil {
 				t.Fatal("changed worker ownership or capacity reported Ready")

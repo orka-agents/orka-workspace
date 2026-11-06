@@ -67,6 +67,11 @@ func validateRequiredFeatures(request workspaceprovider.WorkloadRequest) error {
 	if request.Runtime == nil {
 		return nil
 	}
+	// Sandbox Pods enforce egress only through a Kubernetes NetworkPolicy;
+	// running a host-name allowlist request would drop the requested isolation.
+	if request.Runtime.Egress != nil {
+		return fmt.Errorf("Sandbox does not support required feature %q", workspacev1alpha1.WorkspaceFeatureEgressAllowlist)
+	}
 	for _, feature := range request.Runtime.RequiredFeatures {
 		switch feature {
 		case workspacev1alpha1.WorkspaceFeatureACPRuntime, workspacev1alpha1.WorkspaceFeatureSuspend:

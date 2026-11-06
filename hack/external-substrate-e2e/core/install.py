@@ -33,7 +33,28 @@ for obj in objects:
                            "resources": ["substrateproviderconfigs", "substrateworkspaceprofiles"],
                            "verbs": ["get", "list", "watch"]}
     if obj["kind"] == "Deployment":
-        obj["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = "IfNotPresent"
+        pod_spec = obj["spec"]["template"]["spec"]
+        manager = pod_spec["containers"][0]
+        manager["imagePullPolicy"] = "IfNotPresent"
+        # Core reaches routed native runtimes only through atenet-router with
+        # its allowlisted pod certificate (install-backend.sh) and verifies the
+        # router against the Substrate service trust bundle.
+        manager.setdefault("args", []).extend([
+            "--substrate-api-cert-file=/run/substrate-client/credential-bundle.pem",
+            "--substrate-api-key-file=/run/substrate-client/credential-bundle.pem",
+            "--substrate-api-ca-file=/run/substrate-server/trust-bundle.pem",
+            "--substrate-router-url=https://atenet-router.ate-system.svc:443"])
+        manager.setdefault("volumeMounts", []).extend([
+            {"name": "substrate-client", "mountPath": "/run/substrate-client", "readOnly": True},
+            {"name": "substrate-server", "mountPath": "/run/substrate-server", "readOnly": True}])
+        pod_spec.setdefault("volumes", []).extend([
+            {"name": "substrate-client", "projected": {"sources": [{"podCertificate": {
+                "signerName": "podidentity.podcert.ate.dev/identity", "keyType": "ECDSAP256",
+                "credentialBundlePath": "credential-bundle.pem"}}]}},
+            {"name": "substrate-server", "projected": {"sources": [{"clusterTrustBundle": {
+                "signerName": "servicedns.podcert.ate.dev/identity",
+                "labelSelector": {"matchLabels": {"podcert.ate.dev/canarying": "live"}},
+                "path": "trust-bundle.pem"}}]}}])
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
@@ -49,7 +70,9 @@ def add(version, kind, name, ns=None, **fields):
     return value
 
 
-add("v1", "ServiceAccount", "native-core-proof", namespace)
+# The proof Job runs in the fixed client namespace whose pod-certificate
+# identity install-backend.sh made a bootstrap owner and router client.
+client_namespace = "external-substrate-e2e"
 add("rbac.authorization.k8s.io/v1", "Role", "native-core-proof", namespace, rules=[
     {"apiGroups": ["core.orka.ai"], "resources": ["agents", "tasks"], "verbs": ["create", "get"]},
     {"apiGroups": ["core.orka.ai"], "resources": ["runtimepools"], "verbs": ["get", "list"]},
@@ -57,20 +80,22 @@ add("rbac.authorization.k8s.io/v1", "Role", "native-core-proof", namespace, rule
     {"apiGroups": ["workspace.orka.ai"], "resources": ["executionworkspaces"], "verbs": ["get", "list"]},
     {"apiGroups": ["substrate.workspace.orka.ai"], "resources": ["substrateworkspaceprofiles"], "verbs": ["create", "get"]},
     {"apiGroups": ["ate.dev"], "resources": ["workerpools"], "verbs": ["get", "list"]},
-    {"apiGroups": [""], "resources": ["pods", "secrets"], "verbs": ["get", "list"]},
-    {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["get", "list"]}])
+    {"apiGroups": [""], "resources": ["pods", "secrets"], "verbs": ["get", "list"]}])
 add("rbac.authorization.k8s.io/v1", "RoleBinding", "native-core-proof", namespace,
     roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "native-core-proof"},
-    subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": namespace}])
-add("rbac.authorization.k8s.io/v1", "ClusterRole", namespace, rules=[
+    subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": client_namespace}])
+# The fixed namespace also names the manager's cluster-scoped RBAC, so the
+# proof's cluster-scoped objects need their own names.
+proof_cluster_rbac = namespace + "-proof"
+add("rbac.authorization.k8s.io/v1", "ClusterRole", proof_cluster_rbac, rules=[
     {"apiGroups": ["workspace.orka.ai"], "resources": ["executionworkspaceproviders"], "resourceNames": ["substrate"], "verbs": ["get"]}])
-add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", namespace,
-    roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": namespace},
-    subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": namespace}])
-add("ate.dev/v1alpha1", "WorkerPool", "native-core", namespace, spec={
-    "replicas": 1, "workerImage": worker_image,
-    "template": {"resources": {"requests": {"cpu": "250m", "memory": "512Mi"},
-                               "limits": {"cpu": "4", "memory": "8Gi"}}}})["metadata"]["labels"] = {"orka.workspace.e2e/pool": namespace}
+add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", proof_cluster_rbac,
+    roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": proof_cluster_rbac},
+    subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": client_namespace}])
+# Operator source pool: it runs no workers; the provider sizes each private copy.
+add("ate.dev/v1", "WorkerPool", "native-core", namespace, spec={
+    "replicas": 0, "workerImage": worker_image,
+    "sandboxClasses": [{"name": "gvisor"}]})["metadata"]["labels"] = {"orka.workspace.e2e/pool": namespace}
 
 client_volume = {"name": "native-client", "projected": {"sources": [{"podCertificate": {
     "signerName": "podidentity.podcert.ate.dev/identity", "keyType": "ECDSAP256", "credentialBundlePath": "credential-bundle.pem"}}]}}
@@ -81,7 +106,7 @@ mounts = [{"name": "native-client", "mountPath": "/native/client", "readOnly": T
 
 # This Job uses the Kubernetes public APIs and native read-only observations.
 # It never invokes the provider lifecycle/reconciler or writes workspace status.
-add("batch/v1", "Job", "native-core-proof", namespace, spec={"backoffLimit": 0, "activeDeadlineSeconds": 900,
+add("batch/v1", "Job", namespace, client_namespace, spec={"backoffLimit": 0, "activeDeadlineSeconds": 900,
     "template": {"metadata": {"labels": {"orka.workspace.e2e/proof": "native-core"}}, "spec": {
         "serviceAccountName": "native-core-proof", "restartPolicy": "Never",
         "securityContext": {"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532},
@@ -104,17 +129,23 @@ for obj in provider_objects:
     if obj["kind"] == "SubstrateWorkspaceProfile":
         continue
     if obj["kind"] == "Deployment":
+        # The shipped transport is kept: a projected ServiceAccount token for
+        # ate-api (least-privilege access policies) and a pod certificate for
+        # atenet-router (ingress allowlist).
         spec = obj["spec"]["template"]["spec"]
         spec["securityContext"].update({"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532})
-        spec["volumes"] = [client_volume, server_volume]
         container = spec["containers"][0]
         container["image"], container["imagePullPolicy"] = provider_image, "IfNotPresent"
-        container["volumeMounts"] = mounts
-        container["args"] = [value for value in container["args"] if not value.startswith(("--native-ca-file=", "--native-token-file=", "--native-direct-egress="))]
-        container["args"] += ["--native-ca-file=/native/server/trust-bundle.pem",
-                              "--native-cert-file=/native/client/credential-bundle.pem",
-                              "--native-key-file=/native/client/credential-bundle.pem",
-                              "--native-direct-egress=true"]
     objects.append(obj)
+
+# Applying a List silently replaces an earlier object with a later same-identity
+# one; fail rendering instead of overwriting another component's permissions.
+identities = set()
+for obj in objects:
+    identity = (obj["apiVersion"].split("/")[0] if "/" in obj["apiVersion"] else "", obj["kind"],
+                obj["metadata"].get("namespace", ""), obj["metadata"]["name"])
+    if identity in identities:
+        sys.exit("duplicate rendered object %s" % "/".join(part for part in identity if part))
+    identities.add(identity)
 
 json.dump({"apiVersion": "v1", "kind": "List", "items": objects}, sys.stdout, indent=2)
