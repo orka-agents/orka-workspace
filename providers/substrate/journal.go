@@ -127,9 +127,14 @@ type journalRecord struct {
 	Pending             *checkpointIntent `json:"pending,omitempty"`
 	Checkpoint          *checkpointRecord `json:"checkpoint,omitempty"`
 	InheritedCheckpoint *checkpointRecord `json:"inheritedCheckpoint,omitempty"`
-	CheckpointCatalog   *catalogReference `json:"checkpointCatalog,omitempty"`
-	InheritedCatalog    *catalogReference `json:"inheritedCatalog,omitempty"`
-	DeleteIssued        bool              `json:"deleteIssued,omitempty"`
+	// RestoreRuntime is the sandbox runtime stamped on the Actor's worker
+	// assignment during this instance's single boot. It is the only evidence
+	// of which runtime performed a restore: a CRASHED Actor has no assignment,
+	// and a Worker's default runtime can change without a new epoch.
+	RestoreRuntime    *sandboxRuntimeStamp `json:"restoreRuntime,omitempty"`
+	CheckpointCatalog *catalogReference    `json:"checkpointCatalog,omitempty"`
+	InheritedCatalog  *catalogReference    `json:"inheritedCatalog,omitempty"`
+	DeleteIssued      bool                 `json:"deleteIssued,omitempty"`
 	// StartedAt bounds creation and boot until first process evidence.
 	StartedAt metav1.Time `json:"startedAt,omitempty"`
 	// Failure records an exact-instance loss. The instance never restarts;

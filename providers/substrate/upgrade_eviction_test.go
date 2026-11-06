@@ -301,6 +301,50 @@ func TestRestoreCrashOnARestartedWorkerIsNotClassifiedByItsNewRuntime(t *testing
 	}
 }
 
+func restoreCrashCondition(t *testing.T, c client.Client, native *nativeFixture, next sdk.WorkloadRequest) *metav1.Condition {
+	t.Helper()
+	var workspace *api.ExecutionWorkspace
+	for range 12 {
+		workspace = reconcileFailureFixture(t, c, native, next)
+		if workspace.Status.State == api.ExecutionWorkspaceStateFailed {
+			break
+		}
+	}
+	provisioned := sdk.FindCondition(workspace.Status.Conditions, string(api.ConditionWorkspaceProvisioned))
+	if workspace.Status.State != api.ExecutionWorkspaceStateFailed || provisioned == nil {
+		t.Fatalf("crashed restore reported %s %+v", workspace.Status.State, provisioned)
+	}
+	return provisioned
+}
+
+// SetWorkerSandboxRuntimes may replace a Worker's default runtime within one
+// registration epoch, so a later default says nothing about the runtime that
+// performed the restore.
+func TestRestoreCrashIgnoresASameEpochDefaultRuntimeChange(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	native.crashOnResume = true
+	native.afterCrash = func(worker *pb.Worker) {
+		worker.Status.SandboxClasses[0].DefaultRuntime.Version = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
+	}
+	if provisioned := restoreCrashCondition(t, c, native, next); provisioned.Reason != instanceFailedReason {
+		t.Fatalf("same-runtime restore crash after a same-epoch default change = %+v; want %s", provisioned, instanceFailedReason)
+	}
+}
+
+// Without an assignment observed for the restore, the runtime is unknown and
+// the crash is not classified, even if the Worker now runs another runtime.
+func TestRestoreCrashWithoutRestoreEvidenceIsNotClassified(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	native.runtime = &pb.VersionedSandboxCompat{SchemaVersion: "v1", Attributes: []*pb.AttributeEntry{{Key: "sandbox_bundle_hash", Value: "runsc-release-2"}}}
+	native.crashOnResume = true
+	native.crashBeforeAssignment = true
+	if provisioned := restoreCrashCondition(t, c, native, next); provisioned.Reason != instanceFailedReason {
+		t.Fatalf("restore crash without restore evidence = %+v; want %s", provisioned, instanceFailedReason)
+	}
+}
+
 func TestRestoreCrashUnderAnotherSandboxRuntimeIsClassified(t *testing.T) {
 	for _, upgraded := range []bool{true, false} {
 		name := "same runtime"

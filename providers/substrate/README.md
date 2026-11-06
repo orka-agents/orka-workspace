@@ -316,10 +316,14 @@ A retried capture whose catalog was published before stamping keeps that
 unstamped record; its Tag digest already pins the snapshot.
 Agent Substrate runs every gVisor restore without memory under the worker's
 default `runsc` and does not check cross-version compatibility. When a restore
-crashes before its supervisor boots and the worker's runtime differs from the
-checkpoint's, the failure is recorded with the distinct `Provisioned` reason
-`SandboxRuntimeRestoreFailed` instead of `InstanceFailed`; the checkpoint stays
-available to explicit recovery and nothing is replayed. Explicit core Retirement.Suspend is honored
+crashes before its supervisor boots and the runtime stamped on the Actor's
+worker assignment during that boot differs from the checkpoint's, the failure is
+recorded with the distinct `Provisioned` reason `SandboxRuntimeRestoreFailed`
+instead of `InstanceFailed`; the checkpoint stays available to explicit recovery
+and nothing is replayed. The provider journals that assignment stamp when it
+first observes it and never infers the runtime from the Worker's current
+default, which can change within a registration epoch; without the stamp the
+crash is reported as `InstanceFailed`. Explicit core Retirement.Suspend is honored
 also while desiredState remains Ready during epoch rotation.
 Actor creation intent is also journaled before its RPC. An issued create recovers
 only by observing the Actor; absence without a recorded UID blocks allocation

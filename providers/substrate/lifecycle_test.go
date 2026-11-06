@@ -51,6 +51,8 @@ type nativeFixture struct {
 	// crashOnResume crashes the next resumed Actor before its process boots.
 	crashOnResume bool
 	afterCrash    func(*pb.Worker)
+	// crashBeforeAssignment returns the crashed Actor from Resume itself.
+	crashBeforeAssignment bool
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -231,17 +233,22 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_RUNNING
 	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}
+	// The Resume response carries the assignment; a crash surfaces on a
+	// later read, when the native protocol has released the assignment.
+	response := proto.Clone(v).(*pb.Actor)
 	if f.crashOnResume {
 		f.crashOnResume = false
 		v.Status.State = pb.ActorState_ACTOR_STATE_CRASHED
-		// The native protocol leaves a CRASHED Actor without a worker
-		// assignment, so the crash must be classified from the Worker.
 		f.releaseWorker(v)
 		if f.afterCrash != nil {
 			f.afterCrash(w)
 		}
+		if f.crashBeforeAssignment {
+			// The restore died before any assignment was reported.
+			response = proto.Clone(v).(*pb.Actor)
+		}
 	}
-	return &pb.ResumeActorResponse{Actor: proto.Clone(v).(*pb.Actor), Resumed: true}, f.effect("resume")
+	return &pb.ResumeActorResponse{Actor: response, Resumed: true}, f.effect("resume")
 }
 func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	if w := f.workers[v.Status.GetWorkerAssignment().GetWorker().GetName()]; w != nil {

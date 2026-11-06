@@ -7,6 +7,7 @@ import (
 
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	"google.golang.org/protobuf/proto"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // sandboxRuntimeStamp is the immutable runtime provenance of a data
@@ -59,31 +60,40 @@ func (s *sandboxRuntimeStamp) String() string {
 // filesystem checkpoint.
 const nativeRestoreRuntimeMismatchPrefix = "the native data restore crashed under a different sandbox runtime"
 
-// restoreRuntimeMismatch classifies a crashed restore. It returns the failure
-// to record, or "" when the runtimes match or either is unknown.
-func (d *Lifecycle) restoreRuntimeMismatch(ctx context.Context, record *journalRecord, actor *pb.Actor) string {
+// recordRestoreRuntime saves the runtime stamped on the Actor's worker
+// assignment the first time this restore is observed with one. It reports
+// whether it saved the record.
+func (d *Lifecycle) recordRestoreRuntime(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (bool, error) {
+	if record.InheritedCheckpoint == nil || record.RestoreRuntime != nil {
+		return false, nil
+	}
+	assigned := actor.GetStatus().GetWorkerAssignment().GetSandboxRuntime()
+	if assigned == nil {
+		return false, nil
+	}
+	stamp, err := stampSandboxRuntime(assigned.GetSandboxClass(), assigned.GetVersion())
+	if err != nil || stamp == nil {
+		// An unreadable stamp is no evidence; the runtime stays unknown.
+		return false, nil
+	}
+	record.RestoreRuntime = stamp
+	return true, d.save(ctx, cm, record)
+}
+
+// restoreRuntimeMismatch classifies a crashed restore from evidence of the
+// restore attempt itself: the Actor's current assignment, or the assignment
+// recorded while it booted. It never consults the Worker's current default
+// runtime, which can change within a registration epoch. It returns the
+// failure to record, or "" when the runtimes match or either is unknown.
+func (d *Lifecycle) restoreRuntimeMismatch(record *journalRecord, actor *pb.Actor) string {
 	if record.InheritedCheckpoint == nil || record.InheritedCheckpoint.SandboxRuntime == nil || record.ChallengeSHA256 != "" {
 		return ""
 	}
 	want := record.InheritedCheckpoint.SandboxRuntime
-	var got *sandboxRuntimeStamp
+	got := record.RestoreRuntime
 	if assigned := actor.GetStatus().GetWorkerAssignment().GetSandboxRuntime(); assigned != nil {
-		got, _ = stampSandboxRuntime(assigned.GetSandboxClass(), assigned.GetVersion())
-	}
-	if got == nil && record.Worker != nil && record.Worker.Epoch != 0 {
-		// A CRASHED Actor has no worker assignment, so read the runtime from
-		// the Worker that restored it. A restarted worker process keeps its
-		// UID but registers a new epoch and may run another runtime, so only
-		// the exact registration that performed the restore is trusted;
-		// otherwise the runtime is unknown.
-		worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: record.Worker.Name}})
-		if err == nil && worker.GetMetadata().GetUid() == record.Worker.UID &&
-			worker.GetStatus().GetRegisteredEpoch() == record.Worker.Epoch {
-			for _, class := range worker.GetStatus().GetSandboxClasses() {
-				if class.GetSandboxClass() == want.Class {
-					got, _ = stampSandboxRuntime(class.GetSandboxClass(), class.GetDefaultRuntime().GetVersion())
-				}
-			}
+		if current, _ := stampSandboxRuntime(assigned.GetSandboxClass(), assigned.GetVersion()); current != nil {
+			got = current
 		}
 	}
 	if got == nil || *got == *want {
