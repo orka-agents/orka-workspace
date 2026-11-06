@@ -3,6 +3,7 @@ package substrate
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -110,6 +111,9 @@ func (d *Lifecycle) importCheckpoint(ctx context.Context, cm *corev1.ConfigMap, 
 	transition, err := dataResumeRuntimePool(artifact.RuntimePoolSpec, record.RuntimePoolSpec, metav1.Now())
 	if err != nil {
 		return fmt.Errorf("checkpoint restore changed worker infrastructure: %w", err)
+	}
+	if !maps.Equal(artifact.RuntimePoolOperatorLabels, operatorPoolLabels(record)) {
+		return fmt.Errorf("checkpoint restore changed the operator worker pool labels")
 	}
 	if err := d.acquireCatalog(ctx, record.Request.Key.Namespace, reference, publicOwner, owner); err != nil {
 		return err

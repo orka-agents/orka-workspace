@@ -137,7 +137,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 				if err != nil {
 					return err
 				}
-				if transition != nil && !maps.Equal(operatorPoolLabels(record), operatorPoolLabels(fresh)) {
+				// The operator pool's own labels are immutable for a data-only
+				// resume, whether or not the worker image moved.
+				if !maps.Equal(operatorPoolLabels(record), operatorPoolLabels(fresh)) {
 					return fmt.Errorf("native resume changed the operator worker pool labels")
 				}
 				if fresh.WorkerImageProvenance, err = inheritWorkerImageProvenance(record.WorkerImageProvenance, transition); err != nil {

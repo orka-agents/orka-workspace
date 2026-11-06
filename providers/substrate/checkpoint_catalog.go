@@ -37,18 +37,21 @@ const (
 // Owners are exact Kubernetes object lifetimes. A false entry is a release
 // tombstone; it keeps cleanup evidence until that object's finalization ends.
 type checkpointArtifact struct {
-	Version         string                      `json:"version"`
-	Digest          string                      `json:"digest"`
-	Checkpoint      checkpointRecord            `json:"checkpoint"`
-	TemplateSpec    *pb.ActorTemplate           `json:"templateSpec"`
-	RuntimePoolSpec json.RawMessage             `json:"runtimePoolSpec"`
-	Placement       api.PodReference            `json:"placement"`
-	SourceWorkspace api.ObjectIdentityReference `json:"sourceWorkspace"`
-	ClassBinding    api.ImmutableObjectBinding  `json:"classBinding"`
-	ProviderBinding api.ImmutableObjectBinding  `json:"providerBinding"`
-	Owners          map[string]bool             `json:"owners"`
-	Deleting        bool                        `json:"deleting,omitempty"`
-	Collected       bool                        `json:"collected,omitempty"`
+	Version         string            `json:"version"`
+	Digest          string            `json:"digest"`
+	Checkpoint      checkpointRecord  `json:"checkpoint"`
+	TemplateSpec    *pb.ActorTemplate `json:"templateSpec"`
+	RuntimePoolSpec json.RawMessage   `json:"runtimePoolSpec"`
+	// RuntimePoolOperatorLabels are the operator WorkerPool's own labels the
+	// checkpoint was taken under; a restore requires them unchanged.
+	RuntimePoolOperatorLabels map[string]string           `json:"runtimePoolOperatorLabels,omitempty"`
+	Placement                 api.PodReference            `json:"placement"`
+	SourceWorkspace           api.ObjectIdentityReference `json:"sourceWorkspace"`
+	ClassBinding              api.ImmutableObjectBinding  `json:"classBinding"`
+	ProviderBinding           api.ImmutableObjectBinding  `json:"providerBinding"`
+	Owners                    map[string]bool             `json:"owners"`
+	Deleting                  bool                        `json:"deleting,omitempty"`
+	Collected                 bool                        `json:"collected,omitempty"`
 }
 
 // This index is named from the public object's UID, never from its name or
@@ -180,6 +183,12 @@ func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecor
 			// Recover the first completion time after a catalog write whose
 			// journal write or API response was lost.
 			checkpoint.CreatedAt = artifact.Checkpoint.CreatedAt
+			// A catalog written before runtime stamping keeps its published,
+			// unstamped record: its Tag digest already pins the snapshot, and
+			// an unstamped checkpoint only forgoes cross-runtime classification.
+			if artifact.Checkpoint.SandboxRuntime == nil {
+				checkpoint.SandboxRuntime = nil
+			}
 			if artifact.Deleting || cm.DeletionTimestamp != nil || !reflect.DeepEqual(*checkpoint, artifact.Checkpoint) || artifact.ClassBinding != workspace.Spec.ClassBinding || artifact.ProviderBinding != workspace.Spec.ProviderBinding || !artifact.Owners[owner] || !proto.Equal(artifact.TemplateSpec, record.TemplateSpec) || !compatibleRuntimePool(artifact.RuntimePoolSpec, record.RuntimePoolSpec) {
 				return sdk.ErrRequestConflict
 			}
@@ -190,7 +199,7 @@ func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecor
 		if err != nil {
 			return err
 		}
-		artifact = &checkpointArtifact{Version: catalogVersion, Digest: hash, Checkpoint: *checkpoint, TemplateSpec: proto.Clone(record.TemplateSpec).(*pb.ActorTemplate), RuntimePoolSpec: append(json.RawMessage(nil), record.RuntimePoolSpec...), Placement: record.Placement, SourceWorkspace: api.ObjectIdentityReference{Name: workspace.Name, UID: workspace.UID}, ClassBinding: workspace.Spec.ClassBinding, ProviderBinding: workspace.Spec.ProviderBinding, Owners: map[string]bool{owner: true}}
+		artifact = &checkpointArtifact{Version: catalogVersion, Digest: hash, Checkpoint: *checkpoint, TemplateSpec: proto.Clone(record.TemplateSpec).(*pb.ActorTemplate), RuntimePoolSpec: append(json.RawMessage(nil), record.RuntimePoolSpec...), RuntimePoolOperatorLabels: operatorPoolLabels(record), Placement: record.Placement, SourceWorkspace: api.ObjectIdentityReference{Name: workspace.Name, UID: workspace.UID}, ClassBinding: workspace.Spec.ClassBinding, ProviderBinding: workspace.Spec.ProviderBinding, Owners: map[string]bool{owner: true}}
 		cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
 		if err := d.saveCatalog(ctx, cm, artifact); err != nil {
 			if apierrors.IsAlreadyExists(err) {

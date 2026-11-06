@@ -90,9 +90,16 @@ func TestPrivatePoolPinsTheOperatorPoolResolvedSandboxConfig(t *testing.T) {
 }
 
 func TestOperatorSandboxConfigMustBeResolvedAndStable(t *testing.T) {
+	const generation = 3
 	status := func(entry map[string]any) map[string]any {
 		return map[string]any{"sandboxClasses": []any{entry}}
 	}
+	resolution := func(config, state string, observed int64) map[string]any {
+		entry := resolvedSandboxClassStatus(config)
+		entry["conditions"] = []any{map[string]any{"type": "Resolved", "status": state, "reason": "Resolved", "observedGeneration": observed}}
+		return entry
+	}
+	resolved := func(config string) map[string]any { return resolution(config, "True", generation) }
 	for _, test := range []struct {
 		name    string
 		class   map[string]any
@@ -100,17 +107,24 @@ func TestOperatorSandboxConfigMustBeResolvedAndStable(t *testing.T) {
 		want    string
 		wantErr string
 	}{
-		{name: "class default resolved", class: map[string]any{"name": "gvisor"}, status: status(map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}), want: "gvisor-1"},
-		{name: "declared and resolved", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}, status: status(map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}), want: "gvisor-1"},
-		{name: "declared before first resolution", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}, want: "gvisor-1"},
+		{name: "class default resolved", class: map[string]any{"name": "gvisor"}, status: status(resolved("gvisor-1")), want: "gvisor-1"},
+		{name: "declared and resolved", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}, status: status(resolved("gvisor-1")), want: "gvisor-1"},
+		{name: "declared before first resolution", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}, wantErr: "has not resolved"},
 		{name: "unresolved class default", class: map[string]any{"name": "gvisor"}, wantErr: "has not resolved"},
+		// Agent Substrate keeps the last resolved configRef while the class
+		// does not resolve, e.g. a removed default or a deleting config.
+		{name: "kept after resolution failed", class: map[string]any{"name": "gvisor"}, status: status(resolution("gvisor-1", "False", generation)), wantErr: "has not resolved"},
+		{name: "declared kept after resolution failed", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}, status: status(resolution("gvisor-1", "False", generation)), wantErr: "has not resolved"},
+		{name: "resolution of an older generation", class: map[string]any{"name": "gvisor"}, status: status(resolution("gvisor-1", "True", generation-1)), wantErr: "has not resolved"},
+		{name: "no resolution condition", class: map[string]any{"name": "gvisor"}, status: status(map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}), wantErr: "has not resolved"},
 		{name: "switching", class: map[string]any{"name": "gvisor"}, status: status(map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}, "pendingConfigRef": map[string]any{"name": "gvisor-2"}}), wantErr: "switching"},
-		{name: "declared differs from resolved", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-2"}}, status: status(map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1"}}), wantErr: "switching"},
+		{name: "declared differs from resolved", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-2"}}, status: status(resolved("gvisor-1")), wantErr: "switching"},
 		{name: "malformed reference", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-1", "namespace": "x"}}, wantErr: "exactly one SandboxConfig"},
 		{name: "empty reference", class: map[string]any{"name": "gvisor", "configRef": map[string]any{"name": ""}}, wantErr: "exactly one SandboxConfig"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			source := poolObject()
+			source.SetGeneration(generation)
 			if test.status != nil {
 				source.Object["status"] = test.status
 			}
@@ -179,7 +193,7 @@ func TestDataOnlyResumeOntoNewWorkerImageFailsClosed(t *testing.T) {
 			if err := setSourceWorkerImage(pinnedWorkerImageB)(pool); err != nil {
 				return err
 			}
-			return unstructured.SetNestedSlice(pool.Object, []any{map[string]any{"name": "gvisor", "configRef": map[string]any{"name": "gvisor-next"}}}, "status", "sandboxClasses")
+			return unstructured.SetNestedSlice(pool.Object, []any{resolvedSandboxClassStatus("gvisor-next")}, "status", "sandboxClasses")
 		}},
 		{name: "image and operator labels", mutate: func(pool *unstructured.Unstructured) error {
 			if err := setSourceWorkerImage(pinnedWorkerImageB)(pool); err != nil {
@@ -390,5 +404,123 @@ func TestCheckpointRestoreFollowsDigestPinnedOperatorWorkerImage(t *testing.T) {
 				t.Fatalf("restore worker image provenance = %#v", record.WorkerImageProvenance)
 			}
 		})
+	}
+}
+
+func setSourceOperatorLabel(pool *unstructured.Unstructured) error {
+	labels := pool.GetLabels()
+	labels["operator.example/tier"] = "changed"
+	pool.SetLabels(labels)
+	return nil
+}
+
+// The operator pool's own labels are immutable for a data-only resume even
+// when its worker image is unchanged.
+func TestDataOnlyResumeRejectsChangedOperatorPoolLabels(t *testing.T) {
+	c, native, request := fixture(t, true)
+	next := suspendedSuccessor(t, c, native, request)
+	mutateSourcePool(t, c, setSourceOperatorLabel)
+	if _, err := driver(c, native).EnsureAllocation(t.Context(), next); err == nil || !strings.Contains(err.Error(), "operator worker pool labels") {
+		t.Fatalf("data-only resume accepted changed operator pool labels: %v", err)
+	}
+	if native.boots != 1 || len(native.actors) != 0 {
+		t.Fatal("rejected operator pool labels reached native execution")
+	}
+}
+
+// A checkpoint carries the operator pool labels it was taken under; a restore
+// under changed labels fails before acquiring or restoring the checkpoint,
+// with or without a worker image transition.
+func TestCheckpointRestoreRejectsChangedOperatorPoolLabels(t *testing.T) {
+	for _, image := range []string{"", pinnedWorkerImageB} {
+		name := "same image"
+		if image != "" {
+			name = "pinned image transition"
+		}
+		t.Run(name, func(t *testing.T) {
+			c, native, source, _ := suspendedSource(t)
+			cp := exportReady(t, c, native, newCheckpoint(t, c, source, false))
+			request := restoreRequest(t, c, source, cp)
+			_, sourceRecord, err := driver(c, native).read(t.Context(), source.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog := catalogKey(source.Key.Namespace, sourceRecord.Checkpoint.Tag.UID)
+			_, artifact, err := driver(c, native).readCatalog(t.Context(), catalog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if artifact.RuntimePoolOperatorLabels["selected"] != "native" {
+				t.Fatalf("checkpoint did not record the operator pool labels: %v", artifact.RuntimePoolOperatorLabels)
+			}
+			if image != "" {
+				mutateSourcePool(t, c, setSourceWorkerImage(image))
+			}
+			mutateSourcePool(t, c, setSourceOperatorLabel)
+			if _, err := driver(c, native).EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), "operator worker pool labels") {
+				t.Fatalf("checkpoint restore accepted changed operator pool labels: %v", err)
+			}
+			if _, artifact, err = driver(c, native).readCatalog(t.Context(), catalog); err != nil {
+				t.Fatal(err)
+			}
+			if _, acquired := artifact.Owners[workspaceArtifactOwner(request.Key)]; acquired || native.boots != 1 {
+				t.Fatal("rejected restore acquired the checkpoint or reached native execution")
+			}
+		})
+	}
+}
+
+// A suspension whose catalog write committed before runtime stamping existed,
+// but whose journal write was lost, retries after the upgrade with a stamped
+// record. It recovers the published unstamped checkpoint instead of
+// conflicting forever.
+func TestRegisterCheckpointRecoversUnstampedCatalog(t *testing.T) {
+	c, native, request := fixture(t, true)
+	first := ready(t, c, native, request)
+	retired(t, c, native, request, first.Identity, true)
+	d := driver(c, native)
+	_, record, err := d.read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Checkpoint == nil || record.Checkpoint.SandboxRuntime == nil {
+		t.Fatal("fixture checkpoint is not stamped")
+	}
+	stamped := *record.Checkpoint
+	// Rewrite the catalog as a pre-stamping provider published it.
+	catalogCM, artifact, err := d.readCatalog(t.Context(), catalogKey(request.Key.Namespace, stamped.Tag.UID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.Checkpoint.SandboxRuntime = nil
+	if artifact.Digest, err = artifactDigest(artifact.Checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.saveCatalog(t.Context(), catalogCM, artifact); err != nil {
+		t.Fatal(err)
+	}
+	retry := stamped
+	reference, err := d.registerCheckpoint(t.Context(), record, &retry)
+	if err != nil {
+		t.Fatalf("retry conflicted with the unstamped catalog: %v", err)
+	}
+	if reference.Digest != artifact.Digest || retry.SandboxRuntime != nil {
+		t.Fatalf("recovery changed the published checkpoint: %v, %v", reference, retry.SandboxRuntime)
+	}
+	// A stamp that differs from a stamped catalog still conflicts.
+	catalogCM, artifact, err = d.readCatalog(t.Context(), catalogKey(request.Key.Namespace, stamped.Tag.UID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.Checkpoint.SandboxRuntime = &sandboxRuntimeStamp{Class: gvisorSandboxClass, SchemaVersion: "v1", Digest: "sha256:other"}
+	if artifact.Digest, err = artifactDigest(artifact.Checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.saveCatalog(t.Context(), catalogCM, artifact); err != nil {
+		t.Fatal(err)
+	}
+	retry = stamped
+	if _, err := d.registerCheckpoint(t.Context(), record, &retry); !errors.Is(err, sdk.ErrRequestConflict) {
+		t.Fatalf("a differing runtime stamp did not conflict: %v", err)
 	}
 }

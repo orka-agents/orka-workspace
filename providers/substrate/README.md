@@ -130,8 +130,10 @@ configuration, scheduling, labels and annotations into a private single-replica
 WorkerPool for each instance. The private pool always names its SandboxConfig:
 an omitted `configRef` is pinned to the source pool's resolved
 `status.sandboxClasses[].configRef`, because the class default can move during an
-upgrade. A source pool whose config is unresolved, switching
-(`pendingConfigRef`), or declared differently from what it resolved is refused. Its Pod template carries private allocation and
+upgrade. A source pool whose config is unresolved (no `Resolved=True` class
+condition at the pool's current generation; Agent Substrate keeps the last
+`configRef` while a removed default or deleting config fails to resolve),
+switching (`pendingConfigRef`), or declared differently from what it resolved is refused. Its Pod template carries private allocation and
 instance labels from birth, and the derived template's `workerSelector` adds
 those labels. v1 workers report `--max-actors` (default 1000) as their Actor
 count, so the provider instead sizes the private worker for exactly one Actor:
@@ -284,7 +286,7 @@ pool's own labels must remain identical; anything else fails closed. Each such
 transition is appended to the journal's `workerImageProvenance` (from, to,
 the previous private pool digest, time), bounded at 16 per lineage. A
 `RestoreFrom` import applies the same rule against the checkpoint's recorded
-pool specification. Do not patch the private `-workers` pools during an upgrade;
+pool specification and source pool labels. Do not patch the private `-workers` pools during an upgrade;
 patch the operator pools, then let running workspaces move by eviction.
 It creates a fresh Actor from the Tag under that original template (v1 seeds an
 Actor only under the Tag's template), checks the Actor holds exactly the Tag's
@@ -309,6 +311,8 @@ retained.
 **Runtime provenance.** Each data checkpoint records the Tag snapshot's
 `sandbox_runtime` (class, schema version, attribute digest); a stamp from another
 sandbox class fails the capture, and verification rejects a mismatching record.
+A retried capture whose catalog was published before stamping keeps that
+unstamped record; its Tag digest already pins the snapshot.
 Agent Substrate runs every gVisor restore without memory under the worker's
 default `runsc` and does not check cross-version compatibility. When a restore
 crashes before its supervisor boots and the worker's runtime differs from the

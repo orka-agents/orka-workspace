@@ -478,6 +478,12 @@ func fixtureEgress() *api.RuntimeEgressPolicy {
 // reports as resolved.
 const fixtureSandboxConfig = "gvisor-default"
 
+// resolvedSandboxClassStatus is a gVisor class status Agent Substrate reports
+// once the class resolves to config at generation 0.
+func resolvedSandboxClassStatus(config string) map[string]any {
+	return map[string]any{"name": "gvisor", "configRef": map[string]any{"name": config}, "conditions": []any{map[string]any{"type": "Resolved", "status": "True", "reason": "Resolved"}}}
+}
+
 func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.WorkloadRequest) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -519,7 +525,7 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 	request := sdk.WorkloadRequest{Sequence: 1, Key: sdk.AllocationKey{Namespace: workspace.Namespace, Name: workspace.Name, WorkspaceUID: workspace.UID, ProviderUID: provider.UID}, Image: image, Command: container.Command, ParametersRef: &api.TypedObjectReference{Group: profile.GroupVersion.Group, Kind: "SubstrateWorkspaceProfile", Name: parameter.Name}, ParametersBinding: &api.ImmutableObjectBinding{Name: parameter.Name, UID: parameter.UID, Generation: 1, ProfileHash: hash}, Runtime: &sdk.RuntimeWorkload{BootstrapPort: 80, PoolBinding: api.ImmutableObjectBinding{Name: "pool", UID: "pool-uid", Generation: 1, ProfileHash: class.ProfileHash}, ClassBinding: class, Protocol: "orka.harness.v2", ContainerName: container.Name, Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Namespace: "runtime"}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(bool), SecurityContext: &corev1.PodSecurityContext{RunAsUser: new(int64(0)), RunAsGroup: new(int64(0))}, Containers: []corev1.Container{container}}}, Egress: fixtureEgress()}}
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
-	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}, "status": map[string]any{"sandboxClasses": []any{map[string]any{"name": "gvisor", "configRef": map[string]any{"name": fixtureSandboxConfig}}}}}}
+	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}, "status": map[string]any{"sandboxClasses": []any{resolvedSandboxClassStatus(fixtureSandboxConfig)}}}}
 	uid := 0
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider, workspace, parameter, pool).WithStatusSubresource(workspace, provider, &api.ExecutionWorkspaceCheckpoint{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if obj.GetUID() == "" {

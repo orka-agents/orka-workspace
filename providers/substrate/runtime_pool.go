@@ -143,7 +143,10 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 // pinnedSandboxConfig names the SandboxConfig the operator pool actually runs.
 // An omitted configRef follows the class default, which an upgrade may move,
 // so the private pool pins the operator pool's resolved config by name. A
-// config that is switching or unresolved fails closed.
+// config that is switching or unresolved fails closed: while the class's
+// Resolved condition is not True for the current generation, Agent Substrate
+// keeps the last resolved configRef, which may be a removed default or a
+// deleting config.
 func pinnedSandboxConfig(source *unstructured.Unstructured, class map[string]any) (string, error) {
 	declared := ""
 	if raw, set := class["configRef"]; set {
@@ -167,18 +170,37 @@ func pinnedSandboxConfig(source *unstructured.Unstructured, class map[string]any
 		if pending, set := status["pendingConfigRef"]; set && pending != nil {
 			return "", fmt.Errorf("operator WorkerPool sandbox config is switching; retry after it resolves")
 		}
+		if !sandboxClassResolved(status, source.GetGeneration()) {
+			return "", fmt.Errorf("operator WorkerPool has not resolved a SandboxConfig for gVisor")
+		}
 		resolved, _, _ = unstructured.NestedString(status, "configRef", "name")
 	}
 	switch {
-	case declared == "" && resolved == "":
+	case resolved == "":
 		return "", fmt.Errorf("operator WorkerPool has not resolved a SandboxConfig for gVisor")
-	case declared != "" && resolved != "" && declared != resolved:
+	case declared != "" && declared != resolved:
 		return "", fmt.Errorf("operator WorkerPool sandbox config is switching; retry after it resolves")
-	case declared != "":
-		return declared, nil
 	default:
 		return resolved, nil
 	}
+}
+
+// sandboxClassResolved reports a True Resolved condition observed at the
+// operator pool's current generation.
+func sandboxClassResolved(status map[string]any, generation int64) bool {
+	conditions, _, err := unstructured.NestedSlice(status, "conditions")
+	if err != nil {
+		return false
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if !ok || condition["type"] != "Resolved" {
+			continue
+		}
+		observed, _, err := unstructured.NestedInt64(condition, "observedGeneration")
+		return err == nil && condition["status"] == string(metav1.ConditionTrue) && observed == generation
+	}
+	return false
 }
 
 func runtimePoolMatches(pool *unstructured.Unstructured, record *journalRecord) bool {
