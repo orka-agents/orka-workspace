@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"regexp"
+	"strings"
 
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
@@ -76,6 +78,11 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 			return fmt.Errorf("operator WorkerPool sandbox class has an unsupported field")
 		}
 	}
+	configRef, err := pinnedSandboxConfig(source, class)
+	if err != nil {
+		return err
+	}
+	classes = []any{map[string]any{"name": gvisorSandboxClass, "configRef": map[string]any{"name": configRef}}}
 	spec["sandboxClasses"] = classes
 	template, _, err := unstructured.NestedMap(spec, "template")
 	if err != nil {
@@ -133,6 +140,69 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 	return err
 }
 
+// pinnedSandboxConfig names the SandboxConfig the operator pool actually runs.
+// An omitted configRef follows the class default, which an upgrade may move,
+// so the private pool pins the operator pool's resolved config by name. A
+// config that is switching or unresolved fails closed: while the class's
+// Resolved condition is not True for the current generation, Agent Substrate
+// keeps the last resolved configRef, which may be a removed default or a
+// deleting config.
+func pinnedSandboxConfig(source *unstructured.Unstructured, class map[string]any) (string, error) {
+	declared := ""
+	if raw, set := class["configRef"]; set {
+		ref, ok := raw.(map[string]any)
+		name, _ := ref["name"].(string)
+		if !ok || len(ref) != 1 || strings.TrimSpace(name) == "" || name != strings.TrimSpace(name) {
+			return "", fmt.Errorf("operator WorkerPool sandbox configRef must name exactly one SandboxConfig")
+		}
+		declared = name
+	}
+	statuses, _, err := unstructured.NestedSlice(source.Object, "status", "sandboxClasses")
+	if err != nil {
+		return "", fmt.Errorf("operator WorkerPool sandbox class status is invalid")
+	}
+	resolved := ""
+	for _, raw := range statuses {
+		status, ok := raw.(map[string]any)
+		if !ok || status["name"] != gvisorSandboxClass {
+			continue
+		}
+		if pending, set := status["pendingConfigRef"]; set && pending != nil {
+			return "", fmt.Errorf("operator WorkerPool sandbox config is switching; retry after it resolves")
+		}
+		if !sandboxClassResolved(status, source.GetGeneration()) {
+			return "", fmt.Errorf("operator WorkerPool has not resolved a SandboxConfig for gVisor")
+		}
+		resolved, _, _ = unstructured.NestedString(status, "configRef", "name")
+	}
+	switch {
+	case resolved == "":
+		return "", fmt.Errorf("operator WorkerPool has not resolved a SandboxConfig for gVisor")
+	case declared != "" && declared != resolved:
+		return "", fmt.Errorf("operator WorkerPool sandbox config is switching; retry after it resolves")
+	default:
+		return resolved, nil
+	}
+}
+
+// sandboxClassResolved reports a True Resolved condition observed at the
+// operator pool's current generation.
+func sandboxClassResolved(status map[string]any, generation int64) bool {
+	conditions, _, err := unstructured.NestedSlice(status, "conditions")
+	if err != nil {
+		return false
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if !ok || condition["type"] != "Resolved" {
+			continue
+		}
+		observed, _, err := unstructured.NestedInt64(condition, "observedGeneration")
+		return err == nil && condition["status"] == string(metav1.ConditionTrue) && observed == generation
+	}
+	return false
+}
+
 func runtimePoolMatches(pool *unstructured.Unstructured, record *journalRecord) bool {
 	spec, found, err := unstructured.NestedMap(pool.Object, "spec")
 	if err != nil || !found {
@@ -148,12 +218,84 @@ func runtimePoolMatches(pool *unstructured.Unstructured, record *journalRecord) 
 // frozen, including image, native isolation, scheduling, resources and labels
 // supplied by the operator. Missing provenance fails closed.
 func compatibleRuntimePool(previous, next json.RawMessage) bool {
-	previousDigest, previousErr := runtimePoolRestoreDigest(previous)
-	nextDigest, nextErr := runtimePoolRestoreDigest(next)
+	previousDigest, previousErr := runtimePoolRestoreDigest(previous, false)
+	nextDigest, nextErr := runtimePoolRestoreDigest(next, false)
 	return previousErr == nil && nextErr == nil && previousDigest == nextDigest
 }
 
-func runtimePoolRestoreDigest(data json.RawMessage) (string, error) {
+// workerImageTransition is journal provenance for a data-only resume or
+// restore that followed the operator pool to a new worker image.
+type workerImageTransition struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// PreviousRuntimePoolDigest identifies the exact private pool
+	// specification the retained data was written under.
+	PreviousRuntimePoolDigest string      `json:"previousRuntimePoolDigest"`
+	ObservedAt                metav1.Time `json:"observedAt"`
+}
+
+// maxWorkerImageTransitions bounds inherited provenance on a long lineage.
+const maxWorkerImageTransitions = 16
+
+var digestPinnedImage = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+
+// dataResumeRuntimePool decides whether retained VOLUMES data may cold boot on
+// the operator pool's current specification. Agent Substrate upgrades roll
+// WorkerPools to a new worker image, and an API server must never be newer
+// than its workers, so a data-only resume follows the operator pool's
+// current image. Nothing else may change: replicas, sandbox class and pinned
+// SandboxConfig, scheduling, resources, and operator labels stay exactly
+// equal, and the new image must be pinned by digest. A memory restore is never
+// admitted on this backend, so no process state crosses the image change. The
+// returned transition is nil when the image is unchanged.
+func dataResumeRuntimePool(previous, next json.RawMessage, now metav1.Time) (*workerImageTransition, error) {
+	if compatibleRuntimePool(previous, next) {
+		return nil, nil
+	}
+	previousDigest, previousErr := runtimePoolRestoreDigest(previous, true)
+	nextDigest, nextErr := runtimePoolRestoreDigest(next, true)
+	if previousErr != nil || nextErr != nil || previousDigest != nextDigest {
+		return nil, fmt.Errorf("native resume changed immutable worker infrastructure")
+	}
+	var before, after map[string]any
+	if json.Unmarshal(previous, &before) != nil || json.Unmarshal(next, &after) != nil {
+		return nil, fmt.Errorf("private worker infrastructure provenance is invalid")
+	}
+	from, _, _ := unstructured.NestedString(before, "workerImage")
+	to, _, _ := unstructured.NestedString(after, "workerImage")
+	if !digestPinnedImage.MatchString(to) {
+		return nil, fmt.Errorf("native resume onto a new worker image requires the operator pool's current image pinned by digest")
+	}
+	return &workerImageTransition{From: from, To: to, PreviousRuntimePoolDigest: digest(previous), ObservedAt: now}, nil
+}
+
+// inheritWorkerImageProvenance carries a lineage's image transitions forward
+// and appends a new one, bounded.
+func inheritWorkerImageProvenance(previous []workerImageTransition, transition *workerImageTransition) ([]workerImageTransition, error) {
+	out := append([]workerImageTransition(nil), previous...)
+	if transition != nil {
+		out = append(out, *transition)
+	}
+	if len(out) > maxWorkerImageTransitions {
+		return nil, fmt.Errorf("native worker image provenance exceeded its bound")
+	}
+	return out, nil
+}
+
+// operatorPoolLabels returns the operator's own WorkerPool labels, without
+// the provider's per-allocation ownership and confinement labels.
+func operatorPoolLabels(record *journalRecord) map[string]string {
+	out := maps.Clone(record.RuntimePoolLabels)
+	for key := range labels(record) {
+		delete(out, key)
+	}
+	for key := range workerLabels(record) {
+		delete(out, key)
+	}
+	return out
+}
+
+func runtimePoolRestoreDigest(data json.RawMessage, ignoreImage bool) (string, error) {
 	var spec map[string]any
 	if len(data) == 0 || json.Unmarshal(data, &spec) != nil {
 		return "", fmt.Errorf("private worker infrastructure provenance is missing")
@@ -165,6 +307,9 @@ func runtimePoolRestoreDigest(data json.RawMessage) (string, error) {
 	}
 	if class, ok := classes[0].(map[string]any); !ok || class["name"] != gvisorSandboxClass {
 		return "", fmt.Errorf("private worker infrastructure must use gVisor")
+	}
+	if ignoreImage {
+		delete(spec, "workerImage")
 	}
 	if limits, _, err := unstructured.NestedStringMap(spec, "template", "resources", "limits"); err != nil || limits["cpu"] == "" || limits["memory"] == "" {
 		return "", fmt.Errorf("private worker infrastructure has no single-Actor size")
@@ -241,38 +386,47 @@ func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord
 // Labels and size exist before this worker is eligible to execute. Pin the
 // exact ready, empty, single-Actor worker and its process epoch before issuing
 // the one-time native Resume.
-func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
-	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
-		return false, err
-	}
+// privatePoolWorker returns the private pool's only Worker, nil when it has
+// none, and an error when it has more than one.
+func (d *Lifecycle) privatePoolWorker(ctx context.Context, record *journalRecord) (*pb.Worker, error) {
 	var selected *pb.Worker
 	token := ""
 	seen := map[string]bool{}
 	for pages := 0; ; pages++ {
 		if pages == 100 {
-			return false, fmt.Errorf("native worker listing exceeded bound")
+			return nil, fmt.Errorf("native worker listing exceeded bound")
 		}
 		workers, err := d.control.ListWorkers(ctx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1000, PageToken: token}})
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		for _, worker := range workers.GetWorkers() {
 			if worker.GetWorkerNamespace() != record.Placement.Namespace || worker.GetWorkerPool() != record.RuntimePool.Name {
 				continue
 			}
 			if selected != nil {
-				return false, fmt.Errorf("private native pool has multiple workers")
+				return nil, fmt.Errorf("private native pool has multiple workers")
 			}
 			selected = worker
 		}
 		token = workers.GetNextPageToken()
 		if token == "" {
-			break
+			return selected, nil
 		}
 		if seen[token] {
-			return false, fmt.Errorf("native worker pagination repeated a token")
+			return nil, fmt.Errorf("native worker pagination repeated a token")
 		}
 		seen[token] = true
+	}
+}
+
+func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
+		return false, err
+	}
+	selected, err := d.privatePoolWorker(ctx, record)
+	if err != nil {
+		return false, err
 	}
 	if selected == nil {
 		return false, nil

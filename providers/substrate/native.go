@@ -211,7 +211,12 @@ func (d *Lifecycle) bindWorker(ctx context.Context, record *journalRecord) error
 	if err := d.client.Get(ctx, key, pod); err != nil {
 		return err
 	}
-	if string(pod.UID) != worker.PodUID || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != worker.Pool {
+	// The exact fenced worker stays observable while it terminates gracefully
+	// (an upgrade roll, node drain, or Spot reclaim): Core must keep reaching
+	// the instance to drain it and authorize a data-only suspension inside the
+	// eviction window. Core closes admission on its own observation of the
+	// same Pod's termination. A new worker is never bound while terminating.
+	if string(pod.UID) != worker.PodUID || pod.Labels[workerPoolLabel] != worker.Pool {
 		return sdk.ErrStaleIdentity
 	}
 	for key, expected := range workerLabels(record) {
@@ -247,7 +252,10 @@ func (d *Lifecycle) worker(ctx context.Context, record *journalRecord, actor *pb
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: worker.GetWorkerNamespace(), Name: worker.GetWorkerPod()}, pod); err != nil {
 		return nil, err
 	}
-	if string(pod.UID) != worker.GetWorkerPodUid() || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != record.RuntimePool.Name {
+	if string(pod.UID) != worker.GetWorkerPodUid() || pod.Labels[workerPoolLabel] != record.RuntimePool.Name {
+		return nil, sdk.ErrStaleIdentity
+	}
+	if pod.DeletionTimestamp != nil && (record.Worker == nil || record.Worker.PodUID != string(pod.UID)) {
 		return nil, sdk.ErrStaleIdentity
 	}
 	for key, expected := range workerLabels(record) {
