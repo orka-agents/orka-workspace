@@ -147,7 +147,7 @@ func ValidateRuntimeEgressCredentialHeaders(protocol RuntimeEgressProtocol, host
 		if !validRuntimeEgressHeaderName(header.Header) || len(header.Header) > 128 {
 			return fmt.Errorf("credential header %d must be an HTTP header name", i)
 		}
-		if reservedRuntimeEgressCredentialHeaders[name] || strings.HasPrefix(name, "x-envoy-") || strings.HasPrefix(name, "x-ate-") {
+		if reservedRuntimeEgressCredentialHeaders[name] || strings.HasPrefix(name, "x-forwarded-") || strings.HasPrefix(name, "x-envoy-") || strings.HasPrefix(name, "x-ate-") {
 			return fmt.Errorf("credential header %q is reserved", header.Header)
 		}
 		if seen[name] {

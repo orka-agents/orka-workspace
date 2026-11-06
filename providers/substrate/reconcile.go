@@ -68,10 +68,20 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation
 		err := workloadErr
+		if workloadErr != nil {
+			// An invalid launch intent must not leave an existing Actor's
+			// credential-bearing gateway effects applied.
+			err = errors.Join(err, driver.revokeWithdrawnEgressCredentials(ctx, key))
+		}
 		if workloadErr == nil {
 			observed, err = driver.Observe(ctx, key)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				observed, err = driver.recordFailure(ctx, key, lost)
+			} else if err != nil && !errors.Is(err, workspaceprovider.ErrNotFound) {
+				// Withdrawn credential injection makes a ready Actor's
+				// observation fail, which would keep reconciliation from
+				// reaching EnsureAllocation's revocation. Revoke here.
+				err = errors.Join(err, driver.revokeWithdrawnEgressCredentials(ctx, key))
 			}
 		}
 		if (workloadErr != nil && maintenance) || deleted || quarantined || current.Spec.Retirement != nil {
