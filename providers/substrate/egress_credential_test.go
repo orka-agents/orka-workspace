@@ -125,7 +125,19 @@ func TestNativeAppliesCredentialEffectsBeforeResume(t *testing.T) {
 	// Losing the credential provider later fails verification and a
 	// re-application installs deny-all rather than a rule without its credential.
 	unconfigured := New(c, native, Config{RouterEndpoint: fixtureRouter})
+	unconfigured.challengeClient = native
 	if err := unconfigured.verifyEgressPolicy(t.Context(), record); err == nil {
 		t.Fatal("verification passed without a configured credential provider")
+	}
+	// Re-ensuring the running allocation after the configuration is withdrawn
+	// refuses it and replaces the credential-bearing policy with deny-all.
+	if _, err := unconfigured.EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("withdrawn credential configuration was not refused: %v", err)
+	}
+	if rules := native.egress[record.Atespace+"/"+record.Actor.Name].GetRules(); len(rules) != 0 {
+		t.Fatalf("withdrawn credential configuration left gateway effects applied: %v", rules)
+	}
+	if _, revoked, err := d.read(t.Context(), request.Key); err != nil || !revoked.EgressDenyAll {
+		t.Fatalf("revocation was not journaled: %v", err)
 	}
 }

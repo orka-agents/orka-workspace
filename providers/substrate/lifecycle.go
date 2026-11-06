@@ -33,7 +33,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		return sdk.AllocationObservation{}, err
 	}
 	if err := d.config.admitEgressCredentials(request); err != nil {
-		return sdk.AllocationObservation{}, err
+		return sdk.AllocationObservation{}, errors.Join(err, d.revokeEgressCredentials(ctx, request.Key))
 	}
 	if d.control == nil || d.endpoint() == "" {
 		return sdk.AllocationObservation{}, fmt.Errorf("native control and router-based Actor routing are required")
