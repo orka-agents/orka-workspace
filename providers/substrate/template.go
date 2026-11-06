@@ -61,7 +61,7 @@ func validateRequest(request sdk.WorkloadRequest) error {
 		return err
 	}
 	for _, feature := range request.Runtime.RequiredFeatures {
-		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore {
+		if feature != api.WorkspaceFeatureACPRuntime && feature != api.WorkspaceFeatureNativeProcess && feature != api.WorkspaceFeatureSuspend && feature != api.WorkspaceFeatureCheckpoint && feature != api.WorkspaceFeatureRestore && feature != api.WorkspaceFeatureEgressAllowlist {
 			return fmt.Errorf("native runtime feature %s is unsupported", feature)
 		}
 	}
@@ -484,8 +484,10 @@ func compileResources(base *pb.ResourceRequirements, requirements corev1.Resourc
 			}
 			limits.CpuMillicores = millicores
 		case corev1.ResourceMemory:
-			bytes, exact := quantity.AsInt64()
-			if !exact {
+			// Value rounds up, so an exact integral byte count is the only
+			// value that compares equal; fractional or overflowing limits fail.
+			bytes := quantity.Value()
+			if resource.NewQuantity(bytes, resource.BinarySI).Cmp(quantity) != 0 {
 				return nil, fmt.Errorf("native memory limit must be a whole number of bytes")
 			}
 			limits.MemoryBytes = bytes

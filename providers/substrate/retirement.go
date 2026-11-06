@@ -42,7 +42,7 @@ func (d *Lifecycle) verifyRetiringWorker(ctx context.Context, record *journalRec
 	if worker.GetMetadata().GetName() != f.Name || worker.GetMetadata().GetUid() != f.UID || worker.GetWorkerPodUid() != f.PodUID || worker.GetWorkerNamespace() != f.Namespace || worker.GetWorkerPool() != f.Pool || worker.GetWorkerPod() != f.Pod {
 		return sdk.ErrStaleIdentity
 	}
-	if err := verifySingleActorWorker(record, worker); err != nil {
+	if err := verifySingleActorWorkerShape(record, worker, true); err != nil {
 		return err
 	}
 	pod := &corev1.Pod{}

@@ -146,8 +146,18 @@ func expectedWorkerCapacity(record *journalRecord) (cpu, memory int64) {
 // verifySingleActorWorker checks the native worker is gVisor and sized so the
 // template-sized Actor is the only one that fits.
 func verifySingleActorWorker(record *journalRecord, worker *pb.Worker) error {
+	return verifySingleActorWorkerShape(record, worker, false)
+}
+
+// verifySingleActorWorkerShape checks the gVisor class and single-Actor
+// sizing. A worker process that is re-registering reports no sandbox classes
+// until it lists its runtimes again; teardown may proceed through that window
+// (allowRegistering) because the exact identity, capacity and exclusive
+// assignment checks still apply, while startup always requires the class.
+func verifySingleActorWorkerShape(record *journalRecord, worker *pb.Worker, allowRegistering bool) error {
 	classes := worker.GetStatus().GetSandboxClasses()
-	if len(classes) != 1 || classes[0].GetSandboxClass() != gvisorSandboxClass {
+	registering := allowRegistering && len(classes) == 0
+	if !registering && (len(classes) != 1 || classes[0].GetSandboxClass() != gvisorSandboxClass) {
 		return fmt.Errorf("native worker must run only the gVisor sandbox class")
 	}
 	cpu, memory := expectedWorkerCapacity(record)

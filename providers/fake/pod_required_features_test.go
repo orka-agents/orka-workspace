@@ -126,3 +126,21 @@ func TestLegacyUnadvertisedPodFeatureWithdrawsStartupButStillCleansUp(t *testing
 		t.Fatalf("unsupported legacy feature blocked exact cleanup or replayed compute: %+v, %v", deleted, err)
 	}
 }
+
+func TestPodRejectsEgressAllowlistBeforeEffects(t *testing.T) {
+	c, request := runtimeFixture(t)
+	request.Runtime.NetworkPolicy = nil
+	request.Runtime.Egress = &workspacev1alpha1.RuntimeEgressPolicy{}
+	request.Revision, _ = workspaceprovider.WorkloadRevision(request)
+	if err := publishRequest(t.Context(), c, request); err != nil {
+		t.Fatal(err)
+	}
+	before := workspaceFor(t, c, request.Key)
+	observed, err := New(c).EnsureAllocation(t.Context(), request)
+	if err == nil || !strings.Contains(err.Error(), "required feature") || observed.Startup != nil {
+		t.Fatalf("egress allowlist request produced allocation without NetworkPolicy isolation: %+v, %v", observed, err)
+	}
+	if c.creates != 0 || !reflect.DeepEqual(before, workspaceFor(t, c, request.Key)) {
+		t.Fatal("egress allowlist request wrote allocation intent or Pod")
+	}
+}
