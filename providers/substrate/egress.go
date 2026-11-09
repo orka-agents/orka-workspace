@@ -112,10 +112,19 @@ func (c Config) credentialNamespace(workloadNamespace string, ref api.RuntimeEgr
 // admitEgressCredentials refuses a workload whose credential replacements this
 // installation cannot enforce, before any native object is created.
 func (c Config) admitEgressCredentials(request sdk.WorkloadRequest) error {
-	if request.Runtime == nil || !request.Runtime.Egress.HasCredentialInjection() {
+	if request.Runtime == nil {
 		return nil
 	}
-	if !slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+	required := slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection)
+	// A required feature is a contract even when no rule uses it yet: this
+	// provider does not advertise injection without a credential provider.
+	if required && !c.EgressCredentialInjectionEnabled() {
+		return fmt.Errorf("native egress credential injection is not configured for this provider")
+	}
+	if !request.Runtime.Egress.HasCredentialInjection() {
+		return nil
+	}
+	if !required {
 		return fmt.Errorf("native egress credential replacement requires the %s feature", api.WorkspaceFeatureEgressCredentialInjection)
 	}
 	for _, rule := range request.Runtime.Egress.Rules {

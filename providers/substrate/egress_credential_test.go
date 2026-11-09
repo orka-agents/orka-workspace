@@ -95,6 +95,23 @@ func TestNativeRejectsCredentialInjectionWithoutConfiguredProviderBeforeEffects(
 	assertNativeRequestRejectedBeforeEffects(t, c, native, credentialRequest(t, request), "not configured")
 }
 
+// A workload may require the feature before any rule replaces a header. The
+// provider advertises it only with a credential provider, so it must refuse
+// the requirement otherwise instead of admitting a contract it cannot meet.
+func TestNativeRejectsRequiredCredentialInjectionFeatureWithoutConfiguredProvider(t *testing.T) {
+	c, native, request := fixture(t, false)
+	request.Runtime.RequiredFeatures = append(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection)
+	if request.Runtime.Egress.HasCredentialInjection() {
+		t.Fatal("fixture request already replaces headers")
+	}
+	assertNativeRequestRejectedBeforeEffects(t, c, native, request, "not configured")
+
+	configured := Config{EgressCredentialProvider: KubernetesSecretsCredentialProvider}
+	if err := configured.admitEgressCredentials(request); err != nil {
+		t.Fatalf("configured provider refused the required feature: %v", err)
+	}
+}
+
 func TestNativeAppliesCredentialEffectsBeforeResume(t *testing.T) {
 	c, native, request := fixture(t, false)
 	request = credentialRequest(t, request)
