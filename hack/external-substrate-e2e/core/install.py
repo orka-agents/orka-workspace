@@ -84,10 +84,13 @@ add("rbac.authorization.k8s.io/v1", "Role", "native-core-proof", namespace, rule
 add("rbac.authorization.k8s.io/v1", "RoleBinding", "native-core-proof", namespace,
     roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "native-core-proof"},
     subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": client_namespace}])
-add("rbac.authorization.k8s.io/v1", "ClusterRole", namespace, rules=[
+# The fixed namespace also names the manager's cluster-scoped RBAC, so the
+# proof's cluster-scoped objects need their own names.
+proof_cluster_rbac = namespace + "-proof"
+add("rbac.authorization.k8s.io/v1", "ClusterRole", proof_cluster_rbac, rules=[
     {"apiGroups": ["workspace.orka.ai"], "resources": ["executionworkspaceproviders"], "resourceNames": ["substrate"], "verbs": ["get"]}])
-add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", namespace,
-    roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": namespace},
+add("rbac.authorization.k8s.io/v1", "ClusterRoleBinding", proof_cluster_rbac,
+    roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": proof_cluster_rbac},
     subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": client_namespace}])
 # Operator source pool: it runs no workers; the provider sizes each private copy.
 add("ate.dev/v1", "WorkerPool", "native-core", namespace, spec={
@@ -134,5 +137,15 @@ for obj in provider_objects:
         container = spec["containers"][0]
         container["image"], container["imagePullPolicy"] = provider_image, "IfNotPresent"
     objects.append(obj)
+
+# Applying a List silently replaces an earlier object with a later same-identity
+# one; fail rendering instead of overwriting another component's permissions.
+identities = set()
+for obj in objects:
+    identity = (obj["apiVersion"].split("/")[0] if "/" in obj["apiVersion"] else "", obj["kind"],
+                obj["metadata"].get("namespace", ""), obj["metadata"]["name"])
+    if identity in identities:
+        sys.exit("duplicate rendered object %s" % "/".join(part for part in identity if part))
+    identities.add(identity)
 
 json.dump({"apiVersion": "v1", "kind": "List", "items": objects}, sys.stdout, indent=2)
