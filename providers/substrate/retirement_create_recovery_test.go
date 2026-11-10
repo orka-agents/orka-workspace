@@ -14,7 +14,6 @@ import (
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -57,8 +56,6 @@ func interruptedResource(record *journalRecord, resource string) *nativeReferenc
 		return &record.RuntimePool
 	case "anchor":
 		return &record.Anchor
-	case "policy":
-		return &record.NetworkPolicy
 	case "template":
 		return &record.Template
 	default:
@@ -83,8 +80,6 @@ func interruptedResourceCreate(t *testing.T, resource, failure string) (client.C
 				matches = resource == "pool" && object.GetKind() == "WorkerPool" && object.GetLabels()[workerInstanceLabel] != ""
 			case *corev1.ConfigMap:
 				matches = resource == "anchor" && object.Data["journalUID"] != ""
-			case *networkingv1.NetworkPolicy:
-				matches = resource == "policy"
 			}
 			if failure == "create response" && matches && !failed {
 				failed = true
@@ -142,7 +137,7 @@ func authorizeInterruptedDeletion(t *testing.T, c client.Client, request sdk.Wor
 }
 
 func TestLostCreatedResourceCancellationFullReconcile(t *testing.T) {
-	for _, resource := range []string{"pool", "anchor", "policy", "template"} {
+	for _, resource := range []string{"pool", "anchor", "template"} {
 		for _, failure := range []string{"create response", "UID save"} {
 			t.Run(resource+"/"+failure, func(t *testing.T) {
 				c, native, request, record := interruptedResourceCreate(t, resource, failure)
@@ -162,8 +157,6 @@ func TestLostCreatedResourceCancellationFullReconcile(t *testing.T) {
 						switch object.(type) {
 						case *unstructured.Unstructured:
 							ref = &saved.RuntimePool
-						case *networkingv1.NetworkPolicy:
-							ref = &saved.NetworkPolicy
 						case *corev1.ConfigMap:
 							ref = &saved.Anchor
 						}
@@ -180,7 +173,7 @@ func TestLostCreatedResourceCancellationFullReconcile(t *testing.T) {
 				})
 				native.client = wrapped
 				control := &retirementCreateControl{nativeFixture: native, t: t, key: request.Key}
-				r := &ExecutionWorkspaceReconciler{Client: wrapped, Control: control, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+				r := &ExecutionWorkspaceReconciler{Client: wrapped, Control: control, Config: Config{RouterEndpoint: fixtureRouter}}
 				for range 12 {
 					if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}); err != nil {
 						t.Fatal(err)
@@ -218,7 +211,7 @@ func TestLostCreatedResourceCancellationFullReconcile(t *testing.T) {
 }
 
 func TestLostCreatedResourceRetirementFailsClosed(t *testing.T) {
-	for _, resource := range []string{"pool", "anchor", "policy", "template"} {
+	for _, resource := range []string{"pool", "anchor", "template"} {
 		for _, mutation := range []string{"missing", "spec", "ownership", "empty UID", "UID save"} {
 			t.Run(resource+"/"+mutation, func(t *testing.T) {
 				c, native, request, record := interruptedResourceCreate(t, resource, "create response")
@@ -231,7 +224,7 @@ func TestLostCreatedResourceRetirementFailsClosed(t *testing.T) {
 					case "missing":
 						delete(native.templates, key)
 					case "spec":
-						template.SandboxConfig.ConfigName = "foreign"
+						template.Containers[0].Image = "foreign"
 					case "ownership":
 						template.Metadata.Name = "foreign"
 					case "empty UID":
@@ -243,8 +236,6 @@ func TestLostCreatedResourceRetirementFailsClosed(t *testing.T) {
 						object = poolObject()
 					case "anchor":
 						object = &corev1.ConfigMap{}
-					case "policy":
-						object = &networkingv1.NetworkPolicy{}
 					}
 					if err := c.Get(t.Context(), client.ObjectKey{Namespace: record.Placement.Namespace, Name: ref.Name}, object); err != nil {
 						t.Fatal(err)
@@ -260,8 +251,6 @@ func TestLostCreatedResourceRetirementFailsClosed(t *testing.T) {
 							object.Object["spec"].(map[string]any)["workerImage"] = "foreign"
 						case *corev1.ConfigMap:
 							object.Data["journalName"] = "foreign"
-						case *networkingv1.NetworkPolicy:
-							object.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{{}}
 						}
 					case "ownership":
 						object.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "foreign", UID: "foreign"}})
@@ -290,7 +279,7 @@ func TestLostCreatedResourceRetirementFailsClosed(t *testing.T) {
 						return inner.Update(ctx, object, options...)
 					},
 				})
-				r := &ExecutionWorkspaceReconciler{Client: wrapped, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+				r := &ExecutionWorkspaceReconciler{Client: wrapped, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 				failures := 0
 				for range 6 {
 					_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)})

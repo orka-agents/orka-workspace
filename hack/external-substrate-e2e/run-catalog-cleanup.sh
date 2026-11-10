@@ -6,6 +6,9 @@ namespace_uid="$2"
 catalog_name="$3"
 catalog_uid="$4"
 runner_namespace="$5"
+# Proof Jobs run in the fixed client namespace allowlisted at install; the
+# runner is the Job named after its proof namespace.
+client_namespace=external-substrate-e2e
 case "$(kubectl config current-context)" in
   kind-orka-workspace-*-external-su-*) ;;
   *) printf 'Refusing foreign catalog cleanup cluster\n' >&2; exit 1 ;;
@@ -20,7 +23,9 @@ job_name="native-catalog-cleanup-${run_id}"
 run_dir="${PWD}/bin/${namespace}/catalog-cleanup-${run_id}"
 mkdir -p "${run_dir}"
 chmod 700 "${run_dir}"
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/native-data-proof" ./proof
 docker build -f hack/external-substrate-e2e/proof.Dockerfile -t "localhost:5002/orka/native-data-proof:catalog-${run_id}" "${run_dir}"
 docker push "localhost:5002/orka/native-data-proof:catalog-${run_id}"
 image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-data-proof:catalog-${run_id}")"
@@ -49,10 +54,10 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata: {name: ${job_name}}
-subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${runner_namespace}}]
+subjects: [{kind: ServiceAccount, name: native-data-proof, namespace: ${client_namespace}}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: ${job_name}}
 YAML
-kubectl -n "${runner_namespace}" get job native-data-proof -o json |
+kubectl -n "${client_namespace}" get job "${runner_namespace}" -o json |
   jq --arg name "${job_name}" --arg image "${image}" --arg namespace "${namespace}" --arg namespaceUID "${namespace_uid}" --arg catalog "${catalog_name}" --arg catalogUID "${catalog_uid}" '
     {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace},spec:{backoffLimit:0,activeDeadlineSeconds:300,template:.spec.template}} |
     .spec.template.metadata = {labels:{"orka.workspace.e2e/cleanup":"catalog"}} |
@@ -63,11 +68,11 @@ kubectl -n "${runner_namespace}" get job native-data-proof -o json |
       {name:"SUBSTRATE_E2E_CATALOG_UID",value:$catalogUID},
       {name:"SUBSTRATE_E2E_NAMESPACE_UID",value:$namespaceUID}]' |
   kubectl create -f -
-kubectl -n "${runner_namespace}" wait --for=condition=complete "job/${job_name}" --timeout=5m || {
-  kubectl -n "${runner_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
+kubectl -n "${client_namespace}" wait --for=condition=complete "job/${job_name}" --timeout=5m || {
+  kubectl -n "${client_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
   exit 1
 }
-kubectl -n "${runner_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
+kubectl -n "${client_namespace}" logs "job/${job_name}" | tee "${run_dir}/catalog.log"
 # Catalog collection does not prove all native resources are gone. Namespace
 # deletion and its existing proof RBAC remain owned by the full cleanup caller.
 kubectl delete clusterrolebinding "${job_name}" --ignore-not-found

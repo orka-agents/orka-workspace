@@ -140,7 +140,7 @@ func TestNativeRequestsCoveredByBookedActorLimits(t *testing.T) {
 			t.Fatal(err)
 		}
 		limits := record.TemplateSpec.GetResources().GetLimits()
-		if len(limits) != 2 || limits[0].Name != "cpu" || limits[0].Quantity != "2" || limits[1].Name != "memory" || limits[1].Quantity != "4Gi" || record.TemplateSpec.Containers[0].Resources != nil {
+		if limits.GetCpuMillicores() != 2000 || limits.GetMemoryBytes() != 4<<30 || record.TemplateSpec.Containers[0].Resources != nil {
 			t.Fatalf("native Actor does not book/enforce the limits covering Core requests: %v", limits)
 		}
 	}
@@ -177,7 +177,7 @@ func TestNativeProcessIntentPreservesDurableMountWithoutPodScratch(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	durable, identity := false, false
+	durable, identity, trust := false, false, false
 	for _, volume := range record.TemplateSpec.Volumes {
 		if volume.Name == durableVolumeName && volume.DurableDir != nil {
 			durable = true
@@ -185,8 +185,11 @@ func TestNativeProcessIntentPreservesDurableMountWithoutPodScratch(t *testing.T)
 		if volume.Name == identityVolumeName && volume.SystemInfo != nil {
 			identity = true
 		}
+		if volume.Name == egressTrustVolumeName && len(volume.GetSystemInfo().GetDataSources()) == 1 && volume.GetSystemInfo().GetDataSources()[0].GetTrustBundle().GetPath() == egressTrustFile {
+			trust = true
+		}
 	}
-	if !durable || !identity || len(record.TemplateSpec.Containers[0].VolumeMounts) != 2 {
+	if !durable || !identity || !trust || len(record.TemplateSpec.Containers[0].VolumeMounts) != 3 {
 		t.Fatal("native process intent lost exact durable or identity mounts")
 	}
 	capabilities := record.TemplateSpec.Containers[0].GetSecurityContext().GetCapabilities()

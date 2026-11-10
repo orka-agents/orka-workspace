@@ -3,10 +3,11 @@ package ateapipb
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"google.golang.org/protobuf/reflect/protoreflect"
 	"os"
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 func TestNativeProtocolIsPinnedUntouched(t *testing.T) {
@@ -19,17 +20,27 @@ func TestNativeProtocolIsPinnedUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(raw)
-	if !strings.Contains(string(pin), "SUBSTRATE_UPSTREAM_COMMIT=fa6d949685a6318940a9a0195c867c864009b820") || !strings.Contains(string(pin), "SUBSTRATE_UPSTREAM_PROTO_SHA256="+hex.EncodeToString(sum[:])) {
-		t.Fatal("native control source drifted from the pinned provider")
+	for _, line := range []string{
+		"SUBSTRATE_UPSTREAM_COMMIT=b34fbee742906494b5eb4f1f36987176bf8770a4",
+		"SUBSTRATE_UPSTREAM_PROTO_PATH=api/ateapi/v1/ateapi.proto",
+		"SUBSTRATE_UPSTREAM_PROTO_SHA256=" + hex.EncodeToString(sum[:]),
+		"SUBSTRATE_PROTOC_VERSION=36.0",
+	} {
+		if !strings.Contains(string(pin), line+"\n") {
+			t.Fatalf("native control source drifted from the pinned provider: missing %q", line)
+		}
+	}
+	if File_ateapi_proto.Package() != "substrate.ateapi.v1" {
+		t.Fatalf("native control package is %q, want substrate.ateapi.v1", File_ateapi_proto.Package())
 	}
 	for _, message := range []string{"SuspendActorRequest", "ResumeActorRequest", "DeleteActorRequest"} {
 		descriptor := File_ateapi_proto.Messages().ByName(protoreflect.Name(message))
 		if descriptor == nil {
 			t.Fatal("missing upstream lifecycle message")
 		}
-		for _, name := range []string{"actor_uid", "actor_version", "operation_id", "request_revision"} {
+		for _, name := range []string{"actor_uid", "actor_version", "operation_id", "request_revision", "boot", "any_state"} {
 			if descriptor.Fields().ByName(protoreflect.Name(name)) != nil {
-				t.Fatalf("adapter manufactured native operation fence %s.%s", message, name)
+				t.Fatalf("adapter manufactured or retained a native operation field %s.%s", message, name)
 			}
 		}
 	}

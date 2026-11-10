@@ -22,7 +22,7 @@ import (
 
 func reconcileFailureFixture(t *testing.T, c client.Client, native *nativeFixture, request sdk.WorkloadRequest) *api.ExecutionWorkspace {
 	t.Helper()
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +81,8 @@ func TestLostNativeActorFailsWithoutRestartAndRetiresOnlyByCoreStop(t *testing.T
 
 			workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: api.WorkloadRetirementStop}
 			updateFailureWorkspace(t, c, workspace)
-			native.failAfter = "drain"
-			r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+			native.failAfter = "assignments"
+			r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 			if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil {
 				t.Fatal("transient cleanup error was hidden")
 			}
@@ -125,7 +125,7 @@ func TestLostNativeActorFailsWithoutRestartAndRetiresOnlyByCoreStop(t *testing.T
 func privateWorkerPools(t *testing.T, c client.Client) []unstructured.Unstructured {
 	t.Helper()
 	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion("ate.dev/v1alpha1")
+	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
 	if err := c.List(t.Context(), pools); err != nil {
 		t.Fatal(err)
@@ -326,7 +326,7 @@ func TestUnreadableFailureRecordNeverSelectsSuspensionOrLiveState(t *testing.T) 
 	updateFailureWorkspace(t, c, workspace)
 	// Observe reads the journal first; the failure lookup's read then fails.
 	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key), skip: 1}
-	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil || !flaky.fired {
 		t.Fatalf("unreadable failure record was hidden: fired=%v err=%v", flaky.fired, err)
 	}
@@ -365,7 +365,7 @@ func TestActiveAttachmentNeverHidesFailedStateFromAnUnreadableJournal(t *testing
 		t.Fatal(err)
 	}
 	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key), skip: 1}
-	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil || !flaky.fired {
 		t.Fatalf("unreadable failure record was hidden: fired=%v err=%v", flaky.fired, err)
 	}
@@ -408,7 +408,7 @@ func TestFailedInstanceDoesNotPollStaleRetirement(t *testing.T) {
 	}
 	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence + 1, Identity: identity, Action: api.WorkloadRetirementStop}
 	updateFailureWorkspace(t, c, workspace)
-	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)})
 	if err != nil || result.RequeueAfter != providerHeartbeatPeriod {
 		t.Fatalf("stale retirement kept a failed workspace polling: %+v %v", result, err)
@@ -455,7 +455,7 @@ func TestFailedInstanceWithMissingJournalStaysFailedWithoutCleanup(t *testing.T)
 	workspace.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: api.WorkloadRetirementStop}
 	updateFailureWorkspace(t, c, workspace)
 	missing := &journalMissing{Client: c, journal: journalKey(request.Key)}
-	r := &ExecutionWorkspaceReconciler{Client: missing, Control: native, Config: Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}}
+	r := &ExecutionWorkspaceReconciler{Client: missing, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil {
 		t.Fatal("missing journal after allocation evidence was hidden")
 	}

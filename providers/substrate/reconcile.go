@@ -154,7 +154,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			observed.Startup = nil
 		}
 		current.Status.ObservedGeneration = current.Generation
-		current.Status.ProviderBinding = &workspacev1alpha1.ExecutionWorkspaceProviderBindingStatus{ContractVersion: workspacev1alpha1.ContractVersionV1, AdapterVersion: AdapterVersion, BackendAPIVersion: "ateapi.v0.1.0"}
+		current.Status.ProviderBinding = &workspacev1alpha1.ExecutionWorkspaceProviderBindingStatus{ContractVersion: workspacev1alpha1.ContractVersionV1, AdapterVersion: AdapterVersion, BackendAPIVersion: BackendAPIVersion}
 		current.Status.Endpoints = nil
 		current.Status.ConnectionSecretRef = nil
 		current.Status.Disposition = nil
@@ -257,6 +257,9 @@ func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorks
 			// Operators otherwise see only a stalled allocation; the cause is
 			// in provider logs alone.
 			provisionedReason = providerOperationFailedReason
+			if errors.Is(operationErr, errLegacyNativeState) {
+				provisionedReason = legacyNativeStateReason
+			}
 			provisionedMessage = "provider allocation could not be verified: " + operationFailureCause(operationErr)
 		}
 	} else if failure != "" && observed.State != workspaceprovider.AllocationDeleted {
@@ -329,6 +332,9 @@ func chooseMessage(ok bool, success, failure string) string {
 const (
 	instanceFailedReason          = "InstanceFailed"
 	providerOperationFailedReason = "ProviderOperationFailed"
+	// legacyNativeStateReason marks Agent Substrate v0.1.0 provider state,
+	// which the v1.0.0 provider never adopts.
+	legacyNativeStateReason       = "LegacySubstrateV0State"
 	maxOperationFailureCauseRunes = 256
 )
 

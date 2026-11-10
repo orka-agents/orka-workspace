@@ -2,6 +2,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: orka-workspace-system
+  labels:
+    # Agent Substrate's ate-system NetworkPolicy admits ate-api clients only
+    # from namespaces carrying this label.
+    ate.dev/api-access: "true"
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -35,14 +39,29 @@ spec:
           args:
             - --leader-elect=true
             - --leader-election-namespace=orka-workspace-system
+            # ate-api authenticates this ServiceAccount token as
+            # system:serviceaccount:orka-workspace-system:orka-workspace-substrate.
+            # Grant that principal editor on each profile Atespace and global
+            # viewer; see providers/substrate/README.md.
             - --native-api-endpoint=api.ate-system.svc:443
-            - --native-ca-file=/native-control/ca.crt
-            - --native-token-file=/native-control/token
-            - --native-direct-egress=false
-            - --actor-dns-suffix=actors.resources.substrate.ate.dev
+            - --native-ca-file=/run/substrate-serving-ca/trust-bundle.pem
+            - --native-token-file=/run/substrate-token/token
+            # atenet-router authenticates the pod certificate as
+            # spiffe://cluster.local/ns/orka-workspace-system/sa/orka-workspace-substrate,
+            # which must be in --ingress-allowed-spiffe-ids.
+            - --native-router-endpoint=https://atenet-router.ate-system.svc:443
+            - --native-router-ca-file=/run/substrate-serving-ca/trust-bundle.pem
+            - --native-router-cert-file=/run/substrate-podidentity/credential-bundle.pem
+            - --native-router-key-file=/run/substrate-podidentity/credential-bundle.pem
           volumeMounts:
-            - name: native-control
-              mountPath: /native-control
+            - name: substrate-token
+              mountPath: /run/substrate-token
+              readOnly: true
+            - name: substrate-serving-ca
+              mountPath: /run/substrate-serving-ca
+              readOnly: true
+            - name: substrate-podidentity
+              mountPath: /run/substrate-podidentity
               readOnly: true
           ports:
             - containerPort: 8081
@@ -67,6 +86,26 @@ spec:
             capabilities:
               drop: [ALL]
       volumes:
-        - name: native-control
-          secret:
-            secretName: substrate-native-control
+        - name: substrate-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: api.ate-system.svc
+                  expirationSeconds: 3600
+                  path: token
+        - name: substrate-serving-ca
+          projected:
+            sources:
+              - clusterTrustBundle:
+                  signerName: servicedns.podcert.ate.dev/identity
+                  labelSelector:
+                    matchLabels:
+                      podcert.ate.dev/canarying: live
+                  path: trust-bundle.pem
+        - name: substrate-podidentity
+          projected:
+            sources:
+              - podCertificate:
+                  signerName: podidentity.podcert.ate.dev/identity
+                  keyType: ECDSAP256
+                  credentialBundlePath: credential-bundle.pem

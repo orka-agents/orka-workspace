@@ -7,7 +7,8 @@ case "$(kubectl config current-context)" in
   *) printf 'Refusing foreign native Core proof cluster\n' >&2; exit 1 ;;
 esac
 test -n "${KUBECONFIG:-}"
-test "$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')" = arm64
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
 node_cpu="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.cpu}')"
 node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memory}')"
 # A failed test before && does not trip set -e; reject unknown formats explicitly.
@@ -15,18 +16,18 @@ node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memo
 (( node_cpu >= 4 ))
 [[ "${node_memory}" =~ ^([0-9]+)Ki$ ]] || { printf 'Unsupported allocatable memory format: %s\n' "${node_memory}" >&2; exit 1; }
 (( BASH_REMATCH[1] >= 8 * 1024 * 1024 ))
-kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router -o json |
-  jq -e 'all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
-# The isolated fixture enables direct egress explicitly. Refuse a backend still
-# routing runtime traffic through its privileged egress gateway. kind proves
-# policy identity and ordering; packet enforcement needs a compatible CNI.
-kubectl -n ate-system get deployment ate-api-server -o json |
-  jq -e '[.spec.template.spec.containers[] | select(.name == "ate-api-server") | .args[] | select(startswith("--egress-gateway-address="))] == ["--egress-gateway-address="]' >/dev/null
+# Agent Substrate v1.0.0 sends all Actor egress through its gateway and routes
+# ingress through atenet-router; both must be serving. No installation setting
+# is patched.
+kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress -o json |
+  jq -e '(.items | length) == 4 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
+client_namespace=external-substrate-e2e
+kubectl -n "${client_namespace}" get serviceaccount native-core-proof >/dev/null
 registry=orka-external-substrate-registry
 test "$(docker inspect -f '{{index .Config.Labels "orka.workspace.e2e"}}' "${registry}")" = external-substrate
 registry_ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "${registry}")"
 test -n "${registry_ip}"
-printf 'Isolated pinned native installation and arm64 registry preflight passed.\n'
+printf 'Isolated pinned native installation and %s registry preflight passed.\n' "${arch}"
 if [[ "${mode}" == preflight ]]; then exit 0; fi
 
 # Compilation and installation are a separate release point from preparing this
@@ -44,8 +45,16 @@ if kubectl -n orka-workspace-system get deployment/orka-workspace-substrate >/de
   exit 1
 fi
 run_id="$(date -u +%Y%m%d%H%M%S)"
-namespace="external-substrate-core-${run_id}"
-run_dir="${PWD}/bin/${namespace}"
+# Core reaches routed runtimes only through atenet-router, whose ingress
+# allowlist is fixed at install time (install-backend.sh). The Core manager's
+# pod-certificate SPIFFE ID therefore needs a stable namespace; runs are already
+# serialized by the deployment guard above.
+namespace="external-substrate-core"
+if kubectl get namespace "${namespace}" >/dev/null 2>&1 || kubectl -n "${client_namespace}" get job "${namespace}" >/dev/null 2>&1; then
+  printf 'A retained native Core proof (%s) requires explicit review before another run.\n' "${namespace}" >&2
+  exit 1
+fi
+run_dir="${PWD}/bin/${namespace}-${run_id}"
 mkdir -p "${run_dir}"
 chmod 700 "${run_dir}"
 shared_snapshot="${run_dir}/orka-workspace"
@@ -65,7 +74,7 @@ for label, source, snapshot in [('core',sys.argv[1],sys.argv[3]),('shared',sys.a
         digest.update(name.encode()+b'\0'+(root/name).read_bytes()+b'\0')
     pins[label]={'gitCommit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),
                  'goSourceSHA256':digest.hexdigest()}
-pins['nativeCommit']='fa6d949685a6318940a9a0195c867c864009b820'
+pins['nativeCommit']='b34fbee742906494b5eb4f1f36987176bf8770a4'
 fixture_root=pathlib.Path(sys.argv[4])
 fixture_files=[path for path in (fixture_root/'hack/external-substrate-e2e/core').iterdir() if path.is_file()]
 fixture_files.append(fixture_root/'scripts/external-substrate-core-e2e.sh')
@@ -80,12 +89,12 @@ core_context="${run_dir}/images/core"
 provider_context="${run_dir}/images/provider"
 proof_context="${run_dir}/images/proof"
 mkdir -p "${runtime_context}" "${core_context}" "${provider_context}" "${proof_context}"
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/orka-acp-runtime" ./cmd/orka-acp-runtime
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/orka-acp-exec-helper" ./cmd/orka-acp-exec-helper
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${core_context}/manager" ./cmd
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${shared_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/acp-agent" ./hack/external-workspace-e2e/acp-agent
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${shared_snapshot}/providers" build -p 4 -buildvcs=false -trimpath -o "${provider_context}/orka-workspace-substrate" ./substrate/cmd/orka-workspace-substrate
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${shared_snapshot}/hack/external-substrate-e2e" build -p 4 -buildvcs=false -trimpath -o "${proof_context}/native-data-proof" ./core
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/orka-acp-runtime" ./cmd/orka-acp-runtime
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/orka-acp-exec-helper" ./cmd/orka-acp-exec-helper
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${core_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${core_context}/manager" ./cmd
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${shared_snapshot}" build -p 4 -buildvcs=false -trimpath -o "${runtime_context}/acp-agent" ./hack/external-workspace-e2e/acp-agent
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${shared_snapshot}/providers" build -p 4 -buildvcs=false -trimpath -o "${provider_context}/orka-workspace-substrate" ./substrate/cmd/orka-workspace-substrate
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${shared_snapshot}/hack/external-substrate-e2e" build -p 4 -buildvcs=false -trimpath -o "${proof_context}/native-data-proof" ./core
 chmod 0555 "${runtime_context}/orka-acp-runtime" "${runtime_context}/orka-acp-exec-helper" "${runtime_context}/acp-agent" "${core_context}/manager"
 docker build -f "${shared_snapshot}/hack/external-workspace-e2e/acp-runtime.Dockerfile" -t "localhost:5002/orka/native-core-runtime:${run_id}" "${runtime_context}"
 docker build -f "${shared_snapshot}/hack/external-workspace-e2e/core.Dockerfile" -t "localhost:5002/orka/native-core:${run_id}" "${core_context}"
@@ -99,7 +108,8 @@ core_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/
 provider_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-provider:${run_id}")"
 proof_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-core-proof:${run_id}")"
 runtime_image="${runtime_image/localhost:5002/${registry_ip}:5000}"
-worker_image="${SUBSTRATE_WORKER_IMAGE:-localhost:5002/ateom-gvisor-715889664656de67e44382a8d6ab981d@sha256:6055430a2c29d7815f3b94bc0682cbb6495c5d90012b6531b86ac92bba86d372}"
+# The cmd/ateworker-gvisor image built from the pinned checkout (see run-proof.sh).
+worker_image="${SUBSTRATE_WORKER_IMAGE:?set SUBSTRATE_WORKER_IMAGE to the pinned cmd/ateworker-gvisor image}"
 python3 - "${run_dir}/images.json" "${runtime_image}" "${core_image}" "${provider_image}" "${proof_image}" "${worker_image}" <<'PY'
 import json,pathlib,sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(zip(['runtime','core','provider','proof','worker'],sys.argv[2:])),indent=2)+'\n')
@@ -117,6 +127,8 @@ openssl rand 32 >"${run_dir}/private/key"
 openssl rand -hex 32 >"${run_dir}/private/token"
 chmod 600 "${run_dir}/private/"*
 kubectl create namespace "${namespace}"
+# ate-system's NetworkPolicy admits Substrate clients only from labeled namespaces.
+kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
 kubectl -n "${namespace}" create secret tls external-substrate-core-tls --key="${run_dir}/private/tls.key" --cert="${run_dir}/private/tls.crt"
 kubectl create --dry-run=client -f "${core_snapshot}/config/rbac/role.yaml" -o json >"${run_dir}/core-role.json"
@@ -128,14 +140,14 @@ jq '.items[] | select(.kind == "Job")' "${run_dir}/install.json" | kubectl creat
 printf 'Actual native Core Task proof namespace: %s\nArtifacts: %s\n' "${namespace}" "${run_dir}"
 start="$(date +%s)"
 while true; do
-  job="$(kubectl -n "${namespace}" --request-timeout=15s get job native-core-proof -o json)"
+  job="$(kubectl -n "${client_namespace}" --request-timeout=15s get job "${namespace}" -o json)"
   if jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs job/native-core-proof | tee "${run_dir}/proof.log"
+    kubectl -n "${client_namespace}" logs "job/${namespace}" | tee "${run_dir}/proof.log"
     printf 'Failed proof retained; never replay an uncertain accepted Task. Namespace: %s\n' "${namespace}" >&2
     exit 1
   fi
   if jq -e 'any(.status.conditions[]?; .type == "Complete" and .status == "True")' <<<"${job}" >/dev/null; then
-    kubectl -n "${namespace}" logs job/native-core-proof | tee "${run_dir}/proof.log"
+    kubectl -n "${client_namespace}" logs "job/${namespace}" | tee "${run_dir}/proof.log"
     break
   fi
   (( $(date +%s) - start < 900 )) || exit 1

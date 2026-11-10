@@ -26,9 +26,12 @@ const (
 	catalogLabel     = "substrate.workspace.orka.ai/checkpoint-catalog"
 	catalogFinalizer = ControllerName + "/checkpoint-data"
 	catalogDataKey   = "checkpoint.json"
-	catalogVersion   = "substrate.workspace.checkpoint.v1"
-	exportLabel      = "substrate.workspace.orka.ai/checkpoint-uid"
-	exportDataKey    = "export.json"
+	catalogVersion   = "substrate.workspace.checkpoint.v2"
+	// legacyCatalogVersion catalogs and export indexes hold Agent Substrate
+	// v0.1.0 Tags. They are never adopted; see errLegacyNativeState.
+	legacyCatalogVersion = "substrate.workspace.checkpoint.v1"
+	exportLabel          = "substrate.workspace.orka.ai/checkpoint-uid"
+	exportDataKey        = "export.json"
 )
 
 // Owners are exact Kubernetes object lifetimes. A false entry is a release
@@ -105,6 +108,9 @@ func (d *Lifecycle) readCatalog(ctx context.Context, key types.NamespacedName) (
 	if len(raw) == 0 || len(raw) > 512<<10 {
 		return nil, nil, fmt.Errorf("checkpoint catalog size is invalid")
 	}
+	if cm.Labels[catalogLabel] == legacyCatalogVersion {
+		return nil, nil, errLegacyNativeState
+	}
 	artifact := &checkpointArtifact{}
 	if err := json.Unmarshal([]byte(raw), artifact); err != nil {
 		return nil, nil, fmt.Errorf("checkpoint catalog is unreadable")
@@ -120,7 +126,7 @@ func (d *Lifecycle) readCatalog(ctx context.Context, key types.NamespacedName) (
 	if err != nil {
 		return nil, nil, err
 	}
-	if artifact.Version != catalogVersion || artifact.Checkpoint.Atespace == "" || artifact.Checkpoint.Tag.UID == "" || artifact.Checkpoint.Template.UID == "" || artifact.Checkpoint.CreatedAt.IsZero() || artifact.Placement.UID == "" || artifact.Digest != hash || artifact.Checkpoint.Template.Digest != templateHash || artifact.Owners == nil || artifact.ProviderBinding.UID == "" || cm.UID == "" || key != catalogKey(cm.Namespace, artifact.Checkpoint.Tag.UID) || cm.Labels[catalogLabel] != catalogVersion || cm.Labels[providerLabel] != string(artifact.ProviderBinding.UID) || (artifact.Collected && (!artifact.Deleting || activeOwners(artifact) != 0)) {
+	if artifact.Version != catalogVersion || artifact.Checkpoint.Atespace == "" || artifact.Checkpoint.Tag.UID == "" || artifact.Checkpoint.Template.UID == "" || artifact.Checkpoint.SnapshotURI == "" || artifact.Checkpoint.CreatedAt.IsZero() || artifact.Placement.UID == "" || artifact.Digest != hash || artifact.Checkpoint.Template.Digest != templateHash || artifact.Owners == nil || artifact.ProviderBinding.UID == "" || cm.UID == "" || key != catalogKey(cm.Namespace, artifact.Checkpoint.Tag.UID) || cm.Labels[catalogLabel] != catalogVersion || cm.Labels[providerLabel] != string(artifact.ProviderBinding.UID) || (artifact.Collected && (!artifact.Deleting || activeOwners(artifact) != 0)) {
 		return nil, nil, fmt.Errorf("checkpoint catalog identity or immutable provenance is invalid")
 	}
 	return cm, artifact, nil
@@ -235,16 +241,28 @@ func (d *Lifecycle) releaseCatalog(ctx context.Context, namespace string, ref *c
 		return d.saveCatalog(ctx, cm, artifact)
 	})
 }
+
+// listCatalogs fails closed on any legacy catalog in scope: its Tags and
+// references cannot be verified against the v1 backend.
 func (d *Lifecycle) listCatalogs(ctx context.Context, namespace string) ([]corev1.ConfigMap, error) {
 	list := &corev1.ConfigMapList{}
-	options := []client.ListOption{client.MatchingLabels{catalogLabel: catalogVersion}}
+	options := []client.ListOption{client.HasLabels{catalogLabel}}
 	if namespace != "" {
 		options = append(options, client.InNamespace(namespace))
 	}
 	if err := d.client.List(ctx, list, options...); err != nil {
 		return nil, err
 	}
-	return list.Items, nil
+	items := list.Items[:0]
+	for _, item := range list.Items {
+		switch item.Labels[catalogLabel] {
+		case catalogVersion:
+			items = append(items, item)
+		case legacyCatalogVersion:
+			return nil, errLegacyNativeState
+		}
+	}
+	return items, nil
 }
 func (d *Lifecycle) catalogReferenced(ctx context.Context, namespace, atespace, uid string, template bool, excluding string) (bool, error) {
 	items, err := d.listCatalogs(ctx, namespace)
@@ -325,7 +343,7 @@ func (d *Lifecycle) collectCatalog(ctx context.Context, key types.NamespacedName
 			if err := d.verifyCheckpoint(ctx, checkpoint); err != nil {
 				return false, err
 			}
-			if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Tag.Name}}); err != nil && status.Code(err) != codes.NotFound {
+			if _, err := d.control.DeleteTag(ctx, &pb.DeleteTagRequest{Tag: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Tag.Name}, Options: &pb.DeleteOptions{Uid: checkpoint.Tag.UID}}); err != nil && status.Code(err) != codes.NotFound {
 				return false, err
 			}
 			return false, nil
@@ -343,7 +361,7 @@ func (d *Lifecycle) collectCatalog(ctx context.Context, key types.NamespacedName
 				if err := d.verifyTemplate(ctx, checkpoint.Atespace, checkpoint.Template); err != nil {
 					return false, err
 				}
-				if _, err := d.control.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Template.Name}}); err != nil && status.Code(err) != codes.NotFound {
+				if _, err := d.control.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: &pb.ObjectRef{Atespace: checkpoint.Atespace, Name: checkpoint.Template.Name}, Options: &pb.DeleteOptions{Uid: checkpoint.Template.UID}}); err != nil && status.Code(err) != codes.NotFound {
 					return false, err
 				}
 				return false, nil

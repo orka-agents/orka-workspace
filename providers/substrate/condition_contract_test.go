@@ -272,7 +272,7 @@ func newConditionContractFixture(t *testing.T) conditionContractFixture {
 	t.Helper()
 	c, native, request := fixture(t, false)
 	control := &conditionWaitingControl{nativeFixture: native}
-	config := Config{ActorDNSSuffix: "actors.local", DirectEgressEnabled: true}
+	config := Config{RouterEndpoint: fixtureRouter}
 	return prepareConditionContractFixture(t, conditionContractFixture{client: c, request: request,
 		reconciler: func(c client.Client) conditionContractReconciler {
 			return &ExecutionWorkspaceReconciler{Client: c, Control: control, Config: config}

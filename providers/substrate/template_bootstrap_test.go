@@ -9,7 +9,6 @@ import (
 
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -102,20 +101,20 @@ func assertNativeRequestRejectedBeforeEffects(t *testing.T, c client.Client, nat
 	if _, err := driver(c, native).EnsureAllocation(t.Context(), request); err == nil || !strings.Contains(err.Error(), expected) {
 		t.Fatalf("unsupported native intent was not rejected: %v", err)
 	}
-	if native.boots != 0 || len(native.actors) != 0 || len(native.workers) != 0 || len(native.tags) != 0 || len(native.templates) != 1 {
+	if native.boots != 0 || len(native.actors) != 0 || len(native.workers) != 0 || len(native.tags) != 0 || len(native.egress) != 0 || len(native.templates) != 1 {
 		t.Fatal("rejected intent created native resources")
 	}
-	configMaps, pods, policies := &corev1.ConfigMapList{}, &corev1.PodList{}, &networkingv1.NetworkPolicyList{}
-	for _, list := range []client.ObjectList{configMaps, pods, policies} {
+	configMaps, pods := &corev1.ConfigMapList{}, &corev1.PodList{}
+	for _, list := range []client.ObjectList{configMaps, pods} {
 		if err := c.List(t.Context(), list); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(configMaps.Items) != 0 || len(pods.Items) != 0 || len(policies.Items) != 0 {
-		t.Fatal("rejected intent created a journal, anchor, worker, or network policy")
+	if len(configMaps.Items) != 0 || len(pods.Items) != 0 {
+		t.Fatal("rejected intent created a journal, anchor, or worker")
 	}
 	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion("ate.dev/v1alpha1")
+	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
 	if err := c.List(t.Context(), pools); err != nil {
 		t.Fatal(err)

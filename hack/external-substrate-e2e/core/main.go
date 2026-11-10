@@ -10,13 +10,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	"github.com/orka-agents/orka-workspace/native-data-proof/nativee2e"
 	provider "github.com/orka-agents/orka-workspace/providers/substrate"
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -25,11 +25,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -98,8 +96,8 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 		return nil, nil, nil, nil, fmt.Errorf("provider omitted separate exact native process and worker identity")
 	}
 	endpoint, err := url.Parse(startup.Endpoint)
-	if err != nil || endpoint.Scheme != "http" || (endpoint.Port() != "" && endpoint.Port() != "80") {
-		return nil, nil, nil, nil, fmt.Errorf("native startup endpoint did not preserve supervisor port 80")
+	if err != nil || endpoint.Scheme != "https" || startup.Endpoint != nativee2e.RouterEndpoint || process.RouterTarget != process.Namespace+"/"+process.Name || w.Spec.Workload.Runtime.BootstrapPort != api.NativeRouterTargetPort {
+		return nil, nil, nil, nil, fmt.Errorf("native startup endpoint is not the router with the exact Actor target and supervisor port 80")
 	}
 	ref := &pb.ObjectRef{Atespace: process.Namespace, Name: process.Name}
 	actor, err := p.native.GetActor(ctx, &pb.GetActorRequest{Actor: ref})
@@ -118,7 +116,7 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 		return nil, nil, nil, nil, fmt.Errorf("observed worker Pod was replaced")
 	}
 	pool := &unstructured.Unstructured{}
-	pool.SetAPIVersion("ate.dev/v1alpha1")
+	pool.SetAPIVersion("ate.dev/v1")
 	pool.SetKind("WorkerPool")
 	if err := p.c.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: assignment.GetWorkerPool()}, pool); err != nil {
 		return nil, nil, nil, nil, err
@@ -132,41 +130,38 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 			return nil, nil, nil, nil, fmt.Errorf("private native worker birth labels differ")
 		}
 	}
-	var policies networkingv1.NetworkPolicyList
-	if err := p.c.List(ctx, &policies, client.InNamespace(pod.Namespace)); err != nil {
-		return nil, nil, nil, nil, err
-	}
-	selected := []string{}
-	preBirth := false
-	for _, policy := range policies.Items {
-		selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
-		if err == nil && selector.Matches(labels.Set(pod.Labels)) {
-			selected = append(selected, policy.Name)
-			if policy.Labels["substrate.workspace.orka.ai/workspace-uid"] == string(w.UID) && !policy.CreationTimestamp.After(pod.CreationTimestamp.Time) {
-				preBirth = true
-			}
-		}
-	}
-	if !preBirth {
-		return nil, nil, nil, nil, fmt.Errorf("provider egress policy did not exist before worker Pod birth")
-	}
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, startup.Endpoint+"/v2/credential-bootstrap", nil)
-	response, err := (&http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}).Do(request)
+	template, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	defer response.Body.Close()
+	nativeWorker, err := p.native.GetWorker(ctx, &pb.GetWorkerRequest{Worker: assignment.GetWorker()})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if err := nativee2e.VerifySingleActorWorker(nativeWorker, template, actor); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	egress, err := nativee2e.VerifyEgressPolicy(ctx, p.native, ref)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// Core admits the allowlist; the provider compiles it verbatim. Report
+	// the applied host patterns for review.
+	selected := []string{}
+	for _, rule := range egress.GetRules() {
+		selected = append(selected, rule.GetHttp().GetHostnames()...)
+		selected = append(selected, rule.GetHttps().GetHostnames()...)
+		selected = append(selected, rule.GetTlsPassthrough().GetHostnames()...)
+	}
 	var challenge publicChallenge
-	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNotFound {
-		return nil, nil, nil, nil, fmt.Errorf("native public startup challenge returned %d", response.StatusCode)
+	code, readErr := nativee2e.RouterGetJSON(ctx, startup.Endpoint, process.RouterTarget, "/v2/credential-bootstrap", &challenge)
+	if readErr != nil && code != http.StatusNotFound {
+		return nil, nil, nil, nil, fmt.Errorf("native public startup challenge through the router: %w", readErr)
 	}
 	// Core closes this one-time endpoint after sealed credential delivery. A
 	// 404 is accepted only with the independent authenticated Serving proof
 	// required below; the data proof separately captures the public challenge.
-	if response.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(io.LimitReader(response.Body, 32<<10)).Decode(&challenge); err != nil {
-			return nil, nil, nil, nil, err
-		}
+	if code == http.StatusOK {
 		canonical, err := json.Marshal(challenge)
 		if err != nil {
 			return nil, nil, nil, nil, err
@@ -189,8 +184,8 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 	if err != nil || again.GetMetadata().GetUid() != actor.GetMetadata().GetUid() || again.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() || !proto.Equal(again.GetStatus().GetWorkerAssignment(), assignment) {
 		return nil, nil, nil, nil, fmt.Errorf("native fence changed while observing public challenge: %v", err)
 	}
-	template, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
-	if err != nil || template.GetSnapshotsConfig().GetOnPause() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || template.GetSnapshotsConfig().GetOnCommit() != pb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_DATA || template.GetSnapshotsConfig().GetOnResume().GetFromData() != pb.ResumeSource_RESUME_SOURCE_COLD_BOOT {
+	again2, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: actor.ActorTemplate})
+	if err != nil || again2.GetMetadata().GetUid() != template.GetMetadata().GetUid() || nativee2e.VerifyDataOnlyTemplate(again2) != nil {
 		return nil, nil, nil, nil, fmt.Errorf("native full-memory gate differs: %v", err)
 	}
 	return actor, pod, pool, selected, nil
@@ -201,11 +196,13 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: p.namespace, Name: "infrastructure"},
-		Containers: []*pb.Container{{Name: "runtime", Image: p.image}}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"orka.workspace.e2e/pool": p.namespace}},
-		SandboxConfig:   &pb.SandboxConfig{SandboxClass: pb.SandboxClass_SANDBOX_CLASS_GVISOR, ConfigName: "gvisor-default"},
-		SnapshotsConfig: &pb.SnapshotsConfig{StorageLocation: "s3://ate-snapshots/" + p.namespace + "/"}}})
+	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
 	if err != nil {
+		return nil, err
+	}
+	// The deployed provider authenticates as its own ServiceAccount, with
+	// editor on this profile Atespace and global viewer only.
+	if err := nativee2e.GrantProviderAccess(ctx, p.native, p.namespace, nativee2e.ProviderPrincipal); err != nil {
 		return nil, err
 	}
 	parameters := &profile.SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: p.namespace, Name: "native-core"},
@@ -309,9 +306,9 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	if !available || startup == nil || workspace == nil || servingInstance != identity["runtimeInstanceID"] || servingBoot != identity["runtimeSessionSupervisorBootID"] || servingProfile == "" {
 		return nil, fmt.Errorf("successful Task lacks independently observed startup, authenticated Serving or persisted result evidence")
 	}
-	p.pass("provider process evidence matches exact Actor UID/version/worker; full-memory remains gated")
+	p.pass("provider process evidence matches exact Actor UID/version/worker, routed target and egress allowlist; full-memory remains gated")
 	if p.challengeRead {
-		p.pass("independent public challenge read binds the native process and provider hash before closure")
+		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
 	p.pass("actual supervisor reaches authenticated Serving on native port 80 and completes an ACP RuntimeSession prompt with persisted result")
 	if err := wait(ctx, func() (bool, error) {
@@ -341,7 +338,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		if nativeErr != nil && status.Code(nativeErr) != codes.NotFound {
 			return false, nativeErr
 		}
-		poolErr := p.c.Get(ctx, client.ObjectKeyFromObject(pool), &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1alpha1", "kind": "WorkerPool"}})
+		poolErr := p.c.Get(ctx, client.ObjectKeyFromObject(pool), &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool"}})
 		workerErr := p.c.Get(ctx, client.ObjectKeyFromObject(worker), &corev1.Pod{})
 		return status.Code(nativeErr) == codes.NotFound && apierrors.IsNotFound(poolErr) && apierrors.IsNotFound(workerErr), nil
 	}); err != nil {
@@ -378,7 +375,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	p.pass("terminal Core settlement deletes its exact RuntimePool and credentials, attachment Secrets, native Actor, private WorkerPool and worker Pod")
 	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
 		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
-		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "selectedNetworkPolicies": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
+		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
 		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
 }
 
@@ -437,20 +434,20 @@ func (p *proof) verifyRetiredTask(ctx context.Context) (map[string]any, error) {
 }
 
 func (p *proof) verifyRetiredInventory(ctx context.Context, workspaceUID, poolUID string) (map[string]any, error) {
-	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, PageSize: 1000})
+	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(actors.GetActors()) != 0 || actors.GetNextPageToken() != "" {
 		return nil, fmt.Errorf("rejected native namespace retains Actors: %v", err)
 	}
-	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, PageSize: 1000})
+	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(tags.GetTags()) != 0 || tags.GetNextPageToken() != "" {
 		return nil, fmt.Errorf("rejected native namespace retains Tags: %v", err)
 	}
-	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, PageSize: 1000})
+	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(templates.GetActorTemplates()) != 1 || templates.GetActorTemplates()[0].GetMetadata().GetName() != "infrastructure" || templates.GetNextPageToken() != "" {
 		return nil, fmt.Errorf("rejected native namespace has a derived runtime template: %v", err)
 	}
 	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion("ate.dev/v1alpha1")
+	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
 	if err := p.c.List(ctx, pools, client.InNamespace(p.namespace)); err != nil {
 		return nil, err
@@ -496,14 +493,13 @@ func main() {
 	config, err := rest.InClusterConfig()
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
-	_ = networkingv1.AddToScheme(scheme)
 	_ = api.AddToScheme(scheme)
 	_ = profile.AddToScheme(scheme)
 	var c client.Client
 	if err == nil {
 		c, err = client.New(config, client.Options{Scheme: scheme})
 	}
-	controlConfig := provider.Config{APIEndpoint: "api.ate-system.svc:443", CAFile: "/native/server/trust-bundle.pem", CertFile: "/native/client/credential-bundle.pem", KeyFile: "/native/client/credential-bundle.pem", ActorDNSSuffix: "actors.resources.substrate.ate.dev", DirectEgressEnabled: true}
+	controlConfig := nativee2e.ProofTransport()
 	var report map[string]any
 	if err == nil {
 		conn, dialErr := provider.Dial(controlConfig)

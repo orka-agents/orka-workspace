@@ -143,6 +143,7 @@ func TestNativePreservesResolvedEnvironmentLiterals(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := record.TemplateSpec.Containers[0].Env
+	env = env[:len(env)-len(egressTrustEnvironment)]
 	want := container.Env[len(container.Env)-3:]
 	for i, actual := range env[len(env)-3:] {
 		if actual.Name != want[i].Name || actual.Value != want[i].Value {
