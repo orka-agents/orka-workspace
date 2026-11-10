@@ -104,7 +104,7 @@ func VerifyEgressPolicy(ctx context.Context, native pb.ControlClient, ref *pb.Ob
 func GrantProviderAccess(ctx context.Context, native pb.ControlClient, atespace, principal string) error {
 	member := "user:" + principal
 	_, err := native.CreateAtespaceAccessPolicy(ctx, &pb.CreateAtespaceAccessPolicyRequest{Atespace: &pb.ObjectRef{Name: atespace},
-		AccessPolicy: &pb.AccessPolicy{Metadata: &pb.ResourceMetadata{Atespace: atespace, Name: "default"}, Bindings: []*pb.Binding{{Role: "editor", Members: []string{member}}}}})
+		AccessPolicy: &pb.AccessPolicy{Metadata: &pb.ResourceMetadata{Name: "default"}, Bindings: []*pb.Binding{{Role: "editor", Members: []string{member}}}}})
 	if err != nil {
 		return fmt.Errorf("grant provider Atespace editor: %w", err)
 	}
