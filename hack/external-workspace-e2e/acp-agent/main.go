@@ -2,15 +2,43 @@
 
 // The deterministic stdio agent follows the existing Orka security-scan ACP
 // fixture protocol. It makes no model, repository, or external network calls.
+//
+// Orka captures a native Codex session before a Session suspend and restores
+// it only through session/resume, so the agent advertises
+// sessionCapabilities.resume and, when it runs with a CODEX_HOME, publishes a
+// real Codex 0.160.0 rollout (testdata/rollout.jsonl, sessionkit's "basic"
+// compatibility fixture, MIT) whose UUIDv7 thread ID is the ACP session ID.
 package main
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
+
+// fixtureThreadID is the thread of the embedded Codex rollout.
+const fixtureThreadID = "01a10020-1222-76e3-977d-d5165792ae72"
+
+//go:embed testdata/rollout.jsonl
+var fixtureRollout []byte
+
+// publishRollout writes the embedded rollout under CODEX_HOME at Codex's
+// canonical sessions/YYYY/MM/DD path and reports whether it did.
+func publishRollout() bool {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		return false
+	}
+	dir := filepath.Join(home, "sessions", "2026", "10", "02")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false
+	}
+	return os.WriteFile(filepath.Join(dir, "rollout-2026-10-02T21-57-44-"+fixtureThreadID+".jsonl"), fixtureRollout, 0o600) == nil
+}
 
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -37,13 +65,16 @@ func main() {
 		result := map[string]any{}
 		switch message.Method {
 		case "initialize":
-			result = map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "external-workspace-fixture", "version": "1"}, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true}}, "authMethods": []any{map[string]any{"id": "api-key", "name": "Fixture API key"}}}
+			result = map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "external-workspace-fixture", "version": "1"}, "agentCapabilities": map[string]any{"loadSession": true, "sessionCapabilities": map[string]any{"resume": map[string]any{}}, "mcpCapabilities": map[string]any{"http": true}}, "authMethods": []any{map[string]any{"id": "api-key", "name": "Fixture API key"}}}
 		case "authenticate":
 		case "session/new":
 			sequence++
 			sessionID = fmt.Sprintf("external-workspace-%d", sequence)
+			if sequence == 1 && publishRollout() {
+				sessionID = fixtureThreadID
+			}
 			result["sessionId"] = sessionID
-		case "session/load":
+		case "session/load", "session/resume":
 			var params struct {
 				Params struct {
 					SessionID string `json:"sessionId"`
