@@ -40,6 +40,44 @@ func publishRollout() bool {
 	return os.WriteFile(filepath.Join(dir, "rollout-2026-10-02T21-57-44-"+fixtureThreadID+".jsonl"), fixtureRollout, 0o600) == nil
 }
 
+// safeSessionID accepts only the letters, digits and hyphens of a session ID, so
+// the ID can be neither a path nor a glob pattern.
+func safeSessionID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// nativeSessionRestored reports whether a session can be resumed. Without a
+// CODEX_HOME the fixture keeps no native session, so any ID is accepted as
+// before. With one, the session's rollout must be present under
+// sessions/YYYY/MM/DD, as Codex requires: a resume that restored nothing must
+// not succeed.
+func nativeSessionRestored(home, sessionID string) bool {
+	if home == "" {
+		return true
+	}
+	if !safeSessionID(sessionID) {
+		return false
+	}
+	matches, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+sessionID+".jsonl"))
+	if err != nil {
+		return false
+	}
+	for _, match := range matches {
+		if info, err := os.Stat(match); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64<<10), 2<<20)
@@ -82,6 +120,12 @@ func main() {
 			}
 			if err := json.Unmarshal(scanner.Bytes(), &params); err != nil {
 				os.Exit(2)
+			}
+			if !nativeSessionRestored(os.Getenv("CODEX_HOME"), params.Params.SessionID) {
+				if len(message.ID) != 0 {
+					write(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32002, "message": "session not found", "data": map[string]any{"sessionId": params.Params.SessionID}}})
+				}
+				continue
 			}
 			sessionID = params.Params.SessionID
 		case "session/prompt":
