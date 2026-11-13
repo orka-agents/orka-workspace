@@ -23,12 +23,12 @@ func TestNativeSessionRestoredRequiresTheRollout(t *testing.T) {
 	if !nativeSessionRestored(home, fixtureThreadID) {
 		t.Fatal("a resume must succeed once the rollout is restored")
 	}
-	for _, id := range []string{"", "external-workspace-1", "../" + fixtureThreadID, "*", "01a10020-*"} {
+	for _, id := range []string{"", "external-workspace-1", "../" + fixtureThreadID, "*", "01a10020-*", fixtureThreadID[len(fixtureThreadID)-12:], fixtureThreadID[9:], "57-44-" + fixtureThreadID} {
 		if nativeSessionRestored(home, id) {
 			t.Fatalf("session %q must not resume", id)
 		}
 	}
-	empty := filepath.Join(home, "sessions", "2026", "10", "03", "rollout-x-empty-session.jsonl")
+	empty := filepath.Join(home, "sessions", "2026", "10", "03", "rollout-2026-10-03T00-00-00-empty-session.jsonl")
 	if err := os.MkdirAll(filepath.Dir(empty), 0o700); err != nil {
 		t.Fatal(err)
 	}

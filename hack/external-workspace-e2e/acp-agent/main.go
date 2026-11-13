@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -54,11 +55,15 @@ func safeSessionID(id string) bool {
 	return true
 }
 
+// rolloutName is Codex's rollout file name: its creation time, then the full
+// session ID.
+var rolloutName = regexp.MustCompile(`^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-(.+)\.jsonl$`)
+
 // nativeSessionRestored reports whether a session can be resumed. Without a
 // CODEX_HOME the fixture keeps no native session, so any ID is accepted as
-// before. With one, the session's rollout must be present under
-// sessions/YYYY/MM/DD, as Codex requires: a resume that restored nothing must
-// not succeed.
+// before. With one, a non-empty rollout whose file name carries exactly the
+// requested session ID must be present under sessions/YYYY/MM/DD, as Codex
+// requires: a resume that restored nothing must not succeed.
 func nativeSessionRestored(home, sessionID string) bool {
 	if home == "" {
 		return true
@@ -66,11 +71,15 @@ func nativeSessionRestored(home, sessionID string) bool {
 	if !safeSessionID(sessionID) {
 		return false
 	}
-	matches, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+sessionID+".jsonl"))
+	matches, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*.jsonl"))
 	if err != nil {
 		return false
 	}
 	for _, match := range matches {
+		name := rolloutName.FindStringSubmatch(filepath.Base(match))
+		if name == nil || name[1] != sessionID {
+			continue
+		}
 		if info, err := os.Stat(match); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
 			return true
 		}
