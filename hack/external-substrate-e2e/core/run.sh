@@ -235,12 +235,14 @@ router_traces="${run_dir}/private/router-traces"
 mkdir -p "${router_traces}"
 tracing_failed=0
 for attempt in $(seq 1 12); do
-  kubectl -n "${namespace}" logs deployment/orka-otel-collector --tail=-1 >"${run_dir}/collector.log"
-  for trace_id in $(python3 -I "${fixture}/traces.py" trace-ids "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json"); do
+  # Raw spans stay under private/, which evidence uploads exclude: a failed
+  # privacy check below must not publish what it rejected.
+  kubectl -n "${namespace}" logs deployment/orka-otel-collector --tail=-1 >"${run_dir}/private/collector.log"
+  for trace_id in $(python3 -I "${fixture}/traces.py" trace-ids "${run_dir}/private/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json"); do
     kubectl --request-timeout=15s get --raw "/api/v1/namespaces/otel-system/services/jaeger:16686/proxy/api/traces/${trace_id}" \
       >"${router_traces}/${trace_id}.json" 2>/dev/null || rm -f "${router_traces}/${trace_id}.json"
   done
-  if python3 -I "${fixture}/traces.py" check "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json" \
+  if python3 -I "${fixture}/traces.py" check "${run_dir}/private/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json" \
     "${router_traces}" "${run_dir}/private/token" "${run_dir}/traces.json"; then
     break
   fi

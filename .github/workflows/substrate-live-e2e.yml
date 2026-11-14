@@ -148,4 +148,5 @@ jobs:
             !orka-workspace/bin/external-substrate-core-*/orka/**
             !orka-workspace/bin/external-substrate-core-*/orka-workspace/**
             !orka-workspace/bin/**/images/**
+            !orka-workspace/bin/**/collector.log
             !orka-workspace/bin/external-substrate-proof-*/native-data-*
