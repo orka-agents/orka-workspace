@@ -1,0 +1,147 @@
+name: Substrate live E2E
+
+# Live Agent Substrate v1.0.0 proofs on a dedicated kind cluster: the provider
+# Data proof (capture, checkpoint export, cold import), then the actual Orka
+# Core proof (ACP Task with gateway credential injection and tracing, then a
+# two-turn Session across a worker eviction with data-only suspension and cold
+# resume). See hack/external-substrate-e2e/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      orka-ref:
+        description: orka-agents/orka ref (branch, tag or SHA) used as the Core source
+        required: false
+        default: main
+  schedule:
+    # Weekly, Monday 07:17 UTC.
+    - cron: "17 7 * * 1"
+  pull_request:
+    paths:
+      - ".github/workflows/substrate-live-e2e.yml"
+      - "api/**"
+      - "sdk/**"
+      - "go.mod"
+      - "go.sum"
+      - "providers/substrate/**"
+      - "providers/go.mod"
+      - "providers/go.sum"
+      - "hack/external-substrate-e2e/**"
+      - "hack/external-workspace-e2e/**"
+      - "scripts/external-substrate*.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: substrate-live-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  substrate-live-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      KIND_VERSION: v0.33.0
+      KIND_SHA256_AMD64: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KIND_SHA256_ARM64: 20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2
+      ORKA_REF: ${{ inputs.orka-ref || 'main' }}
+      # The checkout directory keeps the repository basename: kindctl derives
+      # the cluster name from it and the scripts accept only
+      # kind-orka-workspace-*-external-su-* contexts.
+      ORKA_CORE_SOURCE: ${{ github.workspace }}/orka
+      KINDCTL_BIN: ${{ github.workspace }}/orka/.agents/skills/kindctl/bin/kindctl
+      SUBSTRATE_CLONE: "1"
+    defaults:
+      run:
+        working-directory: orka-workspace
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: orka-workspace
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: orka-agents/orka
+          ref: ${{ env.ORKA_REF }}
+          path: orka
+          persist-credentials: false
+
+      - name: Free disk space
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -Eeuo pipefail
+          df -h
+          docker system prune -af || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: orka-workspace/go.mod
+          cache-dependency-path: |
+            orka-workspace/go.sum
+            orka-workspace/providers/go.sum
+            orka-workspace/hack/external-substrate-e2e/go.sum
+            orka/go.sum
+
+      - name: Install kind and tools
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -Eeuo pipefail
+          case "$(uname -m)" in
+            x86_64|amd64) arch=amd64; expected="${KIND_SHA256_AMD64}" ;;
+            aarch64|arm64) arch=arm64; expected="${KIND_SHA256_ARM64}" ;;
+            *) echo "unsupported runner architecture" >&2; exit 1 ;;
+          esac
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 --retry-delay 2 -o "${tmp}/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${arch}"
+          printf '%s  %s\n' "${expected}" "${tmp}/kind" | sha256sum --check --strict -
+          sudo install -m 0755 "${tmp}/kind" /usr/local/bin/kind
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync
+          kind version
+          kubectl version --client=true
+          test -x "${KINDCTL_BIN}"
+          git -C orka rev-parse HEAD
+
+      - name: Host preflight
+        run: bash scripts/external-substrate-e2e.sh preflight-host
+
+      - name: Install Agent Substrate v1.0.0
+        run: bash scripts/external-substrate-e2e.sh install
+
+      - name: Data proof
+        run: bash scripts/external-substrate-e2e.sh proof
+
+      - name: Core proof preflight
+        run: bash scripts/external-substrate-core-e2e.sh preflight
+
+      - name: Core proof
+        env:
+          ORKA_CORE_BUILD_RELEASED: "1"
+        run: bash scripts/external-substrate-core-e2e.sh proof
+
+      - name: Redacted diagnostics
+        if: failure()
+        run: bash scripts/external-substrate-e2e.sh diagnostics || true
+
+      - name: Upload proof evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: substrate-live-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 14
+          # Reports, logs and redacted diagnostics only: never private/
+          # credentials, frozen source snapshots or image build contexts.
+          path: |
+            orka-workspace/bin/external-substrate-*/
+            orka-workspace/bin/diagnostics-*/
+            orka-workspace/bin/external-substrate-proof-namespace
+            !orka-workspace/bin/**/private/
+            !orka-workspace/bin/**/private/**
+            !orka-workspace/bin/external-substrate-core-*/orka/**
+            !orka-workspace/bin/external-substrate-core-*/orka-workspace/**
+            !orka-workspace/bin/**/images/**
+            !orka-workspace/bin/external-substrate-proof-*/native-data-*
