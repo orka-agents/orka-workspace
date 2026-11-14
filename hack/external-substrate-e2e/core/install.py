@@ -144,6 +144,11 @@ for obj in provider_objects:
         spec["securityContext"].update({"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532})
         container = spec["containers"][0]
         container["image"], container["imagePullPolicy"] = provider_image, "IfNotPresent"
+        # install-backend.sh installed the gateway with the k8s.io credential
+        # provider and run.sh grants this run's Atespace its own namespace, so
+        # the provider may attest credential injection. Core keeps its provider
+        # Secret in the workload namespace; no extra namespace is listed.
+        container["args"].append("--egress-credential-provider=k8s.io")
     objects.append(obj)
 
 # Applying a List silently replaces an earlier object with a later same-identity

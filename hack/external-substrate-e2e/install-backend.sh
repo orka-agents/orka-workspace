@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Called only by kindctl exec --tag external-substrate from the shared repo.
 # Installs the pinned, unmodified Agent Substrate v1.0.0 checkout with its
-# official ate-setup installer onto this dedicated cluster. A v0.1.0 install
-# cannot be upgraded in place: use a fresh dedicated cluster.
+# official ate-setup installer onto this dedicated cluster, with the bundled
+# Kubernetes Secrets egress credential provider. Its namespace policy is
+# installed empty (granting nothing); the Core proof grants only its own run.
+# A v0.1.0 install cannot be upgraded in place: use a fresh dedicated cluster.
 set -euo pipefail
 source_dir="$1"
 test -n "${KUBECONFIG:-}"
@@ -68,11 +70,12 @@ ATE_INSTALL_KIND=true KIND_CLUSTER_NAME="${context#kind-}" KUBECTL_CONTEXT="${co
   go run ./cmd/ate-setup deploy ate-system \
     --rollout-timeout=5m \
     --sandbox-classes=gvisor \
-    --credential-provider='{"enabled":false}' \
+    --credential-provider='{"name":"k8s.io"}' \
     --ateapi-authz-bootstrap-owners="${proof_id},${core_proof_id}" \
     --ingress-allowed-spiffe-ids="${ingress_ids}"
 test -z "$(git status --porcelain --untracked-files=all)"
 cd - >/dev/null
+kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeout=5m
 kubectl create namespace "${client_namespace}" --dry-run=client -o yaml | kubectl apply -f -
 # ate-system's NetworkPolicy admits ate-api clients only from labeled namespaces.
 kubectl label namespace "${client_namespace}" ate.dev/api-access=true --overwrite

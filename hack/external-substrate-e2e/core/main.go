@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -52,7 +54,16 @@ type proof struct {
 	image         string
 	checks        []string
 	challengeRead bool
+	// injection summarizes the gateway credential injection observed at startup.
+	injection map[string]any
 }
+
+// Bounds the routed challenge read's retries of a 503 while the router route
+// to a starting Actor becomes available.
+const (
+	challengeStartupDeadline = 30 * time.Second
+	challengeRetryInterval   = 500 * time.Millisecond
+)
 
 func (p *proof) object(kind, name string, spec map[string]any) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "core.orka.ai/v1alpha1", "kind": kind,
@@ -145,6 +156,9 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	if p.injection, err = requireCredentialInjection(w, egress); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	// Core admits the allowlist; the provider compiles it verbatim. Report
 	// the applied host patterns for review.
 	selected := []string{}
@@ -154,7 +168,7 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 		selected = append(selected, rule.GetTlsPassthrough().GetHostnames()...)
 	}
 	var challenge publicChallenge
-	code, readErr := nativee2e.RouterGetJSON(ctx, startup.Endpoint, process.RouterTarget, "/v2/credential-bootstrap", &challenge)
+	code, readErr := readChallenge(ctx, startup.Endpoint, process.RouterTarget, &challenge)
 	if readErr != nil && code != http.StatusNotFound {
 		return nil, nil, nil, nil, fmt.Errorf("native public startup challenge through the router: %w", readErr)
 	}
@@ -189,6 +203,78 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 		return nil, nil, nil, nil, fmt.Errorf("native full-memory gate differs: %v", err)
 	}
 	return actor, pod, pool, selected, nil
+}
+
+// readChallenge reads the one-time public startup challenge through the
+// router. While the route to a starting Actor becomes available the router
+// briefly answers 503; that alone is retried, within challengeStartupDeadline.
+// Every other outcome, including a persistent 503, is returned unchanged.
+func readChallenge(ctx context.Context, endpoint, target string, challenge *publicChallenge) (int, error) {
+	deadline := time.Now().Add(challengeStartupDeadline)
+	for {
+		code, err := nativee2e.RouterGetJSON(ctx, endpoint, target, "/v2/credential-bootstrap", challenge)
+		if code != http.StatusServiceUnavailable || !time.Now().Add(challengeRetryInterval).Before(deadline) {
+			return code, err
+		}
+		select {
+		case <-ctx.Done():
+			return code, err
+		case <-time.After(challengeRetryInterval):
+		}
+	}
+}
+
+// requireCredentialInjection checks that Core delivered the provider token by
+// gateway injection rather than into the sandbox: the admitted request needs
+// the injection feature and names one provider Secret key for exactly one
+// rule, and the applied native EgressPolicy carries that Secret's ate-secret
+// URI on exactly one rule. Only public references are reported.
+func requireCredentialInjection(w *api.ExecutionWorkspace, egress *pb.EgressPolicy) (map[string]any, error) {
+	runtime := w.Spec.Workload.Runtime
+	if runtime.Egress == nil || !slices.Contains(runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		return nil, fmt.Errorf("Core did not request gateway credential injection")
+	}
+	var requested *api.RuntimeEgressRule
+	for i := range runtime.Egress.Rules {
+		if len(runtime.Egress.Rules[i].ReplaceHeaders) == 0 {
+			continue
+		}
+		if requested != nil {
+			return nil, fmt.Errorf("Core requested credential replacement on more than one rule")
+		}
+		requested = &runtime.Egress.Rules[i]
+	}
+	if requested == nil || requested.Protocol != api.RuntimeEgressHTTP || len(requested.ReplaceHeaders) != 1 {
+		return nil, fmt.Errorf("Core credential replacement is not one header on one HTTP rule")
+	}
+	header := requested.ReplaceHeaders[0]
+	ref := header.SecretKeyRef
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = w.Namespace
+	}
+	if namespace != w.Namespace || ref.Name == "" || ref.Key == "" {
+		return nil, fmt.Errorf("Core credential replacement does not name a provider Secret key in the workload namespace")
+	}
+	uri := fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", namespace, ref.Name, ref.Key)
+	applied := 0
+	for _, rule := range egress.GetRules() {
+		for _, effects := range []*pb.HttpRuleEffects{rule.GetHttp().GetEffects(), rule.GetHttps().GetEffects()} {
+			replace := effects.GetReplaceHeaders()
+			if len(replace) == 0 {
+				continue
+			}
+			if rule.GetHttp() == nil || !slices.Equal(rule.GetHttp().GetHostnames(), []string{requested.Host}) || len(replace) != 1 ||
+				!strings.EqualFold(replace[0].GetHeader(), header.Header) || replace[0].GetPrefix() != header.Prefix || replace[0].GetCredentialUri() != uri {
+				return nil, fmt.Errorf("applied native EgressPolicy credential effect differs from Core's request")
+			}
+			applied++
+		}
+	}
+	if applied != 1 {
+		return nil, fmt.Errorf("applied native EgressPolicy carries %d credential effects, want 1", applied)
+	}
+	return map[string]any{"requiredFeature": api.WorkspaceFeatureEgressCredentialInjection, "host": requested.Host, "header": header.Header, "credentialURI": uri}, nil
 }
 
 func (p *proof) run(ctx context.Context) (map[string]any, error) {
@@ -307,6 +393,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("successful Task lacks independently observed startup, authenticated Serving or persisted result evidence")
 	}
 	p.pass("provider process evidence matches exact Actor UID/version/worker, routed target and egress allowlist; full-memory remains gated")
+	p.pass("Core delivers the provider token by gateway injection: its request names one provider Secret key and the applied native EgressPolicy carries its exact ate-secret URI")
 	if p.challengeRead {
 		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
@@ -375,7 +462,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	p.pass("terminal Core settlement deletes its exact RuntimePool and credentials, attachment Secrets, native Actor, private WorkerPool and worker Pod")
 	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
 		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
-		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
+		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks, "credentialInjection": p.injection,
 		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
 }
 
