@@ -55,6 +55,14 @@ for obj in objects:
                 "signerName": "servicedns.podcert.ate.dev/identity",
                 "labelSelector": {"matchLabels": {"podcert.ate.dev/canarying": "live"}},
                 "path": "trust-bundle.pem"}}]}}])
+        # Agent Substrate's DNS relay answers only allowlisted names, and the
+        # sandbox resolver (ndots:5 with the worker Pod's search list) never
+        # sends the absolute short "<svc>.<ns>.svc." form kube-dns resolves.
+        # Core freezes these origins into the runtime egress allowlist, so
+        # they must be cluster-domain FQDNs.
+        manager["args"] = [arg.replace(".svc:8080", ".svc.cluster.local:8080")
+                           if arg.startswith(("--acp-provider-proxy-base-url=", "--controller-url=")) else arg
+                           for arg in manager["args"]]
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
