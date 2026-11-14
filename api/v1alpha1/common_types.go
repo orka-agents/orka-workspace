@@ -104,6 +104,12 @@ const (
 	// provider advertising it rejects RuntimeWorkload.NetworkPolicy; one without
 	// it receives the Kubernetes NetworkPolicy shape.
 	WorkspaceFeatureEgressAllowlist ExecutionWorkspaceFeature = "runtime.egress-allowlist"
+	// WorkspaceFeatureEgressCredentialInjection declares that the provider's
+	// backend gateway enforces RuntimeEgressRule.ReplaceHeaders: it replaces
+	// the named request headers with credentials resolved from Kubernetes
+	// Secrets and fails closed when a credential cannot be resolved. A request
+	// that carries replacements must require this feature.
+	WorkspaceFeatureEgressCredentialInjection ExecutionWorkspaceFeature = "runtime.egress-credential-injection"
 )
 
 // ExecutionWorkspaceMode distinguishes task-attached workspaces from persistent service workspaces.

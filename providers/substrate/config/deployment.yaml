@@ -53,6 +53,12 @@ spec:
             - --native-router-ca-file=/run/substrate-serving-ca/trust-bundle.pem
             - --native-router-cert-file=/run/substrate-podidentity/credential-bundle.pem
             - --native-router-key-file=/run/substrate-podidentity/credential-bundle.pem
+            # Egress credential injection is off by default. Enable it only after
+            # installing the egress gateway with --credential-provider='{"name":"k8s.io"}'
+            # and granting the credential provider's namespace policy; see
+            # providers/substrate/README.md.
+            # - --egress-credential-provider=k8s.io
+            # - --egress-credential-namespace=orka-runtimes
           volumeMounts:
             - name: substrate-token
               mountPath: /run/substrate-token

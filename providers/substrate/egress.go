@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // egressPolicyName is the singleton name of an Actor's nested egress policy.
@@ -33,7 +34,12 @@ func validateNativeEgress(runtime *sdk.RuntimeWorkload) error {
 
 // compileEgressPolicy translates the admitted allowlist into one native rule
 // per host pattern. Everything else stays denied, including DNS resolution.
-func compileEgressPolicy(atespace string, egress *api.RuntimeEgressPolicy) (*pb.EgressPolicy, error) {
+// Credential header replacements compile into gateway header effects that
+// name Kubernetes Secret keys; the credential value never passes through this
+// provider. Without a configured credential provider any replacement fails
+// compilation, so the Actor is never resumed with a rule the gateway would
+// forward without its credential.
+func compileEgressPolicy(atespace, workloadNamespace string, egress *api.RuntimeEgressPolicy, config Config) (*pb.EgressPolicy, error) {
 	if egress == nil {
 		return nil, fmt.Errorf("native runtime has no admitted egress allowlist")
 	}
@@ -44,18 +50,89 @@ func compileEgressPolicy(atespace string, egress *api.RuntimeEgressPolicy) (*pb.
 	for _, rule := range egress.Rules {
 		ports := &pb.Ports{Numbers: slices.Sorted(slices.Values(rule.Ports))}
 		hosts := []string{rule.Host}
+		effects, err := compileCredentialHeaders(workloadNamespace, rule.ReplaceHeaders, config)
+		if err != nil {
+			return nil, err
+		}
 		switch rule.Protocol {
 		case api.RuntimeEgressHTTP:
-			policy.Rules = append(policy.Rules, &pb.EgressRule{Http: &pb.HttpRule{Hostnames: hosts, Ports: ports}})
+			policy.Rules = append(policy.Rules, &pb.EgressRule{Http: &pb.HttpRule{Hostnames: hosts, Ports: ports, Effects: effects}})
 		case api.RuntimeEgressHTTPS:
-			policy.Rules = append(policy.Rules, &pb.EgressRule{Https: &pb.HttpsRule{Hostnames: hosts, Ports: ports}})
+			policy.Rules = append(policy.Rules, &pb.EgressRule{Https: &pb.HttpsRule{Hostnames: hosts, Ports: ports, Effects: effects}})
 		case api.RuntimeEgressTLSPassthrough:
+			if effects != nil {
+				return nil, fmt.Errorf("native TLS passthrough cannot replace credential headers")
+			}
 			policy.Rules = append(policy.Rules, &pb.EgressRule{TlsPassthrough: &pb.TlsPassthroughRule{Hostnames: hosts, Ports: ports}})
 		default:
 			return nil, fmt.Errorf("native egress protocol %q is unsupported", rule.Protocol)
 		}
 	}
 	return policy, nil
+}
+
+// compileCredentialHeaders maps header replacements to the upstream
+// ate-secret://k8s.io/default/<namespace>/<secret>/<key> references served by
+// the Kubernetes Secrets credential provider.
+func compileCredentialHeaders(workloadNamespace string, headers []api.RuntimeEgressCredentialHeader, config Config) (*pb.HttpRuleEffects, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	if !config.EgressCredentialInjectionEnabled() {
+		return nil, fmt.Errorf("native egress credential injection is not configured for this provider")
+	}
+	effects := &pb.HttpRuleEffects{}
+	for _, header := range headers {
+		namespace, err := config.credentialNamespace(workloadNamespace, header.SecretKeyRef)
+		if err != nil {
+			return nil, err
+		}
+		uri := fmt.Sprintf("ate-secret://%s/default/%s/%s/%s", config.EgressCredentialProvider, namespace, header.SecretKeyRef.Name, header.SecretKeyRef.Key)
+		effects.ReplaceHeaders = append(effects.ReplaceHeaders, &pb.CredentialHeader{Header: header.Header, Prefix: header.Prefix, CredentialUri: uri})
+	}
+	return effects, nil
+}
+
+// credentialNamespace resolves a Secret reference's namespace: the workload's
+// own, or one the operator explicitly listed for this provider.
+func (c Config) credentialNamespace(workloadNamespace string, ref api.RuntimeEgressSecretKeyReference) (string, error) {
+	namespace := ref.Namespace
+	if namespace == "" || namespace == workloadNamespace {
+		if len(validation.IsDNS1123Label(workloadNamespace)) != 0 {
+			return "", fmt.Errorf("native egress credential requires a workload namespace")
+		}
+		return workloadNamespace, nil
+	}
+	if !slices.Contains(c.EgressCredentialNamespaces, namespace) {
+		return "", fmt.Errorf("native egress credential namespace %q is not permitted for this provider", namespace)
+	}
+	return namespace, nil
+}
+
+// admitEgressCredentials refuses a workload whose credential replacements this
+// installation cannot enforce, before any native object is created.
+func (c Config) admitEgressCredentials(request sdk.WorkloadRequest) error {
+	if request.Runtime == nil {
+		return nil
+	}
+	required := slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection)
+	// A required feature is a contract even when no rule uses it yet: this
+	// provider does not advertise injection without a credential provider.
+	if required && !c.EgressCredentialInjectionEnabled() {
+		return fmt.Errorf("native egress credential injection is not configured for this provider")
+	}
+	if !request.Runtime.Egress.HasCredentialInjection() {
+		return nil
+	}
+	if !required {
+		return fmt.Errorf("native egress credential replacement requires the %s feature", api.WorkspaceFeatureEgressCredentialInjection)
+	}
+	for _, rule := range request.Runtime.Egress.Rules {
+		if _, err := compileCredentialHeaders(request.Key.Namespace, rule.ReplaceHeaders, c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func egressRulesDigest(rules []*pb.EgressRule) (string, error) {
@@ -67,7 +144,18 @@ func egressRulesDigest(rules []*pb.EgressRule) (string, error) {
 // before every Resume. A compilation failure installs deny-all and refuses to
 // boot. Writes carry the observed policy's metadata as preconditions.
 func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
-	desired, compileErr := compileEgressPolicy(record.Atespace, record.Request.Runtime.Egress)
+	desired, compileErr := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
+	return d.applyEgressPolicy(ctx, cm, record, desired, compileErr)
+}
+
+// denyAllEgressPolicy installs the empty policy unconditionally. Revocation
+// never re-applies compiled rules: a journal that fails admission for any
+// reason must not keep or change credential-bearing effects.
+func (d *Lifecycle) denyAllEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, cause error) error {
+	return d.applyEgressPolicy(ctx, cm, record, nil, cause)
+}
+
+func (d *Lifecycle) applyEgressPolicy(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, desired *pb.EgressPolicy, compileErr error) error {
 	if compileErr != nil {
 		desired = &pb.EgressPolicy{Metadata: &pb.ResourceMetadata{Atespace: record.Atespace, Name: egressPolicyName}}
 	}
@@ -130,9 +218,67 @@ func (d *Lifecycle) ensureEgressPolicy(ctx context.Context, cm *corev1.ConfigMap
 		}
 	}
 	if compileErr != nil {
-		return fmt.Errorf("native egress allowlist did not compile; the Actor denies all egress and is not resumed: %w", compileErr)
+		return fmt.Errorf("%w: %w", errEgressDeniedAll, compileErr)
 	}
 	return nil
+}
+
+// errEgressDeniedAll reports that the Actor's policy is now deny-all because
+// its allowlist no longer admits or compiles. The deny-all policy is applied.
+var errEgressDeniedAll = errors.New("native egress allowlist did not compile; the Actor denies all egress and is not resumed")
+
+// revokeWithdrawnEgressCredentials runs when observation or workload
+// validation fails. Either can stop reconciliation before EnsureAllocation's
+// revocation, so a journaled allowlist that no longer admits or compiles -
+// withdrawn provider configuration or a header this provider now reserves -
+// would otherwise keep credential-bearing gateway effects applied. The journal
+// is read without re-validating its request, which may be what became invalid;
+// compilation then fails and the Actor's policy becomes deny-all.
+func (d *Lifecycle) revokeWithdrawnEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
+	// An unreadable journal is already the reported error; only a revocation
+	// that was actually attempted can add a distinct failure.
+	cm, record, err := d.readForEgressRevocation(ctx, key)
+	if err != nil || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() {
+		return nil
+	}
+	if record.EgressPolicy.UID == "" || record.EgressDenyAll {
+		return nil
+	}
+	cause := d.config.admitEgressCredentials(record.Request)
+	if cause == nil {
+		if _, cause = compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config); cause == nil {
+			return nil
+		}
+	}
+	return d.denyAllEgressPolicy(ctx, cm, record, cause)
+}
+
+// revokeLiveEgressCredentials covers every live Actor whose withdrawn
+// credential configuration no other path revokes in this pass: one whose
+// observation verifies no egress (failed, retiring, or still booting before
+// its readiness challenge), one under a Disabled provider, where
+// EnsureAllocation does not run, and one whose cleanup request failed. While
+// such an Actor exists and is not suspended, withdrawn credential effects
+// become deny-all; revocation never re-applies compiled rules and is a no-op
+// while the configuration still admits and compiles. The reconciler calls
+// this after any cleanup it issued, so revocation never delays that request,
+// and for a retiring Actor an applied deny-all is not an error.
+func (d *Lifecycle) revokeLiveEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
+	_, record, err := d.readForEgressRevocation(ctx, key)
+	if err != nil || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
+		return nil
+	}
+	actor, err := d.actor(ctx, record)
+	if err != nil || actor == nil || actor.GetStatus().GetState() == pb.ActorState_ACTOR_STATE_SUSPENDED {
+		return err
+	}
+	err = d.revokeWithdrawnEgressCredentials(ctx, key)
+	if record.Operation != "ensure" && errors.Is(err, errEgressDeniedAll) {
+		// A retiring Actor has no allocation to report as failed; deny-all
+		// is in place, so its cleanup proceeds unobstructed.
+		return nil
+	}
+	return err
 }
 
 // verifyEgressPolicy read-only checks the exact applied allowlist.
@@ -140,7 +286,7 @@ func (d *Lifecycle) verifyEgressPolicy(ctx context.Context, record *journalRecor
 	if record.EgressPolicy.UID == "" || record.EgressPolicy.Digest == "" || record.EgressDenyAll {
 		return fmt.Errorf("native Actor has no applied admitted egress allowlist")
 	}
-	desired, err := compileEgressPolicy(record.Atespace, record.Request.Runtime.Egress)
+	desired, err := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
 	if err != nil {
 		return err
 	}

@@ -197,6 +197,17 @@ func (d *Lifecycle) read(ctx context.Context, key sdk.AllocationKey) (*corev1.Co
 	return d.readAt(ctx, key, journalKey(key))
 }
 func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name types.NamespacedName) (*corev1.ConfigMap, *journalRecord, error) {
+	return d.readAtChecked(ctx, key, name, validateJournalRecord)
+}
+
+// readForEgressRevocation reads a journal whose structure and identity are
+// exact but whose admitted request may no longer validate, for example after
+// a header became reserved. Only egress revocation may act on such a record.
+func (d *Lifecycle) readForEgressRevocation(ctx context.Context, key sdk.AllocationKey) (*corev1.ConfigMap, *journalRecord, error) {
+	return d.readAtChecked(ctx, key, journalKey(key), validateJournalStructure)
+}
+
+func (d *Lifecycle) readAtChecked(ctx context.Context, key sdk.AllocationKey, name types.NamespacedName, validate func(*journalRecord) error) (*corev1.ConfigMap, *journalRecord, error) {
 	if err := key.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -227,7 +238,7 @@ func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name type
 	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !reflect.DeepEqual(cm.Labels, labels(record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
 		return nil, nil, sdk.ErrStaleIdentity
 	}
-	if err := validateJournalRecord(record); err != nil {
+	if err := validate(record); err != nil {
 		return nil, nil, err
 	}
 	return cm, record, nil
@@ -235,11 +246,17 @@ func (d *Lifecycle) readAt(ctx context.Context, key sdk.AllocationKey, name type
 
 // validateJournalRecord is shared by read-only lifecycle recovery and GC release.
 func validateJournalRecord(record *journalRecord) error {
+	if err := validateJournalStructure(record); err != nil {
+		return err
+	}
+	return validateRequest(record.Request)
+}
+
+// validateJournalStructure checks infrastructure intent and instance fences,
+// but not the admitted request.
+func validateJournalStructure(record *journalRecord) error {
 	if record.TemplateSpec == nil || record.Template.Name == "" || record.Actor.Name == "" || record.Atespace == "" || record.Placement.UID == "" || record.Anchor.Name == "" || record.EgressPolicy.Name != egressPolicyName {
 		return fmt.Errorf("native journal has incomplete infrastructure intent")
-	}
-	if err := validateRequest(record.Request); err != nil {
-		return err
 	}
 	if record.Worker != nil && (record.Worker.AllocationID != record.Observation.Identity.AllocationID || record.Worker.InstanceID != record.Observation.Identity.InstanceID) {
 		return sdk.ErrStaleIdentity
