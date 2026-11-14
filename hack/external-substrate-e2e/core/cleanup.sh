@@ -73,8 +73,14 @@ namespace_uid="$(jq -r '.metadata.annotations["orka.workspace.e2e/namespace-uid"
   printf 'Namespace %s is not the lifetime the proof Job recorded; inspect it by hand.\n' "${namespace}" >&2
   exit 1
 }
-# The native objects this run created, from the proof Job's own log.
-proof_log="$(kubectl -n "${client_namespace}" logs "job/${namespace}")"
+# The native objects this run created, from the proof Job's own log. A Job
+# whose container never started has no log and created nothing. An unreadable
+# log only withholds UIDs: the cleanup Job never deletes a native object whose
+# UID was not recorded, so it refuses rather than adopts one.
+proof_log="$(kubectl -n "${client_namespace}" logs "job/${namespace}" 2>/dev/null)" || {
+  printf 'The proof Job log is unavailable; only absent native objects can be accepted.\n' >&2
+  proof_log=""
+}
 owned_atespace="$(sed -n 's/^NATIVE_OWNED_ATESPACE_UID \([0-9a-f-]*\)$/\1/p' <<<"${proof_log}" | tail -n 1)"
 owned_template="$(sed -n 's/^NATIVE_OWNED_TEMPLATE_UID \([0-9a-f-]*\)$/\1/p' <<<"${proof_log}" | tail -n 1)"
 # Core and the provider retire their own objects, so both must still serve.
