@@ -1,7 +1,10 @@
 // Copyright (c) 2026. MIT License - see LICENSE file for details.
 
 // The deterministic stdio agent follows the existing Orka security-scan ACP
-// fixture protocol. It makes no model, repository, or external network calls.
+// fixture protocol. It makes no repository or external network calls, and no
+// model call unless the prompt opts in with a marker (see probe.go): the
+// Substrate Core proof uses one to send a request through the supervisor's
+// provider proxy and to hold a prompt open while it evicts the worker.
 //
 // Orka captures a native Codex session before a Session suspend and restores
 // it only through session/resume, so the agent advertises
@@ -18,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -101,6 +105,8 @@ func main() {
 	}
 	var sequence uint64
 	sessionID := ""
+	// sessionMode reports how the current session began: new, load or resume.
+	sessionMode := ""
 	for scanner.Scan() {
 		var message struct {
 			ID     json.RawMessage `json:"id"`
@@ -121,6 +127,7 @@ func main() {
 				sessionID = fixtureThreadID
 			}
 			result["sessionId"] = sessionID
+			sessionMode = "new"
 		case "session/load", "session/resume":
 			var params struct {
 				Params struct {
@@ -137,11 +144,22 @@ func main() {
 				continue
 			}
 			sessionID = params.Params.SessionID
+			sessionMode = strings.TrimPrefix(message.Method, "session/")
 		case "session/prompt":
 			// Leave time for the independent proof client to observe Serving
 			// and verify the selected Pod before terminal settlement retires it.
 			time.Sleep(2 * time.Second)
-			write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "External workspace fixture completed."}}}})
+			text := "External workspace fixture completed."
+			prompt := promptText(scanner.Bytes())
+			if strings.Contains(prompt, providerProbeMarker) {
+				if code, err := providerProbe(sessionMode, sessionID); err != nil {
+					text += " Provider probe failed."
+				} else {
+					text += fmt.Sprintf(" Provider probe HTTP %d.", code)
+				}
+			}
+			time.Sleep(holdDuration(prompt))
+			write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text}}}})
 			result["stopReason"] = "end_turn"
 		case "session/cancel":
 			continue

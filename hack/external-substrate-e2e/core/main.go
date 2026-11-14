@@ -52,6 +52,8 @@ type proof struct {
 	image         string
 	checks        []string
 	challengeRead bool
+	// egress is the applied native EgressPolicy of the last observed startup.
+	egress *pb.EgressPolicy
 }
 
 func (p *proof) object(kind, name string, spec map[string]any) *unstructured.Unstructured {
@@ -145,6 +147,7 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	p.egress = egress
 	// Core admits the allowlist; the provider compiles it verbatim. Report
 	// the applied host patterns for review.
 	selected := []string{}
@@ -240,7 +243,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("Agent admission: %w", err)
 	}
 	task := p.object("Task", "native-core", map[string]any{"type": "agent", "agentRef": map[string]any{"name": agent.GetName()},
-		"prompt": "Run the deterministic external native workspace fixture.", "timeout": "5m",
+		"prompt": "Run the deterministic external native workspace fixture. " + providerProbeMarker, "timeout": "5m",
 		"execution":    map[string]any{"workspace": map[string]any{"classRef": map[string]any{"name": class.Name}, "reusePolicy": "none", "onDetach": "Delete"}},
 		"agentRuntime": map[string]any{"maxTurns": int64(1), "allowedTools": []any{"Glob", "Grep", "Read"}, "allowBash": false}})
 	if err := p.c.Create(ctx, task); err != nil {
@@ -311,6 +314,36 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
 	p.pass("actual supervisor reaches authenticated Serving on native port 80 and completes an ACP RuntimeSession prompt with persisted result")
+	injection, err := p.verifyCredentialInjection(ctx, workspace)
+	if err != nil {
+		return nil, err
+	}
+	p.pass("Core requests replaceHeaders for the provider-proxy origin and the applied native EgressPolicy carries the exact ate-secret credential URI")
+	providerRequests, err := p.waitProviderRequests(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	if providerRequests.Sessions[0] != "mode=new;session="+fixtureThreadID {
+		return nil, fmt.Errorf("provider probe reported an unexpected session: %q", providerRequests.Sessions[0])
+	}
+	p.pass("the runtime's provider request reaches the provider-proxy origin with Core's token injected by the egress gateway; no placeholder or other credential arrives")
+	if err := p.waitRetirement(ctx, workspace, startup, pool, worker, str(task, "status", "execution", "runtimePoolName"), str(task, "status", "execution", "runtimePoolUID")); err != nil {
+		return nil, err
+	}
+	p.pass("terminal Core settlement deletes its exact RuntimePool and credentials, attachment Secrets, native Actor, private WorkerPool and worker Pod")
+	corePoolName, corePoolUID := str(task, "status", "execution", "runtimePoolName"), str(task, "status", "execution", "runtimePoolUID")
+	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
+		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
+		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
+		"credentialInjection": injection, "providerRequests": providerRequests,
+		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
+}
+
+// waitRetirement waits for the exact terminal retirement of one workspace
+// instance: public workspace deletion with its saved allocation fence, the
+// native Actor, private WorkerPool and worker Pod, then the Core RuntimePool
+// and every attachment and pool credential Secret.
+func (p *proof) waitRetirement(ctx context.Context, workspace *api.ExecutionWorkspace, startup *api.StartupEvidence, pool *unstructured.Unstructured, worker *corev1.Pod, corePoolName, corePoolUID string) error {
 	if err := wait(ctx, func() (bool, error) {
 		current := &api.ExecutionWorkspace{}
 		err := p.c.Get(ctx, client.ObjectKeyFromObject(workspace), current)
@@ -331,7 +364,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		}
 		return sdk.ValidateInteractiveDeletedDisposition(current.Status.Disposition, current.Spec.Lifecycle.DeletionPolicy) == nil, nil
 	}); err != nil {
-		return nil, fmt.Errorf("Core terminal retirement: %w", err)
+		return fmt.Errorf("Core terminal retirement: %w", err)
 	}
 	if err := wait(ctx, func() (bool, error) {
 		_, nativeErr := p.native.GetActor(ctx, &pb.GetActorRequest{Actor: &pb.ObjectRef{Atespace: startup.Process.Namespace, Name: startup.Process.Name}})
@@ -342,11 +375,10 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		workerErr := p.c.Get(ctx, client.ObjectKeyFromObject(worker), &corev1.Pod{})
 		return status.Code(nativeErr) == codes.NotFound && apierrors.IsNotFound(poolErr) && apierrors.IsNotFound(workerErr), nil
 	}); err != nil {
-		return nil, fmt.Errorf("exact native Actor/private pool/worker retirement: %w", err)
+		return fmt.Errorf("exact native Actor/private pool/worker retirement: %w", err)
 	}
-	corePoolName, corePoolUID := str(task, "status", "execution", "runtimePoolName"), str(task, "status", "execution", "runtimePoolUID")
 	if corePoolName == "" || corePoolUID == "" {
-		return nil, fmt.Errorf("successful Task omitted its exact Core RuntimePool fence")
+		return fmt.Errorf("successful Task omitted its exact Core RuntimePool fence")
 	}
 	if err := wait(ctx, func() (bool, error) {
 		currentPool := p.object("RuntimePool", corePoolName, nil)
@@ -370,13 +402,9 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		}
 		return true, nil
 	}); err != nil {
-		return nil, fmt.Errorf("Core RuntimePool and credential retirement: %w", err)
+		return fmt.Errorf("Core RuntimePool and credential retirement: %w", err)
 	}
-	p.pass("terminal Core settlement deletes its exact RuntimePool and credentials, attachment Secrets, native Actor, private WorkerPool and worker Pod")
-	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
-		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
-		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
-		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
+	return nil
 }
 
 func (p *proof) verifyRejectedRetirement(ctx context.Context) (map[string]any, error) {
@@ -506,13 +534,20 @@ func main() {
 		err = dialErr
 		if err == nil {
 			defer conn.Close()
-			ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 28*time.Minute)
 			defer cancel()
 			p := &proof{c: c, native: pb.NewControlClient(conn), namespace: namespace, image: image}
 			if os.Getenv("RETIRED_TASK_UID") != "" {
 				report, err = p.verifyRetiredTask(ctx)
 			} else if os.Getenv("REJECTED_WORKSPACE_UID") != "" {
 				report, err = p.verifyRejectedRetirement(ctx)
+			} else if os.Getenv("PROOF_PHASE") == "session" {
+				// run.sh starts this Job only after the single-Task Job
+				// passed and Core was reconfigured without telemetry.
+				report, err = p.runSession(ctx)
+				if err == nil {
+					report["checks"] = p.checks
+				}
 			} else {
 				report, err = p.run(ctx)
 			}
