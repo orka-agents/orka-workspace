@@ -265,6 +265,9 @@ func setLifecycleMilestoneConditions(workspace *workspacev1alpha1.ExecutionWorks
 	} else if failure != "" && observed.State != workspaceprovider.AllocationDeleted {
 		provisionedStatus = metav1.ConditionFalse
 		provisionedReason = instanceFailedReason
+		if strings.HasPrefix(failure, nativeRestoreRuntimeMismatchPrefix) {
+			provisionedReason = sandboxRuntimeRestoreFailedReason
+		}
 		provisionedMessage = operationFailureCause(errors.New(failure))
 	}
 	workspaceprovider.SetCondition(&workspace.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceProvisioned), Status: provisionedStatus, Reason: provisionedReason, Message: provisionedMessage, ObservedGeneration: workspace.Generation})
@@ -330,8 +333,11 @@ func chooseMessage(ok bool, success, failure string) string {
 }
 
 const (
-	instanceFailedReason          = "InstanceFailed"
-	providerOperationFailedReason = "ProviderOperationFailed"
+	instanceFailedReason = "InstanceFailed"
+	// sandboxRuntimeRestoreFailedReason distinguishes a data restore that
+	// crashed under a sandbox runtime other than its checkpoint's.
+	sandboxRuntimeRestoreFailedReason = "SandboxRuntimeRestoreFailed"
+	providerOperationFailedReason     = "ProviderOperationFailed"
 	// legacyNativeStateReason marks Agent Substrate v0.1.0 provider state,
 	// which the v1.0.0 provider never adopts.
 	legacyNativeStateReason       = "LegacySubstrateV0State"

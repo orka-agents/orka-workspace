@@ -325,6 +325,15 @@ func (d *Lifecycle) verifyCheckpoint(ctx context.Context, checkpoint *checkpoint
 	if err != nil {
 		return err
 	}
+	runtime, err := checkpointSandboxRuntime(tag.GetStatus().GetSnapshot())
+	if err != nil {
+		return err
+	}
+	// A checkpoint recorded before runtime stamping carries none; its Tag
+	// digest below already pins the snapshot, including any runtime stamp.
+	if checkpoint.SandboxRuntime != nil && (runtime == nil || *runtime != *checkpoint.SandboxRuntime) {
+		return sdk.ErrStaleIdentity
+	}
 	if tag.GetMetadata().GetUid() != checkpoint.Tag.UID || tag.GetMetadata().GetAtespace() != checkpoint.Atespace || tag.GetMetadata().GetName() != checkpoint.Tag.Name || tag.GetScope() != pb.TagScope_TAG_SCOPE_ATESPACE || tag.GetSourceActor().GetAtespace() != checkpoint.Atespace || tag.GetSourceActor().GetName() != checkpoint.SourceName || checkpoint.SourceUID == "" || tag.GetStatus().GetActorTemplateUid() != checkpoint.Template.UID || checkpoint.SnapshotURI == "" || tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri() != checkpoint.SnapshotURI || hash != checkpoint.Tag.Digest {
 		return sdk.ErrStaleIdentity
 	}
@@ -517,7 +526,11 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		return fmt.Errorf("native source changed during immutable Tag copy")
 	}
 	operation.Tag.Digest = tagHash
-	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Now()}
+	runtime, err := checkpointSandboxRuntime(tag.GetStatus().GetSnapshot())
+	if err != nil {
+		return err
+	}
+	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Now(), SandboxRuntime: runtime}
 	reference, err := d.registerCheckpoint(ctx, record, checkpoint)
 	if err != nil {
 		return err

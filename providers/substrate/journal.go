@@ -81,6 +81,9 @@ type checkpointRecord struct {
 	// SnapshotURI is the Tag's own durable data-only snapshot location.
 	SnapshotURI string      `json:"snapshotURI"`
 	CreatedAt   metav1.Time `json:"createdAt"`
+	// SandboxRuntime is the runtime the snapshot was taken under, when
+	// Agent Substrate stamps it.
+	SandboxRuntime *sandboxRuntimeStamp `json:"sandboxRuntime,omitempty"`
 }
 
 type catalogReference struct {
@@ -102,7 +105,10 @@ type journalRecord struct {
 	RuntimePoolSpec     json.RawMessage           `json:"runtimePoolSpec"`
 	RuntimePoolLabels   map[string]string         `json:"runtimePoolLabels"`
 	RuntimePoolDeleting bool                      `json:"runtimePoolDeleting,omitempty"`
-	Anchor              nativeReference           `json:"anchor"`
+	// WorkerImageProvenance records each data-only resume or restore of this
+	// lineage that followed the operator pool to a new worker image.
+	WorkerImageProvenance []workerImageTransition `json:"workerImageProvenance,omitempty"`
+	Anchor                nativeReference         `json:"anchor"`
 	// EgressPolicy is the Actor's nested native egress policy. Digest pins the
 	// compiled rules; deny-all is recorded with DenyAll.
 	EgressPolicy        nativeReference   `json:"egressPolicy"`
@@ -121,9 +127,20 @@ type journalRecord struct {
 	Pending             *checkpointIntent `json:"pending,omitempty"`
 	Checkpoint          *checkpointRecord `json:"checkpoint,omitempty"`
 	InheritedCheckpoint *checkpointRecord `json:"inheritedCheckpoint,omitempty"`
-	CheckpointCatalog   *catalogReference `json:"checkpointCatalog,omitempty"`
-	InheritedCatalog    *catalogReference `json:"inheritedCatalog,omitempty"`
-	DeleteIssued        bool              `json:"deleteIssued,omitempty"`
+	// RestoreRuntime is the sandbox runtime stamped on the Actor's worker
+	// assignment during this instance's single boot. It is the only evidence
+	// of which runtime performed a restore: a CRASHED Actor has no assignment,
+	// and a Worker's default runtime can change without a new epoch.
+	RestoreRuntime *sandboxRuntimeStamp `json:"restoreRuntime,omitempty"`
+	// PreResumeRuntime is the fenced Worker's default runtime for the
+	// checkpoint's class, read just before Resume. Agent Substrate restores
+	// a data-only gVisor snapshot under that default and clears the Actor's
+	// assignment when a restore crashes synchronously, so this, revalidated
+	// against an unchanged Worker after the crash, is the remaining evidence.
+	PreResumeRuntime  *sandboxRuntimeStamp `json:"preResumeRuntime,omitempty"`
+	CheckpointCatalog *catalogReference    `json:"checkpointCatalog,omitempty"`
+	InheritedCatalog  *catalogReference    `json:"inheritedCatalog,omitempty"`
+	DeleteIssued      bool                 `json:"deleteIssued,omitempty"`
 	// StartedAt bounds creation and boot until first process evidence.
 	StartedAt metav1.Time `json:"startedAt,omitempty"`
 	// Failure records an exact-instance loss. The instance never restarts;
