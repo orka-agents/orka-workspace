@@ -51,7 +51,18 @@ atenet-router; a retained earlier run must be reviewed and removed first.
 `SUBSTRATE_E2E_EXTRA_INGRESS_SPIFFE_IDS` appends more identities. The Core proof grants the deployed provider only `editor`
 on the run Atespace and global `viewer`.
 
-No DNS or installation setting is patched. Actor ingress goes through
+After the installer, setup sets one router environment variable,
+`OTEL_TRACES_SAMPLER=parentbased_always_on` on `ate-system/atenet-router`, and
+waits for its rollout. This is a test-only setting: the v1.0.0 router gives
+Envoy only a root `RandomSampling` ratio (1% by default) that replaces the
+caller's sampling decision, so a sampled Orka trace reaches the Actor
+unsampled and the ACP supervisor, which samples by parent, exports no spans.
+`parentbased_always_on` maps to a ratio of 1 (upstream
+`internal/serverboot/sampling.go`). Operators need the same setting for
+end-to-end supervisor traces. Reapplying the unchanged value with
+`SUBSTRATE_REUSE_CLUSTER=1` does not roll the router.
+
+No DNS or other installation setting is patched. Actor ingress goes through
 `atenet-router` with the `ate-target-actor` header, and all Actor egress goes
 through the installed egress gateway under each Actor's `EgressPolicy`. Routed
 reads retry only while the router route becomes available; native operations
@@ -184,8 +195,9 @@ This proof requires an Orka core that admits `RuntimeWorkload.Egress` (including
 its provider-authentication proxy origin), consumes `NativeProcessEvidence.RouterTarget`,
 reaches the runtime through `atenet-router` with an allowlisted identity,
 injects the provider-proxy token at the egress gateway (Orka ADR 0045), drains
-and suspends on worker eviction (ADR 0046), and exports Substrate-routed ACP
-traces (Orka #1061).
+and suspends on worker eviction (ADR 0046), exports Substrate-routed ACP
+traces (Orka #1061), and fits supervisor telemetry into the native 32-entry
+environment limit, reporting it on the RuntimePool `TelemetryReady` condition.
 
 `KINDCTL_BIN`, `GOCACHE`, and `GOMODCACHE` overrides are inherited. The proof
 requires the dedicated installation and registry described above. It freezes
@@ -194,7 +206,8 @@ separate fixture hash, and built image digests in
 `bin/external-substrate-core-<UTC timestamp>/`. Preflight requires at least four
 CPU (a GitHub-hosted runner has exactly four) and 8 GiB of allocatable node
 memory and serving `ate-api-server`, `ate-controller`, `atenet-router`,
-`atenet-egress` and `k8s-credential-provider`. Existing Core/provider
+`atenet-egress` and `k8s-credential-provider`, plus the installer's
+`otel-system` `opentelemetry-collector` and `jaeger` (see Tracing). Existing Core/provider
 deployments cause a refusal so a later run cannot replace an earlier accepted
 Task implicitly.
 
@@ -222,8 +235,9 @@ Failures retain their accepted Task and evidence for inspection and are not
 replayed; normal controllers may retire allocation resources.
 
 The run has two in-cluster Jobs, `external-substrate-core` (the single Task)
-and `external-substrate-core-session` (the Session), started in that order;
-the second starts only after the first passed and its traces were verified.
+and `external-substrate-core-session` (the Session), started in that order
+against the same Core, both with telemetry. The second starts only after the
+first passed; traces are verified after both.
 
 ### Egress credential injection
 
@@ -260,29 +274,47 @@ it upstream with the bootstrap placeholder bearer. The proof requires:
 
 ### Tracing
 
-Core runs the single-Task phase with `--enable-telemetry`,
-`--runtime-telemetry-collector-egress` and only
+Core runs with `--enable-telemetry`, `--runtime-telemetry-collector-egress`
+and only
 `OTEL_EXPORTER_OTLP_ENDPOINT=http://orka-otel-collector.<namespace>.svc.cluster.local:4317`
-(gRPC; Substrate admits 32 environment entries, see the limit below). An
-`otel/opentelemetry-collector:0.111.0` (digest-pinned, mirrored into the
+(gRPC), the smallest telemetry configuration. Core fits supervisor telemetry
+into the 32 environment entries Substrate admits per container and reports the
+outcome on the RuntimePool `TelemetryReady` condition. Every Core RuntimePool
+(the single Task's and each Session turn's suspendable one) must report
+`TelemetryReady=True/TelemetryProjected`; `False/NativeEnvironmentLimit` fails
+the proof as soon as it is observed.
+
+An `otel/opentelemetry-collector:0.111.0` (digest-pinned, mirrored into the
 dedicated registry) logs spans with the debug exporter. `core/traces.py`
-requires one trace in which the supervisor's `acp.supervisor.prompt`
-(`service.name=orka-acp-supervisor`, `orka.task.uid` of the Task) is the child
-of a Core span, Core's `acp.prompt` and `substrate.router POST` are present,
-and `invoke_agent codex` and `chat gpt-5.4` (the probe's model call) are its
-descendants. The collector log must contain neither the provider token nor
-prompt text (the fixture markers). The result is `traces.json` and the
-report's `tracing`.
+requires, for the single Task and for at least one Session turn, one trace in
+which:
+
+- Core's `acp.prompt` has a `substrate.router PUT` child: the routed, streamed
+  ACP prompt request;
+- the supervisor's `acp.supervisor.prompt` (`service.name=orka-acp-supervisor`,
+  `orka.task.uid` of that Task) is a child of that request, either directly or
+  through the `atenet-router-envoy` `ingress` span that is the request's
+  child;
+- `invoke_agent codex` is a child of `acp.supervisor.prompt` and
+  `chat gpt-5.4` (the probe's model call) a child of `invoke_agent codex`.
+
+With root sampling on, atenet-router's Envoy records an `ingress` span
+between Core and the Actor and reports it to the installer's own trace
+backend (`ate-system/ate-otel-config` points it at
+`otel-system/opentelemetry-collector`, which feeds `otel-system/jaeger`), not
+to the proof's collector. `run.sh` reads each candidate trace from that Jaeger
+through the API server proxy, read-only, into `private/router-traces/`;
+`traces.py` reads only `atenet-router-envoy` spans from it. Neither the
+collector log nor those traces may contain the provider token or prompt text
+(the fixture markers). The result is `traces.json` (span names, IDs and
+services only) and the report's `tracing`.
 
 ### Session continuation across a worker eviction
 
-Before this phase `run.sh` restarts Core without telemetry: a suspendable
-native supervisor already uses 31 of the 32 environment entries Substrate
-admits (`ORKA_ACP_DURABLE_WORKSPACE_DIR` and `..._KEY` included), so even the
-two-entry trace projection makes 33 and the provider refuses the workload
-(`native environment exceeds upstream limit`) while the pool stays `Starting`.
-The proof deployment's SQLite store is an `emptyDir`, so the Session starts on
-a fresh store after the single Task retired. The Session Job then:
+The Session runs on the same Core and store as the single Task, with
+telemetry: a suspendable native supervisor also uses two durable-workspace
+entries (`ORKA_ACP_DURABLE_WORKSPACE_DIR` and `..._KEY`), and Core still fits
+its supervisor telemetry (see Tracing). The Session Job:
 
 1. Creates a `SuspendMode: DataOnly` profile and a class with reuse scope
    `Session`, `Suspend` (default) and `Delete` detach actions, a two-minute
@@ -318,20 +350,15 @@ a fresh store after the single Task retired. The Session Job then:
 
 ### Limits
 
-- Tracing currently fails (the assertion is kept). On the 2026-11-14 run Core
-  exported `acp.prompt`, `acp.session.create` and `substrate.router` client
-  spans, and atenet-router logged the Task's trace ID on the routed requests,
-  but the supervisor exported no spans: through the gateway it sent only
-  `MetricsService/Export` (`gen_ai.client.operation.duration`,
-  `gen_ai.invoke_agent.duration`), never `TraceService/Export`, even while its
-  Actor stayed up well past the five-second batch interval after a routed
-  operation ended. The cause is in Orka's supervisor trace path or the
-  propagated sampling decision, not collector egress.
-- A suspendable native workspace cannot carry supervisor telemetry within
-  Substrate's 32-entry environment limit, so the Session phase runs without
-  it, and Core then publishes a workload the provider refuses
-  (`native environment exceeds upstream limit`) while the pool stays
-  `Starting`.
+- Turn 1's supervisor is evicted while its prompt is held, and its prompt
+  span is not always received: in one of the two 2026-11-14 runs it exported
+  `acp.supervisor.session.create`, `acp.supervisor.prompt.lease` and
+  `acp.supervisor.drain` but not `acp.supervisor.prompt` or its GenAI
+  children. The proof therefore requires at least one complete Session turn
+  and records both.
+- The Envoy hop is read from the installer's Jaeger, which keeps traces in
+  memory: a Jaeger restart between the run and the check loses it and fails
+  the tracing assertion.
 - Eviction is triggered by deleting the attested ateworker Pod. A node drain
   through the Eviction API and the `DisruptionTarget` and supervisor `SIGTERM`
   signal paths are not exercised separately, nor is
@@ -341,32 +368,42 @@ a fresh store after the single Task retired. The Session Job then:
   read-intent Codex sessions cannot write the workspace.
 - kind's default CNI does not enforce NetworkPolicy, and egress enforcement is
   the gateway's. The packet-level check covers one HTTP origin only.
-- The Session phase restarts Core onto an empty SQLite store (an `emptyDir`),
-  so it does not test continuity of Core's store across a restart.
 
 ### Last run
 
-2026-11-14, amd64, a dedicated kindctl cluster (16 CPU), Agent Substrate v1.0.0
-`b34fbee742906494b5eb4f1f36987176bf8770a4`, Orka core
-`1a8f67c5599df830d92394571123d5ae9905b8c2` (a working tree whose uncommitted
-edits touched no component this proof builds), and this repository on
-`d200093` plus this change. On a fresh cluster: install took 266 s and the Data
-proof 124 s (`bin/external-substrate-proof-20261114201650/report.json` is the
-rerun on a second fresh cluster, 76 s, all checks passed). The Core proof took
-314 s, `bin/external-substrate-core-20261114201808/report.json`:
+2026-11-14, amd64, a fresh dedicated kindctl cluster (16 CPU), Agent Substrate
+v1.0.0 `b34fbee742906494b5eb4f1f36987176bf8770a4`, Orka core
+`a11e5a267b3705293dfbdfb86380018922ebc12b` (a local branch merging two
+unmerged Orka changes onto `main`: the router root-sampling e2e fix
+`131fa4ba6` and the native telemetry environment fit `b66717282`), and this
+repository at `1060ca0`. Install took 130 s, the Data proof 82 s
+(`bin/external-substrate-proof-20261114215643/report.json`, all checks
+passed), and the Core proof 216 s,
+`bin/external-substrate-core-20261114215807/report.json`, with every check
+passing:
 
-- The single Task passed every check, including credential injection
-  (`ate-secret://k8s.io/default/external-substrate-core/<provider Secret>/token`
-  applied; the origin saw one injected request and no placeholder, missing or
-  other bearer).
-- Tracing failed as described under Limits (`traces.json`).
-- The Session passed: the eviction record bound the exact instance
-  (`source: WorkerTermination`, a 30-minute deadline, outcome
-  `EvictionSuspended`). `EvictionDraining`, `AdmissionClosed` and `Draining`
-  were observed, then `EvictionSuspended`. Turn 2 resumed workload sequence 2
-  on a new Actor, worker Pod, private pool and supervisor boot, with the same
-  RuntimeSession UID and the agent reporting `mode=resume` for the rollout
-  thread. Retirement was complete.
+- The single Task passed every check, including credential injection (one
+  injected request; no placeholder, missing or other bearer). Its RuntimePool
+  reported `TelemetryReady=True/TelemetryProjected`.
+- Tracing passed for the single Task and both Session turns: each trace runs
+  `acp.prompt` → `substrate.router PUT` → `atenet-router-envoy ingress` →
+  `acp.supervisor.prompt` → `invoke_agent codex` → `chat gpt-5.4`. The
+  supervisor also exported `gen_ai.client.operation.duration` and
+  `gen_ai.invoke_agent.duration`. Neither the collector nor the router traces
+  held the provider token or prompt text.
+- The Session passed with telemetry on the same Core: the suspendable
+  RuntimePool reported `TelemetryReady=True/TelemetryProjected` for both
+  turns. The eviction record bound the exact instance (`source:
+  WorkerTermination`, a 30-minute deadline, outcome `EvictionSuspended`);
+  `EvictionDraining`, `AdmissionClosed` and `Draining` were observed, then
+  `EvictionSuspended`. Turn 2 cold-resumed on a new Actor, worker Pod,
+  private pool and supervisor boot with the agent reporting `mode=resume`
+  for the rollout thread, and retirement was complete.
+
+An earlier run the same day on the same sources (before the trace assertion
+followed the router hop) is `bin/external-substrate-core-20261114214415/`.
+It passed every other check; its supervisor spans arrived, but turn 1's
+prompt span did not (see Limits).
 
 The previous installed run, `bin/external-substrate-core-20261006022705/report.json`,
 was against v0.1.0 with Core commit `2599695ae06f5213d0411721347865888a0eff97`
