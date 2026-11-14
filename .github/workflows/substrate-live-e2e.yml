@@ -79,11 +79,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: orka-workspace/go.mod
-          cache-dependency-path: |
-            orka-workspace/go.sum
-            orka-workspace/providers/go.sum
-            orka-workspace/hack/external-substrate-e2e/go.sum
-            orka/go.sum
+          # This job runs code from a second repository; write no cache a
+          # later default-branch run could restore.
+          cache: false
 
       - name: Install kind and tools
         working-directory: ${{ github.workspace }}
@@ -104,6 +102,12 @@ jobs:
           kubectl version --client=true
           test -x "${KINDCTL_BIN}"
           git -C orka rev-parse HEAD
+
+      - name: Prepare the Orka UI embed stub
+        # The Core proof builds Orka's ./cmd with plain go build, which embeds
+        # internal/uiembed/dist; a fresh checkout has none.
+        working-directory: ${{ github.workspace }}/orka
+        run: make ensure-ui-embed
 
       - name: Host preflight
         run: bash scripts/external-substrate-e2e.sh preflight-host
