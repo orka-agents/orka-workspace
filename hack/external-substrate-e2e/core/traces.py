@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Assert one trace joins Core and supervisor GenAI spans for a proof prompt.
 
-Usage: traces.py <collector-debug-log> <report.json> <token-file> <out.json>
+Usage: traces.py <collector-debug-log> <report.json> <session-report.json> <token-file> <out.json>
 
 Parses the OpenTelemetry collector debug exporter (verbosity: detailed). For
-the single-Task phase's Task it looks for the supervisor's acp.supervisor.prompt span
-carrying orka.task.uid and requires, in the same trace, Core's acp.prompt and
+each proof Task it looks for the supervisor's acp.supervisor.prompt span
+carrying orka.task.uid and checks, in the same trace, Core's acp.prompt and
 substrate.router POST spans, acp.supervisor.prompt parented by a Core span,
-invoke_agent codex under it and chat <model> under invoke_agent. The log must contain neither prompt
-content (the fixture markers) nor the provider token. Writes only span names,
-IDs and service names.
+invoke_agent codex under it and chat <model> under invoke_agent. The
+single-Task phase's Task and at least one Session turn (both run with
+telemetry on suspendable and non-suspendable native runtimes) must each have
+a complete trace. The log must contain neither prompt content (the fixture
+markers) nor the provider token. Writes only span names, IDs and service
+names.
 """
 import json
 import pathlib
@@ -112,7 +115,7 @@ def supervisor_metrics(text):
 
 
 def main():
-    log_path, report_path, token_path, out_path = sys.argv[1:]
+    log_path, report_path, session_path, token_path, out_path = sys.argv[1:]
     text = pathlib.Path(log_path).read_text(errors="replace")
     token = pathlib.Path(token_path).read_text().strip()
     if token and token in text:
@@ -120,16 +123,18 @@ def main():
     if "orka-fixture:" in text:
         sys.exit("collector received prompt content")
     report = json.loads(pathlib.Path(report_path).read_text())
-    # The Session phase runs without telemetry (see run.sh); only the
-    # single-Task phase exports traces.
-    tasks = [report["taskUID"]]
+    session = json.loads(pathlib.Path(session_path).read_text())
     spans = parse(text)
-    chains = [chain(spans, uid) for uid in tasks]
-    result = {"spansParsed": len(spans), "services": sorted({s["service"] for s in spans}), "tasks": chains,
+    task = chain(spans, report["taskUID"])
+    # Turn 1's worker is evicted while its prompt is held; turn 2 cold-resumes.
+    turns = {name: chain(spans, session[name]["taskUID"]) for name in ("turn1", "turn2")}
+    result = {"spansParsed": len(spans), "services": sorted({s["service"] for s in spans}), "task": task, "session": turns,
               "supervisorMetrics": supervisor_metrics(text), "contentCaptured": False, "providerTokenInTelemetry": False}
     pathlib.Path(out_path).write_text(json.dumps(result, indent=2) + "\n")
-    if not any(c["complete"] for c in chains):
-        sys.exit("no proof prompt produced Core and supervisor GenAI spans in one trace: %s" % json.dumps(chains))
+    if not task["complete"]:
+        sys.exit("the single Task produced no trace joining Core and supervisor GenAI spans: %s" % json.dumps(task))
+    if not any(turn["complete"] for turn in turns.values()):
+        sys.exit("no Session turn produced a trace joining Core and supervisor GenAI spans: %s" % json.dumps(turns))
 
 
 if __name__ == "__main__":

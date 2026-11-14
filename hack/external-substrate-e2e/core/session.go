@@ -162,6 +162,43 @@ func conditionOf(u *unstructured.Unstructured, kind string) (string, string) {
 	return "", ""
 }
 
+// telemetryReady is the last observed TelemetryReady condition of a Core
+// RuntimePool. Core sets it when it publishes a native workload with
+// telemetry enabled: True/TelemetryProjected when every supervisor signal fits
+// the backend's 32-entry environment limit, else False/NativeEnvironmentLimit.
+type telemetryReady struct {
+	RuntimePool string `json:"runtimePool"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason"`
+	Message     string `json:"message"`
+}
+
+// observeTelemetryReady records pool's TelemetryReady condition and fails as
+// soon as Core reports that it left supervisor telemetry out.
+func observeTelemetryReady(pool *unstructured.Unstructured, seen *telemetryReady) error {
+	conditions, _, _ := unstructured.NestedSlice(pool.Object, "status", "conditions")
+	for _, item := range conditions {
+		c, ok := item.(map[string]any)
+		if !ok || c["type"] != "TelemetryReady" {
+			continue
+		}
+		*seen = telemetryReady{RuntimePool: pool.GetName(), Status: fmt.Sprint(c["status"]), Reason: fmt.Sprint(c["reason"]), Message: fmt.Sprint(c["message"])}
+		if seen.Status != "True" || seen.Reason != "TelemetryProjected" {
+			return fmt.Errorf("RuntimePool %s reports TelemetryReady=%s/%s: %s", seen.RuntimePool, seen.Status, seen.Reason, seen.Message)
+		}
+	}
+	return nil
+}
+
+// requireTelemetryReady requires that a RuntimePool reported every supervisor
+// telemetry signal projected.
+func requireTelemetryReady(seen telemetryReady, what string) error {
+	if seen.Status != "True" || seen.Reason != "TelemetryProjected" {
+		return fmt.Errorf("%s RuntimePool never reported TelemetryReady=True/TelemetryProjected (last observed %+v)", what, seen)
+	}
+	return nil
+}
+
 // sessionInstance is one observed runtime instance of the session workspace.
 type sessionInstance struct {
 	workspace *api.ExecutionWorkspace
@@ -170,10 +207,11 @@ type sessionInstance struct {
 	worker    *corev1.Pod
 	pool      *unstructured.Unstructured
 	task      *unstructured.Unstructured
+	telemetry telemetryReady
 }
 
 func (i *sessionInstance) report() map[string]any {
-	return map[string]any{"task": i.task.GetName(), "taskUID": i.task.GetUID(), "workloadSequence": i.workspace.Spec.Workload.Sequence, "workloadRevision": i.workspace.Spec.Workload.Revision,
+	return map[string]any{"task": i.task.GetName(), "taskUID": i.task.GetUID(), "telemetryReady": i.telemetry, "workloadSequence": i.workspace.Spec.Workload.Sequence, "workloadRevision": i.workspace.Spec.Workload.Revision,
 		"identity": i.workspace.Status.Allocation.Identity, "nativeActorUID": i.actor.GetMetadata().GetUid(), "worker": map[string]any{"name": i.worker.Name, "uid": i.worker.UID},
 		"privateWorkerPool": map[string]any{"name": i.pool.GetName(), "uid": i.pool.GetUID()}, "runtimePool": str(i.task, "status", "execution", "runtimePoolName"),
 		"runtimeSessionUID": str(i.task, "status", "execution", "runtimeSessionUID"), "runtimeInstanceID": str(i.task, "status", "execution", "runtimeInstanceID"),
@@ -202,6 +240,16 @@ func (p *proof) sessionTask(ctx context.Context, name, class, onDetach, prompt s
 		}
 		if phase := str(task, "status", "phase"); phase == "Failed" || phase == "Cancelled" {
 			return false, fmt.Errorf("%s became %s: %s %s", name, phase, str(task, "status", "execution", "reason"), str(task, "status", "execution", "message"))
+		}
+		if poolName := str(task, "status", "execution", "runtimePoolName"); poolName != "" {
+			pool := p.object("RuntimePool", poolName, nil)
+			if err := p.c.Get(ctx, client.ObjectKeyFromObject(pool), pool); err == nil {
+				if err := observeTelemetryReady(pool, &instance.telemetry); err != nil {
+					return false, err
+				}
+			} else if !apierrors.IsNotFound(err) {
+				return false, err
+			}
 		}
 		if instance.startup == nil {
 			workspaceName := task.GetLabels()["acp.workspace.orka.ai/execution-workspace"]
@@ -303,6 +351,11 @@ func (p *proof) runSession(ctx context.Context) (map[string]any, error) {
 	if poolName == "" {
 		return nil, fmt.Errorf("running turn omitted its RuntimePool")
 	}
+	// Core runs this phase with telemetry: a suspendable native supervisor
+	// must still receive every supervisor signal within the 32-entry limit.
+	if err := requireTelemetryReady(first.telemetry, "turn 1"); err != nil {
+		return nil, err
+	}
 	uid := first.worker.UID
 	if err := p.c.Delete(ctx, first.worker.DeepCopy(), client.Preconditions{UID: &uid}); err != nil {
 		return nil, fmt.Errorf("evict exact worker Pod: %w", err)
@@ -318,6 +371,9 @@ func (p *proof) runSession(ctx context.Context) (map[string]any, error) {
 	if err := wait(ctx, func() (bool, error) {
 		pool := p.object("RuntimePool", poolName, nil)
 		if err := p.c.Get(ctx, client.ObjectKeyFromObject(pool), pool); err != nil {
+			return false, err
+		}
+		if err := observeTelemetryReady(pool, &first.telemetry); err != nil {
 			return false, err
 		}
 		if raw := pool.GetAnnotations()[evictionAnnotation]; raw != "" {
@@ -396,6 +452,10 @@ func (p *proof) runSession(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := requireTelemetryReady(second.telemetry, "turn 2"); err != nil {
+		return nil, err
+	}
+	p.pass("both Session turns run with supervisor telemetry: each suspendable native RuntimePool reports TelemetryReady=True/TelemetryProjected")
 	w := second.workspace
 	if w.Spec.Workload.PreviousInstance == nil || *w.Spec.Workload.PreviousInstance != first.workspace.Status.Allocation.Identity || w.Spec.Workload.RetainedData == nil ||
 		suspended.Status.Allocation.RetainedData == nil || *w.Spec.Workload.RetainedData != *suspended.Status.Allocation.RetainedData {

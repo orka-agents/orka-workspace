@@ -76,6 +76,16 @@ ATE_INSTALL_KIND=true KIND_CLUSTER_NAME="${context#kind-}" KUBECTL_CONTEXT="${co
 test -z "$(git status --porcelain --untracked-files=all)"
 cd - >/dev/null
 kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeout=5m
+# Test-only router setting; nothing else in the installation is changed. The
+# v1.0.0 atenet-router gives Envoy only a root RandomSampling ratio (1% by
+# default) that replaces the caller's sampling decision, so a sampled Orka
+# trace reaches the Actor unsampled and the ParentBased ACP supervisor exports
+# no spans. parentbased_always_on maps to a ratio of 1 (upstream
+# internal/serverboot/sampling.go). Operators need the same setting for
+# end-to-end supervisor traces. Setting an unchanged value does not roll the
+# Deployment, so a SUBSTRATE_REUSE_CLUSTER=1 install is unaffected.
+kubectl -n ate-system set env deployment/atenet-router OTEL_TRACES_SAMPLER=parentbased_always_on
+kubectl -n ate-system rollout status deployment/atenet-router --timeout=5m
 kubectl create namespace "${client_namespace}" --dry-run=client -o yaml | kubectl apply -f -
 # ate-system's NetworkPolicy admits ate-api clients only from labeled namespaces.
 kubectl label namespace "${client_namespace}" ate.dev/api-access=true --overwrite

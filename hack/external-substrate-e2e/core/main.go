@@ -258,6 +258,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	var pool *unstructured.Unstructured
 	var policies []string
 	servingInstance, servingProfile, servingBoot := "", "", ""
+	var telemetry telemetryReady
 	if err := wait(ctx, func() (bool, error) {
 		if err := p.c.Get(ctx, client.ObjectKeyFromObject(task), task); err != nil {
 			return false, err
@@ -284,10 +285,15 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		}
 		if name := str(task, "status", "execution", "runtimePoolName"); name != "" {
 			runtimePool := p.object("RuntimePool", name, nil)
-			if err := p.c.Get(ctx, client.ObjectKeyFromObject(runtimePool), runtimePool); err == nil && str(runtimePool, "status", "lifecycle") == "Serving" {
-				servingInstance = str(runtimePool, "status", "activeInstance", "runtimeInstanceID")
-				servingProfile = str(runtimePool, "status", "activeInstance", "profileDigest")
-				servingBoot = str(runtimePool, "status", "activeInstance", "bootID")
+			if err := p.c.Get(ctx, client.ObjectKeyFromObject(runtimePool), runtimePool); err == nil {
+				if err := observeTelemetryReady(runtimePool, &telemetry); err != nil {
+					return false, err
+				}
+				if str(runtimePool, "status", "lifecycle") == "Serving" {
+					servingInstance = str(runtimePool, "status", "activeInstance", "runtimeInstanceID")
+					servingProfile = str(runtimePool, "status", "activeInstance", "profileDigest")
+					servingBoot = str(runtimePool, "status", "activeInstance", "bootID")
+				}
 			}
 		}
 		phase := str(task, "status", "phase")
@@ -314,6 +320,10 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
 	p.pass("actual supervisor reaches authenticated Serving on native port 80 and completes an ACP RuntimeSession prompt with persisted result")
+	if err := requireTelemetryReady(telemetry, "single-Task"); err != nil {
+		return nil, err
+	}
+	p.pass("the native RuntimePool reports TelemetryReady=True/TelemetryProjected: every supervisor telemetry signal fits the 32-entry limit")
 	injection, err := p.verifyCredentialInjection(ctx, workspace)
 	if err != nil {
 		return nil, err
@@ -334,7 +344,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	corePoolName, corePoolUID := str(task, "status", "execution", "runtimePoolName"), str(task, "status", "execution", "runtimePoolUID")
 	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
 		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
-		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
+		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true, "telemetryReady": telemetry}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
 		"credentialInjection": injection, "providerRequests": providerRequests,
 		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
 }
@@ -543,7 +553,7 @@ func main() {
 				report, err = p.verifyRejectedRetirement(ctx)
 			} else if os.Getenv("PROOF_PHASE") == "session" {
 				// run.sh starts this Job only after the single-Task Job
-				// passed and Core was reconfigured without telemetry.
+				// passed, on the same Core with telemetry.
 				report, err = p.runSession(ctx)
 				if err == nil {
 					report["checks"] = p.checks

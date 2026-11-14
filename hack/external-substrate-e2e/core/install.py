@@ -69,10 +69,13 @@ for obj in objects:
         manager["args"] = [arg.replace(".svc:8080", ".svc.cluster.local:8080")
                            if arg.startswith(("--acp-provider-proxy-base-url=", "--controller-url=")) else arg
                            for arg in manager["args"]]
-        # Core and supervisor traces go to the proof's collector. Only the
-        # generic gRPC endpoint is set: Substrate admits 32 environment entries
-        # and a suspendable native supervisor leaves two for telemetry. The
-        # collector origin is admitted to the runtime egress allowlist.
+        # Core and supervisor traces go to the proof's collector, in both
+        # phases. Only the generic gRPC endpoint is set, the smallest
+        # telemetry configuration: Core fits supervisor telemetry into the 32
+        # environment entries Substrate admits and reports the outcome on the
+        # RuntimePool's TelemetryReady condition, which the proof requires
+        # True. The collector origin is admitted to the runtime egress
+        # allowlist.
         manager["args"].extend(["--enable-telemetry", "--runtime-telemetry-collector-egress"])
         manager.setdefault("env", []).append({"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": collector_endpoint})
     if obj["kind"] == "Service" and obj["metadata"]["name"] == proxy_service:
@@ -186,8 +189,8 @@ mounts = [{"name": "native-client", "mountPath": "/native/client", "readOnly": T
 
 # This Job uses the Kubernetes public APIs and native read-only observations.
 # It never invokes the provider lifecycle/reconciler or writes workspace status.
-# Two Jobs, run in order by run.sh: the single Task (with telemetry), then the
-# Session across a worker eviction (after Core drops telemetry; see run.sh).
+# Two Jobs, run in order by run.sh against the same Core with telemetry: the
+# single Task, then the Session across a worker eviction.
 for job, phase, deadline in [(namespace, "task", 1200), (namespace + "-session", "session", 1800)]:
     add("batch/v1", "Job", job, client_namespace, spec={"backoffLimit": 0, "activeDeadlineSeconds": deadline,
         "template": {"metadata": {"labels": {"orka.workspace.e2e/proof": "native-core"}}, "spec": {

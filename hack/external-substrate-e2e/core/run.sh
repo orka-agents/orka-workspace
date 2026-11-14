@@ -216,34 +216,26 @@ PY
 }
 
 run_job "${namespace}" "${run_dir}/proof.log" "${run_dir}/report.json" 1200
-# One trace must join Core's ACP prompt spans with the supervisor's GenAI
-# spans; the batch exporters flush within seconds, so retry briefly.
-# A tracing failure is reported at the end, after the Session phase also ran.
+# The Session (a suspendable native runtime, across a worker eviction) runs on
+# the same Core with telemetry: Core fits supervisor telemetry into the native
+# 32-entry environment limit and the proof requires TelemetryReady=True.
+run_job "${namespace}-session" "${run_dir}/session-proof.log" "${run_dir}/session-report.json" 1800
+# The single Task and at least one Session turn must each have one trace
+# joining Core's ACP prompt spans with the supervisor's GenAI spans; the batch
+# exporters flush within seconds, so retry briefly.
 tracing_failed=0
 for attempt in $(seq 1 12); do
   kubectl -n "${namespace}" logs deployment/orka-otel-collector --tail=-1 >"${run_dir}/collector.log"
-  if python3 -I "${fixture}/traces.py" "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/private/token" "${run_dir}/traces.json"; then
+  if python3 -I "${fixture}/traces.py" "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json" "${run_dir}/private/token" "${run_dir}/traces.json"; then
     break
   fi
   if (( attempt == 12 )); then
     tracing_failed=1
-    printf 'Tracing assertion FAILED; continuing with the Session phase. See %s\n' "${run_dir}/traces.json" >&2
+    printf 'Tracing assertion FAILED. See %s\n' "${run_dir}/traces.json" >&2
     break
   fi
   sleep 5
 done
-
-# A suspendable native supervisor already uses 31 of the 32 environment
-# entries Agent Substrate admits (two for its durable workspace), so Core
-# cannot add even the two-entry trace projection: the provider refuses such a
-# workload ("native environment exceeds upstream limit"). Restart Core without
-# telemetry for the Session phase. The proof deployment's SQLite store is an
-# emptyDir, so the Session starts on a fresh store; phase one already retired.
-kubectl -n "${namespace}" get deployment external-substrate-core -o json |
-  jq '.spec.template.spec.containers[0] |= (.args |= map(select(. != "--enable-telemetry" and . != "--runtime-telemetry-collector-egress"))
-      | .env |= map(select(.name | startswith("OTEL_") | not)))' | kubectl apply -f -
-kubectl -n "${namespace}" rollout status deployment/external-substrate-core --timeout=180s
-run_job "${namespace}-session" "${run_dir}/session-proof.log" "${run_dir}/session-report.json" 1800
 
 python3 - "${run_dir}/report.json" "${run_dir}/traces.json" "${run_dir}/session-report.json" <<'PY'
 import json,pathlib,sys
@@ -253,7 +245,7 @@ report['session']=json.loads(pathlib.Path(sys.argv[3]).read_text())
 pathlib.Path(sys.argv[1]).write_text(json.dumps(report,indent=2)+'\n')
 PY
 if (( tracing_failed )); then
-  printf 'Core proof failed: no single trace joined Core and supervisor GenAI spans (report: %s)\n' "${run_dir}/report.json" >&2
+  printf 'Core proof failed: Core and supervisor GenAI spans were not joined in one trace for the Task and a Session turn (report: %s)\n' "${run_dir}/report.json" >&2
   exit 1
 fi
 printf 'Actual Core and deployed native provider Task proof report: %s\n' "${run_dir}/report.json"
