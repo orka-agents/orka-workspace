@@ -24,6 +24,10 @@ node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memo
 # provider (install-backend.sh installs the gateway with it).
 kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress k8s-credential-provider -o json |
   jq -e '(.items | length) == 5 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
+# The installer's trace backend, which receives atenet-router's Envoy spans
+# (ate-otel-config); the tracing assertion reads the router hop from it.
+kubectl -n otel-system get deployments opentelemetry-collector jaeger -o json |
+  jq -e '(.items | length) == 2 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
 client_namespace=external-substrate-e2e
 kubectl -n "${client_namespace}" get serviceaccount native-core-proof >/dev/null
 registry=orka-external-substrate-registry
@@ -222,11 +226,22 @@ run_job "${namespace}" "${run_dir}/proof.log" "${run_dir}/report.json" 1200
 run_job "${namespace}-session" "${run_dir}/session-proof.log" "${run_dir}/session-report.json" 1800
 # The single Task and at least one Session turn must each have one trace
 # joining Core's ACP prompt spans with the supervisor's GenAI spans; the batch
-# exporters flush within seconds, so retry briefly.
+# exporters flush within seconds, so retry briefly. atenet-router's Envoy span
+# sits between Core's routed request and the supervisor; the router reports it
+# to the installation's own Jaeger (otel-system, installed by ate-setup), so
+# each candidate trace is read from there, read-only, into private/: the proof
+# keeps only span names and IDs from it (traces.json).
+router_traces="${run_dir}/private/router-traces"
+mkdir -p "${router_traces}"
 tracing_failed=0
 for attempt in $(seq 1 12); do
   kubectl -n "${namespace}" logs deployment/orka-otel-collector --tail=-1 >"${run_dir}/collector.log"
-  if python3 -I "${fixture}/traces.py" "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json" "${run_dir}/private/token" "${run_dir}/traces.json"; then
+  for trace_id in $(python3 -I "${fixture}/traces.py" trace-ids "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json"); do
+    kubectl --request-timeout=15s get --raw "/api/v1/namespaces/otel-system/services/jaeger:16686/proxy/api/traces/${trace_id}" \
+      >"${router_traces}/${trace_id}.json" 2>/dev/null || rm -f "${router_traces}/${trace_id}.json"
+  done
+  if python3 -I "${fixture}/traces.py" check "${run_dir}/collector.log" "${run_dir}/report.json" "${run_dir}/session-report.json" \
+    "${router_traces}" "${run_dir}/private/token" "${run_dir}/traces.json"; then
     break
   fi
   if (( attempt == 12 )); then
