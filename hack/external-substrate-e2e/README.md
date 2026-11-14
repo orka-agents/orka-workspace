@@ -13,8 +13,11 @@ The backend is an unchanged checkout of
 at commit `b34fbee742906494b5eb4f1f36987176bf8770a4`, version `v1.0.0`
 (`providers/substrate/nativepb/upstream.env`). Setup invokes its official
 installer, `go run ./cmd/ate-setup deploy ate-system` with the kind profile
-(`ATE_INSTALL_KIND=true`), `--sandbox-classes=gvisor` and egress credential
-injection disabled. It builds every component from the checkout with `ko`.
+(`ATE_INSTALL_KIND=true`), `--sandbox-classes=gvisor` and the bundled
+Kubernetes Secrets egress credential provider
+(`--credential-provider='{"name":"k8s.io"}'`). Its namespace policy is created
+empty, granting nothing; only the Core proof grants its own run (below). It
+builds every component from the checkout with `ko`.
 Agent Substrate cannot upgrade a v0.1.0 install in place (upstream
 `docs/guides/upgrade.md`): retire a cluster that ran the previous pin and use a
 fresh dedicated cluster.
@@ -161,9 +164,20 @@ both source trees before compilation and records source hashes, commit IDs, a
 separate fixture hash, and built image digests in
 `bin/external-substrate-core-<UTC timestamp>/`. Preflight requires at least four
 CPU and 8 GiB of allocatable node memory and serving `ate-api-server`,
-`ate-controller`, `atenet-router` and `atenet-egress`. Existing Core/provider
-deployments cause a refusal so a later run cannot replace an earlier accepted
-Task implicitly.
+`ate-controller`, `atenet-router`, `atenet-egress` and `k8s-credential-provider`.
+Existing Core/provider deployments cause a refusal so a later run cannot
+replace an earlier accepted Task implicitly.
+
+Core delivers its provider-proxy token only by egress gateway injection; the
+proof never passes `--acp-workspace-allow-provider-token-in-sandbox`. Each run
+grants its Atespace (the run namespace) only Core's labeled provider Secrets
+(`orka.ai/runtime-pool-provider-credential: "true"`) in that namespace in the
+`k8s-credential-provider-namespace-policy` ConfigMap, restarts the credential
+provider, and starts the provider with `--egress-credential-provider=k8s.io`.
+The report requires Core's request to name one provider Secret key and the
+applied native EgressPolicy to carry its exact `ate-secret://k8s.io/...` URI
+(`credentialInjection`). An installation made before this setting, with
+`{"enabled":false}`, fails preflight; reinstall it on a fresh cluster.
 
 The provider keeps its shipped transport: a projected ServiceAccount token for
 ate-api, with only the access policies above, and a rotating Pod certificate
@@ -182,12 +196,34 @@ auth/provider credential Secrets.
 
 Core consumes the one-time sealed challenge during credential delivery. The
 client independently checks it through the router when still available and
-reports whether that read preceded closure. A closed listener is accepted only
+reports whether that read preceded closure. The router briefly answers 503
+while the route to a starting Actor becomes available; that read retries a 503
+for up to 30 seconds and fails on any other status but 200 or 404. A closed listener is accepted only
 when the actual Core subsequently proves authenticated Serving for the recorded
 exact instance and supervisor boot. Full-memory restoration stays gated. This
 Task does not test checkpoint persistence; the Data fixture above proves that
 path. Failures retain their accepted Task and evidence for inspection and are
 not replayed; normal controllers may retire allocation resources.
+
+The run namespace is fixed, so a finished run (passed or failed) must be
+retired before the next one:
+
+```sh
+bash scripts/external-substrate-core-e2e.sh cleanup
+```
+
+Cleanup refuses an unfinished proof Job. While Core and the provider still run,
+it deletes the Tasks, then any remaining checkpoints, workspaces, RuntimePools,
+Agent, class and profile through their controllers, and waits up to ten
+minutes until no object in the namespace carries a provider finalizer
+(`v1.substrate.workspace.orka.ai/...`, such as journal protection or checkpoint
+data). A Job with the proof identity then deletes the infrastructure template
+and Atespace by exact UID, refusing if a provider-owned Actor, Data Tag or
+template remains. Only then are Core's webhook, the run namespace (by exact
+UID), the provider namespace and the proof's cluster RBAC removed. No finalizer
+is removed by hand; a release that does not finish keeps everything for
+inspection. The shared CRDs and provider registration stay for the next run.
+Artifacts go to `bin/external-substrate-core-cleanup-<UTC timestamp>/`.
 
 The last installed run, `bin/external-substrate-core-20261006022705/report.json`,
 was against v0.1.0 with Core commit `2599695ae06f5213d0411721347865888a0eff97`

@@ -571,6 +571,64 @@ func (p *proof) verifyRetiredInventory(ctx context.Context, workspaceUID, poolUI
 	return report, nil
 }
 
+// cleanupNative removes this proof's own native objects once Core and the
+// provider have retired every allocation (core/cleanup.sh): the operator
+// infrastructure template and the Atespace, each by exact UID. Provider-owned
+// Actors, Data Tags and derived templates must already be collected; finding
+// one fails the cleanup instead of deleting it here.
+func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
+	var workspaces api.ExecutionWorkspaceList
+	if err := p.c.List(ctx, &workspaces, client.InNamespace(p.namespace)); err != nil {
+		return nil, err
+	}
+	if len(workspaces.Items) != 0 {
+		return nil, fmt.Errorf("cleanup namespace retains %d ExecutionWorkspaces", len(workspaces.Items))
+	}
+	report := map[string]any{"namespace": p.namespace, "nativeCommit": provider.UpstreamCommit}
+	space, err := p.native.GetAtespace(ctx, &pb.GetAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}})
+	if status.Code(err) == codes.NotFound {
+		report["atespace"] = "absent"
+		return report, nil
+	}
+	if err != nil || space.GetMetadata().GetUid() == "" || space.GetMetadata().GetName() != p.namespace {
+		return nil, fmt.Errorf("cleanup native Atespace identity missing: %v", err)
+	}
+	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || len(actors.GetActors()) != 0 || actors.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup Atespace retains native Actors the provider has not retired: %v", err)
+	}
+	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || len(tags.GetTags()) != 0 || tags.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup Atespace retains native Data Tags the provider has not collected: %v", err)
+	}
+	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || templates.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup template inventory failed: %v", err)
+	}
+	ref := &pb.ObjectRef{Atespace: p.namespace, Name: "infrastructure"}
+	for _, template := range templates.GetActorTemplates() {
+		if template.GetMetadata().GetName() != ref.Name || template.GetMetadata().GetUid() == "" || template.GetWorkerSelector().GetMatchLabels()["orka.workspace.e2e/pool"] != p.namespace {
+			return nil, fmt.Errorf("cleanup Atespace retains a template the provider has not collected: %s", template.GetMetadata().GetName())
+		}
+		if _, err := p.native.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: ref, Options: &pb.DeleteOptions{Uid: template.GetMetadata().GetUid()}}); err != nil {
+			return nil, fmt.Errorf("delete infrastructure template: %w", err)
+		}
+		if _, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: ref}); status.Code(err) != codes.NotFound {
+			return nil, fmt.Errorf("cleanup infrastructure template remains: %v", err)
+		}
+		report["infrastructureTemplateUID"] = template.GetMetadata().GetUid()
+	}
+	if _, err := p.native.DeleteAtespace(ctx, &pb.DeleteAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}, Options: &pb.DeleteOptions{Uid: space.GetMetadata().GetUid()}}); err != nil {
+		return nil, fmt.Errorf("delete native Atespace: %w", err)
+	}
+	if _, err := p.native.GetAtespace(ctx, &pb.GetAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}}); status.Code(err) != codes.NotFound {
+		return nil, fmt.Errorf("cleanup native Atespace remains: %v", err)
+	}
+	report["atespace"] = "deleted"
+	report["atespaceUID"] = space.GetMetadata().GetUid()
+	return report, nil
+}
+
 func main() {
 	namespace, image := os.Getenv("POD_NAMESPACE"), os.Getenv("RUNTIME_IMAGE")
 	if namespace == "" || image == "" {
@@ -596,7 +654,9 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
 			defer cancel()
 			p := &proof{c: c, native: pb.NewControlClient(conn), namespace: namespace, image: image}
-			if os.Getenv("RETIRED_TASK_UID") != "" {
+			if os.Getenv("CORE_PROOF_CLEANUP") == "1" {
+				report, err = p.cleanupNative(ctx)
+			} else if os.Getenv("RETIRED_TASK_UID") != "" {
 				report, err = p.verifyRetiredTask(ctx)
 			} else if os.Getenv("REJECTED_WORKSPACE_UID") != "" {
 				report, err = p.verifyRejectedRetirement(ctx)
