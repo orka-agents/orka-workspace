@@ -58,6 +58,12 @@ type proof struct {
 	injection map[string]any
 }
 
+// Job log markers recording the native objects a proof run created.
+const (
+	ownedAtespaceMarker = "NATIVE_OWNED_ATESPACE_UID"
+	ownedTemplateMarker = "NATIVE_OWNED_TEMPLATE_UID"
+)
+
 // Bounds the routed challenge read's retries of a 503 while the router route
 // to a starting Actor becomes available.
 const (
@@ -286,14 +292,18 @@ func requireCredentialInjection(w *api.ExecutionWorkspace, egress *pb.EgressPoli
 }
 
 func (p *proof) run(ctx context.Context) (map[string]any, error) {
-	_, err := p.native.CreateAtespace(ctx, &pb.CreateAtespaceRequest{Atespace: &pb.Atespace{Metadata: &pb.ResourceMetadata{Name: p.namespace}}})
+	space, err := p.native.CreateAtespace(ctx, &pb.CreateAtespaceRequest{Atespace: &pb.Atespace{Metadata: &pb.ResourceMetadata{Name: p.namespace}}})
 	if err != nil {
 		return nil, err
 	}
-	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
+	// core/cleanup.sh deletes only the native objects this run created, by
+	// the UIDs recorded here in the Job log.
+	fmt.Printf("%s %s\n", ownedAtespaceMarker, space.GetMetadata().GetUid())
+	template, err := p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
 	if err != nil {
 		return nil, err
 	}
+	fmt.Printf("%s %s\n", ownedTemplateMarker, template.GetMetadata().GetUid())
 	// The deployed provider authenticates as its own ServiceAccount, with
 	// editor on this profile Atespace and global viewer only.
 	if err := nativee2e.GrantProviderAccess(ctx, p.native, p.namespace, nativee2e.ProviderPrincipal); err != nil {
@@ -581,9 +591,11 @@ func (p *proof) verifyRetiredInventory(ctx context.Context, workspaceUID, poolUI
 
 // cleanupNative removes this proof's own native objects once Core and the
 // provider have retired every allocation (core/cleanup.sh): the operator
-// infrastructure template and the Atespace, each by exact UID. Provider-owned
-// Actors, Data Tags and derived templates must already be collected; finding
-// one fails the cleanup instead of deleting it here.
+// infrastructure template and the Atespace, each by the exact UID the proof
+// run recorded (CORE_PROOF_ATESPACE_UID, CORE_PROOF_TEMPLATE_UID). An object
+// this run did not create is never adopted. Provider-owned Actors, Data Tags
+// and derived templates must already be collected; finding one fails the
+// cleanup instead of deleting it here.
 func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 	var workspaces api.ExecutionWorkspaceList
 	if err := p.c.List(ctx, &workspaces, client.InNamespace(p.namespace)); err != nil {
@@ -600,6 +612,9 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 	}
 	if err != nil || space.GetMetadata().GetUid() == "" || space.GetMetadata().GetName() != p.namespace {
 		return nil, fmt.Errorf("cleanup native Atespace identity missing: %v", err)
+	}
+	if space.GetMetadata().GetUid() != os.Getenv("CORE_PROOF_ATESPACE_UID") {
+		return nil, fmt.Errorf("native Atespace %s was not created by the proof run being retired", p.namespace)
 	}
 	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil || len(actors.GetActors()) != 0 || actors.GetNextPageToken() != "" {
@@ -619,6 +634,9 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 	for _, template := range templates.GetActorTemplates() {
 		if template.GetMetadata().GetName() != ref.Name || template.GetMetadata().GetUid() == "" || template.GetWorkerSelector().GetMatchLabels()["orka.workspace.e2e/pool"] != p.namespace {
 			return nil, fmt.Errorf("cleanup Atespace retains a template the provider has not collected: %s", template.GetMetadata().GetName())
+		}
+		if template.GetMetadata().GetUid() != os.Getenv("CORE_PROOF_TEMPLATE_UID") {
+			return nil, fmt.Errorf("infrastructure template was not created by the proof run being retired")
 		}
 	}
 	for _, template := range templates.GetActorTemplates() {

@@ -47,9 +47,19 @@ teardown() {
 }
 
 job="$(proof_job_json)"
-if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
-  # A previous cleanup already proved release and deleted the run namespace.
-  if [[ -n "${job}" ]]; then require_finished "${job}"; fi
+# Only a confirmed absence counts; any other API error stops here (set -e).
+if [[ -z "$(kubectl get namespace "${namespace}" -o name --ignore-not-found)" ]]; then
+  # Resume only after a cleanup that released and retired this exact run: it
+  # marks the proof Job before deleting the namespace, and removes the Job
+  # last. A namespace deleted any other way may leave its Atespace behind.
+  if [[ -n "${job}" ]]; then
+    require_finished "${job}"
+    jq -e '.metadata.annotations as $a | ($a["orka.workspace.e2e/namespace-uid"] // "") != "" and
+      $a["orka.workspace.e2e/native-cleaned-namespace-uid"] == $a["orka.workspace.e2e/namespace-uid"]' <<<"${job}" >/dev/null || {
+      printf 'Namespace %s is gone without a completed native cleanup; inspect its Atespace by hand.\n' "${namespace}" >&2
+      exit 1
+    }
+  fi
   printf 'Run namespace %s is already gone; resuming the remaining teardown.\n' "${namespace}"
   teardown
   printf 'Native Core proof teardown complete.\n'
@@ -63,6 +73,10 @@ namespace_uid="$(jq -r '.metadata.annotations["orka.workspace.e2e/namespace-uid"
   printf 'Namespace %s is not the lifetime the proof Job recorded; inspect it by hand.\n' "${namespace}" >&2
   exit 1
 }
+# The native objects this run created, from the proof Job's own log.
+proof_log="$(kubectl -n "${client_namespace}" logs "job/${namespace}")"
+owned_atespace="$(sed -n 's/^NATIVE_OWNED_ATESPACE_UID \([0-9a-f-]*\)$/\1/p' <<<"${proof_log}" | tail -n 1)"
+owned_template="$(sed -n 's/^NATIVE_OWNED_TEMPLATE_UID \([0-9a-f-]*\)$/\1/p' <<<"${proof_log}" | tail -n 1)"
 # Core and the provider retire their own objects, so both must still serve.
 kubectl -n "${namespace}" rollout status deployment/external-substrate-core --timeout=120s
 kubectl -n "${provider_namespace}" rollout status deployment/orka-workspace-substrate --timeout=120s
@@ -106,12 +120,13 @@ docker push "localhost:5002/orka/native-core-proof:cleanup-${run_id}"
 cleanup_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-core-proof:cleanup-${run_id}")"
 job_name="native-core-cleanup-${run_id}"
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${namespace_uid}"
-jq --arg name "${job_name}" --arg image "${cleanup_image}" '
+jq --arg name "${job_name}" --arg image "${cleanup_image}" --arg atespace "${owned_atespace}" --arg template "${owned_template}" '
   {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace,labels:{"orka.workspace.e2e/cleanup":"native-core"}},spec:{
     backoffLimit:0,activeDeadlineSeconds:300,template:.spec.template}} |
   .spec.template.metadata = {labels:{"orka.workspace.e2e/cleanup":"native-core"}} |
   .spec.template.spec.containers[0].image = $image |
-  .spec.template.spec.containers[0].env += [{name:"CORE_PROOF_CLEANUP",value:"1"}]' <<<"${job}" |
+  .spec.template.spec.containers[0].env += [{name:"CORE_PROOF_CLEANUP",value:"1"},
+    {name:"CORE_PROOF_ATESPACE_UID",value:$atespace},{name:"CORE_PROOF_TEMPLATE_UID",value:$template}]' <<<"${job}" |
   kubectl create -f -
 start="$(date +%s)"
 while true; do
@@ -141,6 +156,8 @@ PY
 # UID, and the provider only after that namespace is gone. The shared CRDs and
 # provider registration stay; the next run applies them again.
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${namespace_uid}"
+# Evidence for a resumed teardown that native cleanup finished for this run.
+kubectl -n "${client_namespace}" annotate job "${namespace}" "orka.workspace.e2e/native-cleaned-namespace-uid=${namespace_uid}" --overwrite
 kubectl delete validatingwebhookconfiguration external-substrate-core --ignore-not-found
 python3 - "${run_dir}/delete-options.json" "${namespace_uid}" <<'PY'
 import json, pathlib, sys

@@ -220,13 +220,15 @@ Agent, class and profile through their controllers, and waits up to ten
 minutes until no object in the namespace carries a provider finalizer
 (`v1.substrate.workspace.orka.ai/...`, such as journal protection or checkpoint
 data). A Job with the proof identity then deletes the infrastructure template
-and Atespace by exact UID, refusing if a provider-owned Actor, Data Tag or
-template remains. Only then are Core's webhook, the run namespace (by exact
+and Atespace by the exact UIDs the proof recorded in its Job log when it
+created them. It never adopts a same-named object from another run, and it
+refuses if a provider-owned Actor, Data Tag or template remains. Only then are Core's webhook, the run namespace (by exact
 UID), the provider namespace and the proof's cluster RBAC removed, and the
 credential provider's namespace policy is reset to grant nothing. No finalizer
 is removed by hand; a release that does not finish keeps everything for
-inspection. Once the run namespace is gone, rerunning cleanup resumes the
-remaining teardown. The shared CRDs and provider registration stay for the
+inspection. Before deleting the run namespace, cleanup marks the proof Job; once
+that namespace is gone, rerunning cleanup resumes the remaining teardown only
+with that mark. The shared CRDs and provider registration stay for the
 next run.
 Artifacts go to `bin/external-substrate-core-cleanup-<UTC timestamp>/`.
 
