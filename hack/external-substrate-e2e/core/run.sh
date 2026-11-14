@@ -132,6 +132,10 @@ openssl rand 32 >"${run_dir}/private/key"
 openssl rand -hex 32 >"${run_dir}/private/token"
 chmod 600 "${run_dir}/private/"*
 kubectl create namespace "${namespace}"
+# Recorded on the proof Job so core/cleanup.sh retires only this lifetime of
+# the fixed namespace.
+namespace_uid="$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
+test -n "${namespace_uid}"
 # ate-system's NetworkPolicy admits Substrate clients only from labeled namespaces.
 kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
@@ -150,7 +154,7 @@ kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeou
 jq '{apiVersion:"v1",kind:"List",items:[.items[] | select(.kind != "Job")]}' "${run_dir}/install.json" | kubectl apply -f -
 kubectl -n orka-workspace-system rollout status deployment/orka-workspace-substrate --timeout=180s
 kubectl -n "${namespace}" rollout status deployment/external-substrate-core --timeout=180s
-jq '.items[] | select(.kind == "Job")' "${run_dir}/install.json" | kubectl create -f -
+jq --arg uid "${namespace_uid}" '.items[] | select(.kind == "Job") | .metadata.annotations["orka.workspace.e2e/namespace-uid"] = $uid' "${run_dir}/install.json" | kubectl create -f -
 printf 'Actual native Core Task proof namespace: %s\nArtifacts: %s\n' "${namespace}" "${run_dir}"
 start="$(date +%s)"
 while true; do

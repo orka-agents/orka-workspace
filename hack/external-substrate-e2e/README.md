@@ -176,7 +176,8 @@ grants its Atespace (the run namespace) only Core's labeled provider Secrets
 provider, and starts the provider with `--egress-credential-provider=k8s.io`.
 The report requires Core's request to name one provider Secret key and the
 applied native EgressPolicy to carry its exact `ate-secret://k8s.io/...` URI
-(`credentialInjection`). An installation made before this setting, with
+(`credentialInjection`). The deterministic agent sends no provider request, so
+the injected header itself is not exercised on the wire. An installation made before this setting, with
 `{"enabled":false}`, fails preflight; reinstall it on a fresh cluster.
 
 The provider keeps its shipped transport: a projected ServiceAccount token for
@@ -212,7 +213,8 @@ retired before the next one:
 bash scripts/external-substrate-core-e2e.sh cleanup
 ```
 
-Cleanup refuses an unfinished proof Job. While Core and the provider still run,
+Cleanup refuses an unfinished proof Job, and a run namespace whose UID differs
+from the one the proof Job recorded. While Core and the provider still run,
 it deletes the Tasks, then any remaining checkpoints, workspaces, RuntimePools,
 Agent, class and profile through their controllers, and waits up to ten
 minutes until no object in the namespace carries a provider finalizer
@@ -220,9 +222,12 @@ minutes until no object in the namespace carries a provider finalizer
 data). A Job with the proof identity then deletes the infrastructure template
 and Atespace by exact UID, refusing if a provider-owned Actor, Data Tag or
 template remains. Only then are Core's webhook, the run namespace (by exact
-UID), the provider namespace and the proof's cluster RBAC removed. No finalizer
+UID), the provider namespace and the proof's cluster RBAC removed, and the
+credential provider's namespace policy is reset to grant nothing. No finalizer
 is removed by hand; a release that does not finish keeps everything for
-inspection. The shared CRDs and provider registration stay for the next run.
+inspection. Once the run namespace is gone, rerunning cleanup resumes the
+remaining teardown. The shared CRDs and provider registration stay for the
+next run.
 Artifacts go to `bin/external-substrate-core-cleanup-<UTC timestamp>/`.
 
 The last installed run, `bin/external-substrate-core-20261006022705/report.json`,

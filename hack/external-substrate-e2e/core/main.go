@@ -207,10 +207,15 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 
 // readChallenge reads the one-time public startup challenge through the
 // router. While the route to a starting Actor becomes available the router
-// briefly answers 503; that alone is retried, within challengeStartupDeadline.
-// Every other outcome, including a persistent 503, is returned unchanged.
+// briefly answers 503; that alone is retried. challengeStartupDeadline bounds
+// every attempt, including one in flight. Every other outcome, including a
+// persistent 503, is returned unchanged. Core reaches the runtime through the
+// same route, so it cannot deliver credentials or reach Serving while the
+// route answers 503; retrying does not hide the Task's progress.
 func readChallenge(ctx context.Context, endpoint, target string, challenge *publicChallenge) (int, error) {
 	deadline := time.Now().Add(challengeStartupDeadline)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for {
 		code, err := nativee2e.RouterGetJSON(ctx, endpoint, target, "/v2/credential-bootstrap", challenge)
 		if code != http.StatusServiceUnavailable || !time.Now().Add(challengeRetryInterval).Before(deadline) {
@@ -224,11 +229,14 @@ func readChallenge(ctx context.Context, endpoint, target string, challenge *publ
 	}
 }
 
-// requireCredentialInjection checks that Core delivered the provider token by
-// gateway injection rather than into the sandbox: the admitted request needs
+// requireCredentialInjection checks that Core asked for the provider token to
+// be injected at the gateway rather than delivered into the sandbox, and that
+// the provider applied it: the admitted request needs
 // the injection feature and names one provider Secret key for exactly one
 // rule, and the applied native EgressPolicy carries that Secret's ate-secret
-// URI on exactly one rule. Only public references are reported.
+// URI on exactly one rule. Only public references are reported. The
+// deterministic agent sends no provider request, so the injected header on the
+// wire is not exercised here.
 func requireCredentialInjection(w *api.ExecutionWorkspace, egress *pb.EgressPolicy) (map[string]any, error) {
 	runtime := w.Spec.Workload.Runtime
 	if runtime.Egress == nil || !slices.Contains(runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
@@ -393,7 +401,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("successful Task lacks independently observed startup, authenticated Serving or persisted result evidence")
 	}
 	p.pass("provider process evidence matches exact Actor UID/version/worker, routed target and egress allowlist; full-memory remains gated")
-	p.pass("Core delivers the provider token by gateway injection: its request names one provider Secret key and the applied native EgressPolicy carries its exact ate-secret URI")
+	p.pass("Core requests gateway credential injection instead of a sandbox token: its request names one provider Secret key and the applied native EgressPolicy carries its exact ate-secret URI")
 	if p.challengeRead {
 		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
@@ -606,10 +614,14 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("cleanup template inventory failed: %v", err)
 	}
 	ref := &pb.ObjectRef{Atespace: p.namespace, Name: "infrastructure"}
+	// Validate the whole inventory before deleting anything, so a refusal
+	// leaves every native object in place for inspection.
 	for _, template := range templates.GetActorTemplates() {
 		if template.GetMetadata().GetName() != ref.Name || template.GetMetadata().GetUid() == "" || template.GetWorkerSelector().GetMatchLabels()["orka.workspace.e2e/pool"] != p.namespace {
 			return nil, fmt.Errorf("cleanup Atespace retains a template the provider has not collected: %s", template.GetMetadata().GetName())
 		}
+	}
+	for _, template := range templates.GetActorTemplates() {
 		if _, err := p.native.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: ref, Options: &pb.DeleteOptions{Uid: template.GetMetadata().GetUid()}}); err != nil {
 			return nil, fmt.Errorf("delete infrastructure template: %w", err)
 		}

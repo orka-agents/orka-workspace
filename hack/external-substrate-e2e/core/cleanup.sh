@@ -5,7 +5,8 @@
 # workspace, checkpoint and provider-finalized journal or catalog in the run
 # namespace. Only then are the proof's own native objects, the run namespace
 # and, last, the provider removed. No finalizer is removed by hand: a release
-# that does not finish leaves everything in place for inspection.
+# that does not finish leaves everything in place for inspection. Once the run
+# namespace is gone, a rerun resumes the remaining idempotent teardown.
 set -euo pipefail
 case "$(kubectl config current-context)" in
   kind-orka-workspace-*-external-su-*) ;;
@@ -18,11 +19,48 @@ provider_namespace=orka-workspace-system
 # Every finalizer the Substrate provider adds (journal protection, checkpoint
 # data, reference and export) is prefixed with its controller name.
 provider_finalizer=v1.substrate.workspace.orka.ai/
-namespace_uid="$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
-test -n "${namespace_uid}"
-job="$(kubectl -n "${client_namespace}" get job "${namespace}" -o json)"
-jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "Complete") and .status == "True")' <<<"${job}" >/dev/null || {
-  printf 'The Core proof Job has not finished; refusing to retire a running proof.\n' >&2
+proof_job_json() {
+  kubectl -n "${client_namespace}" get job "${namespace}" -o json --ignore-not-found
+}
+require_finished() {
+  jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "Complete") and .status == "True")' <<<"$1" >/dev/null || {
+    printf 'The Core proof Job has not finished; refusing to retire a running proof.\n' >&2
+    exit 1
+  }
+}
+# Idempotent removal of everything outside the run namespace, the provider
+# last. The credential provider's policy goes back to granting nothing, so a
+# later Atespace of the same name holds no grant until its own run makes one.
+teardown() {
+  kubectl delete validatingwebhookconfiguration external-substrate-core --ignore-not-found
+  kubectl delete namespace "${provider_namespace}" --ignore-not-found --wait=true --timeout=5m
+  for name in external-substrate-core external-substrate-core-fixture external-substrate-core-proof orka-workspace-substrate; do
+    kubectl delete clusterrolebinding "${name}" --ignore-not-found
+    kubectl delete clusterrole "${name}" --ignore-not-found
+  done
+  printf 'policies: []\n' | kubectl -n ate-system create configmap k8s-credential-provider-namespace-policy --dry-run=client -o yaml \
+    --from-file=namespace-policy.yaml=/dev/stdin | kubectl apply -f -
+  kubectl -n ate-system rollout restart deployment/k8s-credential-provider
+  kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeout=180s
+  kubectl -n "${client_namespace}" delete job "${namespace}" --ignore-not-found
+  kubectl -n "${client_namespace}" delete job -l orka.workspace.e2e/cleanup=native-core --ignore-not-found
+}
+
+job="$(proof_job_json)"
+if ! kubectl get namespace "${namespace}" >/dev/null 2>&1; then
+  # A previous cleanup already proved release and deleted the run namespace.
+  if [[ -n "${job}" ]]; then require_finished "${job}"; fi
+  printf 'Run namespace %s is already gone; resuming the remaining teardown.\n' "${namespace}"
+  teardown
+  printf 'Native Core proof teardown complete.\n'
+  exit 0
+fi
+test -n "${job}" || { printf 'The Core proof Job is missing; inspect %s by hand.\n' "${namespace}" >&2; exit 1; }
+require_finished "${job}"
+# Retire only the namespace lifetime that this proof Job ran against.
+namespace_uid="$(jq -r '.metadata.annotations["orka.workspace.e2e/namespace-uid"] // empty' <<<"${job}")"
+[[ -n "${namespace_uid}" && "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" == "${namespace_uid}" ]] || {
+  printf 'Namespace %s is not the lifetime the proof Job recorded; inspect it by hand.\n' "${namespace}" >&2
   exit 1
 }
 # Core and the provider retire their own objects, so both must still serve.
@@ -69,7 +107,7 @@ cleanup_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/or
 job_name="native-core-cleanup-${run_id}"
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${namespace_uid}"
 jq --arg name "${job_name}" --arg image "${cleanup_image}" '
-  {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace},spec:{
+  {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace,labels:{"orka.workspace.e2e/cleanup":"native-core"}},spec:{
     backoffLimit:0,activeDeadlineSeconds:300,template:.spec.template}} |
   .spec.template.metadata = {labels:{"orka.workspace.e2e/cleanup":"native-core"}} |
   .spec.template.spec.containers[0].image = $image |
@@ -102,6 +140,7 @@ PY
 # Kubernetes teardown: Core's admission first, then the run namespace by exact
 # UID, and the provider only after that namespace is gone. The shared CRDs and
 # provider registration stay; the next run applies them again.
+test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${namespace_uid}"
 kubectl delete validatingwebhookconfiguration external-substrate-core --ignore-not-found
 python3 - "${run_dir}/delete-options.json" "${namespace_uid}" <<'PY'
 import json, pathlib, sys
@@ -111,10 +150,5 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
 PY
 kubectl delete --raw "/api/v1/namespaces/${namespace}" -f "${run_dir}/delete-options.json" >/dev/null
 kubectl wait --for=delete "namespace/${namespace}" --timeout=5m
-kubectl delete namespace "${provider_namespace}" --wait=true --timeout=5m
-for name in external-substrate-core external-substrate-core-fixture external-substrate-core-proof orka-workspace-substrate; do
-  kubectl delete clusterrolebinding "${name}" --ignore-not-found
-  kubectl delete clusterrole "${name}" --ignore-not-found
-done
-kubectl -n "${client_namespace}" delete job "${namespace}" "${job_name}" --ignore-not-found
+teardown
 printf 'Native Core proof retired; cleanup report: %s\n' "${run_dir}/report.json"
