@@ -27,6 +27,8 @@ import sys
 
 SUPERVISOR = "orka-acp-supervisor"
 MODEL = "gpt-5.4"
+# The provider probe's model request input (hack/external-workspace-e2e/acp-agent/probe.go).
+PROBE_INPUT = "Orka external workspace fixture provider probe."
 # The debug exporter's first line of each batch carries the log timestamp and
 # level ("2026-01-02T03:04:05.678Z<TAB>info<TAB>ResourceSpans #0").
 PREFIX = re.compile(r"^\d{4}-\d\d-\d\dT\S+\s+(?:info|debug|warn|error)\s+")
@@ -172,7 +174,8 @@ def main():
     token = pathlib.Path(token_path).read_text().strip()
     if token and (token in text or token in router_text):
         sys.exit("telemetry received the provider token")
-    if "orka-fixture:" in text or "orka-fixture:" in router_text:
+    # The Task prompts carry the fixture markers; the probe's model input has none.
+    if any(content in text or content in router_text for content in ("orka-fixture:", PROBE_INPUT)):
         sys.exit("telemetry received prompt content")
     spans = parse(text)
     routed = router_spans(router_dir)

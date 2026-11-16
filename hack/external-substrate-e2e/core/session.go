@@ -251,8 +251,9 @@ func (p *proof) taskSucceeded(i *sessionInstance) (bool, error) {
 		return false, nil
 	}
 	available, _, _ := unstructured.NestedBool(i.task.Object, "status", "resultRef", "available")
-	if !available || i.startup == nil || str(i.task, "status", "execution", "promptID") == "" || str(i.task, "status", "execution", "runtimeSessionUID") == "" {
-		return false, fmt.Errorf("%s succeeded without startup, prompt and persisted result evidence", i.task.GetName())
+	if !available || i.startup == nil || str(i.task, "status", "execution", "promptID") == "" || str(i.task, "status", "execution", "runtimeSessionUID") == "" ||
+		str(i.task, "status", "execution", "runtimeSessionSupervisorBootID") == "" {
+		return false, fmt.Errorf("%s succeeded without startup, prompt, supervisor boot and persisted result evidence", i.task.GetName())
 	}
 	return true, nil
 }
