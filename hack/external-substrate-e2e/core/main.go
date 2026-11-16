@@ -380,6 +380,11 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 					if err != nil {
 						return false, err
 					}
+					// While the allocation is active: terminal retirement
+					// deletes the provider Secret once the Task settles.
+					if err := p.requireFixtureInjection(ctx); err != nil {
+						return false, err
+					}
 					startup = current.Status.Allocation.Startup.DeepCopy()
 				}
 			} else if !apierrors.IsNotFound(err) {
@@ -428,9 +433,6 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		return nil, err
 	}
 	p.pass("the native RuntimePool reports TelemetryReady=True/TelemetryProjected: every supervisor telemetry signal fits the 32-entry limit")
-	if err := p.requireFixtureInjection(ctx); err != nil {
-		return nil, err
-	}
 	p.pass("the injected credential is Core's labeled, RuntimePool-owned provider Secret token, as the bearer for the fixture provider-proxy origin")
 	providerRequests, err := p.waitProviderRequests(ctx, 1)
 	if err != nil {

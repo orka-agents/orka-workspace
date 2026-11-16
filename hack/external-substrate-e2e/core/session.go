@@ -96,6 +96,7 @@ func (p *proof) waitProviderRequests(ctx context.Context, want int) (providerObs
 // provider Secret token is the bearer for the provider-proxy origin's port
 // 8080, and that Secret is Core's labeled, RuntimePool-owned credential.
 // Secret values are never read: only the Secret's identity labels and owner.
+// It runs at startup observation, before settlement retires the Secret.
 func (p *proof) requireFixtureInjection(ctx context.Context) error {
 	in := p.injection
 	ports, _ := in["ports"].([]int32)
