@@ -47,6 +47,10 @@ type providerObservations struct {
 	Sessions    []string `json:"sessions"`
 }
 
+// observationsClient is shared by every poll of the fixture proxy, so its
+// connection is reused instead of leaving one idle transport per poll.
+var observationsClient = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
 func (p *proof) proxyHost() string {
 	return "fixture-provider-proxy." + p.namespace + ".svc.cluster.local"
 }
@@ -57,7 +61,7 @@ func (p *proof) providerObservations(ctx context.Context) (providerObservations,
 	if err != nil {
 		return seen, err
 	}
-	response, err := (&http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}).Do(request)
+	response, err := observationsClient.Do(request)
 	if err != nil {
 		return seen, err
 	}
