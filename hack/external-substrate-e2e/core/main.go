@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -52,7 +54,22 @@ type proof struct {
 	image         string
 	checks        []string
 	challengeRead bool
+	// injection summarizes the gateway credential injection observed at startup.
+	injection map[string]any
 }
+
+// Job log markers recording the native objects a proof run created.
+const (
+	ownedAtespaceMarker = "NATIVE_OWNED_ATESPACE_UID"
+	ownedTemplateMarker = "NATIVE_OWNED_TEMPLATE_UID"
+)
+
+// Bounds the routed challenge read's retries of a 503 while the router route
+// to a starting Actor becomes available.
+const (
+	challengeStartupDeadline = 30 * time.Second
+	challengeRetryInterval   = 500 * time.Millisecond
+)
 
 func (p *proof) object(kind, name string, spec map[string]any) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "core.orka.ai/v1alpha1", "kind": kind,
@@ -145,6 +162,9 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	if p.injection, err = requireCredentialInjection(w, egress); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	// Core admits the allowlist; the provider compiles it verbatim. Report
 	// the applied host patterns for review.
 	selected := []string{}
@@ -154,7 +174,7 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 		selected = append(selected, rule.GetTlsPassthrough().GetHostnames()...)
 	}
 	var challenge publicChallenge
-	code, readErr := nativee2e.RouterGetJSON(ctx, startup.Endpoint, process.RouterTarget, "/v2/credential-bootstrap", &challenge)
+	code, readErr := readChallenge(ctx, startup.Endpoint, process.RouterTarget, &challenge)
 	if readErr != nil && code != http.StatusNotFound {
 		return nil, nil, nil, nil, fmt.Errorf("native public startup challenge through the router: %w", readErr)
 	}
@@ -191,15 +211,99 @@ func (p *proof) observeStartup(ctx context.Context, w *api.ExecutionWorkspace) (
 	return actor, pod, pool, selected, nil
 }
 
+// readChallenge reads the one-time public startup challenge through the
+// router. While the route to a starting Actor becomes available the router
+// briefly answers 503; that alone is retried. challengeStartupDeadline bounds
+// every attempt, including one in flight. Every other outcome, including a
+// persistent 503, is returned unchanged. Core reaches the runtime through the
+// same route, so it cannot deliver credentials or reach Serving while the
+// route answers 503; retrying does not hide the Task's progress.
+func readChallenge(ctx context.Context, endpoint, target string, challenge *publicChallenge) (int, error) {
+	deadline := time.Now().Add(challengeStartupDeadline)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	for {
+		code, err := nativee2e.RouterGetJSON(ctx, endpoint, target, "/v2/credential-bootstrap", challenge)
+		if code != http.StatusServiceUnavailable || !time.Now().Add(challengeRetryInterval).Before(deadline) {
+			return code, err
+		}
+		select {
+		case <-ctx.Done():
+			return code, err
+		case <-time.After(challengeRetryInterval):
+		}
+	}
+}
+
+// requireCredentialInjection checks that Core asked for the provider token to
+// be injected at the gateway rather than delivered into the sandbox, and that
+// the provider applied it: the admitted request needs
+// the injection feature and names one provider Secret key for exactly one
+// rule, and the applied native EgressPolicy carries that Secret's ate-secret
+// URI on exactly one rule. Only public references are reported. The
+// deterministic agent sends no provider request, so the injected header on the
+// wire is not exercised here.
+func requireCredentialInjection(w *api.ExecutionWorkspace, egress *pb.EgressPolicy) (map[string]any, error) {
+	runtime := w.Spec.Workload.Runtime
+	if runtime.Egress == nil || !slices.Contains(runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		return nil, fmt.Errorf("Core did not request gateway credential injection")
+	}
+	var requested *api.RuntimeEgressRule
+	for i := range runtime.Egress.Rules {
+		if len(runtime.Egress.Rules[i].ReplaceHeaders) == 0 {
+			continue
+		}
+		if requested != nil {
+			return nil, fmt.Errorf("Core requested credential replacement on more than one rule")
+		}
+		requested = &runtime.Egress.Rules[i]
+	}
+	if requested == nil || requested.Protocol != api.RuntimeEgressHTTP || len(requested.ReplaceHeaders) != 1 {
+		return nil, fmt.Errorf("Core credential replacement is not one header on one HTTP rule")
+	}
+	header := requested.ReplaceHeaders[0]
+	ref := header.SecretKeyRef
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = w.Namespace
+	}
+	if namespace != w.Namespace || ref.Name == "" || ref.Key == "" {
+		return nil, fmt.Errorf("Core credential replacement does not name a provider Secret key in the workload namespace")
+	}
+	uri := fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", namespace, ref.Name, ref.Key)
+	applied := 0
+	for _, rule := range egress.GetRules() {
+		for _, effects := range []*pb.HttpRuleEffects{rule.GetHttp().GetEffects(), rule.GetHttps().GetEffects()} {
+			replace := effects.GetReplaceHeaders()
+			if len(replace) == 0 {
+				continue
+			}
+			if rule.GetHttp() == nil || !slices.Equal(rule.GetHttp().GetHostnames(), []string{requested.Host}) || len(replace) != 1 ||
+				!strings.EqualFold(replace[0].GetHeader(), header.Header) || replace[0].GetPrefix() != header.Prefix || replace[0].GetCredentialUri() != uri {
+				return nil, fmt.Errorf("applied native EgressPolicy credential effect differs from Core's request")
+			}
+			applied++
+		}
+	}
+	if applied != 1 {
+		return nil, fmt.Errorf("applied native EgressPolicy carries %d credential effects, want 1", applied)
+	}
+	return map[string]any{"requiredFeature": api.WorkspaceFeatureEgressCredentialInjection, "host": requested.Host, "header": header.Header, "credentialURI": uri}, nil
+}
+
 func (p *proof) run(ctx context.Context) (map[string]any, error) {
-	_, err := p.native.CreateAtespace(ctx, &pb.CreateAtespaceRequest{Atespace: &pb.Atespace{Metadata: &pb.ResourceMetadata{Name: p.namespace}}})
+	space, err := p.native.CreateAtespace(ctx, &pb.CreateAtespaceRequest{Atespace: &pb.Atespace{Metadata: &pb.ResourceMetadata{Name: p.namespace}}})
 	if err != nil {
 		return nil, err
 	}
-	_, err = p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
+	// core/cleanup.sh deletes only the native objects this run created, by
+	// the UIDs recorded here in the Job log.
+	fmt.Printf("%s %s\n", ownedAtespaceMarker, space.GetMetadata().GetUid())
+	template, err := p.native.CreateActorTemplate(ctx, &pb.CreateActorTemplateRequest{ActorTemplate: nativee2e.InfrastructureTemplate(p.namespace, p.image, p.namespace)})
 	if err != nil {
 		return nil, err
 	}
+	fmt.Printf("%s %s\n", ownedTemplateMarker, template.GetMetadata().GetUid())
 	// The deployed provider authenticates as its own ServiceAccount, with
 	// editor on this profile Atespace and global viewer only.
 	if err := nativee2e.GrantProviderAccess(ctx, p.native, p.namespace, nativee2e.ProviderPrincipal); err != nil {
@@ -307,6 +411,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 		return nil, fmt.Errorf("successful Task lacks independently observed startup, authenticated Serving or persisted result evidence")
 	}
 	p.pass("provider process evidence matches exact Actor UID/version/worker, routed target and egress allowlist; full-memory remains gated")
+	p.pass("Core requests gateway credential injection instead of a sandbox token: its request names one provider Secret key and the applied native EgressPolicy carries its exact ate-secret URI")
 	if p.challengeRead {
 		p.pass("independent routed public challenge read binds the native process and provider hash before closure")
 	}
@@ -375,7 +480,7 @@ func (p *proof) run(ctx context.Context) (map[string]any, error) {
 	p.pass("terminal Core settlement deletes its exact RuntimePool and credentials, attachment Secrets, native Actor, private WorkerPool and worker Pod")
 	return map[string]any{"namespace": p.namespace, "task": task.GetName(), "taskUID": task.GetUID(), "phase": "Succeeded", "workspace": workspace.Name, "workspaceUID": workspace.UID,
 		"process": startup.Process, "endpoint": startup.Endpoint, "nativeActorUID": actor.GetMetadata().GetUid(), "privateWorkerPool": map[string]any{"name": pool.GetName(), "uid": pool.GetUID()},
-		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks,
+		"runtimeSession": identity, "resultAvailable": available, "coreAdmission": workspace.Spec.CoreAdmission, "providerObservedSequence": workspace.Status.Allocation.Sequence, "workloadRevision": workspace.Spec.Workload.Revision, "runtimeProfileDigest": servingProfile, "appliedEgressHosts": policies, "attachmentSecretsRemaining": 0, "coreRuntimePool": map[string]any{"name": corePoolName, "uid": corePoolUID, "deleted": true}, "runtimeCredentialSecretsRemaining": 0, "checks": p.checks, "credentialInjection": p.injection,
 		"nativeCommit": provider.UpstreamCommit, "runtimeImage": p.image, "publicChallengeObservedBeforeClose": p.challengeRead, "networkPolicyEnforcement": "objects and pre-worker ordering verified; kind default CNI does not prove packet enforcement"}, nil
 }
 
@@ -484,6 +589,76 @@ func (p *proof) verifyRetiredInventory(ctx context.Context, workspaceUID, poolUI
 	return report, nil
 }
 
+// cleanupNative removes this proof's own native objects once Core and the
+// provider have retired every allocation (core/cleanup.sh): the operator
+// infrastructure template and the Atespace, each by the exact UID the proof
+// run recorded (CORE_PROOF_ATESPACE_UID, CORE_PROOF_TEMPLATE_UID). An object
+// this run did not create is never adopted. Provider-owned Actors, Data Tags
+// and derived templates must already be collected; finding one fails the
+// cleanup instead of deleting it here.
+func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
+	var workspaces api.ExecutionWorkspaceList
+	if err := p.c.List(ctx, &workspaces, client.InNamespace(p.namespace)); err != nil {
+		return nil, err
+	}
+	if len(workspaces.Items) != 0 {
+		return nil, fmt.Errorf("cleanup namespace retains %d ExecutionWorkspaces", len(workspaces.Items))
+	}
+	report := map[string]any{"namespace": p.namespace, "nativeCommit": provider.UpstreamCommit}
+	space, err := p.native.GetAtespace(ctx, &pb.GetAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}})
+	if status.Code(err) == codes.NotFound {
+		report["atespace"] = "absent"
+		return report, nil
+	}
+	if err != nil || space.GetMetadata().GetUid() == "" || space.GetMetadata().GetName() != p.namespace {
+		return nil, fmt.Errorf("cleanup native Atespace identity missing: %v", err)
+	}
+	if space.GetMetadata().GetUid() != os.Getenv("CORE_PROOF_ATESPACE_UID") {
+		return nil, fmt.Errorf("native Atespace %s was not created by the proof run being retired", p.namespace)
+	}
+	actors, err := p.native.ListActors(ctx, &pb.ListActorsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || len(actors.GetActors()) != 0 || actors.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup Atespace retains native Actors the provider has not retired: %v", err)
+	}
+	tags, err := p.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || len(tags.GetTags()) != 0 || tags.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup Atespace retains native Data Tags the provider has not collected: %v", err)
+	}
+	templates, err := p.native.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Atespace: p.namespace, Options: &pb.ListOptions{PageSize: 1000}})
+	if err != nil || templates.GetNextPageToken() != "" {
+		return nil, fmt.Errorf("cleanup template inventory failed: %v", err)
+	}
+	ref := &pb.ObjectRef{Atespace: p.namespace, Name: "infrastructure"}
+	// Validate the whole inventory before deleting anything, so a refusal
+	// leaves every native object in place for inspection.
+	for _, template := range templates.GetActorTemplates() {
+		if template.GetMetadata().GetName() != ref.Name || template.GetMetadata().GetUid() == "" || template.GetWorkerSelector().GetMatchLabels()["orka.workspace.e2e/pool"] != p.namespace {
+			return nil, fmt.Errorf("cleanup Atespace retains a template the provider has not collected: %s", template.GetMetadata().GetName())
+		}
+		if template.GetMetadata().GetUid() != os.Getenv("CORE_PROOF_TEMPLATE_UID") {
+			return nil, fmt.Errorf("infrastructure template was not created by the proof run being retired")
+		}
+	}
+	for _, template := range templates.GetActorTemplates() {
+		if _, err := p.native.DeleteActorTemplate(ctx, &pb.DeleteActorTemplateRequest{ActorTemplate: ref, Options: &pb.DeleteOptions{Uid: template.GetMetadata().GetUid()}}); err != nil {
+			return nil, fmt.Errorf("delete infrastructure template: %w", err)
+		}
+		if _, err := p.native.GetActorTemplate(ctx, &pb.GetActorTemplateRequest{ActorTemplate: ref}); status.Code(err) != codes.NotFound {
+			return nil, fmt.Errorf("cleanup infrastructure template remains: %v", err)
+		}
+		report["infrastructureTemplateUID"] = template.GetMetadata().GetUid()
+	}
+	if _, err := p.native.DeleteAtespace(ctx, &pb.DeleteAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}, Options: &pb.DeleteOptions{Uid: space.GetMetadata().GetUid()}}); err != nil {
+		return nil, fmt.Errorf("delete native Atespace: %w", err)
+	}
+	if _, err := p.native.GetAtespace(ctx, &pb.GetAtespaceRequest{Atespace: &pb.ObjectRef{Name: p.namespace}}); status.Code(err) != codes.NotFound {
+		return nil, fmt.Errorf("cleanup native Atespace remains: %v", err)
+	}
+	report["atespace"] = "deleted"
+	report["atespaceUID"] = space.GetMetadata().GetUid()
+	return report, nil
+}
+
 func main() {
 	namespace, image := os.Getenv("POD_NAMESPACE"), os.Getenv("RUNTIME_IMAGE")
 	if namespace == "" || image == "" {
@@ -509,7 +684,9 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
 			defer cancel()
 			p := &proof{c: c, native: pb.NewControlClient(conn), namespace: namespace, image: image}
-			if os.Getenv("RETIRED_TASK_UID") != "" {
+			if os.Getenv("CORE_PROOF_CLEANUP") == "1" {
+				report, err = p.cleanupNative(ctx)
+			} else if os.Getenv("RETIRED_TASK_UID") != "" {
 				report, err = p.verifyRetiredTask(ctx)
 			} else if os.Getenv("REJECTED_WORKSPACE_UID") != "" {
 				report, err = p.verifyRejectedRetirement(ctx)

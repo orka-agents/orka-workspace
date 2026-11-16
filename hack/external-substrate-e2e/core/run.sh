@@ -19,8 +19,13 @@ node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memo
 # Agent Substrate v1.0.0 sends all Actor egress through its gateway and routes
 # ingress through atenet-router; both must be serving. No installation setting
 # is patched.
-kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress -o json |
-  jq -e '(.items | length) == 4 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
+# Egress credential injection needs the bundled Kubernetes Secrets credential
+# provider (install-backend.sh installs the gateway with it).
+if ! kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress k8s-credential-provider -o json |
+  jq -e '(.items | length) == 5 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null; then
+  printf 'The native installation is not serving, or lacks the k8s.io egress credential provider; reinstall with install-backend.sh.\n' >&2
+  exit 1
+fi
 client_namespace=external-substrate-e2e
 kubectl -n "${client_namespace}" get serviceaccount native-core-proof >/dev/null
 registry=orka-external-substrate-registry
@@ -127,16 +132,29 @@ openssl rand 32 >"${run_dir}/private/key"
 openssl rand -hex 32 >"${run_dir}/private/token"
 chmod 600 "${run_dir}/private/"*
 kubectl create namespace "${namespace}"
+# Recorded on the proof Job so core/cleanup.sh retires only this lifetime of
+# the fixed namespace.
+namespace_uid="$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
+test -n "${namespace_uid}"
 # ate-system's NetworkPolicy admits Substrate clients only from labeled namespaces.
 kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
 kubectl -n "${namespace}" create secret tls external-substrate-core-tls --key="${run_dir}/private/tls.key" --cert="${run_dir}/private/tls.crt"
 kubectl create --dry-run=client -f "${core_snapshot}/config/rbac/role.yaml" -o json >"${run_dir}/core-role.json"
 python3 "${fixture}/install.py" "${namespace}" "${core_image}" "${runtime_image}" "${proof_image}" "${provider_image}" "${worker_image}" "${run_dir}/private/tls.crt" "${run_dir}/core-role.json" >"${run_dir}/install.json"
+# Grant this run's Atespace (the profile templateRef namespace, which is the
+# run namespace) only Core's labeled provider Secrets in its own runtime
+# namespace, then restart the credential provider, which reads its policy only
+# at startup. This dedicated installation serves no other Atespace.
+printf 'policies:\n- atespace: %s\n  allowedNamespaces: [%s]\n  secretSelector:\n    matchLabels:\n      orka.ai/runtime-pool-provider-credential: "true"\n' "${namespace}" "${namespace}" >"${run_dir}/namespace-policy.yaml"
+kubectl -n ate-system create configmap k8s-credential-provider-namespace-policy --dry-run=client -o yaml \
+  --from-file=namespace-policy.yaml="${run_dir}/namespace-policy.yaml" | kubectl apply -f -
+kubectl -n ate-system rollout restart deployment/k8s-credential-provider
+kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeout=180s
 jq '{apiVersion:"v1",kind:"List",items:[.items[] | select(.kind != "Job")]}' "${run_dir}/install.json" | kubectl apply -f -
 kubectl -n orka-workspace-system rollout status deployment/orka-workspace-substrate --timeout=180s
 kubectl -n "${namespace}" rollout status deployment/external-substrate-core --timeout=180s
-jq '.items[] | select(.kind == "Job")' "${run_dir}/install.json" | kubectl create -f -
+jq --arg uid "${namespace_uid}" '.items[] | select(.kind == "Job") | .metadata.annotations["orka.workspace.e2e/namespace-uid"] = $uid' "${run_dir}/install.json" | kubectl create -f -
 printf 'Actual native Core Task proof namespace: %s\nArtifacts: %s\n' "${namespace}" "${run_dir}"
 start="$(date +%s)"
 while true; do
