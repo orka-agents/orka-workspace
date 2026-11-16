@@ -3,8 +3,8 @@
 # Installs the pinned, unmodified Agent Substrate v1.0.0 checkout with its
 # official ate-setup installer onto this dedicated cluster, with the bundled
 # Kubernetes Secrets egress credential provider. Its namespace policy is
-# installed empty (granting nothing); the Core proof grants only its own run. A v0.1.0 install
-# cannot be upgraded in place: use a fresh dedicated cluster.
+# installed empty (granting nothing); the Core proof grants only its own run.
+# A v0.1.0 install cannot be upgraded in place: use a fresh dedicated cluster.
 set -euo pipefail
 source_dir="$1"
 test -n "${KUBECONFIG:-}"

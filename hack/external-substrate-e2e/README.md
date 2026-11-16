@@ -15,9 +15,9 @@ at commit `b34fbee742906494b5eb4f1f36987176bf8770a4`, version `v1.0.0`
 installer, `go run ./cmd/ate-setup deploy ate-system` with the kind profile
 (`ATE_INSTALL_KIND=true`), `--sandbox-classes=gvisor` and the bundled
 Kubernetes Secrets egress credential provider
-(`--credential-provider='{"name":"k8s.io"}'`). Its namespace policy is
-installed empty and grants nothing; only the Core proof grants its own run (see
-below). It builds every component from the checkout with `ko`.
+(`--credential-provider='{"name":"k8s.io"}'`). Its namespace policy is created
+empty, granting nothing; only the Core proof grants its own run (below). It
+builds every component from the checkout with `ko`.
 Agent Substrate cannot upgrade a v0.1.0 install in place (upstream
 `docs/guides/upgrade.md`): retire a cluster that ran the previous pin and use a
 fresh dedicated cluster.
@@ -98,12 +98,13 @@ the proof Jobs. It never reads Secrets or Pod specs, never writes under
 `private/`, and redacts bearer values, JWTs, PEM blocks and the fixture token.
 
 `.github/workflows/substrate-live-e2e.yml` runs `preflight-host`, `install`,
-the Data proof and the Core proof on a GitHub-hosted runner with
+the Data proof, the Core proof and the Core proof's `cleanup` (below) on a
+GitHub-hosted runner with
 `SUBSTRATE_CLONE=1`, the kindctl vendored in the checked-out Orka core, and
 that checkout as `ORKA_CORE_SOURCE` (`orka-ref` input, default `main`). It
 runs weekly, on demand and on pull requests touching the providers, shared
 APIs, these fixtures or scripts, and uploads `bin/` reports, logs and
-diagnostics without `private/`, source snapshots or image contexts. Both
+diagnostics without `private/`, source snapshots or image build contexts. Both
 checkouts keep their repository basenames: kindctl derives the cluster name
 from the directory, and a basename longer than 25 characters makes the
 control-plane node name exceed 63 characters, which kind cannot register. An existing dedicated cluster requires
@@ -228,7 +229,9 @@ auth/provider credential Secrets.
 
 Core consumes the one-time sealed challenge during credential delivery. The
 client independently checks it through the router when still available and
-reports whether that read preceded closure. A closed listener is accepted only
+reports whether that read preceded closure. The router briefly answers 503
+while the route to a starting Actor becomes available; that read retries a 503
+for up to 30 seconds and fails on any other status but 200 or 404. A closed listener is accepted only
 when the actual Core subsequently proves authenticated Serving for the recorded
 exact instance and supervisor boot. Full-memory restoration stays gated.
 Failures retain their accepted Task and evidence for inspection and are not
@@ -238,6 +241,33 @@ The run has two in-cluster Jobs, `external-substrate-core` (the single Task)
 and `external-substrate-core-session` (the Session), started in that order
 against the same Core, both with telemetry. The second starts only after the
 first passed; traces are verified after both.
+
+The run namespace is fixed, so a finished run (passed or failed) must be
+retired before the next one:
+
+```sh
+bash scripts/external-substrate-core-e2e.sh cleanup
+```
+
+Cleanup refuses while either proof Job (`external-substrate-core` or
+`external-substrate-core-session`) is unfinished, and a run namespace whose UID
+differs from the one the proof Jobs recorded. While Core and the provider still run,
+it deletes the Tasks, then any remaining checkpoints, workspaces, RuntimePools,
+Agent, class and profile through their controllers, and waits up to ten
+minutes until no object in the namespace carries a provider finalizer
+(`v1.substrate.workspace.orka.ai/...`, such as journal protection or checkpoint
+data). A Job with the proof identity then deletes the infrastructure template
+and Atespace by the exact UIDs the proof recorded in its Job log when it
+created them. It never adopts a same-named object from another run, and it
+refuses if a provider-owned Actor, Data Tag or template remains. Only then are Core's webhook, the run namespace (by exact
+UID), the provider namespace and the proof's cluster RBAC removed, and the
+credential provider's namespace policy is reset to grant nothing. No finalizer
+is removed by hand; a release that does not finish keeps everything for
+inspection. Before deleting the run namespace, cleanup marks the single-Task proof Job; once
+that namespace is gone, rerunning cleanup resumes the remaining teardown only
+with that mark, and it deletes that Job last. The shared CRDs and provider registration stay for the
+next run.
+Artifacts go to `bin/external-substrate-core-cleanup-<UTC timestamp>/`.
 
 ### Egress credential injection
 
@@ -249,6 +279,10 @@ the credential provider. The rendered provider Deployment adds
 `--egress-credential-provider=k8s.io`; Core keeps its provider Secret in the
 workload namespace, so no `--egress-credential-namespace` is needed. The
 shipped `providers/substrate/config/deployment.yaml` keeps injection off.
+Core delivers its provider-proxy token only by egress gateway injection; the
+proof never passes `--acp-workspace-allow-provider-token-in-sandbox`. An
+installation made before this setting, with `{"enabled":false}`, fails
+preflight; reinstall it on a fresh cluster.
 
 The listener-less provider-proxy Service is replaced by a fixture origin
 (`core/providerproxy`). It accepts a request only when `Authorization` is

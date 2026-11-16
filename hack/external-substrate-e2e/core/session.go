@@ -91,65 +91,29 @@ func (p *proof) waitProviderRequests(ctx context.Context, want int) (providerObs
 	return seen, nil
 }
 
-// verifyCredentialInjection checks the Core-requested replacement and the
-// native EgressPolicy the provider applied before Resume. Secret values are
-// never read: only the provider Secret's identity labels and owner.
-func (p *proof) verifyCredentialInjection(ctx context.Context, w *api.ExecutionWorkspace) (map[string]any, error) {
-	runtime := w.Spec.Workload.Runtime
-	if runtime.Egress == nil || !slices.Contains(runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
-		return nil, fmt.Errorf("Core did not request gateway credential injection")
-	}
-	var requested *api.RuntimeEgressRule
-	for i, rule := range runtime.Egress.Rules {
-		if len(rule.ReplaceHeaders) == 0 {
-			continue
-		}
-		if requested != nil {
-			return nil, fmt.Errorf("Core requested credential replacement on more than one rule")
-		}
-		requested = &runtime.Egress.Rules[i]
-	}
-	if requested == nil || requested.Protocol != api.RuntimeEgressHTTP || requested.Host != p.proxyHost() || !slices.Equal(requested.Ports, []int32{8080}) || len(requested.ReplaceHeaders) != 1 {
-		return nil, fmt.Errorf("Core credential replacement is not one HTTP rule for the provider-proxy origin: %+v", requested)
-	}
-	header := requested.ReplaceHeaders[0]
-	ref := header.SecretKeyRef
-	if header.Header != "Authorization" || header.Prefix != "Bearer " || ref.Namespace != p.namespace || ref.Name == "" || ref.Key != providerTokenKey {
-		return nil, fmt.Errorf("Core credential replacement does not name its provider Secret token as the bearer")
-	}
-	uri := fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", ref.Namespace, ref.Name, ref.Key)
-	if p.egress == nil {
-		return nil, fmt.Errorf("no applied native EgressPolicy was observed")
-	}
-	applied := 0
-	for _, rule := range p.egress.GetRules() {
-		if rule.GetHttps().GetEffects() != nil {
-			return nil, fmt.Errorf("applied native HTTPS rule carries unexpected effects")
-		}
-		effects := rule.GetHttp().GetEffects()
-		if effects == nil {
-			continue
-		}
-		replace := effects.GetReplaceHeaders()
-		if !slices.Equal(rule.GetHttp().GetHostnames(), []string{p.proxyHost()}) || !slices.Equal(rule.GetHttp().GetPorts().GetNumbers(), []int32{8080}) ||
-			len(replace) != 1 || replace[0].GetHeader() != "Authorization" || replace[0].GetPrefix() != "Bearer " || replace[0].GetCredentialUri() != uri || replace[0].GetActorJwt() != nil {
-			return nil, fmt.Errorf("applied native EgressPolicy credential effect differs from Core's request")
-		}
-		applied++
-	}
-	if applied != 1 {
-		return nil, fmt.Errorf("applied native EgressPolicy carries %d credential rules, want 1", applied)
+// requireFixtureInjection binds the gateway credential injection that
+// observeStartup verified (requireCredentialInjection) to this fixture: Core's
+// provider Secret token is the bearer for the provider-proxy origin's port
+// 8080, and that Secret is Core's labeled, RuntimePool-owned credential.
+// Secret values are never read: only the Secret's identity labels and owner.
+func (p *proof) requireFixtureInjection(ctx context.Context) error {
+	in := p.injection
+	ports, _ := in["ports"].([]int32)
+	name, _ := in["secret"].(string)
+	if in["host"] != p.proxyHost() || !slices.Equal(ports, []int32{8080}) || in["header"] != "Authorization" || in["prefix"] != "Bearer " || name == "" ||
+		in["credentialURI"] != fmt.Sprintf("ate-secret://k8s.io/default/%s/%s/%s", p.namespace, name, providerTokenKey) {
+		return fmt.Errorf("Core credential replacement is not its provider Secret token as the bearer for the provider-proxy origin: %v", in)
 	}
 	secret := &corev1.Secret{}
-	if err := p.c.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
-		return nil, err
+	if err := p.c.Get(ctx, client.ObjectKey{Namespace: p.namespace, Name: name}, secret); err != nil {
+		return err
 	}
 	owner := metav1.GetControllerOf(secret)
 	if secret.Labels["orka.ai/runtime-pool-provider-credential"] != "true" || owner == nil || owner.Kind != "RuntimePool" {
-		return nil, fmt.Errorf("injected provider Secret is not Core's labeled, RuntimePool-owned credential")
+		return fmt.Errorf("injected provider Secret is not Core's labeled, RuntimePool-owned credential")
 	}
-	return map[string]any{"host": p.proxyHost(), "port": 8080, "header": "Authorization", "prefix": "Bearer ", "secret": ref.Name, "credentialURI": uri, "secretOwner": owner.Name,
-		"requiredFeature": api.WorkspaceFeatureEgressCredentialInjection}, nil
+	in["secretOwner"] = owner.Name
+	return nil
 }
 
 func conditionOf(u *unstructured.Unstructured, kind string) (string, string) {

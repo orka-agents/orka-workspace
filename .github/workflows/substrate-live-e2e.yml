@@ -4,7 +4,8 @@ name: Substrate live E2E
 # Data proof (capture, checkpoint export, cold import), then the actual Orka
 # Core proof (ACP Task with gateway credential injection and tracing, then a
 # two-turn Session across a worker eviction with data-only suspension and cold
-# resume). See hack/external-substrate-e2e/README.md.
+# resume), then the Core proof's cleanup. See
+# hack/external-substrate-e2e/README.md.
 
 on:
   workflow_dispatch:
@@ -126,6 +127,12 @@ jobs:
           ORKA_CORE_BUILD_RELEASED: "1"
         run: bash scripts/external-substrate-core-e2e.sh proof
 
+      - name: Core proof cleanup
+        # Retires the passed run through Core and the provider (core/cleanup.sh)
+        # and requires that teardown to complete. A failed run is kept for the
+        # redacted diagnostics below.
+        run: bash scripts/external-substrate-core-e2e.sh cleanup
+
       - name: Redacted diagnostics
         if: failure()
         run: bash scripts/external-substrate-e2e.sh diagnostics || true
@@ -148,5 +155,6 @@ jobs:
             !orka-workspace/bin/external-substrate-core-*/orka/**
             !orka-workspace/bin/external-substrate-core-*/orka-workspace/**
             !orka-workspace/bin/**/images/**
+            !orka-workspace/bin/**/image/**
             !orka-workspace/bin/**/collector.log
             !orka-workspace/bin/external-substrate-proof-*/native-data-*

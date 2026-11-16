@@ -22,8 +22,11 @@ node_memory="$(kubectl get nodes -o jsonpath='{.items[0].status.allocatable.memo
 # is patched.
 # Egress credential injection needs the bundled Kubernetes Secrets credential
 # provider (install-backend.sh installs the gateway with it).
-kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress k8s-credential-provider -o json |
-  jq -e '(.items | length) == 5 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null
+if ! kubectl -n ate-system get deployments ate-api-server ate-controller atenet-router atenet-egress k8s-credential-provider -o json |
+  jq -e '(.items | length) == 5 and all(.items[]; (.status.availableReplicas // 0) >= 1)' >/dev/null; then
+  printf 'The native installation is not serving, or lacks the k8s.io egress credential provider; reinstall with install-backend.sh.\n' >&2
+  exit 1
+fi
 # The installer's trace backend, which receives atenet-router's Envoy spans
 # (ate-otel-config); the tracing assertion reads the router hop from it.
 kubectl -n otel-system get deployments opentelemetry-collector jaeger -o json |
@@ -168,6 +171,10 @@ openssl rand 32 >"${run_dir}/private/key"
 openssl rand -hex 32 >"${run_dir}/private/token"
 chmod 600 "${run_dir}/private/"*
 kubectl create namespace "${namespace}"
+# Recorded on the proof Job so core/cleanup.sh retires only this lifetime of
+# the fixed namespace.
+namespace_uid="$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')"
+test -n "${namespace_uid}"
 # ate-system's NetworkPolicy admits Substrate clients only from labeled namespaces.
 kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
@@ -190,9 +197,11 @@ kubectl -n "${namespace}" rollout status deployment/orka-otel-collector --timeou
 kubectl -n "${namespace}" rollout status deployment/external-substrate-core --timeout=180s
 printf 'Actual native Core Task proof namespace: %s\nArtifacts: %s\n' "${namespace}" "${run_dir}"
 # run_job creates one rendered proof Job, waits for it and extracts its report.
+# Each Job records the namespace lifetime it ran against for core/cleanup.sh.
 run_job() {
   local name="$1" log="$2" report="$3" deadline="$4" start job
-  jq --arg name "${name}" '.items[] | select(.kind == "Job" and .metadata.name == $name)' "${run_dir}/install.json" | kubectl create -f -
+  jq --arg name "${name}" --arg uid "${namespace_uid}" '.items[] | select(.kind == "Job" and .metadata.name == $name) |
+    .metadata.annotations["orka.workspace.e2e/namespace-uid"] = $uid' "${run_dir}/install.json" | kubectl create -f -
   start="$(date +%s)"
   while true; do
     job="$(kubectl -n "${client_namespace}" --request-timeout=15s get job "${name}" -o json)"
