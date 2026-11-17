@@ -6,7 +6,11 @@ MIT License - see LICENSE file for details.
 
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // SubstrateTemplateReference names the operator-owned native infrastructure
 // ActorTemplate. The provider derives its runtime template from this object's
@@ -42,14 +46,29 @@ type SubstrateSuspendPolicy struct {
 // RetentionPolicy limits suspended occupancy per class and namespace. A class
 // permitting suspension must separately configure expiry; a count cap requires
 // maxLifetime because quota contention can defer suspension.
+// +kubebuilder:validation:XValidation:rule="!has(self.suspendAfterDetach) || (duration(self.suspendAfterDetach) > duration('0s') && duration(self.suspendAfterDetach) <= duration('1h'))",message="suspendAfterDetach must be positive and at most 1h"
 type RetentionPolicy struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxSuspendedWorkspaces *int32 `json:"maxSuspendedWorkspaces,omitempty"`
+
+	// SuspendAfterDetach is the warm window defined by Orka ADR 0055. Orka
+	// keeps a detached session-reused workspace Ready, with its Actor and
+	// supervisor running but its attachment revoked, for this long before the
+	// frozen Suspend applies. Unset suspends immediately on detach. It requires
+	// suspend.mode DataOnly and must be positive and at most 1h; Orka core
+	// additionally requires it to be shorter than the class idleTimeout and
+	// maxLifetime. There is no default, so existing profiles keep their hash.
+	// +optional
+	SuspendAfterDetach *metav1.Duration `json:"suspendAfterDetach,omitempty"`
 }
+
+// MaxSuspendAfterDetach bounds the warm window a profile may request.
+const MaxSuspendAfterDetach = time.Hour
 
 // SubstrateWorkspaceProfileSpec contains only Substrate infrastructure inputs.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="SubstrateWorkspaceProfile spec is immutable; create a new profile"
+// +kubebuilder:validation:XValidation:rule="!has(self.retention) || !has(self.retention.suspendAfterDetach) || (has(self.suspend) && self.suspend.mode == 'DataOnly')",message="retention.suspendAfterDetach requires suspend.mode DataOnly"
 type SubstrateWorkspaceProfileSpec struct {
 	TemplateRef SubstrateTemplateReference `json:"templateRef"`
 
