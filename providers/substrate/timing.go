@@ -117,10 +117,14 @@ func stoppedTimingValues(record *journalRecord) []any {
 	values := append(timingSubject(record), "operation", record.Operation)
 	values = phase(values, "suspendMs", t.SuspendIssuedAt, t.SuspendedObservedAt)
 	tagCompleted := t.TagCompletedAt
-	// A recovered checkpoint has only its second-precision CreatedAt, which
-	// can truncate to before the suspension was observed; such a bound would
-	// report a negative Tag phase, so neither Tag-bounded phase is reported.
-	if tagCompleted == nil && t.SuspendedObservedAt != nil && record.Checkpoint != nil && !record.Checkpoint.CreatedAt.IsZero() && !record.Checkpoint.CreatedAt.Before(&metav1.Time{Time: t.SuspendedObservedAt.Time}) {
+	// A recovered checkpoint, or one captured before this journal recorded
+	// timing, has only its second-precision CreatedAt. That can truncate to
+	// before the suspension was observed; such a bound would report a negative
+	// Tag phase, so neither Tag-bounded phase is reported then. Without an
+	// observed suspension there is no Tag phase to distort, and CreatedAt
+	// still bounds the worker teardown.
+	if tagCompleted == nil && record.Checkpoint != nil && !record.Checkpoint.CreatedAt.IsZero() &&
+		(t.SuspendedObservedAt == nil || !record.Checkpoint.CreatedAt.Before(&metav1.Time{Time: t.SuspendedObservedAt.Time})) {
 		tagCompleted = &metav1.MicroTime{Time: record.Checkpoint.CreatedAt.Time}
 	}
 	values = phase(values, "tagMs", t.SuspendedObservedAt, tagCompleted)
