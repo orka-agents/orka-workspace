@@ -1085,6 +1085,56 @@ func cappedRequest(t *testing.T, c client.Client, request sdk.WorkloadRequest, l
 	}
 	return request
 }
+
+// TestWarmWindowProfileHashesStoredContent covers an ADR 0055 warm window
+// written in a non-canonical form. The API server stores "5m" as written and
+// core hashes that, so the provider must not hash a typed round trip ("5m0s").
+func TestWarmWindowProfileHashesStoredContent(t *testing.T) {
+	c, native, request := fixture(t, true)
+	p := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: request.Key.Namespace, Name: request.ParametersRef.Name}, p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.Retention = &profile.RetentionPolicy{SuspendAfterDetach: &metav1.Duration{Duration: 5 * time.Minute}}
+	if err := c.Update(t.Context(), p); err != nil {
+		t.Fatal(err)
+	}
+	// The fake client stores typed objects; restore the operator's spelling on
+	// raw reads the way the API server would return it.
+	stored := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if raw, ok := obj.(*unstructured.Unstructured); ok && raw.GetKind() == "SubstrateWorkspaceProfile" {
+			return unstructured.SetNestedField(raw.Object, "5m", "spec", "retention", "suspendAfterDetach")
+		}
+		return nil
+	}})
+	raw := &unstructured.Unstructured{}
+	raw.SetGroupVersionKind(profile.GroupVersion.WithKind("SubstrateWorkspaceProfile"))
+	if err := stored.Get(t.Context(), types.NamespacedName{Namespace: request.Key.Namespace, Name: request.ParametersRef.Name}, raw); err != nil {
+		t.Fatal(err)
+	}
+	coreHash, err := sdk.ParametersProfileHash(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed, err := runtime.DefaultUnstructuredConverter.ToUnstructured(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	typed["apiVersion"], typed["kind"] = profile.GroupVersion.String(), "SubstrateWorkspaceProfile"
+	if roundTrip, err := sdk.ParametersProfileHash(&unstructured.Unstructured{Object: typed}); err != nil || roundTrip == coreHash {
+		t.Fatalf("fixture does not distinguish stored from re-encoded content: %v", err)
+	}
+	request.ParametersBinding.ProfileHash = coreHash
+	request.Revision, _ = sdk.WorkloadRevision(request)
+	if err := admit(c)(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	ready(t, stored, native, request)
+}
+
 func TestSuspendedQuotaLossAndZeroCapacityFailBeforeMutation(t *testing.T) {
 	for _, zero := range []bool{true, false} {
 		t.Run(fmt.Sprintf("zero=%v", zero), func(t *testing.T) {

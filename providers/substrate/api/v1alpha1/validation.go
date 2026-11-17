@@ -37,5 +37,14 @@ func (p *SubstrateWorkspaceProfile) Validate() error {
 	if p.Spec.Retention != nil && p.Spec.Retention.MaxSuspendedWorkspaces != nil && *p.Spec.Retention.MaxSuspendedWorkspaces < 0 {
 		return fmt.Errorf("maxSuspendedWorkspaces must not be negative")
 	}
+	if p.Spec.Retention != nil && p.Spec.Retention.SuspendAfterDetach != nil {
+		window := p.Spec.Retention.SuspendAfterDetach.Duration
+		if window <= 0 || window > MaxSuspendAfterDetach {
+			return fmt.Errorf("suspendAfterDetach %s must be positive and at most %s", window, MaxSuspendAfterDetach)
+		}
+		if p.Spec.Suspend == nil || p.Spec.Suspend.Mode != SubstrateSuspendModeDataOnly {
+			return fmt.Errorf("suspendAfterDetach requires suspend.mode DataOnly")
+		}
+	}
 	return nil
 }

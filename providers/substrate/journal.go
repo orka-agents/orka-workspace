@@ -403,20 +403,22 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	if request.ParametersRef == nil || request.ParametersBinding == nil || request.ParametersRef.Group != profile.GroupVersion.Group || request.ParametersRef.Kind != "SubstrateWorkspaceProfile" {
 		return fmt.Errorf("native runtime requires an immutable SubstrateWorkspaceProfile")
 	}
+	// Hash the stored object, as core does, rather than a typed round trip:
+	// re-encoding normalizes values such as suspendAfterDetach ("5m" becomes
+	// "5m0s"), which would mismatch the hash core froze.
+	raw := &unstructured.Unstructured{}
+	raw.SetGroupVersionKind(profile.GroupVersion.WithKind("SubstrateWorkspaceProfile"))
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: request.Key.Namespace, Name: request.ParametersRef.Name}, raw); err != nil {
+		return err
+	}
 	object := &profile.SubstrateWorkspaceProfile{}
-	if err := d.client.Get(ctx, types.NamespacedName{Namespace: request.Key.Namespace, Name: request.ParametersRef.Name}, object); err != nil {
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw.Object, object); err != nil {
 		return err
 	}
 	if err := object.Validate(); err != nil {
 		return err
 	}
-	value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
-	if err != nil {
-		return err
-	}
-	value["apiVersion"] = profile.GroupVersion.String()
-	value["kind"] = "SubstrateWorkspaceProfile"
-	hash, err := sdk.ParametersProfileHash(&unstructured.Unstructured{Object: value})
+	hash, err := sdk.ParametersProfileHash(raw)
 	if err != nil {
 		return err
 	}

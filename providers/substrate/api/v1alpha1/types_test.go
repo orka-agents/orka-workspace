@@ -5,11 +5,13 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	structuralcel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	structuralpruning "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/pruning"
 	openapivalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -150,7 +152,7 @@ func TestGeneratedSchemaScopeAndProviderBoundary(t *testing.T) {
 			t.Fatal("unexpected GVK/storage version")
 		}
 		spec := s.crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"]
-		if len(spec.XValidations) != 1 || spec.XValidations[0].Rule != "self == oldSelf" {
+		if len(spec.XValidations) == 0 || spec.XValidations[0].Rule != "self == oldSelf" {
 			t.Fatal("immutable spec rule missing")
 		}
 		for _, key := range []string{"backend", "substrate", "agentSandbox"} {
@@ -183,6 +185,15 @@ func TestGeneratedProfileValidationAndImmutability(t *testing.T) {
 		{"missing template name", func(spec map[string]any) { spec["templateRef"] = map[string]any{} }},
 		{"empty template name", func(spec map[string]any) { spec["templateRef"] = map[string]any{"name": ""} }},
 		{"negative retention", func(spec map[string]any) { spec["retention"] = map[string]any{"maxSuspendedWorkspaces": int64(-1)} }},
+		{"zero warm window", func(spec map[string]any) { spec["retention"] = map[string]any{"suspendAfterDetach": "0s"} }},
+		{"negative warm window", func(spec map[string]any) { spec["retention"] = map[string]any{"suspendAfterDetach": "-1m"} }},
+		{"warm window over 1h", func(spec map[string]any) { spec["retention"] = map[string]any{"suspendAfterDetach": "1h0m1s"} }},
+		{"unparsable warm window", func(spec map[string]any) { spec["retention"] = map[string]any{"suspendAfterDetach": "soon"} }},
+		{"non-string warm window", func(spec map[string]any) { spec["retention"] = map[string]any{"suspendAfterDetach": int64(300)} }},
+		{"warm window without suspend", func(spec map[string]any) {
+			delete(spec, "suspend")
+			spec["retention"] = map[string]any{"suspendAfterDetach": "5m"}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			object := runtime.DeepCopyJSON(valid)
@@ -204,5 +215,89 @@ func TestGeneratedProfileValidationAndImmutability(t *testing.T) {
 	}
 	if !reflect.DeepEqual(valid["spec"], updated["spec"]) {
 		t.Fatal("metadata update changed profile")
+	}
+}
+
+func TestSuspendAfterDetachValidation(t *testing.T) {
+	base := func(window time.Duration, suspend bool) *SubstrateWorkspaceProfile {
+		p := &SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant"}, Spec: SubstrateWorkspaceProfileSpec{
+			TemplateRef: SubstrateTemplateReference{Name: "template"},
+			Retention:   &RetentionPolicy{SuspendAfterDetach: &metav1.Duration{Duration: window}},
+		}}
+		if suspend {
+			p.Spec.Suspend = &SubstrateSuspendPolicy{Mode: SubstrateSuspendModeDataOnly}
+		}
+		return p
+	}
+	for _, tc := range []struct {
+		name    string
+		window  time.Duration
+		suspend bool
+		valid   bool
+	}{
+		{"one second", time.Second, true, true},
+		{"five minutes", 5 * time.Minute, true, true},
+		{"one hour", time.Hour, true, true},
+		{"zero", 0, true, false},
+		{"negative", -time.Minute, true, false},
+		{"over one hour", time.Hour + time.Second, true, false},
+		{"without suspend", 5 * time.Minute, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := base(tc.window, tc.suspend).Validate(); (err == nil) != tc.valid {
+				t.Fatalf("Validate()=%v, valid=%v", err, tc.valid)
+			}
+		})
+	}
+	unset := base(0, false)
+	unset.Spec.Retention.SuspendAfterDetach = nil
+	if err := unset.Validate(); err != nil {
+		t.Fatalf("unset warm window rejected without suspend: %v", err)
+	}
+}
+
+func TestGeneratedSuspendAfterDetachSchema(t *testing.T) {
+	schema := loadSchema(t, "substrateworkspaceprofiles")
+	retention := schema.crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["retention"]
+	window, ok := retention.Properties["suspendAfterDetach"]
+	if !ok || window.Type != "string" {
+		t.Fatalf("suspendAfterDetach missing from structural schema: %#v", window)
+	}
+	// A default would rewrite stored profiles and change their content hash.
+	if window.Default != nil || retention.Default != nil {
+		t.Fatal("suspendAfterDetach must not be defaulted")
+	}
+	for _, value := range []string{"1s", "30s", "5m", "15m0s", "1h", "60m"} {
+		object := map[string]any{"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "suspend": map[string]any{"mode": "DataOnly"}, "retention": map[string]any{"suspendAfterDetach": value, "maxSuspendedWorkspaces": int64(2)}}}
+		if errs := schema.validate(t, object, nil); len(errs) != 0 {
+			t.Fatalf("%s rejected: %v", value, errs)
+		}
+		// Structural pruning keeps the field, so core reads what the operator wrote.
+		pruned := runtime.DeepCopyJSON(object)
+		structuralpruning.Prune(pruned, schema.structural, true)
+		if !reflect.DeepEqual(pruned, object) {
+			t.Fatalf("%s pruned: %v", value, pruned)
+		}
+	}
+	// Existing profiles carry no warm window and remain valid and unchanged.
+	existing := map[string]any{"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "suspend": map[string]any{"mode": "DataOnly"}, "retention": map[string]any{"maxSuspendedWorkspaces": int64(2)}}}
+	pruned := runtime.DeepCopyJSON(existing)
+	structuralpruning.Prune(pruned, schema.structural, true)
+	if errs := schema.validate(t, existing, nil); len(errs) != 0 || !reflect.DeepEqual(pruned, existing) {
+		t.Fatalf("existing profile changed or rejected: %v %v", errs, pruned)
+	}
+	typed := &SubstrateWorkspaceProfile{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(existing, typed); err != nil {
+		t.Fatal(err)
+	}
+	if typed.Spec.Retention.SuspendAfterDetach != nil {
+		t.Fatal("existing profile gained a warm window")
+	}
+	roundTrip, err := runtime.DefaultUnstructuredConverter.ToUnstructured(typed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roundTrip["spec"], existing["spec"]) {
+		t.Fatalf("existing profile spec changed on round trip: %v", roundTrip["spec"])
 	}
 }
