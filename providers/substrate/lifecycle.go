@@ -26,7 +26,8 @@ func newRecord(request sdk.WorkloadRequest) (*journalRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", StartedAt: metav1.Now(), Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, EgressPolicy: nativeReference{Name: egressPolicyName}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
+	start := milestone()
+	return &journalRecord{Version: journalVersion, Request: request, Operation: "ensure", StartedAt: metav1.Time{Time: start.Time}, Timing: lifecycleTiming{AllocationStartedAt: start}, Actor: nativeReference{Name: id}, Template: nativeReference{Name: id + "-template"}, Anchor: nativeReference{Name: id + "-owner"}, EgressPolicy: nativeReference{Name: egressPolicyName}, Observation: sdk.AllocationObservation{Key: request.Key, Sequence: request.Sequence, Identity: sdk.InstanceIdentity{AllocationID: id, InstanceID: id, RequestRevision: request.Revision}, State: sdk.AllocationPending}}, nil
 }
 
 func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRequest) (sdk.AllocationObservation, error) {
@@ -169,7 +170,9 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		}
 		if record.ChallengeSHA256 == "" && record.StartedAt.IsZero() {
 			// A journal written before the boot window starts it now.
-			record.StartedAt = metav1.Now()
+			start := milestone()
+			record.StartedAt = metav1.Time{Time: start.Time}
+			record.Timing.AllocationStartedAt = start
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
 			}
@@ -228,6 +231,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 		if record.ChallengeSHA256 == "" {
 			record.ChallengeSHA256 = hash
 			record.ChallengeVersion = actor.GetMetadata().GetVersion()
+			stamp(&record.Timing.ChallengeObservedAt)
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
 			}
@@ -240,6 +244,10 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			}
 			return err
 		}
+		first := firstReady(record, observed)
+		if first {
+			stamp(&record.Timing.ReadyAt)
+		}
 		record.Observation = observed
 		if observed.State == sdk.AllocationReady && record.Request.Sequence > 1 {
 			if err := d.releaseSuspended(ctx, record); err != nil {
@@ -247,7 +255,13 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 			}
 			record.SuspendedReservation = false
 		}
-		return d.save(ctx, cm, record)
+		if err := d.save(ctx, cm, record); err != nil {
+			return err
+		}
+		if first {
+			logRuntimeReady(ctx, record)
+		}
+		return nil
 	})
 	return observed, err
 }
@@ -284,6 +298,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if record.CreateTemplate.UID == "" {
 			record.CreateTemplate = record.Template
 		}
+		stamp(&record.Timing.TemplateCreatedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -333,6 +348,7 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 			return err
 		}
 		record.Actor.UID = actor.GetMetadata().GetUid()
+		stamp(&record.Timing.ActorCreatedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -354,6 +370,12 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED {
 			return fmt.Errorf("native Actor boot changed outside the recorded intent")
 		}
+		if record.CreateTemplate.Name != record.Template.Name {
+			// The template update has no save of its own; the next save in
+			// this pass (egress policy, worker fence, or boot intent) keeps
+			// the first time it was observed.
+			stamp(&record.Timing.TemplateUpdateObservedAt)
+		}
 		// The resume source is fixed by the Actor's snapshots: none for a cold
 		// boot, or only the inherited data-only Tag snapshot. v1 has no boot
 		// flag, so recheck that before every Resume.
@@ -371,6 +393,8 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		}
 		record.PreResumeRuntime = d.fencedWorkerRuntime(ctx, record)
 		record.BootRequested = true
+		// A rejected Resume is reissued later; time the issuance that boots.
+		record.Timing.ResumeIssuedAt = milestone()
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -547,6 +571,7 @@ func (d *Lifecycle) StopInstance(ctx context.Context, key sdk.AllocationKey, ide
 		}
 		if record.Operation != "stop" {
 			record.Operation = "stop"
+			stamp(&record.Timing.RetirementStartedAt)
 			record.Observation = pendingObservation(record)
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
