@@ -595,7 +595,7 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	}
 	completed := milestone()
 	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Time{Time: completed.Time}, SandboxRuntime: runtime}
-	reference, err := d.registerCheckpoint(ctx, record, checkpoint)
+	reference, recovered, err := d.registerCheckpoint(ctx, record, checkpoint)
 	if err != nil {
 		return err
 	}
@@ -603,7 +603,11 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	record.CheckpointCatalog = reference
 	record.Pending = nil
 	// CreatedAt keeps seconds only; this copy keeps the same instant precisely.
-	record.Timing.TagCompletedAt = completed
+	// A recovered checkpoint keeps the catalog's earlier CreatedAt, so this
+	// pass's time is not its completion; the timing log falls back to CreatedAt.
+	if !recovered {
+		record.Timing.TagCompletedAt = completed
+	}
 	return d.save(ctx, cm, record)
 }
 

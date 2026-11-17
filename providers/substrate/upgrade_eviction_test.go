@@ -623,11 +623,11 @@ func TestRegisterCheckpointRecoversUnstampedCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry := stamped
-	reference, err := d.registerCheckpoint(t.Context(), record, &retry)
+	reference, recovered, err := d.registerCheckpoint(t.Context(), record, &retry)
 	if err != nil {
 		t.Fatalf("retry conflicted with the unstamped catalog: %v", err)
 	}
-	if reference.Digest != artifact.Digest || retry.SandboxRuntime != nil {
+	if !recovered || reference.Digest != artifact.Digest || retry.SandboxRuntime != nil {
 		t.Fatalf("recovery changed the published checkpoint: %v, %v", reference, retry.SandboxRuntime)
 	}
 	// A stamp that differs from a stamped catalog still conflicts.
@@ -643,7 +643,7 @@ func TestRegisterCheckpointRecoversUnstampedCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry = stamped
-	if _, err := d.registerCheckpoint(t.Context(), record, &retry); !errors.Is(err, sdk.ErrRequestConflict) {
+	if _, _, err := d.registerCheckpoint(t.Context(), record, &retry); !errors.Is(err, sdk.ErrRequestConflict) {
 		t.Fatalf("a differing runtime stamp did not conflict: %v", err)
 	}
 }
