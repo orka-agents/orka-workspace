@@ -230,6 +230,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 	}
 	if !record.WorkloadAbsent {
 		record.WorkloadAbsent = true
+		stamp(&record.Timing.WorkerAbsentAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -237,6 +238,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 	if actor != nil {
 		if !record.DeleteIssued {
 			record.DeleteIssued = true
+			stamp(&record.Timing.ActorDeleteIssuedAt)
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
 			}
@@ -249,8 +251,12 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		}
 		return nil
 	}
+	first := record.Observation.State != sdk.AllocationStopped && record.Timing.StoppedAt == nil
 	record.Observation.State = sdk.AllocationStopped
 	record.Observation.Startup = nil
+	if first {
+		stamp(&record.Timing.StoppedAt)
+	}
 	if record.Operation == "suspend" {
 		if record.Checkpoint == nil {
 			return fmt.Errorf("native suspension has no verified Data Tag")
@@ -264,7 +270,13 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		}
 		record.Observation.RetainedData = &sdk.RetainedDataReference{ID: record.Checkpoint.Tag.Name, SourceInstance: record.Observation.Identity, ProofSHA256: digest(data)}
 	}
-	return d.save(ctx, cm, record)
+	if err := d.save(ctx, cm, record); err != nil {
+		return err
+	}
+	if first {
+		logRuntimeStopped(ctx, record)
+	}
+	return nil
 }
 
 // latestSnapshot returns the Actor's highest-generation snapshot.
@@ -388,6 +400,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 			record.Pending = &checkpointIntent{Name: name, Tag: nativeReference{Name: name}, PriorGeneration: actor.GetStatus().GetLastAssignedGeneration(), PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
 			record.Operation = "suspend"
+			stamp(&record.Timing.RetirementStartedAt)
 			record.Observation = pendingObservation(record)
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
@@ -445,6 +458,7 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 			return err
 		}
 		operation.SuspendIssued = true
+		stamp(&record.Timing.SuspendIssuedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -468,6 +482,7 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if operation.SourceSnapshotDigest == "" {
 		operation.SourceSnapshotDigest = hash
 		operation.SourceVersion = actor.GetMetadata().GetVersion()
+		stamp(&record.Timing.SuspendedObservedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
@@ -530,14 +545,21 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if err != nil {
 		return err
 	}
-	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Now(), SandboxRuntime: runtime}
-	reference, err := d.registerCheckpoint(ctx, record, checkpoint)
+	completed := milestone()
+	checkpoint := &checkpointRecord{Tag: operation.Tag, Atespace: record.Atespace, SourceName: record.Actor.Name, SourceUID: record.Actor.UID, Template: record.Template, SnapshotURI: tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), CreatedAt: metav1.Time{Time: completed.Time}, SandboxRuntime: runtime}
+	reference, recovered, err := d.registerCheckpoint(ctx, record, checkpoint)
 	if err != nil {
 		return err
 	}
 	record.Checkpoint = checkpoint
 	record.CheckpointCatalog = reference
 	record.Pending = nil
+	// CreatedAt keeps seconds only; this copy keeps the same instant precisely.
+	// A recovered checkpoint keeps the catalog's earlier CreatedAt, so this
+	// pass's time is not its completion; the timing log falls back to CreatedAt.
+	if !recovered {
+		record.Timing.TagCompletedAt = completed
+	}
 	return d.save(ctx, cm, record)
 }
 

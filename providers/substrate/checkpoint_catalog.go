@@ -165,9 +165,13 @@ func (d *Lifecycle) saveCatalog(ctx context.Context, cm *corev1.ConfigMap, artif
 	}
 	return d.client.Update(ctx, cm)
 }
-func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecord, checkpoint *checkpointRecord) (*catalogReference, error) {
-	var reference *catalogReference
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+
+// registerCheckpoint publishes checkpoint to the catalog. It reports recovered
+// when the catalog already held this checkpoint, in which case checkpoint now
+// carries the catalog's first completion time.
+func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecord, checkpoint *checkpointRecord) (reference *catalogReference, recovered bool, err error) {
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		recovered = false
 		key := catalogKey(record.Request.Key.Namespace, checkpoint.Tag.UID)
 		cm, artifact, err := d.readCatalog(ctx, key)
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -195,6 +199,7 @@ func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecor
 				return sdk.ErrRequestConflict
 			}
 			reference = artifactReference(cm, artifact)
+			recovered = true
 			return nil
 		}
 		hash, err := artifactDigest(*checkpoint)
@@ -212,7 +217,7 @@ func (d *Lifecycle) registerCheckpoint(ctx context.Context, record *journalRecor
 		reference = artifactReference(cm, artifact)
 		return nil
 	})
-	return reference, err
+	return reference, recovered, err
 }
 func (d *Lifecycle) acquireCatalog(ctx context.Context, namespace string, ref *catalogReference, from, owner string) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
