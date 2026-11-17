@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
@@ -421,5 +423,65 @@ func TestLifecycleTimingPhasesNeedBothBounds(t *testing.T) {
 	}
 	if got["suspendMs"] != int64(2000) || got["tagMs"] != int64(900) || got["workerTeardownMs"] != int64(2000) || got["totalMs"] != int64(5600) || got["actorDeleteMs"] != nil {
 		t.Fatalf("suspension phases = %v", got)
+	}
+	// A CreatedAt that truncates to before the suspension was observed bounds
+	// no Tag phase rather than a negative one.
+	stopped.Checkpoint.CreatedAt = metav1.Time{Time: base.Add(2 * time.Second)}
+	values = stoppedTimingValues(stopped)
+	if slices.Contains(values, any("tagMs")) || slices.Contains(values, any("workerTeardownMs")) || !slices.Contains(values, any("suspendMs")) {
+		t.Fatalf("truncated checkpoint time bounded a Tag phase: %v", values)
+	}
+}
+
+// A capture whose catalog write committed but whose journal save was lost is
+// recovered by a later pass. The checkpoint keeps the catalog's first
+// CreatedAt, so the later pass's time is not recorded as the Tag's
+// completion, and the stopped log bounds the Tag phases by CreatedAt.
+func TestLifecycleTimingRecoveredCheckpointKeepsCatalogCompletion(t *testing.T) {
+	c, native, request := fixture(t, true)
+	logs := &timingLogs{}
+	ctx := logs.context(t)
+	first := readyWith(t, ctx, c, native, request)
+	var lost *checkpointRecord
+	wrapped := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, inner client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if cm, ok := obj.(*corev1.ConfigMap); ok && lost == nil && cm.Data[journalDataKey] != "" {
+			var record journalRecord
+			if json.Unmarshal([]byte(cm.Data[journalDataKey]), &record) == nil && record.Checkpoint != nil {
+				lost = record.Checkpoint
+				return fmt.Errorf("lost journal save after catalog registration")
+			}
+		}
+		return inner.Update(ctx, obj, opts...)
+	}})
+	for range 12 {
+		if _, err := driver(wrapped, native).SuspendInstance(ctx, request.Key, first.Identity); err != nil {
+			break
+		}
+	}
+	if lost == nil {
+		t.Fatal("the capture's journal save was never lost")
+	}
+	_, catalog, err := driver(c, native).readCatalog(t.Context(), catalogKey(request.Key.Namespace, lost.Tag.UID))
+	if err != nil {
+		t.Fatalf("catalog registration did not commit before the lost journal save: %v", err)
+	}
+	retiredWith(t, ctx, c, native, request, first.Identity, true)
+	suspended := journal(t, c, native, request.Key)
+	if suspended.Checkpoint == nil || !suspended.Checkpoint.CreatedAt.Equal(&catalog.Checkpoint.CreatedAt) {
+		t.Fatal("recovery did not keep the catalog's first completion time")
+	}
+	if suspended.Timing.TagCompletedAt != nil {
+		t.Fatalf("recovery recorded its own time %v as the Tag's completion", suspended.Timing.TagCompletedAt)
+	}
+	entry := logs.only(t, "Substrate runtime stopped")
+	requireOnlyTimingFields(t, entry)
+	createdAt := suspended.Checkpoint.CreatedAt.Time
+	if observed := suspended.Timing.SuspendedObservedAt; observed != nil && !createdAt.Before(observed.Time) {
+		requireKeys(t, entry, []string{"tagMs", "workerTeardownMs"}, nil)
+		if entry["tagMs"] != float64(createdAt.Sub(observed.Time).Milliseconds()) {
+			t.Fatalf("tagMs = %v, want the phase bounded by the catalog's CreatedAt", entry["tagMs"])
+		}
+	} else {
+		requireKeys(t, entry, nil, []string{"tagMs", "workerTeardownMs"})
 	}
 }
