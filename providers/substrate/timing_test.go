@@ -431,6 +431,18 @@ func TestLifecycleTimingPhasesNeedBothBounds(t *testing.T) {
 	if slices.Contains(values, any("tagMs")) || slices.Contains(values, any("workerTeardownMs")) || !slices.Contains(values, any("suspendMs")) {
 		t.Fatalf("truncated checkpoint time bounded a Tag phase: %v", values)
 	}
+	// A capture that finished before the upgrade recorded no observed
+	// suspension; its CreatedAt still bounds the worker teardown that
+	// finished afterwards.
+	stopped.Timing.SuspendIssuedAt, stopped.Timing.SuspendedObservedAt = nil, nil
+	values = stoppedTimingValues(stopped)
+	got = map[string]any{}
+	for i := 0; i < len(values); i += 2 {
+		got[values[i].(string)] = values[i+1]
+	}
+	if got["workerTeardownMs"] != int64(3000) || got["tagMs"] != nil || got["suspendMs"] != nil {
+		t.Fatalf("pre-upgrade capture phases = %v", got)
+	}
 }
 
 // A capture whose catalog write committed but whose journal save was lost is
