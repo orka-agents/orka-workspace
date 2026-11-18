@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -805,18 +806,38 @@ func TestSharedProfileValidation(t *testing.T) {
 }
 
 func TestSharedLedgerRejectsMalformedState(t *testing.T) {
-	scope := sharedScope{Namespace: "tenant", Atespace: "native", ProfileUID: "p", ProfileHash: "h", SourceUID: "s", Shape: "x", CPUMillicores: 1, MemoryBytes: 1, MaxActors: 2, Lifetime: metav1.Duration{Duration: time.Hour}}
-	for _, ledger := range []sharedLedger{
-		{Version: "v0", Scope: scope, BornAt: metav1.Now(), State: sharedAdmitting},
-		{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.Now(), State: "Open"},
-		{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.Now(), State: sharedAdmitting, Entries: []sharedLedgerEntry{{Journal: "a", Actor: "x"}, {Journal: "b", Actor: "y"}, {Journal: "c", Actor: "z"}}},
-		{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.Now(), State: sharedAdmitting, Entries: []sharedLedgerEntry{{Journal: "a", Actor: "x"}, {Journal: "b", Actor: "x"}}},
-	} {
+	scope := sharedScope{Namespace: "tenant", Atespace: "native", ProfileUID: "p", ProfileHash: "h", SourceUID: "s", Shape: "x", CPUMillicores: 1, MemoryBytes: 1, MaxActors: 2, Lifetime: metav1.Duration{Duration: profile.MinSharedWorkerLifetime}}
+	encode := func(ledger sharedLedger) *unstructured.Unstructured {
 		pool := poolObject()
-		data, _ := json.Marshal(ledger)
+		data, err := json.Marshal(ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
 		pool.SetAnnotations(map[string]string{sharedLedgerAnnotation: string(data)})
-		if _, err := readSharedLedger(pool); err == nil {
-			t.Fatalf("accepted malformed ledger %#v", ledger)
+		return pool
+	}
+	// A well-formed ledger is accepted, so each case below fails only on the
+	// field it changes.
+	valid := sharedLedger{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.Now(), State: sharedAdmitting, Entries: []sharedLedgerEntry{{Journal: "a", Actor: "x"}, {Journal: "b", Actor: "y"}}}
+	if _, err := readSharedLedger(encode(valid)); err != nil {
+		t.Fatalf("rejected a well-formed ledger: %v", err)
+	}
+	for _, tc := range []struct {
+		want   string
+		mutate func(*sharedLedger)
+	}{
+		{"is invalid", func(l *sharedLedger) { l.Version = "v0" }},
+		{"state is invalid", func(l *sharedLedger) { l.State = "Open" }},
+		{"exceeds its slots", func(l *sharedLedger) { l.Entries = append(l.Entries, sharedLedgerEntry{Journal: "c", Actor: "z"}) }},
+		{"duplicate or empty entry", func(l *sharedLedger) { l.Entries[1].Actor = "x" }},
+		{"duplicate or empty entry", func(l *sharedLedger) { l.Entries[1].Journal = "a" }},
+		{"duplicate or empty entry", func(l *sharedLedger) { l.Entries[1].Journal = "" }},
+	} {
+		ledger := valid
+		ledger.Entries = slices.Clone(valid.Entries)
+		tc.mutate(&ledger)
+		if _, err := readSharedLedger(encode(ledger)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("ledger %#v: got %v, want an error containing %q", ledger, err, tc.want)
 		}
 	}
 }
