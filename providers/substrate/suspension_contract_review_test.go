@@ -175,9 +175,12 @@ func (c *workerCheckControl) GetWorker(ctx context.Context, request *pb.GetWorke
 }
 
 func TestSuspensionNotIssuedBeforeDeadlineIsAbandonedToStop(t *testing.T) {
-	for _, test := range []string{"journaled intent retried after deadline", "deadline passes before issuance", "deadline passes while journaling issuance", "issuance withdrawal is lost"} {
+	for _, test := range []string{"journaled intent retried after deadline", "deadline passes before issuance", "deadline passes while journaling issuance", "issuance withdrawal is lost", "issuance withdrawal is lost with its retention ledger"} {
 		t.Run(test, func(t *testing.T) {
 			c, native, request := fixture(t, true)
+			if test == "issuance withdrawal is lost with its retention ledger" {
+				request = cappedRequest(t, c, request, 1)
+			}
 			first := ready(t, c, native, request)
 			window := metav1.NewTime(time.Now().Add(time.Hour))
 			control := &workerCheckControl{nativeFixture: native}
@@ -191,9 +194,10 @@ func TestSuspensionNotIssuedBeforeDeadlineIsAbandonedToStop(t *testing.T) {
 			}
 			d := driver(c, native)
 			d.control = control
-			if test == "deadline passes while journaling issuance" || test == "issuance withdrawal is lost" {
+			lostWithdrawal := strings.HasPrefix(test, "issuance withdrawal is lost")
+			if test == "deadline passes while journaling issuance" || lostWithdrawal {
 				control.hook = func() error { return nil }
-				d.client = &issuanceJournalDelay{Client: c, expire: func() { window = metav1.NewTime(time.Now().Add(-time.Hour)) }, failNext: test == "issuance withdrawal is lost"}
+				d.client = &issuanceJournalDelay{Client: c, expire: func() { window = metav1.NewTime(time.Now().Add(-time.Hour)) }, failNext: lostWithdrawal}
 			}
 			_, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, &window)
 			if test != "journaled intent retried after deadline" {
@@ -213,8 +217,18 @@ func TestSuspensionNotIssuedBeforeDeadlineIsAbandonedToStop(t *testing.T) {
 			}
 			_, record, err := driver(c, native).read(t.Context(), request.Key)
 			// A lost withdrawal leaves the issuance marker without an RPC.
-			if err != nil || record.Operation != "suspend" || record.Pending == nil || record.Pending.SuspendIssued != (test == "issuance withdrawal is lost") || native.suspends != 0 {
+			if err != nil || record.Operation != "suspend" || record.Pending == nil || record.Pending.SuspendIssued != lostWithdrawal || native.suspends != 0 {
 				t.Fatalf("suspension started after its deadline: %v suspends=%d", err, native.suspends)
+			}
+			if test == "issuance withdrawal is lost with its retention ledger" {
+				// Suspension-only accounting now fails; it must not block the
+				// fallback to the exact Stop.
+				if err := c.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: retentionKey(record).Namespace, Name: retentionKey(record).Name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
+					t.Fatal("suspension accounting did not fail without its ledger")
+				}
 			}
 			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, sdk.ErrSuspendDeadlineExceeded) {
 				t.Fatalf("expired unissued suspension did not fall back after restart: %v", err)

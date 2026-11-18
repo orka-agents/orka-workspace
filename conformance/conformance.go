@@ -263,7 +263,9 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 			return fmt.Errorf("provider has no suspension capability")
 		}
 		// Start the suspension inside its window, then keep retrying after the
-		// window closed: a suspension started in time must still finish.
+		// window closed: a suspension started in time must still finish. A
+		// call that returns without error has started it (see
+		// SuspensionController), and until stops at the first error.
 		window := metav1.NewTime(time.Now().Add(time.Hour))
 		retired, err = until(ctx, func() (workspaceprovider.AllocationObservation, error) {
 			observed, err := driver.SuspendInstance(ctx, request.Key, first.Identity, &window)

@@ -91,7 +91,9 @@ func AttachmentEpochAcknowledgement(workspace *workspacev1alpha1.ExecutionWorksp
 // ErrSuspendDeadlineExceeded without changing the instance, including on
 // every retry after the caller's fallback Stop. The deadline check and the
 // durable record that a suspension started must be one atomic journal update.
-// A suspension that started before the deadline continues to completion.
+// A suspension that started before the deadline continues to completion. A
+// call that returns without error has started the suspension: a provider that
+// cannot issue its backend suspend in that call returns an error instead.
 type SuspensionController interface {
 	SuspendInstance(ctx context.Context, key AllocationKey, identity InstanceIdentity, notAfter *metav1.Time) (AllocationObservation, error)
 }
