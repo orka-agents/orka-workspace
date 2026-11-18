@@ -398,9 +398,10 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 				return err
 			}
 		}
-		// The journaled suspend operation, saved below with optimistic
-		// concurrency, marks the start. Past the authorization's deadline a
-		// suspension that has not started never starts.
+		// The fake's suspension has no backend effect: it starts when it
+		// publishes retained data. Past the authorization's deadline one that
+		// has not never starts; a journaled intent is refused below, before
+		// publication.
 		if operation == "suspend" && record.Operation != "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
 			return workspaceprovider.ErrSuspendDeadlineExceeded
 		}
@@ -458,6 +459,12 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 				observed = record.Observation
 				return nil
 			}
+		}
+		// The intent write can consume the rest of the window; the journaled
+		// intent stays recoverable through the gate above and the exact Stop.
+		if operation == "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			observed = record.Observation
+			return workspaceprovider.ErrSuspendDeadlineExceeded
 		}
 		record.Observation.State = workspaceprovider.AllocationStopped
 		if operation == "suspend" {
