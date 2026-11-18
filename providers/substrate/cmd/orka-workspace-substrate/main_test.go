@@ -15,7 +15,7 @@ func TestUnconfiguredNativeControlRunsOnlyProviderStatus(t *testing.T) {
 	if unrouted.Validate() == nil {
 		t.Fatal("native control without router routing was accepted")
 	}
-	if setups := controllerSetups(nil, unrouted, nil, ""); len(setups) != 2 {
+	if setups := controllerSetups(nil, unrouted, nil, "", provider.DefaultMaxConcurrentReconciles); len(setups) != 2 {
 		t.Fatalf("unconfigured provider registered %d controllers, want provider status and the Kubernetes-only shared worker bounds loop", len(setups))
 	}
 	// The shipped Deployment configures both native control and the router.
@@ -27,7 +27,7 @@ func TestUnconfiguredNativeControlRunsOnlyProviderStatus(t *testing.T) {
 	if err := shipped.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if setups := controllerSetups(nil, shipped, pb.NewControlClient(nil), ""); len(setups) != 5 {
+	if setups := controllerSetups(nil, shipped, pb.NewControlClient(nil), "", provider.DefaultMaxConcurrentReconciles); len(setups) != 5 {
 		t.Fatalf("configured provider registered %d controllers, want provider, shared worker bounds, workspace, checkpoint, and spare workers", len(setups))
 	}
 }
@@ -43,7 +43,7 @@ func TestValidConfigWhoseDialFailsKeepsStatusAndSharedBounds(t *testing.T) {
 	if native != nil || closer != nil || unavailable == "" {
 		t.Fatalf("a failed dial did not degrade: native=%v reason=%q", native, unavailable)
 	}
-	if setups := controllerSetups(nil, config, native, unavailable); len(setups) != 2 {
+	if setups := controllerSetups(nil, config, native, unavailable, provider.DefaultMaxConcurrentReconciles); len(setups) != 2 {
 		t.Fatalf("a failed dial registered %d controllers, want provider status and the Kubernetes-only shared worker bounds loop", len(setups))
 	}
 }
