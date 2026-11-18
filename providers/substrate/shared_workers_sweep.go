@@ -39,21 +39,23 @@ type sharedProfileShape struct {
 // dedicated, and a worker Pod still present when the hard bound nears is
 // re-deleted with a one-second grace.
 func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lifecycle) error {
-	pools, err := listSharedPools(ctx, r.Client)
+	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
+	pools, err := listSharedPools(ctx, r.Client, provenance)
 	if err != nil {
 		return err
 	}
-	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
 	now := sharedNow()
 	var errs []error
 	if provenanceErr != nil {
-		// Without the journals the lifetime ceiling is the server-set
-		// creation time plus the maximum lifetime, still enforced.
+		// Unavailable provenance is doubt: the mutable annotations cannot be
+		// checked, so every pool is bounded by its server-set creation time
+		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
 	}
 	for i := range pools {
 		pool := &pools[i]
-		retireAt, escalateAt, evidence := sharedBoundsOf(pool, provenance[pool.GetUID()])
+		recorded := provenance[pool.GetUID()]
+		retireAt, escalateAt, evidence := sharedBoundsOf(pool, recorded, provenanceErr == nil)
 		if pool.GetDeletionTimestamp() == nil {
 			switch {
 			case !sharedLabelsIntact(pool):
@@ -62,6 +64,11 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
 			case !evidence:
 				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
+			case recorded.strong:
+				// A journal that recorded this pool's UID holds an unreleased
+				// strong marker or failure, whatever the mutable entry list
+				// now says.
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed"))
 			case sharedRetirementPersisted(pool):
 				// A retirement state saved before a crash, or before a native
 				// sweep ran out of time, is unconditional deletion intent.
@@ -83,10 +90,12 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	return errors.Join(errs...)
 }
 
-// listSharedPools lists every WorkerPool that carries any shared-pool
-// evidence: the provider-owned label, the ledger or deadline annotation, or
-// the ate-shared- name. Discovery never depends on a removable label alone.
-func listSharedPools(ctx context.Context, c client.Client) ([]unstructured.Unstructured, error) {
+// listSharedPools lists every WorkerPool that carries provider-written
+// shared-pool evidence: the provider-owned label, the ledger or deadline
+// annotation, or a provider journal or archived record that recorded its UID.
+// Discovery never depends on a removable label alone, and a name alone is
+// never evidence: an operator pool named ate-shared-... is never touched.
+func listSharedPools(ctx context.Context, c client.Client, provenance map[types.UID]sharedProvenance) ([]unstructured.Unstructured, error) {
 	all := &unstructured.UnstructuredList{}
 	all.SetAPIVersion(workerPoolAPIVersion())
 	all.SetKind("WorkerPoolList")
@@ -98,7 +107,7 @@ func listSharedPools(ctx context.Context, c client.Client) ([]unstructured.Unstr
 		_, labeled := pool.GetLabels()[sharedPoolLabel]
 		_, ledger := pool.GetAnnotations()[sharedLedgerAnnotation]
 		_, deadline := pool.GetAnnotations()[sharedDeadlineAnnotation]
-		if labeled || ledger || deadline || strings.HasPrefix(pool.GetName(), sharedPoolPrefix) {
+		if labeled || ledger || deadline || provenance[pool.GetUID()].found {
 			out = append(out, pool)
 		}
 	}
@@ -119,6 +128,8 @@ type sharedProvenance struct {
 	// lifetime is the shortest recorded lifetime.
 	lifetime time.Duration
 	scopes   []sharedScope
+	// strong is an unreleased recorded Strong marker or instance failure.
+	strong bool
 }
 
 // sharedJournalProvenance reads every journal and archived record (Kubernetes
@@ -142,6 +153,9 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 		}
 		entry.found = true
 		entry.scopes = append(entry.scopes, scope)
+		if !record.SharedWorker.Released && (record.SharedWorker.Strong != "" || record.Failure != "") {
+			entry.strong = true
+		}
 		out[uid] = entry
 	}
 	return out, nil
@@ -154,9 +168,15 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 // recorded for the pool. A ledger or deadline annotation that disagrees with
 // those journals (or with each other, or is unreadable) is doubt: retirement
 // starts at once and escalation follows the shortest bound, never longer.
-func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance) (time.Time, time.Time, bool) {
+//
+// When the journal inventory itself is unavailable (known is false), the
+// ceiling is the creation time plus the minimum lifetime.
+func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance, known bool) (time.Time, time.Time, bool) {
 	created := pool.GetCreationTimestamp().Time
 	ceiling := created.Add(profile.MaxSharedWorkerLifetime)
+	if !known {
+		ceiling = created.Add(profile.MinSharedWorkerLifetime)
+	}
 	if provenance.found {
 		ceiling = minTime(ceiling, created.Add(provenance.lifetime))
 	}
@@ -219,7 +239,7 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 // profile's requested warm slots. With no opted-in profile and no shared pool
 // it makes no native call.
 func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache) error {
-	discovered, err := listSharedPools(ctx, r.Client)
+	discovered, err := listSharedPools(ctx, r.Client, nil)
 	if err != nil {
 		return err
 	}
@@ -257,6 +277,12 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// Maintenance and every pool creation need a complete, successful template
 	// inventory; a failed inventory creates nothing.
 	templates, templatesErr := d.listAllActorTemplates(ctx)
+	ours, oursErr := d.providerTemplates(ctx)
+	if templatesErr == nil && oursErr != nil {
+		// Without the provider's own template record, no same-Atespace
+		// template can be told apart; nothing is verified or created.
+		templatesErr = oursErr
+	}
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -269,7 +295,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		}
 	}
 	for i := range pools.Items {
-		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, templatesErr))
+		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr))
 	}
 	if templatesErr != nil {
 		// Without a verified template inventory nothing new is created.
@@ -277,7 +303,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	}
 	for uid, shape := range shapes {
 		for free[uid] < shape.warm {
-			if err := d.createWarmSharedPool(ctx, shape, templates); err != nil {
+			if err := d.createWarmSharedPool(ctx, shape, templates, ours); err != nil {
 				errs = append(errs, err)
 				break
 			}
@@ -319,7 +345,7 @@ func (d *Lifecycle) profileSharedShape(ctx context.Context, item *profile.Substr
 }
 
 // createWarmSharedPool creates an empty admitting shared pool.
-func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape, templates []*pb.ActorTemplate) error {
+func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape, templates []*pb.ActorTemplate, ours map[string]string) error {
 	name, err := randomName(sharedPoolPrefix)
 	if err != nil {
 		return err
@@ -330,7 +356,7 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 	}
 	// Checked against this pool's real labels: an empty selector, or one the
 	// generated label satisfies, still fails closed.
-	if templatesReach(templates, shape.scope.Atespace, sharedLabels(label)) {
+	if templatesReach(templates, shape.scope.Atespace, sharedLabels(label), ours) {
 		return errForeignTemplate
 	}
 	spec, err := buildSharedPoolSpec(shape.source, shape.scope, label)
@@ -361,7 +387,7 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 }
 
 //nolint:gocyclo // Every pool-wide rule is evaluated in one pass, in priority order.
-func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, templatesErr error) error {
+func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr error) error {
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
@@ -383,7 +409,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	} else if suspect {
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
 	}
-	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels()) {
+	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
 		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
 	}
 	poolWorkers, err := workers.pool(ctx, pool)

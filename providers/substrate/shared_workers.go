@@ -66,6 +66,9 @@ const (
 	sharedLedgerJournalMax = 256
 	// sharedLedgerReasonMax bounds the recorded retirement reason.
 	sharedLedgerReasonMax = 512
+	// sharedLedgerRetirementHeadroom is reserved below sharedLedgerMaxBytes
+	// for the retirement state and reason.
+	sharedLedgerRetirementHeadroom = 1 << 10
 	// operatorTaintAnnotation is Orka core's durable operator-access marker
 	// on an ExecutionWorkspace (Orka ADR 0044).
 	operatorTaintAnnotation = "acp.workspace.orka.ai/operator-tainted"
@@ -368,6 +371,15 @@ func readSharedLedger(pool *unstructured.Unstructured) (*sharedLedger, error) {
 	}
 	if len(ledger.Reason) > sharedLedgerReasonMax {
 		return nil, fmt.Errorf("shared worker ledger reason is oversized")
+	}
+	if worker := ledger.Worker; worker != nil && (len(worker.Name) > sharedLedgerFieldMax || len(worker.UID) > sharedLedgerFieldMax || len(worker.PodUID) > sharedLedgerFieldMax) {
+		return nil, fmt.Errorf("shared worker ledger worker identity is oversized")
+	}
+	// Every variable-length field is bounded above, so an accepted ledger
+	// always leaves room for its retirement state and reason; this is checked
+	// again explicitly so a future field cannot erode that headroom.
+	if len(raw) > sharedLedgerMaxBytes-sharedLedgerRetirementHeadroom {
+		return nil, fmt.Errorf("shared worker ledger leaves no room for its retirement write")
 	}
 	seen := map[string]bool{}
 	for _, entry := range ledger.Entries {
@@ -1136,7 +1148,10 @@ func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Uns
 		if err := setSharedLedger(pool, ledger); err != nil {
 			return err
 		}
-		if err := d.client.Update(ctx, pool); err != nil {
+		// Only a conflict stops here: the pool changed since the snapshot the
+		// caller judged, so it is re-evaluated. Any other failed ledger write
+		// never blocks the Delete.
+		if err := d.client.Update(ctx, pool); apierrors.IsConflict(err) {
 			return err
 		}
 		namespace := ledger.Scope.Namespace
@@ -1526,7 +1541,7 @@ func (d *Lifecycle) strongSharedAbsence(ctx context.Context, record *journalReco
 	if !poolGone {
 		if string(pool.GetUID()) != shared.UID {
 			poolGone = true
-		} else if err := d.retireSharedPool(ctx, pool, sharedRetiring, shared.Strong); err != nil {
+		} else if err := d.hardRetireSharedPool(ctx, pool, sharedRetiring, shared.Strong); err != nil {
 			return false, err
 		}
 	}
@@ -1745,7 +1760,7 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 
 // errForeignTemplate reports an ActorTemplate outside the shared pool's
 // Atespace that could be placed on it.
-var errForeignTemplate = errors.New("an ActorTemplate outside the shared worker's Atespace could be placed on it; shared admission is closed")
+var errForeignTemplate = errors.New("an ActorTemplate this provider did not create could be placed on the shared worker; shared admission is closed")
 
 // foreignTemplateMatches lists every ActorTemplate on the install (the
 // provider holds global viewer) and reports whether one outside atespace has
@@ -1757,7 +1772,50 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 	if err != nil {
 		return false, err
 	}
-	return templatesReach(templates, atespace, poolLabels), nil
+	ours, err := d.providerTemplates(ctx)
+	if err != nil {
+		return false, err
+	}
+	return templatesReach(templates, atespace, poolLabels, ours), nil
+}
+
+// providerTemplates is every derived template this provider recorded: each
+// journal or archived record's template and create template, and each
+// checkpoint catalog's template (which may outlive its workspace). Keys are
+// <atespace>/<name>; values are the recorded UID, or "" before it is known.
+func (d *Lifecycle) providerTemplates(ctx context.Context) (map[string]string, error) {
+	out := map[string]string{}
+	add := func(atespace string, ref nativeReference) {
+		if atespace == "" || ref.Name == "" {
+			return
+		}
+		key := atespace + "/" + ref.Name
+		if existing, found := out[key]; !found || existing == "" {
+			out[key] = ref.UID
+		}
+	}
+	journals := &corev1.ConfigMapList{}
+	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		return nil, err
+	}
+	for i := range journals.Items {
+		if record, ok := decodeClaimRecord(&journals.Items[i]); ok {
+			add(record.Atespace, record.Template)
+			add(record.Atespace, record.CreateTemplate)
+		}
+	}
+	catalogs, err := d.listCatalogs(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	for i := range catalogs {
+		_, artifact, err := d.readCatalog(ctx, client.ObjectKeyFromObject(&catalogs[i]))
+		if err != nil {
+			return nil, err
+		}
+		add(artifact.Checkpoint.Atespace, artifact.Checkpoint.Template)
+	}
+	return out, nil
 }
 
 // listAllActorTemplates lists ActorTemplates in every Atespace.
@@ -1782,11 +1840,21 @@ func (d *Lifecycle) listAllActorTemplates(ctx context.Context) ([]*pb.ActorTempl
 	}
 }
 
-// templatesReach reports a template outside atespace whose worker selector,
-// empty or not, a worker with these labels satisfies.
-func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string) bool {
+// templatesReach reports a foreign template whose worker selector, empty or
+// not, a worker with these labels satisfies. Outside the pool's Atespace
+// every such template is foreign. Inside it, so is any that is not a derived
+// template this provider recorded (ours), with the recorded UID once known.
+func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string, ours map[string]string) bool {
 	return slices.ContainsFunc(templates, func(template *pb.ActorTemplate) bool {
-		return template.GetMetadata().GetAtespace() != atespace && selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels)
+		if !selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels) {
+			return false
+		}
+		meta := template.GetMetadata()
+		if meta.GetAtespace() != atespace {
+			return true
+		}
+		uid, recorded := ours[meta.GetAtespace()+"/"+meta.GetName()]
+		return !recorded || uid != "" && uid != meta.GetUid()
 	})
 }
 
@@ -1843,7 +1911,7 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 	if string(pool.GetUID()) != shared.UID {
 		return nil
 	}
-	return d.retireSharedPool(ctx, pool, sharedRetiring, shared.Strong)
+	return d.hardRetireSharedPool(ctx, pool, sharedRetiring, shared.Strong)
 }
 
 // sharedDoubt records the strong path for this record and starts retiring

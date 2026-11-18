@@ -970,10 +970,8 @@ func TestSharedPoolCarriesOnlyProviderOwnedLabels(t *testing.T) {
 func TestSharedForeignTemplateFailsClosed(t *testing.T) {
 	c, native, first, binding := sharedFixture(t, 3)
 	_, record := sharedReady(t, c, native, first)
-	// Templates that cannot reach the pool are fine: another selector, or the
-	// pool's own Atespace (where the ledger guards placement).
+	// A template that cannot reach the pool is fine.
 	native.templates["foreign/selective"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "selective"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"team": "other"}}}
-	native.templates["native/open"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "open"}}
 	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1745,7 +1743,7 @@ func TestSharedDeadlineKeepsSubSecondLifetimePrecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	setSharedDeadline(pool, ledger)
-	if _, _, evidence := sharedBoundsOf(pool, sharedProvenance{}); !evidence {
+	if _, _, evidence := sharedBoundsOf(pool, sharedProvenance{}, true); !evidence {
 		t.Fatalf("a fractional lifetime's deadline annotation %q is inconsistent with its ledger", pool.GetAnnotations()[sharedDeadlineAnnotation])
 	}
 	// Validation rejects sub-second lifetimes outright.
@@ -2185,7 +2183,7 @@ func TestSharedRewrittenLifetimeCannotExtendTheBound(t *testing.T) {
 	}
 	native.nativeDown = true
 	// The journal froze 3h: the bound and the disagreement both hold.
-	_, escalateAt, evidence := sharedBoundsOf(pool, sharedProvenance{found: true, lifetime: 3 * time.Hour, scopes: []sharedScope{record.SharedWorker.Scope}})
+	_, escalateAt, evidence := sharedBoundsOf(pool, sharedProvenance{found: true, lifetime: 3 * time.Hour, scopes: []sharedScope{record.SharedWorker.Scope}}, true)
 	if evidence || escalateAt.After(created.Add(3*time.Hour)) {
 		t.Fatalf("a rewritten lifetime extended the bound: evidence=%v escalateAt=%s", evidence, escalateAt.Sub(created))
 	}
@@ -2194,5 +2192,141 @@ func TestSharedRewrittenLifetimeCannotExtendTheBound(t *testing.T) {
 	}
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
 		t.Fatal("a pool whose lifetime was rewritten past its journals' was not retired")
+	}
+}
+
+func TestSharedSameAtespaceTemplateNotCreatedByTheProviderIsForeign(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, record := sharedReady(t, c, native, first)
+	// The provider's own derived templates in the Atespace select the pool
+	// and are not foreign; a second allocation joins.
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	if _, joined := sharedReady(t, c, native, second); joined.SharedWorker.Pool != record.SharedWorker.Pool {
+		t.Fatal("the provider's own derived templates were treated as foreign")
+	}
+	// A template in the same Atespace that this provider did not record,
+	// selecting the pool's label, quarantines the pool before placement.
+	native.templates["native/intruder"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "intruder", Uid: "intruder-uid"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{sharedPoolLabel: record.SharedWorker.Label}}}
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	boots := native.boots
+	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), third); !errors.Is(err, errForeignTemplate) {
+		t.Fatalf("a same-Atespace foreign template did not close admission: %v", err)
+	}
+	if native.boots != boots {
+		t.Fatal("an Actor was placed beside a same-Atespace foreign template")
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a pool reachable by a same-Atespace foreign template was not quarantined")
+	}
+}
+
+func TestSharedOperatorPoolWithTheSharedPrefixIsNeverTouched(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	operator := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "ate-shared-prod", "labels": map[string]any{"team": "prod"}}, "spec": map[string]any{"replicas": int64(1), "workerImage": "fixture.invalid/native-worker:pin"}}}
+	if err := c.Create(t.Context(), operator); err != nil {
+		t.Fatal(err)
+	}
+	for _, dedicated := range []bool{true, false} {
+		config := sharedConfig()
+		config.DedicatedInstall = dedicated
+		if err := (&SpareWorkerReplenisher{Client: c, Config: config}).EnforceSharedBounds(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := (&SpareWorkerReplenisher{Client: c, Control: native, Config: config}).Sweep(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if current, found := getPool(t, c, "ate-shared-prod"); !found || current.GetDeletionTimestamp() != nil {
+		t.Fatal("an operator pool with only the shared name prefix was deleted")
+	}
+}
+
+func TestSharedUnavailableProvenanceBoundsByTheMinimumLifetime(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	created := pool.GetCreationTimestamp().Time
+	// Both mutable annotations are rewritten to the 24h maximum.
+	ledger.Scope.Lifetime = metav1.Duration{Duration: 24 * time.Hour}
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	// The journal inventory cannot be listed.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if _, ok := list.(*corev1.ConfigMapList); ok {
+			return apierrors.NewInternalError(errors.New("configmap list unavailable"))
+		}
+		return w.List(ctx, list, opts...)
+	}})
+	setNow(t, created.Add(profile.MinSharedWorkerLifetime-workerPodTerminationGrace-sharedRetireMargin))
+	_ = (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("unavailable provenance let rewritten annotations extend the bound past creation plus the minimum lifetime")
+	}
+}
+
+func TestSharedRecordedStrongMarkerSurvivesAnEntryRemoval(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	cm, journal, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.SharedWorker.Strong = "persisted before a crash"
+	if err := sharedDriver(c, native).save(t.Context(), cm, journal); err != nil {
+		t.Fatal(err)
+	}
+	// The entry naming that journal is removed from the mutable ledger.
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	ledger.Entries = nil
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("removing the ledger entry hid a journaled strong marker from the bounds loop")
+	}
+}
+
+func TestSharedWorkerIdentityIsBoundedAndStrongDeletesSurviveLedgerWrites(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	ledger.Worker.Name = strings.Repeat("w", 30<<10)
+	data, err := json.Marshal(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := pool.DeepCopy()
+	annotations := maps.Clone(padded.GetAnnotations())
+	annotations[sharedLedgerAnnotation] = string(data)
+	padded.SetAnnotations(annotations)
+	if _, err := readSharedLedger(padded); err == nil {
+		t.Fatal("a ledger with an oversized worker identity was accepted")
+	}
+	// retireSharedPool on a strong path deletes even when the ledger write
+	// fails for a reason other than a conflict.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+			return apierrors.NewRequestEntityTooLargeError("ledger write too large")
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	if err := New(failing, native, sharedConfig()).retireSharedPool(t.Context(), pool, sharedQuarantined, "foreign Actor"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a failed ledger write blocked a strong retirement's Delete")
 	}
 }
