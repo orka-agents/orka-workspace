@@ -14,6 +14,15 @@ namespace="external-substrate-proof-${run_id}"
 run_dir="${repo_root}/bin/${namespace}"
 mkdir -p "${run_dir}"
 chmod 700 "${run_dir}"
+# A failure leaves redacted status/log evidence; the namespace is retained.
+on_exit() {
+  local code=$?
+  if (( code != 0 )); then
+    bash "${repo_root}/hack/external-substrate-e2e/diagnostics.sh" "${run_dir}/diagnostics" || true
+  fi
+  exit "${code}"
+}
+trap on_exit EXIT
 registry=orka-external-substrate-registry
 test "$(docker inspect -f '{{index .Config.Labels "orka.workspace.e2e"}}' "${registry}")" = external-substrate
 registry_ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "${registry}")"
@@ -42,6 +51,9 @@ test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
 
 kubectl apply --server-side -f config/crd/bases
 kubectl apply --server-side -f providers/substrate/config/crd
+# A fresh cluster serves new kinds only once their CRDs are Established.
+kubectl wait --for=condition=Established --timeout=120s crd/executionworkspaceproviders.workspace.orka.ai \
+  crd/substrateproviderconfigs.substrate.workspace.orka.ai crd/substrateworkspaceprofiles.substrate.workspace.orka.ai
 kubectl apply -f providers/substrate/config/registration.yaml
 kubectl create namespace "${namespace}"
 # Namespaced objects name their namespace: the Job runs in the client namespace.

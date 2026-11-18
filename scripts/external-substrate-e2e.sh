@@ -15,17 +15,32 @@ pin="$(sed -n 's/^SUBSTRATE_UPSTREAM_COMMIT=//p' providers/substrate/nativepb/up
 test "${pin}" = b34fbee742906494b5eb4f1f36987176bf8770a4
 source_dir="${SUBSTRATE_SOURCE_DIR:-/tmp/orka-external-substrate-native-pin-${pin}}"
 
+# SUBSTRATE_CLONE=1 (CI) clones the pin when the checkout is absent. An
+# existing directory is never modified; it must pass the checks below.
+if [[ "${SUBSTRATE_CLONE:-0}" == 1 && ! -e "${source_dir}" ]]; then
+  git clone --quiet --filter=blob:none --no-checkout "${upstream}" "${source_dir}"
+  git -C "${source_dir}" -c advice.detachedHead=false checkout --quiet --detach "${pin}"
+fi
+
+host_preflight() {
+  for tool in docker kind go git jq kubectl openssl python3 curl rg rsync; do
+    command -v "${tool}"
+  done
+  go version
+  python3 hack/external-substrate-e2e/read-only-preflight.py docker info --format '{{.Architecture}} {{.OSType}} CPUs={{.NCPU}} memory={{.MemTotal}}'
+  df -h /tmp "${repo_root}"
+  test "$(git -C "${source_dir}" remote get-url origin)" = "${upstream}"
+  test "$(git -C "${source_dir}" rev-parse HEAD)" = "${pin}"
+  test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
+}
+
 case "${1:-preflight}" in
+  preflight-host)
+    # Host-only checks for a runner that has not created the cluster yet.
+    host_preflight
+    ;;
   preflight)
-    for tool in docker kind go git jq kubectl openssl python3 curl rg; do
-      command -v "${tool}"
-    done
-    go version
-    python3 hack/external-substrate-e2e/read-only-preflight.py docker info --format '{{.Architecture}} {{.OSType}} CPUs={{.NCPU}} memory={{.MemTotal}}'
-    df -h /tmp "${repo_root}"
-    test "$(git -C "${source_dir}" remote get-url origin)" = "${upstream}"
-    test "$(git -C "${source_dir}" rev-parse HEAD)" = "${pin}"
-    test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
+    host_preflight
     python3 hack/external-substrate-e2e/read-only-preflight.py "${kindctl}" kubectl --tag "${tag}" --request-timeout=15s get nodes -o wide
     python3 hack/external-substrate-e2e/read-only-preflight.py "${kindctl}" kubectl --tag "${tag}" --request-timeout=15s api-resources --api-group certificates.k8s.io
     ;;
@@ -53,12 +68,16 @@ case "${1:-preflight}" in
     test -z "$(git -C "${source_dir}" status --porcelain --untracked-files=all)"
     "${kindctl}" exec --tag "${tag}" -- bash hack/external-substrate-e2e/run-proof.sh "${source_dir}"
     ;;
+  diagnostics)
+    # Redacted failure evidence (status and logs only) under bin/diagnostics-*.
+    "${kindctl}" exec --tag "${tag}" -- bash hack/external-substrate-e2e/diagnostics.sh
+    ;;
   cleanup)
     test $# = 3 || { printf 'Usage: %s cleanup <failed-proof-namespace> <exact-namespace-UID>\n' "$0" >&2; exit 2; }
     "${kindctl}" exec --tag "${tag}" -- bash hack/external-substrate-e2e/run-cleanup.sh "$2" "$3"
     ;;
   *)
-    printf 'Usage: %s [preflight|install|proof|cleanup <namespace> <UID>]\n' "$0" >&2
+    printf 'Usage: %s [preflight-host|preflight|install|proof|diagnostics|cleanup <namespace> <UID>]\n' "$0" >&2
     exit 2
     ;;
 esac

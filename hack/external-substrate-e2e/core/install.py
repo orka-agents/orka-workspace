@@ -5,7 +5,13 @@ import pathlib
 import subprocess
 import sys
 
-namespace, core_image, runtime_image, proof_image, provider_image, worker_image, certificate, core_role = sys.argv[1:]
+(namespace, core_image, runtime_image, proof_image, provider_image, worker_image, certificate, core_role,
+ proxy_image, collector_image) = sys.argv[1:]
+# The proof's in-cluster origins. Agent Substrate runtimes resolve only fully
+# qualified cluster-domain names (see the Deployment rewrite below).
+proxy_service = "fixture-provider-proxy"
+collector_service = "orka-otel-collector"
+collector_endpoint = "http://%s.%s.svc.cluster.local:4317" % (collector_service, namespace)
 fixture = pathlib.Path(__file__).resolve().parents[2] / "external-workspace-e2e"
 base = json.loads(subprocess.check_output([
     sys.executable, str(fixture / "core-install.py"), core_image, runtime_image, certificate]))
@@ -63,9 +69,80 @@ for obj in objects:
         manager["args"] = [arg.replace(".svc:8080", ".svc.cluster.local:8080")
                            if arg.startswith(("--acp-provider-proxy-base-url=", "--controller-url=")) else arg
                            for arg in manager["args"]]
+        # Core and supervisor traces go to the proof's collector, in both
+        # phases. Only the generic gRPC endpoint is set, the smallest
+        # telemetry configuration: Core fits supervisor telemetry into the 32
+        # environment entries Substrate admits and reports the outcome on the
+        # RuntimePool's TelemetryReady condition, which the proof requires
+        # True. The collector origin is admitted to the runtime egress
+        # allowlist.
+        manager["args"].extend(["--enable-telemetry", "--runtime-telemetry-collector-egress"])
+        manager.setdefault("env", []).append({"name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": collector_endpoint})
+    if obj["kind"] == "Service" and obj["metadata"]["name"] == proxy_service:
+        # Replace the listener-less boundary with the injected-token fixture.
+        obj["spec"] = {"selector": {"app": proxy_service}, "ports": [
+            {"name": "api", "port": 8080, "targetPort": 8080},
+            {"name": "observe", "port": 8081, "targetPort": 8081}]}
+
+# The provider-auth proxy origin. It accepts only Core's provider token, which
+# the runtime never holds: the egress gateway must inject it. Port 8081 reports
+# counts per Authorization class to the proof; Core admits only port 8080 to
+# runtime egress.
+restricted = {"runAsNonRoot": True, "runAsUser": 65532, "runAsGroup": 65532, "allowPrivilegeEscalation": False,
+              "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}}
+objects.append({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": proxy_service, "namespace": namespace}, "spec": {
+    "replicas": 1, "selector": {"matchLabels": {"app": proxy_service}}, "template": {"metadata": {"labels": {"app": proxy_service}}, "spec": {
+        "automountServiceAccountToken": False, "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+        "containers": [{"name": "proxy", "image": proxy_image, "imagePullPolicy": "IfNotPresent",
+                        "env": [{"name": "TOKEN_FILE", "value": "/var/run/fixture/token"}],
+                        "ports": [{"containerPort": 8080}, {"containerPort": 8081}],
+                        "readinessProbe": {"httpGet": {"path": "/healthz", "port": 8081}},
+                        "securityContext": restricted,
+                        "volumeMounts": [{"name": "token", "mountPath": "/var/run/fixture", "readOnly": True}]}],
+        "volumes": [{"name": "token", "secret": {"secretName": "external-substrate-core-fixture", "items": [{"key": "token", "path": "token"}]}}]}}}})
+# OTLP collector with the debug exporter; run.sh parses its log for one
+# trace that joins Core and supervisor spans.
+collector_config = """receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch:
+    timeout: 1s
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+"""
+objects.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": collector_service, "namespace": namespace},
+                "data": {"collector.yaml": collector_config}})
+objects.append({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": collector_service, "namespace": namespace}, "spec": {
+    "replicas": 1, "selector": {"matchLabels": {"app": collector_service}}, "template": {"metadata": {"labels": {"app": collector_service}}, "spec": {
+        "automountServiceAccountToken": False, "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+        "containers": [{"name": "collector", "image": collector_image, "imagePullPolicy": "IfNotPresent",
+                        "args": ["--config=/etc/otelcol/collector.yaml"], "ports": [{"containerPort": 4317}],
+                        "securityContext": restricted,
+                        "volumeMounts": [{"name": "config", "mountPath": "/etc/otelcol", "readOnly": True}]}],
+        "volumes": [{"name": "config", "configMap": {"name": collector_service}}]}}}})
+objects.append({"apiVersion": "v1", "kind": "Service", "metadata": {"name": collector_service, "namespace": namespace},
+                "spec": {"selector": {"app": collector_service}, "ports": [{"name": "otlp-grpc", "port": 4317, "targetPort": 4317}]}})
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
+# Core's API authenticates callers by TokenReview, which Orka's Helm and
+# kustomize installs grant outside the generated role (metrics-auth-role).
+# core/cleanup.sh archives the proof Session through that API.
+role["rules"].append({"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]})
 objects.append(role)
 
 
@@ -88,7 +165,9 @@ add("rbac.authorization.k8s.io/v1", "Role", "native-core-proof", namespace, rule
     {"apiGroups": ["workspace.orka.ai"], "resources": ["executionworkspaces"], "verbs": ["get", "list"]},
     {"apiGroups": ["substrate.workspace.orka.ai"], "resources": ["substrateworkspaceprofiles"], "verbs": ["create", "get"]},
     {"apiGroups": ["ate.dev"], "resources": ["workerpools"], "verbs": ["get", "list"]},
-    {"apiGroups": [""], "resources": ["pods", "secrets"], "verbs": ["get", "list"]}])
+    {"apiGroups": [""], "resources": ["pods", "secrets"], "verbs": ["get", "list"]},
+    # The session phase evicts the exact attested worker Pod (UID precondition).
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["delete"]}])
 add("rbac.authorization.k8s.io/v1", "RoleBinding", "native-core-proof", namespace,
     roleRef={"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "native-core-proof"},
     subjects=[{"kind": "ServiceAccount", "name": "native-core-proof", "namespace": client_namespace}])
@@ -114,13 +193,17 @@ mounts = [{"name": "native-client", "mountPath": "/native/client", "readOnly": T
 
 # This Job uses the Kubernetes public APIs and native read-only observations.
 # It never invokes the provider lifecycle/reconciler or writes workspace status.
-add("batch/v1", "Job", namespace, client_namespace, spec={"backoffLimit": 0, "activeDeadlineSeconds": 900,
-    "template": {"metadata": {"labels": {"orka.workspace.e2e/proof": "native-core"}}, "spec": {
-        "serviceAccountName": "native-core-proof", "restartPolicy": "Never",
-        "securityContext": {"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532},
-        "containers": [{"name": "proof", "image": proof_image, "imagePullPolicy": "IfNotPresent",
-                        "env": [{"name": "POD_NAMESPACE", "value": namespace}, {"name": "RUNTIME_IMAGE", "value": runtime_image}],
-                        "volumeMounts": mounts}], "volumes": [client_volume, server_volume]}}})
+# Two Jobs, run in order by run.sh against the same Core with telemetry: the
+# single Task, then the Session across a worker eviction.
+for job, phase, deadline in [(namespace, "task", 1200), (namespace + "-session", "session", 1800)]:
+    add("batch/v1", "Job", job, client_namespace, spec={"backoffLimit": 0, "activeDeadlineSeconds": deadline,
+        "template": {"metadata": {"labels": {"orka.workspace.e2e/proof": "native-core"}}, "spec": {
+            "serviceAccountName": "native-core-proof", "restartPolicy": "Never",
+            "securityContext": {"runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532},
+            "containers": [{"name": "proof", "image": proof_image, "imagePullPolicy": "IfNotPresent",
+                            "env": [{"name": "POD_NAMESPACE", "value": namespace}, {"name": "RUNTIME_IMAGE", "value": runtime_image},
+                                    {"name": "PROOF_PHASE", "value": phase}],
+                            "volumeMounts": mounts}], "volumes": [client_volume, server_volume]}}})
 
 provider_base = pathlib.Path(__file__).resolve().parents[3] / "providers/substrate/config"
 # Read release manifests through kubectl rather than duplicating provider RBAC.
