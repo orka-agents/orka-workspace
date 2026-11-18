@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -51,62 +52,91 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
 	}
-	// Mandatory work first: every due Delete and escalation, with the clock
-	// re-read per pool. Bookkeeping (retirement state and reason) is queued
-	// and runs afterwards within its own total budget, so it can never delay
-	// a Delete or an escalation.
-	type bookkeeping struct {
+	// Phase 0 decides, reading only Kubernetes and re-reading the clock per
+	// pool. Phase 1 issues every due escalation first, each Pod delete on its
+	// own short context. Phase 2 issues the pool Deletes concurrently, capped,
+	// so one slow DELETE never holds up the others. Phase 3 is the
+	// best-effort bookkeeping within its own total budget. Escalation also
+	// runs in its own short-period loop (RunSharedEscalation) that never waits
+	// on pool deletes.
+	type retirement struct {
 		pool          *unstructured.Unstructured
 		state, reason string
 	}
-	var pending []bookkeeping
-	retire := func(pool *unstructured.Unstructured, state, reason string) {
-		if err := d.deleteSharedPool(ctx, pool); err != nil {
-			errs = append(errs, err)
-			return
-		}
-		pending = append(pending, bookkeeping{pool: pool, state: state, reason: reason})
-	}
+	var retirements []retirement
+	var escalations []*unstructured.Unstructured
 	for i := range pools {
 		pool := &pools[i]
 		recorded := provenance[pool.GetUID()]
 		retireAt, escalateAt, evidence := sharedBoundsOf(pool, recorded, provenanceErr == nil)
 		now := sharedNow()
-		if pool.GetDeletionTimestamp() == nil {
-			switch {
-			case !sharedLabelsIntact(pool):
-				retire(pool, sharedRetiring, "the shared worker carries shared evidence without its provider-owned label")
-			case !r.Config.DedicatedInstall:
-				retire(pool, sharedRetiring, errSharedWorkersNotDedicated.Error())
-			case !evidence:
-				retire(pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent")
-			case recorded.strong:
-				// A journal that recorded this pool's UID holds an unreleased
-				// strong marker or failure, whatever the mutable entry list
-				// now says.
-				retire(pool, sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed")
-			case sharedRetirementPersisted(pool):
-				// A retirement state saved before a crash, or before a native
-				// sweep ran out of time, is unconditional deletion intent.
-				state, reason := sharedPersistedRetirement(pool)
-				retire(pool, state, reason)
-			case d.sharedStrongMarked(ctx, pool):
-				// A hosted journal persisted the strong path or a failure
-				// (possibly crashing before it deleted the pool), or a hosted
-				// workspace became suspect; act on it with no native read.
-				retire(pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
-			case !now.Before(retireAt):
-				retire(pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
-			}
+		if !now.Before(escalateAt) {
+			escalations = append(escalations, pool)
 		}
-		if !sharedNow().Before(escalateAt) {
-			errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
+		if pool.GetDeletionTimestamp() != nil {
+			continue
+		}
+		retire := func(state, reason string) {
+			retirements = append(retirements, retirement{pool: pool, state: state, reason: reason})
+		}
+		switch {
+		case !sharedLabelsIntact(pool):
+			retire(sharedRetiring, "the shared worker carries shared evidence without its provider-owned label")
+		case !r.Config.DedicatedInstall:
+			retire(sharedRetiring, errSharedWorkersNotDedicated.Error())
+		case !evidence:
+			retire(sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent")
+		case recorded.strong:
+			// A journal that recorded this pool's UID holds an unreleased
+			// strong marker or failure, whatever the mutable entry list now
+			// says.
+			retire(sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed")
+		case sharedRetirementPersisted(pool):
+			// A retirement state saved before a crash, or before a native
+			// sweep ran out of time, is unconditional deletion intent.
+			state, reason := sharedPersistedRetirement(pool)
+			retire(state, reason)
+		case d.sharedStrongMarked(ctx, pool):
+			// A hosted journal persisted the strong path or a failure
+			// (possibly crashing before it deleted the pool), or a hosted
+			// workspace became suspect; act on it with no native read.
+			retire(sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
+		case !now.Before(retireAt):
+			retire(sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
 		}
 	}
-	if len(pending) > 0 {
+	for _, pool := range escalations {
+		errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
+	}
+	var mu sync.Mutex
+	var deleted []retirement
+	work := make(chan retirement)
+	var group sync.WaitGroup
+	for range min(sharedDeleteConcurrency, len(retirements)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for item := range work {
+				err := d.deleteSharedPool(ctx, item.pool)
+				mu.Lock()
+				if err != nil {
+					errs = append(errs, err)
+				} else {
+					deleted = append(deleted, item)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, item := range retirements {
+		work <- item
+	}
+	close(work)
+	group.Wait()
+	if len(deleted) > 0 {
 		budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedBookkeepingBudget)
 		defer cancel()
-		for _, item := range pending {
+		for _, item := range deleted {
 			if budget.Err() != nil {
 				break
 			}
@@ -190,6 +220,55 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 	return out, nil
 }
 
+// sharedDeleteConcurrency caps concurrent pool Deletes in one bounds pass.
+const sharedDeleteConcurrency = 8
+
+// sharedEscalationTimeout bounds each escalating Pod delete.
+const sharedEscalationTimeout = 10 * time.Second
+
+// sharedEscalationPeriod is how often the escalation-only loop runs.
+const sharedEscalationPeriod = 10 * time.Second
+
+// EnforceSharedEscalation runs one Kubernetes-only escalation pass: every
+// shared pool past its escalation time has its worker Pods re-deleted with a
+// one-second grace. It never issues or waits on a pool Delete.
+func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) error {
+	d := New(r.Client, nil, r.Config)
+	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
+	pools, err := listSharedPools(ctx, r.Client, provenance)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	if provenanceErr != nil {
+		errs = append(errs, provenanceErr)
+	}
+	for i := range pools {
+		pool := &pools[i]
+		if _, escalateAt, _ := sharedBoundsOf(pool, provenance[pool.GetUID()], provenanceErr == nil); !sharedNow().Before(escalateAt) {
+			errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// RunSharedEscalation runs EnforceSharedEscalation every period until ctx
+// ends, independently of the bounds loop's pool deletes.
+func (r *SpareWorkerReplenisher) RunSharedEscalation(ctx context.Context, period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for {
+		if err := r.EnforceSharedEscalation(ctx); err != nil && ctx.Err() == nil {
+			ctrl.LoggerFrom(ctx).Error(err, "Substrate shared worker escalation failed")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // sharedBookkeepingBudget bounds the total time one bounds pass spends on
 // best-effort retirement bookkeeping, after all mandatory work.
 const sharedBookkeepingBudget = 30 * time.Second
@@ -255,7 +334,9 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 		}
 		grace := sharedEscalationGrace
 		ctrl.LoggerFrom(ctx).Info("Substrate shared worker Pod escalated before its hard lifetime bound", "reason", "the worker Pod outlived its strong retirement")
-		err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}, client.GracePeriodSeconds(grace))
+		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
+		err := d.client.Delete(deleteCtx, pod, client.Preconditions{UID: &pod.UID}, client.GracePeriodSeconds(grace))
+		cancel()
 		if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			errs = append(errs, err)
 		}

@@ -2511,3 +2511,83 @@ func TestSharedBoundsPassDoesMandatoryWorkBeforeBookkeeping(t *testing.T) {
 		t.Fatal("bookkeeping exceeded its total budget")
 	}
 }
+
+// manySharedPools readies workspaces until at least n shared pools exist.
+func manySharedPools(t *testing.T, c client.Client, native *nativeFixture, first sdk.WorkloadRequest, binding *api.ImmutableObjectBinding, n int) []string {
+	t.Helper()
+	_, record := sharedReady(t, c, native, first)
+	pools := []string{record.SharedWorker.Pool}
+	for i := 0; len(pools) < n; i++ {
+		item := sharedWorkspace(t, c, first, "tenant", fmt.Sprintf("m%02d", i), types.UID(fmt.Sprintf("m%02d-uid", i)), binding)
+		_, r := sharedReady(t, c, native, item)
+		if !slices.Contains(pools, r.SharedWorker.Pool) {
+			pools = append(pools, r.SharedWorker.Pool)
+		}
+	}
+	return pools
+}
+
+func TestSharedEscalationIsIndependentOfSlowPoolDeletes(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	pools := manySharedPools(t, c, native, first, binding, 11)
+	pool, ledger := poolLedger(t, c, pools[0])
+	setNow(t, sharedEscalateAt(pool, ledger).Add(time.Minute))
+	var escalated atomic.Int64
+	// Every WorkerPool DELETE blocks until its context ends; Pod DELETEs work.
+	slow := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		switch o := obj.(type) {
+		case *unstructured.Unstructured:
+			if o.GetKind() == "WorkerPool" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		case *corev1.Pod:
+			escalated.Add(1)
+		}
+		return w.Delete(ctx, obj, opts...)
+	}}))
+	t.Run("bounds pass", func(t *testing.T) {
+		escalated.Store(0)
+		done := make(chan struct{})
+		started := time.Now()
+		go func() {
+			defer close(done)
+			_ = (&SpareWorkerReplenisher{Client: slow, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		}()
+		deadline := time.Now().Add(3 * time.Second)
+		for escalated.Load() < int64(len(pools)) {
+			if time.Now().After(deadline) {
+				t.Fatalf("only %d/%d escalations within 3s of a pass whose pool deletes block", escalated.Load(), len(pools))
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// 11 blocked deletes, 8 at a time, each bounded by its own timeout.
+		bound := 2*sharedCleanupTimeout + 15*time.Second
+		select {
+		case <-done:
+		case <-time.After(bound):
+			t.Fatalf("the bounds pass did not finish within %s", bound)
+		}
+		if elapsed := time.Since(started); elapsed > bound {
+			t.Fatalf("the bounds pass took %s", elapsed)
+		}
+	})
+	t.Run("escalation loop", func(t *testing.T) {
+		escalated.Store(0)
+		// Pods lost to the first subtest are recreated as the workers' Pods.
+		for _, name := range pools {
+			podName := name + "-worker"
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "native-workers", Name: podName, UID: types.UID(podName + "-uid"), Labels: map[string]string{workerPoolLabel: name}}}
+			if err := c.Create(t.Context(), pod); err != nil && !apierrors.IsAlreadyExists(err) {
+				t.Fatal(err)
+			}
+		}
+		started := time.Now()
+		if err := (&SpareWorkerReplenisher{Client: slow, Config: sharedConfig()}).EnforceSharedEscalation(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if escalated.Load() < int64(len(pools)) || time.Since(started) > 3*time.Second {
+			t.Fatalf("the escalation-only pass escalated %d/%d in %s", escalated.Load(), len(pools), time.Since(started))
+		}
+	})
+}
