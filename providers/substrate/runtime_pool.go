@@ -30,8 +30,11 @@ func poolObject() *unstructured.Unstructured {
 // The source pool is operator infrastructure. Each request gets a separate
 // single-replica gVisor pool whose workers are born with unique labels and
 // sized so exactly one template-sized Actor fits. v1 workers report a large
-// Actor count, so capacity, not count, is what keeps the worker private.
-func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecord) error {
+// Actor count, so capacity, not count, is what keeps the worker private. With
+// spares > 0 the request first selects an existing spare built by the same
+// copy logic (spare_workers.go); the claim itself happens later, after the
+// journal records it.
+func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecord, spares int, profileUID types.UID) error {
 	source := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, source); err != nil {
 		return err
@@ -40,65 +43,94 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 		return sdk.ErrStaleIdentity
 	}
 	record.SourceSelector = maps.Clone(record.TemplateSpec.GetWorkerSelector().GetMatchLabels())
-	for _, key := range []string{workerAllocationLabel, workerInstanceLabel} {
-		if _, found := record.SourceSelector[key]; found {
+	if err := checkSourceSelector(record.SourceSelector, source); err != nil {
+		return err
+	}
+	cpu, memory := expectedWorkerCapacity(record)
+	spec, err := buildPrivatePoolSpec(source, cpu, memory, workerLabels(record))
+	if err != nil {
+		return err
+	}
+	record.RuntimePoolSpec = spec
+	if err := bindPrivatePool(record, record.Actor.Name+"-workers", source.GetLabels()); err != nil {
+		return err
+	}
+	if spares > 0 {
+		return d.selectSpare(ctx, record, profileUID)
+	}
+	return nil
+}
+
+// checkSourceSelector refuses an operator selector or pool that already uses
+// a reserved confinement label.
+func checkSourceSelector(selector map[string]string, source *unstructured.Unstructured) error {
+	for _, key := range []string{workerAllocationLabel, workerInstanceLabel, spareProfileLabel} {
+		if _, found := selector[key]; found {
 			return fmt.Errorf("operator native selector uses a reserved confinement label")
 		}
 		if _, found := source.GetLabels()[key]; found {
 			return fmt.Errorf("operator native pool uses a reserved confinement label")
 		}
 	}
+	return nil
+}
+
+// buildPrivatePoolSpec copies the operator pool's worker image, sandbox class with
+// its pinned SandboxConfig, and scheduling into a single-replica pool sized
+// for exactly one (cpu, memory) Actor, whose workers carry birth labels.
+// Per-instance pools and spares are both built here, so a spare differs from
+// the pool an allocation would create only in its birth label values.
+func buildPrivatePoolSpec(source *unstructured.Unstructured, cpu, memory int64, birth map[string]string) (json.RawMessage, error) {
 	spec, found, err := unstructured.NestedMap(source.Object, "spec")
 	if err != nil || !found {
-		return fmt.Errorf("operator WorkerPool has no usable immutable specification")
+		return nil, fmt.Errorf("operator WorkerPool has no usable immutable specification")
 	}
 	if image, _, _ := unstructured.NestedString(spec, "workerImage"); image == "" {
-		return fmt.Errorf("operator WorkerPool has no worker image")
+		return nil, fmt.Errorf("operator WorkerPool has no worker image")
 	}
 	spec["replicas"] = int64(1)
 	if _, legacy := spec["sandboxClass"]; legacy {
-		return fmt.Errorf("operator WorkerPool uses the removed v1alpha1 sandboxClass field")
+		return nil, fmt.Errorf("operator WorkerPool uses the removed v1alpha1 sandboxClass field")
 	}
 	classes, found, err := unstructured.NestedSlice(spec, "sandboxClasses")
 	if err != nil {
-		return fmt.Errorf("operator WorkerPool sandbox classes are invalid")
+		return nil, fmt.Errorf("operator WorkerPool sandbox classes are invalid")
 	}
 	if !found || len(classes) == 0 {
 		classes = []any{map[string]any{"name": gvisorSandboxClass}}
 	}
 	if len(classes) != 1 {
-		return fmt.Errorf("operator WorkerPool must use exactly one sandbox class, gVisor")
+		return nil, fmt.Errorf("operator WorkerPool must use exactly one sandbox class, gVisor")
 	}
 	class, ok := classes[0].(map[string]any)
 	if !ok || class["name"] != gvisorSandboxClass {
-		return fmt.Errorf("operator WorkerPool must use gVisor")
+		return nil, fmt.Errorf("operator WorkerPool must use gVisor")
 	}
 	for key := range class {
 		if key != "name" && key != "configRef" {
-			return fmt.Errorf("operator WorkerPool sandbox class has an unsupported field")
+			return nil, fmt.Errorf("operator WorkerPool sandbox class has an unsupported field")
 		}
 	}
 	configRef, err := pinnedSandboxConfig(source, class)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	classes = []any{map[string]any{"name": gvisorSandboxClass, "configRef": map[string]any{"name": configRef}}}
 	spec["sandboxClasses"] = classes
 	template, _, err := unstructured.NestedMap(spec, "template")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if template == nil {
 		template = map[string]any{}
 	}
 	if _, set := template["resources"]; set {
-		return fmt.Errorf("operator WorkerPool template resources are provider-owned; the private worker is sized for exactly one Actor")
+		return nil, fmt.Errorf("operator WorkerPool template resources are provider-owned; the private worker is sized for exactly one Actor")
 	}
 	// The worker reports its Pod limits, less the gVisor reservation, as
 	// capacity. Pin both so the template-sized Actor exactly fills it.
-	cpu, memory := expectedWorkerCapacity(record)
 	if cpu <= 0 || memory <= 0 {
-		return fmt.Errorf("native template has no Actor size for its private worker")
+		return nil, fmt.Errorf("native template has no Actor size for its private worker")
 	}
 	quantities := map[string]any{
 		"cpu":    resource.NewMilliQuantity(cpu, resource.DecimalSI).String(),
@@ -107,27 +139,30 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 	template["resources"] = map[string]any{"limits": quantities, "requests": maps.Clone(quantities)}
 	podLabels, _, err := unstructured.NestedStringMap(template, "labels")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if podLabels == nil {
 		podLabels = map[string]string{}
 	}
-	for key, value := range workerLabels(record) {
+	for key, value := range birth {
 		if foreign := podLabels[key]; foreign != "" && foreign != value {
-			return fmt.Errorf("operator worker template uses a reserved confinement label")
+			return nil, fmt.Errorf("operator worker template uses a reserved confinement label")
 		}
 		podLabels[key] = value
 	}
 	if err := unstructured.SetNestedStringMap(template, podLabels, "labels"); err != nil {
-		return err
+		return nil, err
 	}
 	spec["template"] = template
-	record.RuntimePoolSpec, err = json.Marshal(spec)
-	if err != nil {
-		return err
-	}
-	record.RuntimePool = nativeReference{Name: record.Actor.Name + "-workers", Digest: digest(record.RuntimePoolSpec)}
-	record.RuntimePoolLabels = maps.Clone(source.GetLabels())
+	return json.Marshal(spec)
+}
+
+// bindPrivatePool names the record's private pool, its exact metadata labels
+// (the operator pool's own, ownership, and worker birth labels), and the
+// derived template's worker selector, from record.RuntimePoolSpec.
+func bindPrivatePool(record *journalRecord, name string, operatorLabels map[string]string) error {
+	record.RuntimePool = nativeReference{Name: name, Digest: digest(record.RuntimePoolSpec)}
+	record.RuntimePoolLabels = maps.Clone(operatorLabels)
 	if record.RuntimePoolLabels == nil {
 		record.RuntimePoolLabels = map[string]string{}
 	}
@@ -136,6 +171,7 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 	selector := maps.Clone(record.SourceSelector)
 	maps.Copy(selector, workerLabels(record))
 	record.TemplateSpec.WorkerSelector = &pb.Selector{MatchLabels: selector}
+	var err error
 	record.Template.Digest, err = templateDigest(record.TemplateSpec)
 	return err
 }
@@ -334,6 +370,12 @@ func (d *Lifecycle) ensureRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 	if record.RuntimePool.Name == "" || len(record.RuntimePoolSpec) == 0 || len(record.SourceSelector) == 0 || record.RuntimePoolDeleting {
 		return sdk.ErrStaleIdentity
 	}
+	if record.SpareWorker != nil {
+		if record.SpareWorker.Released {
+			return sdk.ErrStaleIdentity
+		}
+		return d.ensureSpareRuntimePool(ctx, cm, record)
+	}
 	pool := poolObject()
 	key := client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.RuntimePool.Name}
 	err := d.client.Get(ctx, key, pool)
@@ -390,34 +432,17 @@ func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord
 // privatePoolWorker returns the private pool's only Worker, nil when it has
 // none, and an error when it has more than one.
 func (d *Lifecycle) privatePoolWorker(ctx context.Context, record *journalRecord) (*pb.Worker, error) {
-	var selected *pb.Worker
-	token := ""
-	seen := map[string]bool{}
-	for pages := 0; ; pages++ {
-		if pages == 100 {
-			return nil, fmt.Errorf("native worker listing exceeded bound")
-		}
-		workers, err := d.control.ListWorkers(ctx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1000, PageToken: token}})
-		if err != nil {
-			return nil, err
-		}
-		for _, worker := range workers.GetWorkers() {
-			if worker.GetWorkerNamespace() != record.Placement.Namespace || worker.GetWorkerPool() != record.RuntimePool.Name {
-				continue
-			}
-			if selected != nil {
-				return nil, fmt.Errorf("private native pool has multiple workers")
-			}
-			selected = worker
-		}
-		token = workers.GetNextPageToken()
-		if token == "" {
-			return selected, nil
-		}
-		if seen[token] {
-			return nil, fmt.Errorf("native worker pagination repeated a token")
-		}
-		seen[token] = true
+	workers, err := d.namespaceWorkers(ctx, record.Placement.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	switch selected := workers[record.RuntimePool.Name]; len(selected) {
+	case 0:
+		return nil, nil
+	case 1:
+		return selected[0], nil
+	default:
+		return nil, fmt.Errorf("private native pool has multiple workers")
 	}
 }
 
@@ -445,6 +470,9 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	}
 	for key, value := range record.TemplateSpec.GetWorkerSelector().GetMatchLabels() {
 		if selected.GetLabels()[key] != value {
+			if spareWorkerLabelsPending(record, selected) {
+				return false, nil
+			}
 			return false, sdk.ErrStaleIdentity
 		}
 	}
@@ -478,8 +506,21 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 }
 
 func (d *Lifecycle) deleteRuntimePool(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
-	if !record.RuntimePool.CreateIssued {
-		return true, nil
+	switch spare := record.SpareWorker; {
+	case spare == nil:
+		if !record.RuntimePool.CreateIssued {
+			return true, nil
+		}
+	case record.RuntimePool.UID == "":
+		// An unbound claim: only this record's own marker makes the spare
+		// its pool. Otherwise nothing of this record's exists to delete.
+		if spare.Released || !spare.ClaimIssued {
+			return true, nil
+		}
+		bound, err := d.bindRetiringSpare(ctx, cm, record)
+		if err != nil || !bound {
+			return err == nil, err
+		}
 	}
 	pool := poolObject()
 	err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.RuntimePool.Name}, pool)

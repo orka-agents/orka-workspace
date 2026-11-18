@@ -105,6 +105,9 @@ type journalRecord struct {
 	RuntimePoolSpec     json.RawMessage           `json:"runtimePoolSpec"`
 	RuntimePoolLabels   map[string]string         `json:"runtimePoolLabels"`
 	RuntimePoolDeleting bool                      `json:"runtimePoolDeleting,omitempty"`
+	// SpareWorker records a selected pre-created spare WorkerPool. When set,
+	// RuntimePool names the spare and its birth labels are the worker labels.
+	SpareWorker *spareClaim `json:"spareWorker,omitempty"`
 	// WorkerImageProvenance records each data-only resume or restore of this
 	// lineage that followed the operator pool to a new worker image.
 	WorkerImageProvenance []workerImageTransition `json:"workerImageProvenance,omitempty"`
@@ -187,8 +190,11 @@ func journalKey(key sdk.AllocationKey) types.NamespacedName {
 	return types.NamespacedName{Namespace: key.Namespace, Name: "substrate-workspace-" + hex.EncodeToString(sum[:20])}
 }
 func historyKey(key sdk.AllocationKey, sequence int64) types.NamespacedName {
-	sum := sha256.Sum256([]byte(journalKey(key).Name + "\x00" + strconv.FormatInt(sequence, 10)))
-	return types.NamespacedName{Namespace: key.Namespace, Name: "substrate-history-" + hex.EncodeToString(sum[:20])}
+	return types.NamespacedName{Namespace: key.Namespace, Name: historyName(journalKey(key).Name, sequence)}
+}
+func historyName(journal string, sequence int64) string {
+	sum := sha256.Sum256([]byte(journal + "\x00" + strconv.FormatInt(sequence, 10)))
+	return "substrate-history-" + hex.EncodeToString(sum[:20])
 }
 func workspaceOwner(key sdk.AllocationKey) metav1.OwnerReference {
 	return metav1.OwnerReference{APIVersion: api.GroupVersion.String(), Kind: "ExecutionWorkspace", Name: key.Name, UID: key.WorkspaceUID}
@@ -262,6 +268,9 @@ func validateJournalStructure(record *journalRecord) error {
 		return fmt.Errorf("native journal has incomplete infrastructure intent")
 	}
 	if record.Worker != nil && (record.Worker.AllocationID != record.Observation.Identity.AllocationID || record.Worker.InstanceID != record.Observation.Identity.InstanceID) {
+		return sdk.ErrStaleIdentity
+	}
+	if spare := record.SpareWorker; spare != nil && (spare.Name != record.RuntimePool.Name || spare.UID == "" || spare.ProfileUID == "" || spare.Birth == "" || record.RuntimePool.CreateIssued || record.RuntimePool.UID != "" && (record.RuntimePool.UID != spare.UID || spare.Released || !spare.ClaimIssued)) {
 		return sdk.ErrStaleIdentity
 	}
 	if len(record.RetirementWorkers) > 16 {
@@ -468,5 +477,8 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	if err := d.compileTemplate(ctx, record, ref.Name); err != nil {
 		return err
 	}
-	return d.prepareRuntimePool(ctx, record)
+	// The spare count is a mutable annotation outside the profile hash; an
+	// invalid value disables spares and the replenisher reports it.
+	spares, _ := spareWorkerCount(object.Annotations)
+	return d.prepareRuntimePool(ctx, record, spares, object.UID)
 }

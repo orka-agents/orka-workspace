@@ -27,7 +27,7 @@ func TestUnconfiguredNativeControlRunsOnlyProviderStatus(t *testing.T) {
 	if err := shipped.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if setups := controllerSetups(nil, shipped, pb.NewControlClient(nil)); len(setups) != 3 {
-		t.Fatalf("configured provider registered %d controllers, want provider, workspace, and checkpoint", len(setups))
+	if setups := controllerSetups(nil, shipped, pb.NewControlClient(nil)); len(setups) != 4 {
+		t.Fatalf("configured provider registered %d controllers, want provider, workspace, checkpoint, and spare workers", len(setups))
 	}
 }

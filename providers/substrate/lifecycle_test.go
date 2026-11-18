@@ -62,6 +62,10 @@ type nativeFixture struct {
 	// crashBeforeAssignment crashes the restore synchronously: Resume fails
 	// after the Actor is CRASHED and its assignment cleared.
 	crashBeforeAssignment bool
+	// foreignWorkers report a foreign Actor assignment on the named workers.
+	foreignWorkers map[string]bool
+	// staleWorkerLabels delays copying changed WorkerPool labels to Workers.
+	staleWorkerLabels bool
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -385,6 +389,11 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		}
 		name := pool.GetName() + "-worker"
 		if f.workers[name] != nil {
+			// Agent Substrate's syncer copies WorkerPool labels onto the
+			// Worker whenever they change.
+			if !f.staleWorkerLabels {
+				f.workers[name].Labels = maps.Clone(pool.GetLabels())
+			}
 			continue
 		}
 		labels, _, err := unstructured.NestedStringMap(pool.Object, "spec", "template", "labels")
@@ -419,7 +428,7 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 			out.ActorAssignments = append(out.ActorAssignments, &pb.ActorAssignment{Actor: &pb.ObjectRef{Atespace: v.Metadata.Atespace, Name: v.Metadata.Name}, ActorUid: v.Metadata.Uid})
 		}
 	}
-	if f.foreignAssignment {
+	if f.foreignAssignment || f.foreignWorkers[req.Worker.Name] {
 		out.ActorAssignments = append(out.ActorAssignments, &pb.ActorAssignment{Actor: &pb.ObjectRef{Atespace: "foreign", Name: "foreign"}, ActorUid: "foreign"})
 	}
 	return out, nil
