@@ -85,7 +85,7 @@ Anything else takes the private single-Actor path of ADR 0006.
   - the scope;
   - the pool's birth time;
   - its admission state: `Admitting`, `Draining`, `Retiring`, or `Quarantined`;
-  - the first fenced worker (Worker UID and Pod UID);
+  - the first fenced worker (Worker UID, Pod UID and registered epoch; a different worker or epoch is doubt);
   - one entry per hosted allocation: the journal marker `<namespace>/<name>/<uid>/<sequence>`, the Actor reference, and the Actor UID once it is known.
 - **Writes.** Every write is an Update preconditioned on the read resourceVersion.
 - **Claiming a slot.** An allocation journals its selection and `claimIssued` before it adds its own entry. It binds only after observing that entry. A pool it creates is created with its entry already in the ledger. Selection or claim doubt before the template exists falls back to another pool or a new pool.
