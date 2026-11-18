@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,35 +39,41 @@ type sharedProfileShape struct {
 // dedicated, and a worker Pod still present when the hard bound nears is
 // re-deleted with a one-second grace.
 func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lifecycle) error {
-	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion(workerPoolAPIVersion())
-	pools.SetKind("WorkerPoolList")
-	if err := r.List(ctx, pools, client.HasLabels{sharedPoolLabel}); err != nil {
+	pools, err := listSharedPools(ctx, r.Client)
+	if err != nil {
 		return err
 	}
+	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
 	now := sharedNow()
 	var errs []error
-	for i := range pools.Items {
-		pool := &pools.Items[i]
-		retireAt, escalateAt, evidence := sharedBoundsOf(pool)
+	if provenanceErr != nil {
+		// Without the journals the lifetime ceiling is the server-set
+		// creation time plus the maximum lifetime, still enforced.
+		errs = append(errs, provenanceErr)
+	}
+	for i := range pools {
+		pool := &pools[i]
+		retireAt, escalateAt, evidence := sharedBoundsOf(pool, provenance[pool.GetUID()])
 		if pool.GetDeletionTimestamp() == nil {
 			switch {
+			case !sharedLabelsIntact(pool):
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker carries shared evidence without its provider-owned label"))
 			case !r.Config.DedicatedInstall:
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
 			case !evidence:
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
 			case sharedRetirementPersisted(pool):
 				// A retirement state saved before a crash, or before a native
 				// sweep ran out of time, is unconditional deletion intent.
 				state, reason := sharedPersistedRetirement(pool)
-				errs = append(errs, d.retireSharedPool(ctx, pool, state, reason))
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, state, reason))
 			case d.sharedStrongMarked(ctx, pool):
 				// A hosted journal persisted the strong path or a failure
 				// (possibly crashing before it deleted the pool), or a hosted
 				// workspace became suspect; act on it with no native read.
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect"))
 			case !now.Before(retireAt):
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
+				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
 			}
 		}
 		if !now.Before(escalateAt) {
@@ -76,18 +83,98 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	return errors.Join(errs...)
 }
 
+// listSharedPools lists every WorkerPool that carries any shared-pool
+// evidence: the provider-owned label, the ledger or deadline annotation, or
+// the ate-shared- name. Discovery never depends on a removable label alone.
+func listSharedPools(ctx context.Context, c client.Client) ([]unstructured.Unstructured, error) {
+	all := &unstructured.UnstructuredList{}
+	all.SetAPIVersion(workerPoolAPIVersion())
+	all.SetKind("WorkerPoolList")
+	if err := c.List(ctx, all); err != nil {
+		return nil, err
+	}
+	var out []unstructured.Unstructured
+	for _, pool := range all.Items {
+		_, labeled := pool.GetLabels()[sharedPoolLabel]
+		_, ledger := pool.GetAnnotations()[sharedLedgerAnnotation]
+		_, deadline := pool.GetAnnotations()[sharedDeadlineAnnotation]
+		if labeled || ledger || deadline || strings.HasPrefix(pool.GetName(), sharedPoolPrefix) {
+			out = append(out, pool)
+		}
+	}
+	return out, nil
+}
+
+// sharedLabelsIntact reports whether a shared pool still carries exactly its
+// provider-owned label. Shared evidence without it is doubt.
+func sharedLabelsIntact(pool *unstructured.Unstructured) bool {
+	label := pool.GetLabels()[sharedPoolLabel]
+	return label != "" && maps.Equal(pool.GetLabels(), sharedLabels(label))
+}
+
+// sharedProvenance is what the journals that recorded a pool's UID froze
+// about it, independently of the pool's own mutable annotations.
+type sharedProvenance struct {
+	found bool
+	// lifetime is the shortest recorded lifetime.
+	lifetime time.Duration
+	scopes   []sharedScope
+}
+
+// sharedJournalProvenance reads every journal and archived record (Kubernetes
+// only) and groups the frozen scopes they recorded by shared pool UID.
+func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]sharedProvenance, error) {
+	journals := &corev1.ConfigMapList{}
+	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		return nil, err
+	}
+	out := map[types.UID]sharedProvenance{}
+	for i := range journals.Items {
+		record, ok := decodeClaimRecord(&journals.Items[i])
+		if !ok || record.SharedWorker == nil || record.SharedWorker.UID == "" {
+			continue
+		}
+		uid := types.UID(record.SharedWorker.UID)
+		entry := out[uid]
+		scope := record.SharedWorker.Scope
+		if !entry.found || scope.Lifetime.Duration < entry.lifetime {
+			entry.lifetime = scope.Lifetime.Duration
+		}
+		entry.found = true
+		entry.scopes = append(entry.scopes, scope)
+		out[uid] = entry
+	}
+	return out, nil
+}
+
 // sharedBoundsOf returns when a pool's strong retirement starts and when its
-// worker Pods are escalated. Unreadable or inconsistent lifetime evidence is
-// doubt: retirement starts at once, and escalation is bounded by the
-// recorded deadline or, failing that, the pool's creation plus the minimum
-// lifetime. It never lengthens the bound.
-func sharedBoundsOf(pool *unstructured.Unstructured) (time.Time, time.Time, bool) {
+// worker Pods are escalated, and whether its lifetime evidence is consistent.
+// The deadline never exceeds the server-set creation time plus the maximum
+// lifetime, nor the creation time plus the shortest lifetime any journal
+// recorded for the pool. A ledger or deadline annotation that disagrees with
+// those journals (or with each other, or is unreadable) is doubt: retirement
+// starts at once and escalation follows the shortest bound, never longer.
+func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance) (time.Time, time.Time, bool) {
+	created := pool.GetCreationTimestamp().Time
+	ceiling := created.Add(profile.MaxSharedWorkerLifetime)
+	if provenance.found {
+		ceiling = minTime(ceiling, created.Add(provenance.lifetime))
+	}
 	ledger, err := readSharedLedger(pool)
 	recorded, recordedOK := sharedRecordedDeadline(pool)
-	if err == nil && recordedOK && recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
-		return sharedRetireAt(pool, ledger), sharedEscalateAt(pool, ledger), true
+	consistent := err == nil && recordedOK && recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration))
+	if consistent {
+		for _, scope := range provenance.scopes {
+			if scope != ledger.Scope {
+				consistent = false
+			}
+		}
 	}
-	deadline := pool.GetCreationTimestamp().Add(profile.MinSharedWorkerLifetime)
+	if consistent {
+		deadline := minTime(sharedDeadline(pool, ledger), ceiling)
+		return deadline.Add(-workerPodTerminationGrace - sharedRetireMargin), deadline.Add(-sharedRetireMargin), true
+	}
+	deadline := minTime(created.Add(profile.MinSharedWorkerLifetime), ceiling)
 	if recordedOK {
 		deadline = minTime(deadline, recorded)
 	}
@@ -99,10 +186,10 @@ func sharedBoundsOf(pool *unstructured.Unstructured) (time.Time, time.Time, bool
 // full drain and Orka core's eviction window has ended, so every neighbour was
 // suspended or failed without replay. A one-second grace keeps the absence
 // proof kubelet-confirmed, which a zero grace would not.
+//
+// It does not wait for the pool's deletion to have started: a deletion that
+// failed must not postpone the bound.
 func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured) error {
-	if pool.GetDeletionTimestamp() == nil {
-		return nil
-	}
 	pods := &corev1.PodList{}
 	if err := d.client.List(ctx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()}); err != nil {
 		return err
@@ -110,9 +197,6 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 	var errs []error
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.Labels[sharedPoolLabel] != pool.GetLabels()[sharedPoolLabel] {
-			continue
-		}
 		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds <= sharedEscalationGrace {
 			continue
 		}
@@ -135,11 +219,17 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 // profile's requested warm slots. With no opted-in profile and no shared pool
 // it makes no native call.
 func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache) error {
-	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion(workerPoolAPIVersion())
-	pools.SetKind("WorkerPoolList")
-	if err := r.List(ctx, pools, client.HasLabels{sharedPoolLabel}); err != nil {
+	discovered, err := listSharedPools(ctx, r.Client)
+	if err != nil {
 		return err
+	}
+	// Pools without their intact provider-owned label are retired by the
+	// bounds loop; native maintenance never touches them.
+	pools := &unstructured.UnstructuredList{}
+	for _, pool := range discovered {
+		if sharedLabelsIntact(&pool) {
+			pools.Items = append(pools.Items, pool)
+		}
 	}
 	shapes := map[string]*sharedProfileShape{}
 	var errs []error

@@ -55,8 +55,17 @@ const (
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
 	// changing worker version; then the strong path applies.
 	sharedMaxProofAttempts = 5
-	// sharedLedgerMaxBytes bounds the ledger annotation.
+	// sharedLedgerMaxBytes bounds the ledger annotation. Its fields are
+	// bounded below so that any valid ledger, with a full retirement reason,
+	// stays far under it: a retirement write can never overflow.
 	sharedLedgerMaxBytes = 32 << 10
+	// sharedLedgerFieldMax bounds each scope field and entry identity.
+	sharedLedgerFieldMax = 128
+	// sharedLedgerJournalMax bounds an entry's journal marker
+	// (<namespace>/<name>/<uid>/<sequence>).
+	sharedLedgerJournalMax = 256
+	// sharedLedgerReasonMax bounds the recorded retirement reason.
+	sharedLedgerReasonMax = 512
 	// operatorTaintAnnotation is Orka core's durable operator-access marker
 	// on an ExecutionWorkspace (Orka ADR 0044).
 	operatorTaintAnnotation = "acp.workspace.orka.ai/operator-tainted"
@@ -120,6 +129,11 @@ type sharedScope struct {
 }
 
 func (s sharedScope) valid() bool {
+	for _, field := range []string{s.Namespace, s.Atespace, s.ProfileUID, s.ProfileHash, s.SourceUID, s.Shape} {
+		if len(field) > sharedLedgerFieldMax {
+			return false
+		}
+	}
 	return s.Namespace != "" && s.Atespace != "" && s.ProfileUID != "" && s.ProfileHash != "" && s.SourceUID != "" && s.Shape != "" &&
 		s.CPUMillicores > 0 && s.MemoryBytes > 0 && s.MaxActors >= profile.MinSharedActorsPerWorker && s.MaxActors <= profile.MaxSharedActorsPerWorker &&
 		s.Lifetime.Duration >= profile.MinSharedWorkerLifetime && s.Lifetime.Duration <= profile.MaxSharedWorkerLifetime
@@ -352,8 +366,14 @@ func readSharedLedger(pool *unstructured.Unstructured) (*sharedLedger, error) {
 	if len(ledger.Entries) > int(ledger.Scope.MaxActors) {
 		return nil, fmt.Errorf("shared worker ledger exceeds its slots")
 	}
+	if len(ledger.Reason) > sharedLedgerReasonMax {
+		return nil, fmt.Errorf("shared worker ledger reason is oversized")
+	}
 	seen := map[string]bool{}
 	for _, entry := range ledger.Entries {
+		if len(entry.Journal) > sharedLedgerJournalMax || len(entry.Actor) > sharedLedgerFieldMax || len(entry.ActorUID) > sharedLedgerFieldMax {
+			return nil, fmt.Errorf("shared worker ledger entry is oversized")
+		}
 		if entry.Journal == "" || entry.Actor == "" || seen[entry.Journal] || seen["actor:"+entry.Actor] {
 			return nil, fmt.Errorf("shared worker ledger has a duplicate or empty entry")
 		}
@@ -1108,6 +1128,9 @@ func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Uns
 	}
 	ctx, cancel := strongCleanupContext(ctx)
 	defer cancel()
+	if len(reason) > sharedLedgerReasonMax {
+		reason = reason[:sharedLedgerReasonMax]
+	}
 	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
 		ledger.State, ledger.Reason = state, reason
 		if err := setSharedLedger(pool, ledger); err != nil {
@@ -1889,4 +1912,37 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 		return true, nil
 	}
 	return slices.Contains(ledger.Entries, entry), nil
+}
+
+// hardRetireSharedPool deletes a pool whose retirement is unconditional:
+// a reached lifetime bound, unreadable or inconsistent lifetime evidence, a
+// persisted retirement state, missing shared labels, or a withdrawn
+// dedicated-install assertion. It records the state when it can, but no
+// failed ledger write (including a conflict) can block the UID-preconditioned
+// Delete.
+func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
+	if pool.GetDeletionTimestamp() != nil {
+		return nil
+	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
+	if len(reason) > sharedLedgerReasonMax {
+		reason = reason[:sharedLedgerReasonMax]
+	}
+	var errs []error
+	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
+		ledger.State, ledger.Reason = state, reason
+		recorded := pool.DeepCopy()
+		if err := setSharedLedger(recorded, ledger); err == nil {
+			if err := d.client.Update(ctx, recorded); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
+	uid := pool.GetUID()
+	if err := d.client.Delete(ctx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }

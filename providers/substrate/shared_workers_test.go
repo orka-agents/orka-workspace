@@ -64,12 +64,15 @@ func useTestClock(t *testing.T) {
 func tick() { testClock.Add(int64(sharedEgressSettle + time.Second)) }
 
 // createSharedProfile creates an opted-in profile and returns its binding.
-func createSharedProfile(t *testing.T, c client.Client, namespace, name string, uid types.UID, maxActors int32) *api.ImmutableObjectBinding {
+func createSharedProfile(t *testing.T, c client.Client, namespace, name string, uid types.UID, maxActors int32, lifetime ...time.Duration) *api.ImmutableObjectBinding {
 	t.Helper()
 	parameter := &profile.SubstrateWorkspaceProfile{TypeMeta: metav1.TypeMeta{APIVersion: profile.GroupVersion.String(), Kind: "SubstrateWorkspaceProfile"}, ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, UID: uid, Generation: 1}, Spec: profile.SubstrateWorkspaceProfileSpec{
 		TemplateRef: profile.SubstrateTemplateReference{Name: "base", Namespace: "native"}, Suspend: &profile.SubstrateSuspendPolicy{Mode: profile.SubstrateSuspendModeDataOnly},
 		Placement: &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{MaxActorsPerWorker: maxActors}},
 	}}
+	if len(lifetime) == 1 {
+		parameter.Spec.Placement.SharedWorkers.MaxWorkerLifetime = &metav1.Duration{Duration: lifetime[0]}
+	}
 	if err := parameter.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -1742,7 +1745,7 @@ func TestSharedDeadlineKeepsSubSecondLifetimePrecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	setSharedDeadline(pool, ledger)
-	if _, _, evidence := sharedBoundsOf(pool); !evidence {
+	if _, _, evidence := sharedBoundsOf(pool, sharedProvenance{}); !evidence {
 		t.Fatalf("a fractional lifetime's deadline annotation %q is inconsistent with its ledger", pool.GetAnnotations()[sharedDeadlineAnnotation])
 	}
 	// Validation rejects sub-second lifetimes outright.
@@ -1827,8 +1830,12 @@ func TestSharedPoolSizedByARuntimeOverrideStaysAdmitting(t *testing.T) {
 	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, ledger := poolLedger(t, c, a.SharedWorker.Pool); ledger.State == sharedAdmitting {
-		t.Fatal("a pool with a stale shape kept admitting")
+	// A ledger whose scope no longer matches its journals' frozen scope is
+	// doubt, so the bounds loop retires the pool outright.
+	if pool, found := getPool(t, c, a.SharedWorker.Pool); found {
+		if ledger, err := readSharedLedger(pool); err == nil && ledger.State == sharedAdmitting {
+			t.Fatal("a pool with a stale shape kept admitting")
+		}
 	}
 }
 
@@ -2066,5 +2073,126 @@ func TestSharedConcurrentSlotReleaseIsNotDoubt(t *testing.T) {
 	}
 	if _, ledger := poolLedger(t, c, recordA.SharedWorker.Pool); ledger.State != sharedAdmitting {
 		t.Fatalf("a concurrent slot release retired a healthy pool: %s %s", ledger.State, ledger.Reason)
+	}
+}
+
+func TestSharedPoolWithoutItsLabelIsStillDiscoveredAndRetired(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	pool.SetLabels(nil)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	native.nativeDown = true
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a shared pool whose label was removed escaped the bounds loop")
+	}
+}
+
+func TestSharedHardRetirementCannotBeBlockedByALedgerWrite(t *testing.T) {
+	t.Run("oversized scope", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		// A scope field padded toward the annotation limit is no longer a
+		// valid ledger, so it can never leave too little room to retire.
+		ledger.Scope.Shape = strings.Repeat("x", 30<<10)
+		data, err := json.Marshal(ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		annotations := maps.Clone(pool.GetAnnotations())
+		annotations[sharedLedgerAnnotation] = string(data)
+		pool.SetAnnotations(annotations)
+		if err := c.Update(t.Context(), pool); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readSharedLedger(pool); err == nil {
+			t.Fatal("a ledger with an oversized scope field was accepted")
+		}
+		if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+			t.Fatal("an oversized ledger blocked hard retirement")
+		}
+	})
+	t.Run("ledger write fails", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		setNow(t, sharedRetireAt(pool, ledger))
+		failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+				return apierrors.NewConflict(corev1.Resource("workerpools"), u.GetName(), errors.New("ledger write refused"))
+			}
+			return w.Update(ctx, obj, opts...)
+		}})
+		_ = (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+			t.Fatal("a failed ledger write blocked the lifetime retirement's Delete")
+		}
+	})
+	t.Run("escalation without a started deletion", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		setNow(t, sharedEscalateAt(pool, ledger))
+		var escalated []int64
+		failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+				return apierrors.NewInternalError(errors.New("pool delete refused"))
+			}
+			if _, ok := obj.(*corev1.Pod); ok {
+				options := &client.DeleteOptions{}
+				options.ApplyOptions(opts)
+				if options.GracePeriodSeconds != nil {
+					escalated = append(escalated, *options.GracePeriodSeconds)
+				}
+			}
+			return w.Delete(ctx, obj, opts...)
+		}})
+		_ = (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		if len(escalated) != 1 || escalated[0] != sharedEscalationGrace {
+			t.Fatalf("a failed pool deletion postponed the worker Pod's escalation: %v", escalated)
+		}
+	})
+}
+
+func TestSharedRewrittenLifetimeCannotExtendTheBound(t *testing.T) {
+	c, native, request := fixture(t, true)
+	useTestClock(t)
+	binding := createSharedProfile(t, c, "tenant", "short", "short-profile-uid", 2, 3*time.Hour)
+	first := sharedWorkspace(t, c, request, "tenant", "workspace", "workspace-uid", binding)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	created := pool.GetCreationTimestamp().Time
+	// A privileged writer rewrites the ledger lifetime and the deadline
+	// annotation consistently, to 24h.
+	ledger.Scope.Lifetime = metav1.Duration{Duration: 24 * time.Hour}
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	native.nativeDown = true
+	// The journal froze 3h: the bound and the disagreement both hold.
+	_, escalateAt, evidence := sharedBoundsOf(pool, sharedProvenance{found: true, lifetime: 3 * time.Hour, scopes: []sharedScope{record.SharedWorker.Scope}})
+	if evidence || escalateAt.After(created.Add(3*time.Hour)) {
+		t.Fatalf("a rewritten lifetime extended the bound: evidence=%v escalateAt=%s", evidence, escalateAt.Sub(created))
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a pool whose lifetime was rewritten past its journals' was not retired")
 	}
 }

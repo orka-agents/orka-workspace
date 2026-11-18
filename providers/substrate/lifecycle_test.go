@@ -699,6 +699,11 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 			uid++
 			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid)))
 		}
+		// The API server sets creationTimestamp, which the fake does not;
+		// shared pool lifetimes are bounded by it.
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" && u.GetCreationTimestamp().Time.IsZero() {
+			obj.SetCreationTimestamp(metav1.NewTime(sharedNow().UTC().Truncate(time.Second)))
+		}
 		return c.Create(ctx, obj, opts...)
 	}}).Build()
 	base := &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "base", Uid: "base-uid"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"selected": "native"}}, SnapshotConfig: &pb.SnapshotConfig{StorageLocation: "gs://native/snapshots", GoldenSnapshotConfig: &pb.GoldenSnapshotConfig{Mode: pb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED}}, Resources: &pb.ResourceRequirements{Limits: &pb.Resources{CpuMillicores: 1000, MemoryBytes: 512 << 20}}}
