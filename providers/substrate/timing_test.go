@@ -153,7 +153,7 @@ func requireKeys(t *testing.T, entry map[string]any, present, absent []string) {
 // the documented Orka-level identity and durations.
 func requireOnlyTimingFields(t *testing.T, entry map[string]any) {
 	t.Helper()
-	allowed := []string{"level", "ts", "msg", "workspaceNamespace", "workspaceName", "runtimePool", "sequence", "path", "operation",
+	allowed := []string{"level", "ts", "msg", "workspaceNamespace", "workspaceName", "runtimePool", "sequence", "path", "workerSource", "operation",
 		"workerPoolMs", "workerActiveMs", "templateCreateMs", "actorCreateMs", "templateUpdateMs", "workerToResumeMs", "resumeToChallengeMs", "challengeToReadyMs",
 		"suspendMs", "tagMs", "workerTeardownMs", "actorDeleteMs", "totalMs"}
 	for key := range entry {
@@ -210,7 +210,7 @@ func TestLifecycleTimingColdPathRecordsMilestonesAndLogsReadyOnce(t *testing.T) 
 	}
 	entry := logs.only(t, "Substrate runtime ready")
 	requireKeys(t, entry, []string{"workspaceNamespace", "workspaceName", "runtimePool", "sequence", "path", "workerPoolMs", "workerActiveMs", "templateCreateMs", "actorCreateMs", "workerToResumeMs", "resumeToChallengeMs", "challengeToReadyMs", "totalMs"}, []string{"templateUpdateMs"})
-	if entry["path"] != "cold" || entry["sequence"] != float64(1) || entry["workspaceNamespace"] != request.Key.Namespace || entry["workspaceName"] != request.Key.Name || entry["runtimePool"] != request.Runtime.PoolBinding.Name {
+	if entry["path"] != "cold" || entry["workerSource"] != "fresh" || entry["sequence"] != float64(1) || entry["workspaceNamespace"] != request.Key.Namespace || entry["workspaceName"] != request.Key.Name || entry["runtimePool"] != request.Runtime.PoolBinding.Name {
 		t.Fatalf("ready log identifies the wrong allocation: %v", entry)
 	}
 	requireOnlyTimingFields(t, entry)
@@ -289,7 +289,7 @@ func TestLifecycleTimingSuspendAndResumeFromTag(t *testing.T) {
 	}
 	resumeEntry := readyEntries[1]
 	requireKeys(t, resumeEntry, []string{"path", "workerPoolMs", "workerActiveMs", "templateCreateMs", "actorCreateMs", "templateUpdateMs", "workerToResumeMs", "resumeToChallengeMs", "challengeToReadyMs", "totalMs"}, nil)
-	if resumeEntry["path"] != "resume" || resumeEntry["sequence"] != float64(2) || readyEntries[0]["path"] != "cold" {
+	if resumeEntry["path"] != "resume" || resumeEntry["workerSource"] != "fresh" || resumeEntry["sequence"] != float64(2) || readyEntries[0]["path"] != "cold" {
 		t.Fatalf("ready logs name the wrong path: %v", readyEntries)
 	}
 	requireOnlyTimingFields(t, resumeEntry)
@@ -397,7 +397,7 @@ func TestLifecycleTimingPhasesNeedBothBounds(t *testing.T) {
 	for i := 0; i < len(values); i += 2 {
 		got[values[i].(string)] = values[i+1]
 	}
-	want := map[string]any{"workspaceNamespace": "tenant", "workspaceName": "workspace", "sequence": int64(3), "path": "cold", "workerPoolMs": int64(40), "resumeToChallengeMs": int64(600), "challengeToReadyMs": int64(250), "totalMs": int64(1750)}
+	want := map[string]any{"workspaceNamespace": "tenant", "workspaceName": "workspace", "sequence": int64(3), "path": "cold", "workerSource": "fresh", "workerPoolMs": int64(40), "resumeToChallengeMs": int64(600), "challengeToReadyMs": int64(250), "totalMs": int64(1750)}
 	if len(got) != len(want) {
 		t.Fatalf("phases = %v, want %v", got, want)
 	}

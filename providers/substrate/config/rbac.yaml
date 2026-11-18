@@ -39,7 +39,8 @@ rules:
     verbs: [delete]
   - apiGroups: [ate.dev]
     resources: [workerpools]
-    verbs: [get, list, create, delete]
+    # update claims a spare worker pool with a resourceVersion precondition.
+    verbs: [get, list, create, update, delete]
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
