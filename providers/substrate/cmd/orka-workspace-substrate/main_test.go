@@ -3,7 +3,11 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
+	"time"
 
 	provider "github.com/orka-agents/orka-workspace/providers/substrate"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -45,5 +49,32 @@ func TestValidConfigWhoseDialFailsKeepsStatusAndSharedBounds(t *testing.T) {
 	}
 	if setups := controllerSetups(nil, config, native, unavailable); len(setups) != 2 {
 		t.Fatalf("a failed dial registered %d controllers, want provider status and the Kubernetes-only shared worker bounds loop", len(setups))
+	}
+}
+
+type nopCloser struct{}
+
+func (nopCloser) Close() error { return nil }
+
+func TestDegradedProviderRestartsOnceNativeControlIsReachable(t *testing.T) {
+	failures := 2
+	r := nativeRedialer{interval: time.Millisecond, dial: func() (io.Closer, error) {
+		if failures > 0 {
+			failures--
+			return nil, errors.New("certificate not yet mounted")
+		}
+		return nopCloser{}, nil
+	}}
+	if err := r.Start(t.Context()); !errors.Is(err, errNativeControlRecovered) {
+		t.Fatalf("a recovered dial did not stop the degraded provider: %v", err)
+	}
+	if failures != 0 {
+		t.Fatal("the redialer stopped before native control was reachable")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	never := nativeRedialer{interval: time.Millisecond, dial: func() (io.Closer, error) { return nil, errors.New("unreachable") }}
+	if err := never.Start(ctx); err != nil {
+		t.Fatalf("a stopped manager made the redialer fail: %v", err)
 	}
 }

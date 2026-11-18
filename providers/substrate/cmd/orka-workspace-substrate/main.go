@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -85,6 +87,14 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 			return err
 		}
 	}
+	if unavailable != "" {
+		// A failed dial may be transient, such as TLS material mounted late.
+		// Keep retrying; once native control is reachable, stop so the
+		// restarted process runs every lifecycle controller.
+		if err := mgr.Add(nativeRedialer{dial: func() (io.Closer, error) { return provider.Dial(config) }, interval: nativeRedialInterval}); err != nil {
+			return err
+		}
+	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return err
 	}
@@ -122,3 +132,38 @@ func controllerSetups(c client.Client, config provider.Config, native pb.Control
 	}
 	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
 }
+
+const nativeRedialInterval = 30 * time.Second
+
+// errNativeControlRecovered stops a degraded provider once native control is
+// reachable, so its restart runs with every lifecycle controller.
+var errNativeControlRecovered = errors.New("native control became reachable; restarting with lifecycle controllers")
+
+// nativeRedialer retries a native dial that failed at startup. It runs on
+// every replica, so a degraded replica recovers whether or not it leads.
+type nativeRedialer struct {
+	dial     func() (io.Closer, error)
+	interval time.Duration
+}
+
+func (r nativeRedialer) Start(ctx context.Context) error {
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			conn, err := r.dial()
+			if err != nil {
+				ctrl.Log.V(1).Info("native control is still unreachable", "reason", err.Error())
+				continue
+			}
+			_ = conn.Close()
+			ctrl.Log.Info("native control is reachable; restarting to start lifecycle controllers")
+			return errNativeControlRecovered
+		}
+	}
+}
+
+func (nativeRedialer) NeedLeaderElection() bool { return false }
