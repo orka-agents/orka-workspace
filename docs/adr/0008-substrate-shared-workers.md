@@ -138,6 +138,7 @@ Anything else takes the private single-Actor path of ADR 0006.
   - one entry per hosted allocation: the journal marker `<namespace>/<name>/<uid>/<sequence>`, the Actor reference, and the Actor UID once it is known.
 - **Writes.** Every write is an Update preconditioned on the read resourceVersion.
 - **Claiming a slot.** An allocation journals its selection and `claimIssued` before it adds its own entry. It binds only after observing that entry. A pool it creates is created with its entry already in the ledger. Selection or claim doubt before the template exists falls back to another pool or a new pool.
+- **Parallel allocations.** Workspaces are reconciled in parallel, so the provider serializes, per scope and within its own process, the choice between joining a pool and creating one; a burst of cold starts then fills a pool before it creates another. A claim that loses a ledger write race re-reads the pool and repeats every admission check, at most five times in one pass, before it falls back. Neither changes what a claim requires: the ledger write's resourceVersion precondition is still what keeps a pool from being overfilled or claimed after it stops admitting.
 - **The Actor UID comes before Resume.** The entry receives the Actor UID before Resume, so an assignment can never precede its ledger entry.
 
 ### Startup
@@ -313,7 +314,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
 ### Warm capacity
 
 - **No private spares.** For opted-in profiles, free slots in admitting shared pools are the warm capacity, and ADR 0007 private spares are not created.
-- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it.
+- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it. An emptied pool that the count still needs keeps admitting until its admission closes, so a resume or cold start of the profile normally lands on a running worker. Without the annotation an emptied pool is kept only for the 5-minute idle period below.
 - **Inventory first.** Every pool creation, by an allocation or for warm capacity, requires a successful, complete template inventory showing no foreign template that could reach it. A failed inventory creates nothing.
 - **Collection.** The leader deletes an empty pool once it has been empty for 5 minutes and is not needed for warm slots, or once its admission has closed. Deletion first proves that no Actor is assigned, and carries UID and resourceVersion preconditions.
 - **Orphans.** A ledger entry whose exact journal record no longer holds it, and whose Actor is not assigned, is removed. A missing journal is not proof.
