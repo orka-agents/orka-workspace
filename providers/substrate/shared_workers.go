@@ -596,10 +596,13 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if shared.Create == nil {
 			return abandon("the shared worker disappeared")
 		}
+		// Every creation attempt, including a retry after a crash or a failed
+		// Create, needs a complete inventory that no foreign template could
+		// reach the new pool. The issuance marker never stands in for it.
+		if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), nil); err != nil {
+			return err
+		}
 		if !shared.CreateIssued {
-			if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), nil); err != nil {
-				return err
-			}
 			shared.CreateIssued = true
 			if err := d.save(ctx, cm, record); err != nil {
 				return err

@@ -1644,3 +1644,43 @@ func contextAwareClient(c client.Client) client.Client {
 		},
 	})
 }
+
+func TestSharedPoolCreateRetryRechecksTheTemplateInventory(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	createFailed := false
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Create: func(ctx context.Context, inner client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if _, shared := obj.GetLabels()[sharedPoolLabel]; shared && !createFailed {
+			createFailed = true
+			return errors.New("injected pool create failure")
+		}
+		return inner.Create(ctx, obj, opts...)
+	}})
+	for range 16 {
+		if _, err := sharedDriver(failing, native).EnsureAllocation(t.Context(), first); err != nil || createFailed {
+			break
+		}
+	}
+	if !createFailed {
+		t.Fatal("the shared pool Create was never attempted")
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker == nil || !record.SharedWorker.CreateIssued || len(sharedPools(t, c)) != 0 {
+		t.Fatal("the failed Create did not leave an issued creation with no pool")
+	}
+	// A foreign empty-selector template appears before the retry.
+	native.templates["foreign/open"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "open"}}
+	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), first); !errors.Is(err, errForeignTemplate) {
+		t.Fatalf("a creation retry skipped the template inventory: %v", err)
+	}
+	if len(sharedPools(t, c)) != 0 {
+		t.Fatal("a creation retry created a pool a foreign template could reach")
+	}
+	delete(native.templates, "foreign/open")
+	sharedReady(t, c, native, first)
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a clean inventory did not allow the retried creation")
+	}
+}
