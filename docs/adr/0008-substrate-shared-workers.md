@@ -175,7 +175,7 @@ The normal retirement path on a shared worker takes these steps:
 
 ### Strong fallback and strong retirement
 
-- **What it does.** The strong path closes the ledger (`Retiring`, or `Quarantined` for a foreign Actor or template) and deletes the WorkerPool with UID precondition and foreground propagation, using Kubernetes alone.
+- **What it does.** The strong path first deletes the WorkerPool, with UID precondition and foreground propagation, using Kubernetes alone. It then records the ledger state (`Retiring`, or `Quarantined` for a foreign Actor or template) as best effort.
 - **The proof.** Each hosted allocation then proves termination exactly as ADR 0006 does: the exact fenced worker Pod UID is absent and the pool is gone.
 - **Neighbours.** Deleting the worker Pod is how co-hosted Actors are suspended. Orka core observes the terminating worker and drains each one for data-only suspension inside its eviction window (Orka ADR 0046).
 
@@ -236,10 +236,12 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - A pool with shared evidence but without its intact provider-owned label is doubt and is strongly retired.
 - **Recorded markers.** An unreleased strong marker or failure in any journal that recorded a pool's UID retires the pool, whatever the mutable entry list says.
 - **Hard retirement.** It is never blocked by a ledger write.
-  - Lifetime, doubt, persisted states, missing labels and a withdrawn dedicated assertion record the state when they can, but always issue the UID-preconditioned Delete.
+  - Every strong retirement issues the UID-preconditioned Delete first, on its own fresh bounded context. A deletionTimestamp already stops admission and startup.
+  - The retirement state and reason are written afterwards, best effort, with a separate 5 s timeout. Neither the result nor the duration of that write can affect the Delete.
   - Escalation does not wait for that deletion to have started.
-  - Every variable-length ledger field is size-bounded, including the fenced worker's identity, and an accepted ledger also leaves explicit headroom. Any valid ledger therefore has room for its retirement write.
-  - A strong retirement's ledger write stops the Delete only on a conflict, so the decision is re-judged against the changed pool; any other write failure never blocks it.
+  - Every variable-length ledger field is size-bounded, including the fenced worker's identity.
+  - The ledger is encoded without HTML escaping, and an accepted ledger must leave explicit headroom both as stored and as re-encoded.
+  - Only the non-strong `Draining` transition keeps a resourceVersion-conflict recheck.
 - **Other reasons to close admission early.** Admission also closes when the operator pool's image or shape changes, the profile disappears, or the template inventory cannot be verified.
 - **Limits.** The bound assumes a responsive kubelet. The Pod's absence on a partitioned node cannot be proven, and its instances then never report termination.
 
