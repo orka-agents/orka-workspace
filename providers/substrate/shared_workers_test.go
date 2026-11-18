@@ -1853,3 +1853,117 @@ func TestSharedEvidenceStopJournalFailureTakesTheStrongPath(t *testing.T) {
 		t.Fatalf("the Stop replayed the suspend or fell back to interim evidence: calls=%d", native.suspendCalls)
 	}
 }
+
+func TestSharedUnverifiableStopTakesTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The shared pool cannot be read during the Stop's verification.
+	failures := 1
+	flaky := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" && key.Name == recordA.SharedWorker.Pool && failures > 0 {
+			failures--
+			return apierrors.NewInternalError(errors.New("pool read unavailable"))
+		}
+		return w.Get(ctx, key, obj, opts...)
+	}})
+	tick()
+	_, _ = sharedDriver(flaky, native).StopInstance(t.Context(), first.Key, a.Identity)
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failures != 0 || record.SharedWorker.Strong == "" {
+		t.Fatalf("an unverifiable Stop did not persist the strong path: %#v", record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("an unverifiable Stop did not start the pool's deletion")
+	}
+	if native.suspendCalls != 0 {
+		t.Fatal("an unverifiable Stop issued the evidence suspend")
+	}
+}
+
+func TestSharedLedgerEntryDisownedByItsJournalIsDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	// A healthy private allocation whose journal holds no shared slot.
+	private := sharedWorkspace(t, c, first, "tenant", "private", "private-uid", binding)
+	private.Runtime.Egress = fixtureEgress()
+	private.Runtime.RequiredFeatures = nil
+	private.Revision, _ = sdk.WorkloadRevision(private)
+	if err := admit(c)(t.Context(), private); err != nil {
+		t.Fatal(err)
+	}
+	sharedReady(t, c, native, private)
+	other := &corev1.ConfigMap{}
+	if err := c.Get(t.Context(), journalKey(private.Key), other); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite A's entry to name the private journal, keeping A's Actor.
+	pool, ledger := poolLedger(t, c, recordA.SharedWorker.Pool)
+	ledger.Entries[0].Journal = other.Namespace + "/" + other.Name + "/" + string(other.UID) + "/1"
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	if suspect, err := sharedDriver(c, native).sharedPoolHostsSuspect(t.Context(), pool, ledger); err != nil || !suspect {
+		t.Fatalf("admission accepted a booted entry its journal disowns: %v %v", suspect, err)
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a pool hiding an Actor behind another allocation's journal was not retired")
+	}
+}
+
+func TestSharedInvalidSnapshotAfterStrongAbsenceBecomesInstanceLoss(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+		t.Fatal(err)
+	}
+	native.suspendFidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.Failure == "" || record.Checkpoint != nil {
+		t.Fatalf("invalid evidence after proven absence did not become an honest instance loss: failure=%q checkpoint=%v", record.Failure, record.Checkpoint)
+	}
+	if podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the instance was reported lost before its worker Pod was proven absent")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if stopped.Observation.RetainedData != nil || native.suspendCalls != 1 {
+		t.Fatalf("the lost instance's Stop invented retained data or replayed the suspend: calls=%d", native.suspendCalls)
+	}
+}
+
+func TestSharedWarmCreationIgnoresATemplateForAnEmptyPoolLabel(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	// A generated shared label is never empty, so this cannot reach a pool.
+	native.templates["foreign/empty-value"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "empty-value"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{sharedPoolLabel: ""}}}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a template that can never reach a shared pool blocked warm provisioning")
+	}
+}

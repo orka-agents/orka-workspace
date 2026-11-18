@@ -393,15 +393,24 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
+			absent := false
 			if shared := record.SharedWorker; shared != nil && shared.Strong != "" {
 				// A persisted strong path drives the pool's deletion and the
 				// absence proof to completion whatever the checkpoint does,
 				// including after a crash right after Strong was saved.
-				if _, err := d.strongSharedAbsence(ctx, record); err != nil {
+				var err error
+				if absent, err = d.strongSharedAbsence(ctx, record); err != nil {
 					return err
 				}
 			}
 			err := d.capture(ctx, cm, record)
+			if absent && err != nil && captureUnrecoverable(err) {
+				// The worker is proven gone, so this capture can never be
+				// retried against a live source: its evidence is final. The
+				// instance is lost; no Tag is invented, the last verified
+				// checkpoint stays retained, and it retires through Stop.
+				err = lostInstance(record, "the strongly retired shared worker is gone and the suspension's data could not be captured ("+err.Error()+"); the last verified checkpoint is retained and uncertain work is never replayed")
+			}
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				// The capture source is gone, so this capture can never finish.
 				// The failed instance retires through the exact Stop path.
@@ -820,4 +829,18 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		return false, nil
 	}
 	return true, nil
+}
+
+// captureUnrecoverable reports a capture error that retrying cannot change:
+// one raised by this provider's own evidence checks. Native RPC status
+// errors, Kubernetes API errors and context errors may be transient.
+func captureUnrecoverable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if _, ok := status.FromError(err); ok {
+		return false
+	}
+	var api apierrors.APIStatus
+	return !errors.As(err, &api)
 }

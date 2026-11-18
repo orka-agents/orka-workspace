@@ -1306,7 +1306,10 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 	if record.BootRequested && !record.WorkloadAbsent {
 		if actor != nil && actor.GetStatus().GetWorkerAssignment() != nil && (record.Worker == nil || !sharedAssignmentMatches(actor.GetStatus().GetWorkerAssignment(), record.Worker)) {
 			if err := d.captureSharedReplacement(ctx, cm, record, actor); err != nil {
-				return err
+				if apierrors.IsConflict(err) {
+					return err
+				}
+				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor's replacement worker could not be recorded"))
 			}
 		}
 		// A persisted strong marker always wins, even over a journaled interim
@@ -1317,7 +1320,10 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		if reason == "" && shared.Proof == nil {
 			var err error
 			if reason, err = d.sharedStrongReason(ctx, cm, record); err != nil {
-				return err
+				// Unverifiable before the proof is doubt: persist it and start
+				// the pool's deletion (under the detached cleanup context)
+				// rather than leave no intent for the bounds loop to recover.
+				reason = "the shared worker could not be verified during retirement: " + err.Error()
 			}
 		}
 		if reason == "" && shared.Proof == nil {
@@ -1661,15 +1667,21 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 		if err != nil {
 			return false, err
 		}
-		if !found || record == nil {
-			continue
-		}
-		if shared := record.SharedWorker; shared != nil && shared.Pool == pool.GetName() && (shared.UID == "" || shared.UID == string(pool.GetUID())) && !shared.Released {
-			// A recorded strong path or instance failure is suspect before
-			// the workspace itself reports Failed.
-			if shared.Strong != "" || record.Failure != "" {
+		held := found && record != nil && sharedEntryHeld(record, pool, entry)
+		if !held {
+			// An entry that names an Actor UID is a booted slot. If its exact
+			// journal does not hold it, under that Actor's name and UID, the
+			// entry hides whose markers apply: doubt. A claim without an Actor
+			// UID can be an abandoned orphan and is neutral.
+			if entry.ActorUID != "" {
 				return true, nil
 			}
+			continue
+		}
+		// A recorded strong path or instance failure is suspect before the
+		// workspace itself reports Failed.
+		if record.SharedWorker.Strong != "" || record.Failure != "" {
+			return true, nil
 		}
 		workspace := &api.ExecutionWorkspace{}
 		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
@@ -1823,4 +1835,13 @@ const sharedCleanupTimeout = 30 * time.Second
 // Kubernetes, so it cannot be postponed by the native API either.
 func strongCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), sharedCleanupTimeout)
+}
+
+// sharedEntryHeld reports whether an entry's exact journal record holds this
+// pool's slot for the same Actor: name, and UID once the entry records one.
+func sharedEntryHeld(record *journalRecord, pool *unstructured.Unstructured, entry sharedLedgerEntry) bool {
+	shared := record.SharedWorker
+	return shared != nil && !shared.Released && shared.Pool == pool.GetName() &&
+		(shared.UID == "" || shared.UID == string(pool.GetUID())) && record.Placement.Namespace == pool.GetNamespace() &&
+		actorKey(record) == entry.Actor && (entry.ActorUID == "" || entry.ActorUID == record.Actor.UID)
 }

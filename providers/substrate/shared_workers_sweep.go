@@ -187,11 +187,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	}
 	for uid, shape := range shapes {
 		for free[uid] < shape.warm {
-			if templatesReach(templates, shape.scope.Atespace, map[string]string{sharedPoolLabel: ""}) {
-				errs = append(errs, errForeignTemplate)
-				break
-			}
-			if err := d.createWarmSharedPool(ctx, shape); err != nil {
+			if err := d.createWarmSharedPool(ctx, shape, templates); err != nil {
 				errs = append(errs, err)
 				break
 			}
@@ -233,7 +229,7 @@ func (d *Lifecycle) profileSharedShape(ctx context.Context, item *profile.Substr
 }
 
 // createWarmSharedPool creates an empty admitting shared pool.
-func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape) error {
+func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape, templates []*pb.ActorTemplate) error {
 	name, err := randomName(sharedPoolPrefix)
 	if err != nil {
 		return err
@@ -241,6 +237,11 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 	label, err := randomLabel()
 	if err != nil {
 		return err
+	}
+	// Checked against this pool's real labels: an empty selector, or one the
+	// generated label satisfies, still fails closed.
+	if templatesReach(templates, shape.scope.Atespace, sharedLabels(label)) {
+		return errForeignTemplate
 	}
 	spec, err := buildSharedPoolSpec(shape.source, shape.scope, label)
 	if err != nil {
@@ -461,10 +462,12 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 		if !journalFound || record == nil {
 			continue
 		}
-		held := record.SharedWorker != nil && !record.SharedWorker.Released && record.SharedWorker.Pool == pool.GetName() &&
-			(record.SharedWorker.UID == "" || record.SharedWorker.UID == string(pool.GetUID())) && record.Placement.Namespace == pool.GetNamespace() && actorKey(record) == entry.Actor
-		if !held {
-			if !assigned[entry.Actor] {
+		if !sharedEntryHeld(record, pool, entry) {
+			// An assigned or booted entry its exact journal disowns hides
+			// whose markers apply: doubt, never silently kept or collected.
+			if assigned[entry.Actor] || entry.ActorUID != "" {
+				suspect = true
+			} else {
 				orphans = append(orphans, entry.Journal)
 			}
 			continue
