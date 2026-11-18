@@ -1,6 +1,7 @@
 package substrate
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -378,7 +379,10 @@ func readSharedLedger(pool *unstructured.Unstructured) (*sharedLedger, error) {
 	// Every variable-length field is bounded above, so an accepted ledger
 	// always leaves room for its retirement state and reason; this is checked
 	// again explicitly so a future field cannot erode that headroom.
-	if len(raw) > sharedLedgerMaxBytes-sharedLedgerRetirementHeadroom {
+	// Measured on the size this provider would write back, so no escaping
+	// or re-encoding can make an accepted ledger overflow on retirement.
+	reencoded, err := encodeSharedLedger(ledger)
+	if err != nil || len(raw) > sharedLedgerMaxBytes-sharedLedgerRetirementHeadroom || len(reencoded) > sharedLedgerMaxBytes-sharedLedgerRetirementHeadroom {
 		return nil, fmt.Errorf("shared worker ledger leaves no room for its retirement write")
 	}
 	seen := map[string]bool{}
@@ -394,8 +398,21 @@ func readSharedLedger(pool *unstructured.Unstructured) (*sharedLedger, error) {
 	return ledger, nil
 }
 
+// encodeSharedLedger is the one ledger encoding, without HTML escaping, so a
+// field never expands to several times its length (json.Marshal escapes
+// <, > and & as six-byte sequences).
+func encodeSharedLedger(ledger *sharedLedger) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(ledger); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
+}
+
 func setSharedLedger(pool *unstructured.Unstructured, ledger *sharedLedger) error {
-	data, err := json.Marshal(ledger)
+	data, err := encodeSharedLedger(ledger)
 	if err != nil {
 		return err
 	}
@@ -1135,33 +1152,7 @@ func (d *Lifecycle) markSharedStrong(ctx context.Context, cm *corev1.ConfigMap, 
 // Actors are suspended: Orka core drains each for data-only suspension inside
 // the worker's eviction window.
 func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
-	if pool.GetDeletionTimestamp() != nil {
-		return nil
-	}
-	ctx, cancel := strongCleanupContext(ctx)
-	defer cancel()
-	if len(reason) > sharedLedgerReasonMax {
-		reason = reason[:sharedLedgerReasonMax]
-	}
-	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
-		ledger.State, ledger.Reason = state, reason
-		if err := setSharedLedger(pool, ledger); err != nil {
-			return err
-		}
-		// Only a conflict stops here: the pool changed since the snapshot the
-		// caller judged, so it is re-evaluated. Any other failed ledger write
-		// never blocks the Delete.
-		if err := d.client.Update(ctx, pool); apierrors.IsConflict(err) {
-			return err
-		}
-		namespace := ledger.Scope.Namespace
-		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "workspaceNamespace", namespace, "state", state, "reason", reason)
-	}
-	uid := pool.GetUID()
-	if err := d.client.Delete(ctx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return d.hardRetireSharedPool(ctx, pool, state, reason)
 }
 
 // revokeSharedEgress installs and verifies deny-all egress, removing every
@@ -1992,25 +1983,37 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
-	ctx, cancel := strongCleanupContext(ctx)
-	defer cancel()
 	if len(reason) > sharedLedgerReasonMax {
 		reason = reason[:sharedLedgerReasonMax]
 	}
-	var errs []error
+	// The UID-preconditioned Delete is mandatory and comes first, on its own
+	// fresh bounded context: neither the result nor the duration of the
+	// ledger write can affect it. A deletionTimestamp already stops admission
+	// and every startup verification.
+	deleteCtx, cancelDelete := strongCleanupContext(ctx)
+	uid := pool.GetUID()
+	err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground))
+	cancelDelete()
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
+	// The state and reason are recorded afterwards, best effort, with a
+	// short timeout of their own.
 	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
 		ledger.State, ledger.Reason = state, reason
 		recorded := pool.DeepCopy()
 		if err := setSharedLedger(recorded, ledger); err == nil {
-			if err := d.client.Update(ctx, recorded); err != nil {
-				errs = append(errs, err)
+			writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+			if err := d.client.Update(writeCtx, recorded); err != nil && !apierrors.IsNotFound(err) {
+				ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement state not recorded; the pool is already deleting", "reason", err.Error())
 			}
+			cancelWrite()
 		}
 	}
-	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
-	uid := pool.GetUID()
-	if err := d.client.Delete(ctx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
+	return nil
 }
+
+// sharedLedgerWriteTimeout bounds the best-effort retirement state write that
+// follows a strong retirement's Delete.
+const sharedLedgerWriteTimeout = 5 * time.Second

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -2328,5 +2329,87 @@ func TestSharedWorkerIdentityIsBoundedAndStrongDeletesSurviveLedgerWrites(t *tes
 	}
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
 		t.Fatal("a failed ledger write blocked a strong retirement's Delete")
+	}
+}
+
+func TestSharedEscapedCharacterLedgerCannotBlockRetirement(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	// Fabricated booted entries within the per-field limits, made of
+	// characters json.Marshal would escape six-fold.
+	ledger.Scope.MaxActors = 16
+	ledger.Entries = nil
+	for i := range 16 {
+		ledger.Entries = append(ledger.Entries, sharedLedgerEntry{Journal: fmt.Sprintf("%03d", i) + strings.Repeat("<", sharedLedgerJournalMax-3), Actor: fmt.Sprintf("%03d", i) + strings.Repeat("&", sharedLedgerFieldMax-3), ActorUID: strings.Repeat(">", sharedLedgerFieldMax)})
+	}
+	raw, err := encodeSharedLedger(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if escaped, _ := json.Marshal(ledger); len(escaped) <= sharedLedgerMaxBytes || len(raw) >= sharedLedgerMaxBytes {
+		t.Fatalf("fixture does not model six-fold escaping: raw=%d escaped=%d", len(raw), len(escaped))
+	}
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedLedgerAnnotation] = string(raw)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	// Written without HTML escaping, the accepted ledger re-encodes to the
+	// same size, so its retirement write always fits.
+	if accepted, err := readSharedLedger(pool); err == nil {
+		reencoded, err := encodeSharedLedger(accepted)
+		if err != nil || len(reencoded) > sharedLedgerMaxBytes-sharedLedgerRetirementHeadroom {
+			t.Fatalf("an accepted ledger re-encodes past its headroom: %d %v", len(reencoded), err)
+		}
+	}
+	// A suspicion-driven retirement of exactly this pool deletes it.
+	if err := sharedDriver(c, native).retireSharedPool(t.Context(), pool, sharedRetiring, "fabricated booted entries"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("an escaped-character ledger blocked the strong retirement")
+	}
+}
+
+func TestSharedBlockedLedgerWriteCannotDelayTheDelete(t *testing.T) {
+	for _, path := range []string{"retire", "hard", "bounds"} {
+		t.Run(path, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+			// An update-only admission webhook that times out: every pool
+			// Update blocks until its context expires.
+			blocking := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return w.Update(ctx, obj, opts...)
+			}}))
+			// Keep the pool observable after its Delete, as foreground
+			// propagation does, so the later state write really runs.
+			pool.SetFinalizers([]string{"test.invalid/hold"})
+			if err := c.Update(t.Context(), pool); err != nil {
+				t.Fatal(err)
+			}
+			pool, _ = poolLedger(t, c, record.SharedWorker.Pool)
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			switch path {
+			case "retire":
+				_ = New(blocking, native, sharedConfig()).retireSharedPool(ctx, pool, sharedQuarantined, "foreign Actor")
+			case "hard":
+				_ = New(blocking, native, sharedConfig()).hardRetireSharedPool(ctx, pool, sharedRetiring, "lifetime")
+			case "bounds":
+				setNow(t, sharedRetireAt(pool, ledger))
+				_ = (&SpareWorkerReplenisher{Client: blocking, Config: sharedConfig()}).EnforceSharedBounds(ctx)
+			}
+			current, found := getPool(t, c, record.SharedWorker.Pool)
+			if !found || current.GetDeletionTimestamp() == nil {
+				t.Fatal("a blocked ledger write delayed or prevented the mandatory Delete")
+			}
+		})
 	}
 }
