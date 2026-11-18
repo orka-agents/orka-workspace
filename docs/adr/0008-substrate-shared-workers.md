@@ -76,7 +76,7 @@ paired with revocation of everything a leaked sandbox could use.
 
 - **A profile field, so opting in needs a new profile.** `SubstrateWorkspaceProfile.spec.placement.sharedWorkers` is:
   - `maxActorsPerWorker`: required, from 2 to 16;
-  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h.
+  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h, in whole seconds.
 - **Hashed and immutable.** The spec is immutable and hashed by `sdk.ParametersProfileHash`. Sharing changes the security model, so it belongs in the frozen spec, never in a mutable annotation.
 - **Today's behavior when absent.** An absent field keeps ADRs 0006 and 0007 on the allocation path: same private pool, same proof, same API calls. Existing profile hashes do not change. The leader sweep adds one Kubernetes list of shared pools per pass, so it can enforce lifetimes left by deleted profiles. It makes no native call while no profile opts in and no shared pool exists.
 - **Validation.** The field requires `suspend.mode: DataOnly`, checked by CEL and by `Validate`.
@@ -193,7 +193,7 @@ These take the strong path:
 
   Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued. Once the worker Pod is proven absent, that instance is reported lost and retires through Stop, keeping its last checkpoint.
 - **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
-  - a hosted entry's journal holds the marker or a recorded instance failure;
+  - a hosted entry's journal holds the marker or a recorded instance failure, or cannot be decoded (its markers are then unreadable, which is doubt, and also blocks admission);
   - a hosted workspace is operator-tainted, quarantined or `Failed`;
   - its ledger was saved as `Retiring` or `Quarantined`.
 
