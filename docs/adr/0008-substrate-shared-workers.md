@@ -191,9 +191,12 @@ These take the strong path:
   - any Tag-capture step fails;
   - the evidence-only suspend issued by a Stop is rejected or times out, or any later step of that Stop's interim evidence fails, including a journal write (a write conflict is retried). The strong reason is persisted, and the pool's retirement started, before that pass returns.
 
-  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued. Once the worker Pod is proven absent, that instance is reported lost and retires through Stop, keeping its last checkpoint.
+  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued.
+  - Once the worker Pod is proven absent, a capture that still fails one of the provider's own evidence checks (not a retryable native or Kubernetes error) is final. That instance is reported lost and retires through Stop, keeping its last verified checkpoint; no Tag is invented.
+  - A Stop whose shared worker, ledger or workspace cannot be verified before its proof also takes the strong path.
 - **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
   - a hosted entry's journal holds the marker or a recorded instance failure, or cannot be decoded (its markers are then unreadable, which is doubt, and also blocks admission);
+  - a booted entry (one with an Actor UID, or an assigned Actor) whose exact journal does not hold that slot under the same Actor name and UID. Such an entry would hide whose markers apply, so it is doubt.
   - a hosted workspace is operator-tainted, quarantined or `Failed`;
   - its ledger was saved as `Retiring` or `Quarantined`.
 
