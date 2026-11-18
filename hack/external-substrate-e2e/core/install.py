@@ -64,6 +64,17 @@ for obj in objects:
                            if arg.startswith(("--acp-provider-proxy-base-url=", "--controller-url=")) else arg
                            for arg in manager["args"]]
 
+# Core's API authenticates ServiceAccount callers (such as core/cleanup.sh's
+# Session cleanup) by TokenReview, as the released chart grants through
+# config/rbac/metrics_auth_role.yaml.
+add_tokenreview = [
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "external-substrate-core-tokenreview"},
+     "rules": [{"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]}]},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "external-substrate-core-tokenreview"},
+     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "external-substrate-core-tokenreview"},
+     "subjects": [{"kind": "ServiceAccount", "name": "orka-controller-manager", "namespace": namespace}]}]
+objects.extend(add_tokenreview)
+
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
 objects.append(role)
