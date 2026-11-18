@@ -51,6 +51,8 @@ type latency struct {
 	window     time.Duration
 	events     []map[string]any
 	violations []string
+	// sharedWorkspaces names workspaces placed on shared workers.
+	sharedWorkspaces map[string]bool
 }
 
 // emit prints one machine-readable event and keeps it for the final report.
@@ -299,8 +301,11 @@ func (l *latency) waitSuspended(ctx context.Context, name, poolName string, befo
 		if err != nil {
 			return false, err
 		}
-		// Exactly the Actor and worker Pod that ran before the detach.
-		return !last.ActorExists && !last.WorkerPodExists && l.instanceGone(ctx, w.Namespace, before), nil
+		// Exactly the Actor and worker Pod that ran before the detach. A
+		// shared worker (provider ADR 0008) outlives its Actors, so only the
+		// Actor's absence counts there.
+		shared := l.sharedWorkspaces[name]
+		return !last.ActorExists && (shared || !last.WorkerPodExists) && l.instanceGone(ctx, w.Namespace, before, shared), nil
 	})
 	if err != nil {
 		return last, time.Since(started), fmt.Errorf("workspace %s suspension: %w", name, err)
@@ -310,7 +315,7 @@ func (l *latency) waitSuspended(ctx context.Context, name, poolName string, befo
 
 // instanceGone reports the exact Actor UID and worker Pod UID of an earlier
 // snapshot absent. It is conservative: any read error counts as present.
-func (l *latency) instanceGone(ctx context.Context, atespace string, s *snapshot) bool {
+func (l *latency) instanceGone(ctx context.Context, atespace string, s *snapshot, sharedWorker bool) bool {
 	if s == nil || s.ActorUID == "" {
 		return true
 	}
@@ -323,7 +328,7 @@ func (l *latency) instanceGone(ctx context.Context, atespace string, s *snapshot
 			return false
 		}
 	}
-	if namespace, name, ok := strings.Cut(s.WorkerPod, "/"); ok {
+	if namespace, name, ok := strings.Cut(s.WorkerPod, "/"); ok && !sharedWorker {
 		pod := &corev1.Pod{}
 		err := l.c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pod)
 		if err == nil && string(pod.UID) == s.WorkerPodUID {
@@ -632,7 +637,7 @@ func (l *latency) ensureClass(ctx context.Context, name string, options classOpt
 // measure runs LATENCY_SCENARIOS (default "detach,warm") LATENCY_REPEATS
 // times (default 3) with warm window LATENCY_WINDOW (default 2m).
 func (p *proof) measure(ctx context.Context) (map[string]any, error) {
-	l := &latency{proof: p, start: time.Now(), window: 2 * time.Minute}
+	l := &latency{proof: p, start: time.Now(), window: 2 * time.Minute, sharedWorkspaces: map[string]bool{}}
 	if raw := os.Getenv("LATENCY_WINDOW"); raw != "" {
 		window, err := time.ParseDuration(raw)
 		if err != nil {

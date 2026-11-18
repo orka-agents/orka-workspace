@@ -411,6 +411,9 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 		return nil, err
 	}
 	a1, b1 := turns[0], turns[1]
+	for _, t := range turns {
+		l.sharedWorkspaces[t.Workspace] = true
+	}
 	snapshots := map[string]*snapshot{}
 	for _, t := range turns {
 		w, err := l.workspace(ctx, t.Workspace)
@@ -610,6 +613,7 @@ func (l *latency) scopeScenario(ctx context.Context, rep int, otherProfileUID st
 	if err != nil {
 		return nil, err
 	}
+	l.sharedWorkspaces[t.Workspace] = true
 	w, err := l.waitSettled(ctx, t)
 	if err != nil {
 		return nil, err

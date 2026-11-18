@@ -96,7 +96,8 @@ jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "
   .spec.template.metadata = {labels:{"orka.workspace.e2e/latency":"native-core"}} |
   .spec.template.spec.containers[0].image = $image |
   .spec.template.spec.containers[0].env += [{name:"LATENCY_MEASURE",value:"1"},{name:"LATENCY_REPEATS",value:$repeats},
-    {name:"LATENCY_WINDOW",value:$window},{name:"LATENCY_SCENARIOS",value:$scenarios},{name:"LATENCY_RUN_ID",value:$sequence}]' <<<"${job}" |
+    {name:"LATENCY_WINDOW",value:$window},{name:"LATENCY_SCENARIOS",value:$scenarios},{name:"LATENCY_RUN_ID",value:$sequence}] +
+    ($ARGS.named.extra | to_entries | map({name: .key, value: .value}))' --argjson extra "$(jq -n 'env | with_entries(select(.key | test("^LATENCY_(SPARE_WORKERS|SHARED_ACTORS|SHARED_SESSIONS|SHARED_SPARES|SHARED_LIFETIME)$")))')" <<<"${job}" |
   kubectl create -f -
 start="$(date +%s)"
 status=0
