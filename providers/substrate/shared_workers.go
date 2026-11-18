@@ -629,28 +629,76 @@ func (d *Lifecycle) updateSharedLedger(ctx context.Context, namespace, name, uid
 	return true, d.client.Update(ctx, pool)
 }
 
-// sharedAssignmentsInLedger lists the worker's assignments, then re-reads the
-// ledger, so an entry written before a concurrent Resume is always seen. It
-// fails closed on any assigned Actor that is not a ledger entry with the same
-// UID, and reports whether this record's Actor is assigned.
-func (d *Lifecycle) sharedAssignmentsInLedger(ctx context.Context, record *journalRecord, workerName string) (assigned bool, count int, err error) {
+// listWorkerAssignments lists every Actor assignment on a worker.
+func (d *Lifecycle) listWorkerAssignments(ctx context.Context, workerName string) ([]*pb.ActorAssignment, error) {
 	var assignments []*pb.ActorAssignment
 	page := ""
 	seen := map[string]bool{}
 	for {
 		response, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: &pb.ObjectRef{Name: workerName}, Options: &pb.ListOptions{PageSize: 1000, PageToken: page}})
 		if err != nil {
-			return false, 0, err
+			return nil, err
 		}
 		assignments = append(assignments, response.GetActorAssignments()...)
 		page = response.GetNextPageToken()
 		if page == "" {
-			break
+			return assignments, nil
 		}
 		if seen[page] || len(seen) >= 100 {
-			return false, 0, fmt.Errorf("native assignment pagination repeated a token or exceeded its bound")
+			return nil, fmt.Errorf("native assignment pagination repeated a token or exceeded its bound")
 		}
 		seen[page] = true
+	}
+}
+
+func assignmentRef(assignment *pb.ActorAssignment) string {
+	return assignment.GetActor().GetAtespace() + "/" + assignment.GetActor().GetName()
+}
+
+func ledgerHolds(ledger *sharedLedger, assignment *pb.ActorAssignment) bool {
+	ref := assignmentRef(assignment)
+	return slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool {
+		return entry.ActorUID != "" && entry.ActorUID == assignment.GetActorUid() && entry.Actor == ref
+	})
+}
+
+// foreignAssignment reports an assignment that is not in the ledger. The
+// assignments are listed before the ledger is read, so an entry written
+// before a concurrent Resume is always seen. An entry is released only after
+// its Actor is deleted, so a listed assignment whose entry was released in
+// between is stale: an unmatched assignment is foreign only if a second
+// listing, taken after the ledger read, still reports it.
+func (d *Lifecycle) foreignAssignment(ctx context.Context, workerName string, assignments []*pb.ActorAssignment, ledger *sharedLedger) (bool, error) {
+	var unmatched []*pb.ActorAssignment
+	for _, assignment := range assignments {
+		if !ledgerHolds(ledger, assignment) {
+			unmatched = append(unmatched, assignment)
+		}
+	}
+	if len(unmatched) == 0 {
+		return false, nil
+	}
+	again, err := d.listWorkerAssignments(ctx, workerName)
+	if err != nil {
+		return false, err
+	}
+	for _, assignment := range unmatched {
+		if slices.ContainsFunc(again, func(current *pb.ActorAssignment) bool {
+			return current.GetActorUid() == assignment.GetActorUid() && assignmentRef(current) == assignmentRef(assignment)
+		}) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// sharedAssignmentsInLedger lists the worker's assignments, then re-reads the
+// ledger. It fails closed on any assigned Actor that is not a ledger entry
+// with the same UID, and reports whether this record's Actor is assigned.
+func (d *Lifecycle) sharedAssignmentsInLedger(ctx context.Context, record *journalRecord, workerName string) (assigned bool, count int, err error) {
+	assignments, err := d.listWorkerAssignments(ctx, workerName)
+	if err != nil {
+		return false, 0, err
 	}
 	pool, err := d.getSharedPool(ctx, record)
 	if err != nil {
@@ -663,13 +711,15 @@ func (d *Lifecycle) sharedAssignmentsInLedger(ctx context.Context, record *journ
 	if err != nil {
 		return false, 0, err
 	}
+	foreign, err := d.foreignAssignment(ctx, workerName, assignments, ledger)
+	if err != nil {
+		return false, 0, err
+	}
+	if foreign {
+		return false, 0, fmt.Errorf("native shared worker hosts an Actor outside its ledger; admission is closed")
+	}
 	for _, assignment := range assignments {
-		ref := assignment.GetActor().GetAtespace() + "/" + assignment.GetActor().GetName()
-		if !slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool {
-			return entry.ActorUID != "" && entry.ActorUID == assignment.GetActorUid() && entry.Actor == ref
-		}) {
-			return false, 0, fmt.Errorf("native shared worker hosts an Actor outside its ledger; admission is closed")
-		}
+		ref := assignmentRef(assignment)
 		if ref == actorKey(record) || assignment.GetActorUid() == record.Actor.UID {
 			if record.Actor.UID == "" || assignment.GetActorUid() != record.Actor.UID || ref != actorKey(record) {
 				return false, 0, sdk.ErrStaleIdentity

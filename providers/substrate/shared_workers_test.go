@@ -791,3 +791,28 @@ func TestSharedWorkerWaitsForASettledEpochAndRetiresARestartedWorker(t *testing.
 		t.Fatal("an allocation joined a retired shared worker")
 	}
 }
+
+func TestSharedStaleAssignmentOfARetiredActorIsNotForeign(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	_, recordB := sharedReady(t, c, native, second)
+	sharedRetired(t, c, native, first, a.Identity, true)
+	stale := &pb.ActorAssignment{Actor: actorRef(recordA), ActorUid: recordA.Actor.UID}
+	native.staleOnce = map[string]*pb.ActorAssignment{recordB.Worker.Name: stale}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, recordB.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a stale listing of a released Actor quarantined the pool: %s", ledger.State)
+	}
+	native.staleOnce = map[string]*pb.ActorAssignment{recordB.Worker.Name: stale}
+	if _, err := sharedDriver(c, native).Observe(t.Context(), second.Key); err != nil {
+		t.Fatalf("a stale listing of a released Actor failed the neighbour: %v", err)
+	}
+	// A foreign Actor that stays assigned still fails closed.
+	native.foreignWorkers = map[string]bool{recordB.Worker.Name: true}
+	if _, err := sharedDriver(c, native).Observe(t.Context(), second.Key); err == nil {
+		t.Fatal("a persistent foreign assignment was accepted")
+	}
+}

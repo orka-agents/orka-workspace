@@ -75,6 +75,9 @@ type nativeFixture struct {
 	lingering map[string]*pb.ActorAssignment
 	// failGetWorker fails the next GetWorker calls.
 	failGetWorker int
+	// staleOnce reports these assignments in only the next listing of their
+	// worker, as a listing taken just before a retirement released them.
+	staleOnce map[string]*pb.ActorAssignment
 	// nativeDown fails every Worker read, as an unavailable control plane.
 	nativeDown bool
 	// churnWorker bumps a Worker's version on every read, as concurrent
@@ -469,6 +472,10 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 		if v.Status.GetWorkerAssignment().GetWorker().GetName() == req.Worker.Name {
 			out.ActorAssignments = append(out.ActorAssignments, &pb.ActorAssignment{Actor: &pb.ObjectRef{Atespace: v.Metadata.Atespace, Name: v.Metadata.Name}, ActorUid: v.Metadata.Uid})
 		}
+	}
+	if stale := f.staleOnce[req.Worker.Name]; stale != nil {
+		delete(f.staleOnce, req.Worker.Name)
+		out.ActorAssignments = append(out.ActorAssignments, proto.Clone(stale).(*pb.ActorAssignment))
 	}
 	for name, assignment := range f.lingering {
 		if f.workers[req.Worker.Name] != nil && strings.HasPrefix(name, req.Worker.Name+"|") {

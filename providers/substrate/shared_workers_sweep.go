@@ -282,30 +282,13 @@ func (r *SpareWorkerReplenisher) writeLedger(ctx context.Context, pool *unstruct
 	return err
 }
 
-// sharedForeignAssignment lists a worker's assignments and then re-reads the
-// pool's ledger, reporting any assigned Actor that is not a ledger entry with
-// the same UID.
+// sharedForeignAssignment lists a worker's assignments, then re-reads the
+// pool's ledger, and reports an assigned Actor that is not a ledger entry with
+// the same UID and that a second listing still reports.
 func sharedForeignAssignment(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, worker string) (bool, error) {
-	var assignments []*pb.ActorAssignment
-	page := ""
-	seen := map[string]bool{}
-	for {
-		response, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: &pb.ObjectRef{Name: worker}, Options: &pb.ListOptions{PageSize: 1000, PageToken: page}})
-		if err != nil {
-			return false, err
-		}
-		assignments = append(assignments, response.GetActorAssignments()...)
-		page = response.GetNextPageToken()
-		if page == "" {
-			break
-		}
-		if seen[page] || len(seen) >= 100 {
-			return false, fmt.Errorf("native assignment pagination repeated a token or exceeded its bound")
-		}
-		seen[page] = true
-	}
-	if len(assignments) == 0 {
-		return false, nil
+	assignments, err := d.listWorkerAssignments(ctx, worker)
+	if err != nil || len(assignments) == 0 {
+		return false, err
 	}
 	current := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKeyFromObject(pool), current); err != nil {
@@ -318,15 +301,7 @@ func sharedForeignAssignment(ctx context.Context, d *Lifecycle, pool *unstructur
 	if err != nil {
 		return true, nil
 	}
-	for _, assignment := range assignments {
-		ref := assignment.GetActor().GetAtespace() + "/" + assignment.GetActor().GetName()
-		if !slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool {
-			return entry.ActorUID != "" && entry.ActorUID == assignment.GetActorUid() && entry.Actor == ref
-		}) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return d.foreignAssignment(ctx, worker, assignments, ledger)
 }
 
 // sharedLedgerHosts reads each entry's exact journal record. It reports
