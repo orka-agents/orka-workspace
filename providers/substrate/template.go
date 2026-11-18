@@ -84,25 +84,11 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	if base.GetMetadata().GetUid() == "" {
 		return fmt.Errorf("native infrastructure requires an exact template identity")
 	}
-	match := base.GetWorkerSelector().GetMatchLabels()
-	if len(match) == 0 {
-		return fmt.Errorf("native template must select exactly one WorkerPool")
-	}
-	pools := &unstructured.UnstructuredList{}
-	pools.SetAPIVersion(workerPoolAPIVersion())
-	pools.SetKind("WorkerPoolList")
-	if err := d.client.List(ctx, pools, client.MatchingLabels(match)); err != nil {
+	source, err := d.operatorPool(ctx, base)
+	if err != nil {
 		return err
 	}
-	pools.Items = slices.DeleteFunc(pools.Items, func(pool unstructured.Unstructured) bool {
-		_, allocation := pool.GetLabels()[workerAllocationLabel]
-		_, instance := pool.GetLabels()[workerInstanceLabel]
-		return allocation || instance
-	})
-	if len(pools.Items) != 1 || pools.Items[0].GetUID() == "" {
-		return fmt.Errorf("native selector must identify one exact WorkerPool")
-	}
-	record.Placement = api.PodReference{Namespace: pools.Items[0].GetNamespace(), Name: pools.Items[0].GetName(), UID: pools.Items[0].GetUID()}
+	record.Placement = api.PodReference{Namespace: source.GetNamespace(), Name: source.GetName(), UID: source.GetUID()}
 	compiled := proto.Clone(base).(*pb.ActorTemplate)
 	compiled.Metadata = &pb.ResourceMetadata{Atespace: record.Atespace, Name: record.Template.Name}
 	compiled.Status = nil
@@ -150,6 +136,31 @@ func (d *Lifecycle) compileTemplate(ctx context.Context, record *journalRecord, 
 	record.TemplateSpec = compiled
 	record.Template.Digest, err = templateDigest(compiled)
 	return err
+}
+
+// operatorPool returns the one operator WorkerPool the infrastructure
+// template selects. Private per-instance pools and spares carry birth labels
+// and are never candidates.
+func (d *Lifecycle) operatorPool(ctx context.Context, base *pb.ActorTemplate) (*unstructured.Unstructured, error) {
+	match := base.GetWorkerSelector().GetMatchLabels()
+	if len(match) == 0 {
+		return nil, fmt.Errorf("native template must select exactly one WorkerPool")
+	}
+	pools := &unstructured.UnstructuredList{}
+	pools.SetAPIVersion(workerPoolAPIVersion())
+	pools.SetKind("WorkerPoolList")
+	if err := d.client.List(ctx, pools, client.MatchingLabels(match)); err != nil {
+		return nil, err
+	}
+	pools.Items = slices.DeleteFunc(pools.Items, func(pool unstructured.Unstructured) bool {
+		_, allocation := pool.GetLabels()[workerAllocationLabel]
+		_, instance := pool.GetLabels()[workerInstanceLabel]
+		return allocation || instance
+	})
+	if len(pools.Items) != 1 || pools.Items[0].GetUID() == "" {
+		return nil, fmt.Errorf("native selector must identify one exact WorkerPool")
+	}
+	return &pools.Items[0], nil
 }
 
 func compileContainer(record *journalRecord) (*pb.Container, error) {
