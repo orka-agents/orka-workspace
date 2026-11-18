@@ -312,7 +312,7 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 		{"maxActorsPerWorker": int64(16), "maxWorkerLifetime": "24h"},
 		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "3h"},
 		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "10800s"},
-		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "4.5h"},
+		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "3h30m"},
 	} {
 		object := shared(policy)
 		if errs := schema.validate(t, object, nil); len(errs) != 0 {
@@ -337,6 +337,11 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 		"fractional seconds":    shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "10800.5s"}),
 		"fractional components": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "3h0m0.5s"}),
 		"sub-millisecond":       shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "3h0m0.0005s"}),
+		// The cheap rule is stricter than Validate: any fraction or
+		// sub-second unit is refused, even when the total is whole seconds.
+		"fractional hours": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "4.5h"}),
+		"milliseconds":     shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "10800000ms"}),
+		"oversized":        shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "000000000000000000000000000000003h"}),
 	} {
 		if len(schema.validate(t, object, nil)) == 0 {
 			t.Fatalf("%s accepted by generated schema", name)

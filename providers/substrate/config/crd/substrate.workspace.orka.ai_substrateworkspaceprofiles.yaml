@@ -78,6 +78,7 @@ spec:
                           early enough for the worker Pod's full termination grace to elapse
                           before the bound, and admission closes an hour before that. From 3h to
                           24h; defaults to 24h.
+                        maxLength: 32
                         type: string
                     required:
                     - maxActorsPerWorker
@@ -87,10 +88,9 @@ spec:
                       rule: '!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime)
                         >= duration(''3h'') && duration(self.maxWorkerLifetime) <=
                         duration(''24h''))'
-                    - message: maxWorkerLifetime must be a whole number of seconds
-                      rule: '!has(self.maxWorkerLifetime) || duration(self.maxWorkerLifetime)
-                        == duration(string(duration(self.maxWorkerLifetime).getSeconds())
-                        + ''s'')'
+                    - message: maxWorkerLifetime must be written in whole hours, minutes
+                        or seconds, without fractions or sub-second units
+                      rule: '!has(self.maxWorkerLifetime) || !self.maxWorkerLifetime.matches(''[.]|ms|us|µs|μs|ns'')'
                 type: object
               retention:
                 description: |-
