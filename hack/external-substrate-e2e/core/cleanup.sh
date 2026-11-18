@@ -24,6 +24,77 @@ session_job_name="${namespace}-session"
 proof_job_json() {
   kubectl -n "${client_namespace}" get job "${1:-${namespace}}" -o json --ignore-not-found
 }
+# A Session turn keeps Core's Task finalizer until its Session is archived:
+# only Core's Session API (DELETE /api/v1/sessions/<name>) retires the
+# Session's runtime and records the per-turn cleanup receipts the finalizer
+# waits for. Like Orka's own e2e cleanup, the Tasks are deleted first, then
+# each Session is archived with a short-lived token of a run-namespace identity
+# that may only read and delete Sessions. 409 means unsettled work; retry it.
+port_forward_pid=""
+archive_dir=""
+stop_archive() {
+  [[ -z "${port_forward_pid}" ]] || kill "${port_forward_pid}" 2>/dev/null || true
+  port_forward_pid=""
+  [[ -z "${archive_dir}" ]] || rm -rf "${archive_dir}"
+  archive_dir=""
+}
+trap stop_archive EXIT
+archive_sessions() {
+  local identity=native-core-session-cleanup port="" token status session deadline rbac_deadline
+  kubectl apply -f - <<EOF
+apiVersion: v1
+kind: List
+items:
+- {apiVersion: v1, kind: ServiceAccount, metadata: {name: ${identity}, namespace: ${namespace}}}
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata: {name: ${identity}, namespace: ${namespace}}
+  rules: [{apiGroups: [core.orka.ai], resources: [sessions], verbs: [get, delete]}]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata: {name: ${identity}, namespace: ${namespace}}
+  roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ${identity}}
+  subjects: [{kind: ServiceAccount, name: ${identity}, namespace: ${namespace}}]
+EOF
+  archive_dir="$(mktemp -d)"
+  chmod 700 "${archive_dir}"
+  kubectl -n "${namespace}" port-forward deployment/external-substrate-core :8080 >"${archive_dir}/port-forward.log" 2>&1 &
+  port_forward_pid=$!
+  for _ in $(seq 60); do
+    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 8080$/\1/p' "${archive_dir}/port-forward.log" | head -n 1)"
+    [[ -n "${port}" ]] && break
+    kill -0 "${port_forward_pid}" 2>/dev/null || break
+    sleep 1
+  done
+  [[ -n "${port}" ]] || { printf 'Core API port-forward did not start:\n' >&2; cat "${archive_dir}/port-forward.log" >&2; exit 1; }
+  token="$(kubectl -n "${namespace}" create token "${identity}" --duration=10m)"
+  rbac_deadline=$(( $(date +%s) + 30 ))
+  while IFS= read -r session; do
+    [[ -n "${session}" ]] || continue
+    deadline=$(( $(date +%s) + 300 ))
+    while true; do
+      status="$(curl -sS -o "${archive_dir}/response" -w '%{http_code}' --max-time 60 -X DELETE -K - \
+        "http://127.0.0.1:${port}/api/v1/sessions/$(jq -rn --arg name "${session}" '$name | @uri')?namespace=${namespace}" \
+        <<<"header = \"Authorization: Bearer ${token}\"")" || status=000
+      case "${status}" in
+        204|404) printf 'Session %s archived (HTTP %s).\n' "${session}" "${status}"; break ;;
+        409|000) ;;
+        # Only while the new RoleBinding reaches the authorizer.
+        403) (( $(date +%s) < rbac_deadline )) || {
+          printf 'Session %s archival is forbidden: %s\n' "${session}" "$(head -c 512 "${archive_dir}/response")" >&2; exit 1; } ;;
+        *) printf 'Session %s archival returned HTTP %s: %s\n' "${session}" "${status}" "$(head -c 512 "${archive_dir}/response")" >&2; exit 1 ;;
+      esac
+      if (( $(date +%s) >= deadline )); then
+        printf 'Session %s was not archived (last HTTP %s: %s); everything is retained for inspection.\n' \
+          "${session}" "${status}" "$(head -c 512 "${archive_dir}/response")" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+  done <<<"$1"
+  token=""
+  stop_archive
+}
 require_finished() {
   jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "Complete") and .status == "True")' <<<"$1" >/dev/null || {
     printf 'The Core proof Job has not finished; refusing to retire a running proof.\n' >&2
@@ -99,7 +170,11 @@ chmod 700 "${run_dir}"
 printf 'Native Core proof cleanup artifacts: %s\n' "${run_dir}"
 
 # Tasks first, so Core settles and retires their RuntimePools and workspaces,
-# then whatever a failed run left behind, through the same controllers.
+# then whatever a failed run left behind, through the same controllers. Session
+# turns finish deleting only once their Session is archived (archive_sessions).
+sessions="$(kubectl -n "${namespace}" get tasks.core.orka.ai -o json | jq -r '[.items[].spec.sessionRef.name // empty] | unique[]')"
+kubectl -n "${namespace}" delete tasks.core.orka.ai --all --wait=false
+[[ -z "${sessions}" ]] || archive_sessions "${sessions}"
 for resource in tasks.core.orka.ai executionworkspacecheckpoints.workspace.orka.ai executionworkspaces.workspace.orka.ai \
   runtimepools.core.orka.ai agents.core.orka.ai executionworkspaceclasses.workspace.orka.ai \
   substrateworkspaceprofiles.substrate.workspace.orka.ai; do

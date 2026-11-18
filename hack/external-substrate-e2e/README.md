@@ -252,7 +252,13 @@ bash scripts/external-substrate-core-e2e.sh cleanup
 Cleanup refuses while either proof Job (`external-substrate-core` or
 `external-substrate-core-session`) is unfinished, and a run namespace whose UID
 differs from the one the proof Jobs recorded. While Core and the provider still run,
-it deletes the Tasks, then any remaining checkpoints, workspaces, RuntimePools,
+it deletes the Tasks and archives each of their Sessions through Core's
+Session API (`DELETE /api/v1/sessions/<name>`, retried while it answers 409),
+because a Session turn keeps Core's Task finalizer until its Session's runtime
+is retired and its turn receipts are archived. The request carries a
+ten-minute token of a run-namespace ServiceAccount that may only get and delete
+Sessions, sent over a port-forward to Core. It then waits for the Tasks and
+deletes any remaining checkpoints, workspaces, RuntimePools,
 Agent, class and profile through their controllers, and waits up to ten
 minutes until no object in the namespace carries a provider finalizer
 (`v1.substrate.workspace.orka.ai/...`, such as journal protection or checkpoint
