@@ -276,7 +276,7 @@ func TestSuspensionRejectsSnapshotsThatAreNotDataOnly(t *testing.T) {
 			native.suspendFidelity = fidelity
 			var lastErr error
 			for range 4 {
-				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity)
+				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 				lastErr = err
 				if observed.State == sdk.AllocationStopped || observed.RetainedData != nil {
 					t.Fatal("non-data snapshot was retained")

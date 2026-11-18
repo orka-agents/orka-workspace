@@ -479,7 +479,7 @@ func actorLossDuringSuspendCapture(t *testing.T, mode string) {
 	}}
 	d := driver(c, native)
 	d.control = control
-	if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity); err != nil {
+	if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, nil); err != nil {
 		t.Fatal(err)
 	}
 	_, record, err := d.read(t.Context(), request.Key)

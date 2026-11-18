@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
@@ -369,18 +370,18 @@ func (d *Lifecycle) Observe(ctx context.Context, key workspaceprovider.Allocatio
 	return record.Observation, nil
 }
 func (d *Lifecycle) StopInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity) (workspaceprovider.AllocationObservation, error) {
-	return d.transition(ctx, key, identity, "stop", nil)
+	return d.transition(ctx, key, identity, "stop", nil, nil)
 }
-func (d *Lifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity) (workspaceprovider.AllocationObservation, error) {
-	return d.transition(ctx, key, identity, "suspend", nil)
+func (d *Lifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, notAfter *metav1.Time) (workspaceprovider.AllocationObservation, error) {
+	return d.transition(ctx, key, identity, "suspend", nil, notAfter)
 }
 func (d *Lifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, policy workspacev1alpha1.ExecutionWorkspaceDeletionPolicy) (workspaceprovider.AllocationObservation, error) {
 	if err := workspaceprovider.ValidateDeletedDisposition(fakeDeletedDisposition(policy), policy); err != nil {
 		return workspaceprovider.AllocationObservation{}, err
 	}
-	return d.transition(ctx, key, identity, "delete", &policy)
+	return d.transition(ctx, key, identity, "delete", &policy, nil)
 }
-func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, operation string, policy *workspacev1alpha1.ExecutionWorkspaceDeletionPolicy) (workspaceprovider.AllocationObservation, error) {
+func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, operation string, policy *workspacev1alpha1.ExecutionWorkspaceDeletionPolicy, notAfter *metav1.Time) (workspaceprovider.AllocationObservation, error) {
 	var observed workspaceprovider.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		cm, record, err := d.read(ctx, key)
@@ -396,6 +397,13 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 			if err := validatePodStorage(record.Request); err != nil {
 				return err
 			}
+		}
+		// The fake's suspension has no backend effect: it starts when it
+		// publishes retained data. Past the authorization's deadline one that
+		// has not never starts; a journaled intent is refused below, before
+		// publication.
+		if operation == "suspend" && record.Operation != "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return workspaceprovider.ErrSuspendDeadlineExceeded
 		}
 		if operation == "suspend" && record.Request.Runtime != nil {
 			return fmt.Errorf("fake Pod workloads do not implement data suspension")
@@ -451,6 +459,12 @@ func (d *Lifecycle) transition(ctx context.Context, key workspaceprovider.Alloca
 				observed = record.Observation
 				return nil
 			}
+		}
+		// The intent write can consume the rest of the window; the journaled
+		// intent stays recoverable through the gate above and the exact Stop.
+		if operation == "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			observed = record.Observation
+			return workspaceprovider.ErrSuspendDeadlineExceeded
 		}
 		record.Observation.State = workspaceprovider.AllocationStopped
 		if operation == "suspend" {

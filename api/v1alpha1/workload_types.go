@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -570,9 +571,25 @@ const (
 // WorkloadRetirement is core's durable authorization to retire one exact instance.
 // DesiredState alone does not authorize terminating a workload: core first closes
 // runtime admission and completes its drain and Task/RuntimeSession settlement.
+// +kubebuilder:validation:XValidation:rule="self.action != 'Stop' || !has(self.notAfter)",message="notAfter bounds only a Suspend authorization"
 type WorkloadRetirement struct {
 	// +kubebuilder:validation:Minimum=1
 	Sequence int64                    `json:"sequence"`
 	Identity InstanceIdentity         `json:"identity"`
 	Action   WorkloadRetirementAction `json:"action"`
+
+	// NotAfter is the latest time at which a provider may start the authorized
+	// Suspend. Core sets it when the data-preserving window is bounded, such as
+	// a worker eviction deadline. A provider that has not started the
+	// suspension by NotAfter, less the SDK's SuspendDeadlineClockSkew margin,
+	// must not start it: it stops the exact instance instead, publishes no
+	// retained data, and reports SuspendDeadlineExceeded. A suspension started
+	// earlier may finish. Absent means the authorization does not expire.
+	//
+	// It is written only with a Suspend authorization. While the action stays
+	// Suspend, core may add it or move it earlier, never remove or extend it.
+	// Superseding Suspend with Delete may keep it unchanged or clear it;
+	// Delete ignores it. A Stop authorization never carries it.
+	// +optional
+	NotAfter *metav1.Time `json:"notAfter,omitempty"`
 }

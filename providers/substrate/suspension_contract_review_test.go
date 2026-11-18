@@ -2,14 +2,19 @@ package substrate
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type suspensionReviewControl struct {
@@ -33,7 +38,7 @@ func TestSuspensionRejectionAndUnknownDeliveryRemainActionableAfterRestart(t *te
 			}}
 			d := driver(c, native)
 			d.control = control
-			if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity); status.Code(err) != code {
+			if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, nil); status.Code(err) != code {
 				t.Fatalf("first backend error changed: %v", err)
 			}
 			for range 3 {
@@ -41,7 +46,7 @@ func TestSuspensionRejectionAndUnknownDeliveryRemainActionableAfterRestart(t *te
 				// backend state, without remembering the earlier RPC error.
 				d = driver(c, native)
 				d.control = control
-				observed, err := d.SuspendInstance(t.Context(), request.Key, first.Identity)
+				observed, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 				if err == nil || !strings.Contains(err.Error(), "outcome is unresolved") || !strings.Contains(err.Error(), "refusing replay") {
 					t.Fatalf("issued suspension silently became successful progress: %v", err)
 				}
@@ -77,13 +82,13 @@ func TestSuspensionLostResponseRecoversExactDataWithoutDuplicateRPC(t *testing.T
 	}}
 	d := driver(c, native)
 	d.control = control
-	if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity); status.Code(err) != codes.Unavailable {
+	if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, nil); status.Code(err) != codes.Unavailable {
 		t.Fatalf("lost-response error changed: %v", err)
 	}
 	for range 2 {
 		d = driver(c, native)
 		d.control = control
-		observed, err := d.SuspendInstance(t.Context(), request.Key, first.Identity)
+		observed, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 		if err != nil || observed.State != sdk.AllocationPending || observed.RetainedData != nil || control.calls != 1 || len(native.tags) != 0 {
 			t.Fatalf("known native SUSPENDING progress failed or replayed: %v", err)
 		}
@@ -101,7 +106,7 @@ func TestSuspensionLostResponseRecoversExactDataWithoutDuplicateRPC(t *testing.T
 	for range 12 {
 		d = driver(c, native)
 		d.control = control
-		stopped, err = d.SuspendInstance(t.Context(), request.Key, first.Identity)
+		stopped, err = d.SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +139,7 @@ func TestLegacyIssuedSuspensionUsesExactBackendStateWithoutReplay(t *testing.T) 
 				t.Fatal(err)
 			}
 			for range 2 {
-				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity)
+				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 				if state == pb.ActorState_ACTOR_STATE_SUSPENDING {
 					if err != nil {
 						t.Fatalf("legacy accepted progress rejected: %v", err)
@@ -153,4 +158,110 @@ func TestLegacyIssuedSuspensionUsesExactBackendStateWithoutReplay(t *testing.T) 
 			}
 		})
 	}
+}
+
+// workerCheckControl runs a hook when the provider verifies the retiring
+// worker, the last native read before SuspendActor is issued.
+type workerCheckControl struct {
+	*nativeFixture
+	hook func() error
+}
+
+func (c *workerCheckControl) GetWorker(ctx context.Context, request *pb.GetWorkerRequest, options ...grpc.CallOption) (*pb.Worker, error) {
+	if err := c.hook(); err != nil {
+		return nil, err
+	}
+	return c.nativeFixture.GetWorker(ctx, request, options...)
+}
+
+func TestSuspensionNotIssuedBeforeDeadlineIsAbandonedToStop(t *testing.T) {
+	for _, test := range []string{"journaled intent retried after deadline", "deadline passes before issuance", "deadline passes while journaling issuance", "issuance withdrawal is lost", "issuance withdrawal is lost with its retention ledger"} {
+		t.Run(test, func(t *testing.T) {
+			c, native, request := fixture(t, true)
+			if test == "issuance withdrawal is lost with its retention ledger" {
+				request = cappedRequest(t, c, request, 1)
+			}
+			first := ready(t, c, native, request)
+			window := metav1.NewTime(time.Now().Add(time.Hour))
+			control := &workerCheckControl{nativeFixture: native}
+			if test == "deadline passes before issuance" {
+				control.hook = func() error {
+					window = metav1.NewTime(time.Now().Add(-time.Hour))
+					return nil
+				}
+			} else {
+				control.hook = func() error { return status.Error(codes.Unavailable, "worker read failed before issuance") }
+			}
+			d := driver(c, native)
+			d.control = control
+			lostWithdrawal := strings.HasPrefix(test, "issuance withdrawal is lost")
+			if test == "deadline passes while journaling issuance" || lostWithdrawal {
+				control.hook = func() error { return nil }
+				d.client = &issuanceJournalDelay{Client: c, expire: func() { window = metav1.NewTime(time.Now().Add(-time.Hour)) }, failNext: lostWithdrawal}
+			}
+			_, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, &window)
+			if test != "journaled intent retried after deadline" {
+				if !errors.Is(err, sdk.ErrSuspendDeadlineExceeded) {
+					t.Fatalf("suspension was issued after its deadline: %v", err)
+				}
+			} else {
+				if status.Code(err) != codes.Unavailable {
+					t.Fatalf("pre-issuance failure changed: %v", err)
+				}
+				// The evicted worker stays unreadable: the expired intent must be
+				// refused before any native read, so the caller can still Stop.
+				window = metav1.NewTime(time.Now().Add(-time.Hour))
+				if _, err := d.SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, sdk.ErrSuspendDeadlineExceeded) {
+					t.Fatalf("unissued suspension resumed after its deadline: %v", err)
+				}
+			}
+			_, record, err := driver(c, native).read(t.Context(), request.Key)
+			// A lost withdrawal leaves the issuance marker without an RPC.
+			if err != nil || record.Operation != "suspend" || record.Pending == nil || record.Pending.SuspendIssued != lostWithdrawal || native.suspends != 0 {
+				t.Fatalf("suspension started after its deadline: %v suspends=%d", err, native.suspends)
+			}
+			if test == "issuance withdrawal is lost with its retention ledger" {
+				// Suspension-only accounting now fails; it must not block the
+				// fallback to the exact Stop.
+				if err := c.Delete(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: retentionKey(record).Namespace, Name: retentionKey(record).Name}}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
+					t.Fatal("suspension accounting did not fail without its ledger")
+				}
+			}
+			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, sdk.ErrSuspendDeadlineExceeded) {
+				t.Fatalf("expired unissued suspension did not fall back after restart: %v", err)
+			}
+			stopped := retired(t, c, native, request, first.Identity, false)
+			if stopped.State != sdk.AllocationStopped || stopped.Identity != first.Identity || stopped.RetainedData != nil || native.suspends != 0 {
+				t.Fatal("abandoned suspension blocked exact Stop or claimed retained data")
+			}
+			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, sdk.ErrSuspendDeadlineExceeded) {
+				t.Fatalf("stopped instance accepted a late suspension: %v", err)
+			}
+		})
+	}
+}
+
+// issuanceJournalDelay lets the authorization window close while the
+// issuance marker is being journaled.
+type issuanceJournalDelay struct {
+	client.Client
+	expire   func()
+	expired  bool
+	failNext bool
+}
+
+func (c *issuanceJournalDelay) Update(ctx context.Context, object client.Object, options ...client.UpdateOption) error {
+	if _, ok := object.(*corev1.ConfigMap); ok && c.expired && c.failNext {
+		c.failNext = false
+		return errors.New("journal write lost")
+	}
+	err := c.Client.Update(ctx, object, options...)
+	if cm, ok := object.(*corev1.ConfigMap); ok && err == nil && !c.expired && strings.Contains(cm.Data[journalDataKey], `"suspendIssued":true`) {
+		c.expired = true
+		c.expire()
+	}
+	return err
 }

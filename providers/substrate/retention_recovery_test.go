@@ -45,7 +45,7 @@ func TestMissingRetentionLedgerRejectsUnreadableJournalBeforeCapture(t *testing.
 			if err := c.Create(t.Context(), object); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil || !strings.Contains(err.Error(), "cannot account for native journal") {
+			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil || !strings.Contains(err.Error(), "cannot account for native journal") {
 				t.Fatalf("unreadable journal allowed capacity reset: %v", err)
 			}
 			if native.suspends != 0 || native.boots != 1 || native.deletes != 0 || len(native.tags) != 0 {
@@ -111,7 +111,7 @@ func TestResetRetentionLedgerCannotAdmitPastRetainedOccupants(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, err := driver(c, native).SuspendInstance(t.Context(), second.Key, secondReady.Identity); err == nil || !strings.Contains(err.Error(), "missing retained workspace") {
+			if _, err := driver(c, native).SuspendInstance(t.Context(), second.Key, secondReady.Identity, nil); err == nil || !strings.Contains(err.Error(), "missing retained workspace") {
 				t.Fatalf("reset ledger admitted another suspended workspace: %v", err)
 			}
 			if native.suspends != 1 {
@@ -177,7 +177,7 @@ func TestResetRetentionLedgerKeepsUnfinishedResumeReservation(t *testing.T) {
 	if err := c.Update(t.Context(), ledger); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := driver(c, native).SuspendInstance(t.Context(), second.Key, secondReady.Identity); err == nil || !strings.Contains(err.Error(), "missing retained workspace") {
+	if _, err := driver(c, native).SuspendInstance(t.Context(), second.Key, secondReady.Identity, nil); err == nil || !strings.Contains(err.Error(), "missing retained workspace") {
 		t.Fatalf("reset ledger ignored an unfinished resume reservation: %v", err)
 	}
 	ready(t, c, native, next)

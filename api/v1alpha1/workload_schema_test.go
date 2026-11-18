@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
@@ -126,6 +127,96 @@ func TestPersistedWorkloadSurvivesPruningAndRejectsMutation(t *testing.T) {
 			}
 			if errs := validate(changed, object); len(errs) == 0 {
 				t.Fatal("accepted immutable workload mutation")
+			}
+		})
+	}
+}
+
+func TestRetirementNotAfterOnlyNarrowsSuspendAuthorization(t *testing.T) {
+	data, err := os.ReadFile("../../config/crd/bases/workspace.orka.ai_executionworkspaces.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.UnmarshalStrict(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	var internal apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(crd.Spec.Versions[0].Schema.OpenAPIV3Schema, &internal, nil); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := structuralschema.NewStructural(&internal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := structuralcel.NewValidator(schema, true, celconfig.PerCallLimit)
+	binding := ImmutableObjectBinding{Name: "class", UID: "class-uid", Generation: 1, ProfileHash: "sha256:" + strings.Repeat("a", 64)}
+	request := &WorkloadRequest{Sequence: 1, Key: AllocationKey{Namespace: "tasks", Name: "workspace", WorkspaceUID: "workspace-uid", ProviderUID: "provider-uid"},
+		Image: "fixture.example/runtime@sha256:" + strings.Repeat("b", 64)}
+	request.Revision, _ = WorkloadRevision(*request)
+	identity := InstanceIdentity{AllocationID: "allocation", InstanceID: "instance", RequestRevision: request.Revision}
+	deadline := metav1.NewTime(time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC))
+	earlier, later := metav1.NewTime(deadline.Add(-time.Minute)), metav1.NewTime(deadline.Add(time.Minute))
+	retirement := func(action WorkloadRetirementAction, notAfter *metav1.Time) *WorkloadRetirement {
+		return &WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: action, NotAfter: notAfter}
+	}
+	object := func(r *WorkloadRetirement) map[string]any {
+		workspace := &ExecutionWorkspace{TypeMeta: metav1.TypeMeta{APIVersion: GroupVersion.String(), Kind: "ExecutionWorkspace"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tasks", Name: "workspace", UID: "workspace-uid"},
+			Spec: ExecutionWorkspaceSpec{Mode: ExecutionWorkspaceModeInteractive, ClassBinding: binding, ProviderBinding: ImmutableObjectBinding{Name: "provider", UID: "provider-uid", Generation: 1},
+				Slot: "default", DesiredState: ExecutionWorkspaceDesiredReady, Lifecycle: testLifecycle(), Workload: request.DeepCopy(), Retirement: r},
+		}
+		value, err := runtime.DefaultUnstructuredConverter.ToUnstructured(workspace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	validate := func(next, previous *WorkloadRetirement, create bool) field.ErrorList {
+		var old any
+		if !create {
+			old = object(previous)
+		}
+		errs, _ := validator.Validate(context.Background(), field.NewPath("object"), schema, object(next), old, celconfig.RuntimeCELCostBudget)
+		return errs
+	}
+	suspend, deletion, stop := WorkloadRetirementSuspend, WorkloadRetirementDelete, WorkloadRetirementStop
+	for _, test := range []struct {
+		name           string
+		previous, next *WorkloadRetirement
+		create         bool
+		rejection      string
+	}{
+		{name: "create deadline-bound Suspend", next: retirement(suspend, &deadline), create: true},
+		{name: "authorize deadline-bound Suspend", next: retirement(suspend, &deadline)},
+		{name: "add a deadline to Suspend", previous: retirement(suspend, nil), next: retirement(suspend, &deadline)},
+		{name: "keep the deadline", previous: retirement(suspend, &deadline), next: retirement(suspend, &deadline)},
+		{name: "move the deadline earlier", previous: retirement(suspend, &deadline), next: retirement(suspend, &earlier)},
+		{name: "supersede with Delete keeping the deadline", previous: retirement(suspend, &deadline), next: retirement(deletion, &deadline)},
+		{name: "supersede with Delete clearing the deadline", previous: retirement(suspend, &deadline), next: retirement(deletion, nil)},
+		{name: "Delete keeps a carried deadline", previous: retirement(deletion, &deadline), next: retirement(deletion, &deadline)},
+		{name: "Delete clears a carried deadline", previous: retirement(deletion, &deadline), next: retirement(deletion, nil)},
+		{name: "create Stop with a deadline", next: retirement(stop, &deadline), create: true, rejection: "notAfter bounds only a Suspend authorization"},
+		{name: "create Delete with a deadline", next: retirement(deletion, &deadline), create: true, rejection: "written only with Suspend"},
+		{name: "authorize Stop with a deadline", next: retirement(stop, &deadline), rejection: "notAfter bounds only a Suspend authorization"},
+		{name: "authorize Delete with a deadline", next: retirement(deletion, &deadline), rejection: "written only with Suspend"},
+		{name: "remove the deadline", previous: retirement(suspend, &deadline), next: retirement(suspend, nil), rejection: "cannot be removed or extended"},
+		{name: "extend the deadline", previous: retirement(suspend, &deadline), next: retirement(suspend, &later), rejection: "cannot be removed or extended"},
+		{name: "supersede with Delete extending the deadline", previous: retirement(suspend, &deadline), next: retirement(deletion, &later), rejection: "cannot be removed or extended"},
+		{name: "supersede with Delete changing the deadline", previous: retirement(suspend, &deadline), next: retirement(deletion, &earlier), rejection: "written only with Suspend"},
+		{name: "supersede an unbounded Suspend with a deadline-bound Delete", previous: retirement(suspend, nil), next: retirement(deletion, &deadline), rejection: "written only with Suspend"},
+		{name: "Delete restores a cleared deadline", previous: retirement(deletion, nil), next: retirement(deletion, &deadline), rejection: "written only with Suspend"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			errs := validate(test.next, test.previous, test.create)
+			if test.rejection == "" {
+				if len(errs) != 0 {
+					t.Fatal(errs)
+				}
+				return
+			}
+			if !strings.Contains(errs.ToAggregate().Error(), test.rejection) {
+				t.Fatalf("got %v, want rejection %q", errs, test.rejection)
 			}
 		})
 	}

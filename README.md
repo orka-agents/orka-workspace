@@ -36,6 +36,8 @@ A workload request binds the workspace and provider UIDs, image digest, command,
 
 Call `conformance.Check` with a fresh admitted fixture and a factory that reconnects to the same durable store. Passing this suite proves the exercised lifecycle behavior. Optional capabilities need their own tests before advertisement.
 
+A provider that implements `sdk.SuspensionController` must also honor a deadline-bound Suspend authorization. `SuspendInstance` receives `spec.retirement.notAfter` and must not start a suspension once `sdk.SuspendDeadlineExceeded` reports it passed; it returns `sdk.ErrSuspendDeadlineExceeded` instead. Controllers call `sdk.SuspendOrStop`, which then stops the exact instance, and report `SuspendDeadlineExceeded` on `DataPlaneReady`. Run `conformance.CheckSuspension` and `conformance.CheckSuspendDeadline` before advertising suspension.
+
 ## Integration status
 
 Orka #572 is implemented on the integration branch. The generic RuntimePool path consumes provider evidence, independently verifies accessible Pods and storage, binds private credentials to the exact instance, and admits only an authenticated supervisor fence. See [installation and retirement](docs/external-providers.md) and [implementation status](docs/implementation-status.md) for validation results and remaining migration work.

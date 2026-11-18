@@ -3,9 +3,13 @@
 package workspaceprovider
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ValidateWorkloadTransition checks core's sequence update against the last
@@ -116,4 +120,47 @@ func ValidateWorkloadRetirement(request *WorkloadRequest, observed *AllocationOb
 		return fmt.Errorf("retirement action is not authorized")
 	}
 	return nil
+}
+
+// SuspendDeadlineClockSkew is how far a provider's clock may trail core's.
+// Providers treat a Suspend authorization as expired this long before its
+// NotAfter, so a slow clock cannot start a suspension after core's deadline.
+const SuspendDeadlineClockSkew = 5 * time.Second
+
+// SuspendDeadlineExceeded reports whether a provider observing now must not
+// start a suspension bounded by notAfter. A nil notAfter never expires.
+func SuspendDeadlineExceeded(notAfter *metav1.Time, now time.Time) bool {
+	return notAfter != nil && !now.Add(SuspendDeadlineClockSkew).Before(notAfter.Time)
+}
+
+// SuspendDeadlineExceededMessage accompanies ReasonSuspendDeadlineExceeded on
+// the DataPlaneReady condition.
+// It does not claim termination; the allocation state reports that.
+const SuspendDeadlineExceededMessage = "suspend authorization expired before suspension started; the instance is retired through Stop and its data is not retained"
+
+// SuspendableLifecycle is a provider that can both stop and suspend.
+type SuspendableLifecycle interface {
+	Lifecycle
+	SuspensionController
+}
+
+// SuspendOrStop performs core's validated Suspend authorization for the exact
+// instance. When the provider reports that the authorization's NotAfter passed
+// before any suspension started, it stops the instance instead and returns
+// deadlineExceeded, so the caller can report ReasonSuspendDeadlineExceeded:
+// the stopped instance carries no retained data. Callers validate the
+// authorization with ValidateWorkloadRetirement first.
+func SuspendOrStop(ctx context.Context, driver SuspendableLifecycle, key AllocationKey, identity InstanceIdentity, retirement *WorkloadRetirement) (observed AllocationObservation, deadlineExceeded bool, err error) {
+	if retirement == nil || retirement.Action != workspacev1alpha1.WorkloadRetirementSuspend {
+		return AllocationObservation{}, false, fmt.Errorf("retirement action is not authorized")
+	}
+	observed, err = driver.SuspendInstance(ctx, key, identity, retirement.NotAfter)
+	if !errors.Is(err, ErrSuspendDeadlineExceeded) {
+		return observed, false, err
+	}
+	observed, err = driver.StopInstance(ctx, key, identity)
+	if err == nil && observed.RetainedData != nil {
+		return observed, true, fmt.Errorf("fallback stop after an expired suspend authorization published retained data")
+	}
+	return observed, true, err
 }

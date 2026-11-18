@@ -64,6 +64,7 @@ func run(conformanceMode, leaderElection bool, leaderNamespace string) error {
 			func(ctx context.Context, factory func() workspaceprovider.Lifecycle, request workspaceprovider.WorkloadRequest) error {
 				return conformance.CheckSuspension(ctx, factory, request, nil)
 			},
+			conformance.CheckSuspendDeadline,
 		}
 		for _, check := range checks {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&workspacev1alpha1.ExecutionWorkspace{}).Build()

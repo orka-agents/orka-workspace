@@ -135,7 +135,7 @@ func TestSandboxRechecksSuspensionPolicyBeforeNativeRetirement(t *testing.T) {
 	updateWorkspacePolicy(t, c, request, func(spec *workspacev1alpha1.ExecutionWorkspaceSpec) {
 		spec.Lifecycle.MaxLifetime = nil
 	})
-	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 		t.Fatal("unbounded concrete workspace suspended its native allocation")
 	}
 	requireSandboxRunning(t, c, request)
@@ -205,7 +205,7 @@ func TestSandboxMalformedDurableJournalFailsClosedWithoutPanic(t *testing.T) {
 					return New(c).EnsureAllocation(t.Context(), request)
 				}},
 				{"suspend", func() (workspaceprovider.AllocationObservation, error) {
-					return New(c).SuspendInstance(t.Context(), request.Key, first.Identity)
+					return New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 				}},
 				{"stop", func() (workspaceprovider.AllocationObservation, error) {
 					return New(c).StopInstance(t.Context(), request.Key, first.Identity)

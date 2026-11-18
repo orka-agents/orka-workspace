@@ -598,7 +598,7 @@ func retired(t *testing.T, c client.Client, native *nativeFixture, request sdk.W
 		var out sdk.AllocationObservation
 		var err error
 		if suspend {
-			out, err = driver(c, native).SuspendInstance(t.Context(), request.Key, identity)
+			out, err = driver(c, native).SuspendInstance(t.Context(), request.Key, identity, nil)
 		} else {
 			out, err = driver(c, native).StopInstance(t.Context(), request.Key, identity)
 		}
@@ -624,9 +624,9 @@ func admit(c client.Client) conformance.AdmitRequest {
 	}
 }
 func TestLifecycleConformance(t *testing.T) {
-	for _, test := range []string{"lifecycle", "replacement", "suspension"} {
+	for _, test := range []string{"lifecycle", "replacement", "suspension", "suspend-deadline"} {
 		t.Run(test, func(t *testing.T) {
-			c, native, request := fixture(t, test == "suspension")
+			c, native, request := fixture(t, test == "suspension" || test == "suspend-deadline")
 			factory := func() sdk.Lifecycle { return driver(c, native) }
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -638,6 +638,8 @@ func TestLifecycleConformance(t *testing.T) {
 				err = conformance.CheckReplacement(ctx, factory, request, admit(c))
 			case "suspension":
 				err = conformance.CheckSuspension(ctx, factory, request, admit(c))
+			case "suspend-deadline":
+				err = conformance.CheckSuspendDeadline(ctx, factory, request)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -674,7 +676,7 @@ func TestLostNativeResponsesRecoverSameLifetime(t *testing.T) {
 			lost := false
 			var stopped sdk.AllocationObservation
 			for range 16 {
-				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity)
+				observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 				if err != nil {
 					if lost {
 						t.Fatal(err)
@@ -789,7 +791,7 @@ func TestSuspensionRequiresExactWorkerAbsenceAndNoForeignAssignment(t *testing.T
 	c, native, request := fixture(t, true)
 	first := ready(t, c, native, request)
 	native.foreignAssignment = true
-	if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+	if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 		t.Fatal("shared worker teardown accepted")
 	}
 	if native.suspends != 0 {
@@ -797,7 +799,7 @@ func TestSuspensionRequiresExactWorkerAbsenceAndNoForeignAssignment(t *testing.T
 	}
 	native.foreignAssignment = false
 	for range 3 {
-		observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity)
+		observed, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -947,6 +949,87 @@ func TestReadyWorkspaceRetiresThroughSuspensionBeforeRollover(t *testing.T) {
 	}
 }
 
+// A Suspend authorization first observed after its notAfter must stop the
+// exact Actor without issuing SuspendActor, publish no retained data, and
+// report the breach. One started inside its window finishes even when the
+// window closes mid-capture.
+func TestReadyWorkspaceSuspendAuthorizationDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		started bool
+	}{{name: "observed after deadline"}, {name: "started before deadline", started: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			c, native, request := fixture(t, true)
+			first := ready(t, c, native, request)
+			w := &api.ExecutionWorkspace{}
+			if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
+				t.Fatal(err)
+			}
+			notAfter := metav1.NewTime(time.Now().Add(-time.Hour))
+			if test.started {
+				notAfter = metav1.NewTime(time.Now().Add(time.Hour))
+			}
+			w.Spec.Retirement = &api.WorkloadRetirement{Sequence: request.Sequence, Identity: first.Identity, Action: api.WorkloadRetirementSuspend, NotAfter: &notAfter}
+			w.Status.Allocation = &first
+			if err := c.Update(t.Context(), w); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Status().Update(t.Context(), w); err != nil {
+				t.Fatal(err)
+			}
+			r := &ExecutionWorkspaceReconciler{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
+			for i := range 12 {
+				if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := r.reconcileLifecycle(t.Context(), w); err != nil {
+					t.Fatal(err)
+				}
+				if test.started && i == 0 {
+					_, record, err := driver(c, native).read(t.Context(), request.Key)
+					if err != nil || native.suspends != 1 || record.Pending == nil || !record.Pending.SuspendIssued || record.Observation.State == sdk.AllocationStopped {
+						t.Fatalf("suspension inside its window did not start and stay in progress: %v suspends=%d", err, native.suspends)
+					}
+					// Core narrows the window after the suspension started.
+					if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
+						t.Fatal(err)
+					}
+					expired := metav1.NewTime(time.Now().Add(-time.Hour))
+					w.Spec.Retirement.NotAfter = &expired
+					if err := c.Update(t.Context(), w); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := c.Get(t.Context(), clientKey(request.Key), w); err != nil {
+					t.Fatal(err)
+				}
+				if w.Status.Allocation != nil && w.Status.Allocation.State == sdk.AllocationStopped {
+					break
+				}
+			}
+			allocation := w.Status.Allocation
+			condition := sdk.FindCondition(w.Status.Conditions, string(api.ConditionWorkspaceDataPlaneReady))
+			if allocation == nil || allocation.State != sdk.AllocationStopped || allocation.Identity != first.Identity || condition == nil || condition.Status != metav1.ConditionFalse {
+				t.Fatalf("authorized retirement did not stop the exact Actor: %+v %+v", allocation, condition)
+			}
+			exceeded := condition.Reason == string(api.ReasonSuspendDeadlineExceeded)
+			if test.started {
+				if allocation.RetainedData == nil || exceeded || native.suspends != 1 {
+					t.Fatalf("suspension started in time did not finish: %+v %+v suspends=%d", allocation, condition, native.suspends)
+				}
+				return
+			}
+			if allocation.RetainedData != nil || !exceeded || native.suspends != 0 || w.Status.State == api.ExecutionWorkspaceStateSuspended {
+				t.Fatalf("late authorization suspended or was not reported: %+v %+v suspends=%d state=%s", allocation, condition, native.suspends, w.Status.State)
+			}
+			_, record, err := driver(c, native).read(t.Context(), request.Key)
+			if err != nil || record.Operation != "stop" || record.Pending != nil {
+				t.Fatalf("late authorization journaled a suspension: %v %+v", err, record)
+			}
+		})
+	}
+}
+
 func TestClosedBootstrapUsesOnlyPersistedExactLifetime(t *testing.T) {
 	c, native, request := fixture(t, false)
 	first := ready(t, c, native, request)
@@ -1013,7 +1096,7 @@ func TestSuspendedQuotaLossAndZeroCapacityFailBeforeMutation(t *testing.T) {
 			request = cappedRequest(t, c, request, limit)
 			first := ready(t, c, native, request)
 			if zero {
-				if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+				if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 					t.Fatal("zero retention cap allowed suspension")
 				}
 				if native.suspends != 0 {
@@ -1033,7 +1116,7 @@ func TestSuspendedQuotaLossAndZeroCapacityFailBeforeMutation(t *testing.T) {
 			if err := c.Delete(t.Context(), cm); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 				t.Fatal("missing occupied quota journal silently reset")
 			}
 			next := *request.DeepCopy()

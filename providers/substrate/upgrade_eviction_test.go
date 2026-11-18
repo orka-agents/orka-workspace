@@ -469,7 +469,7 @@ func TestTerminatingFencedWorkerRemainsObservableAndSuspendable(t *testing.T) {
 	}
 	var stopped sdk.AllocationObservation
 	for i := range 12 {
-		stopped, err = driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity)
+		stopped, err = driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -340,7 +341,7 @@ func (d *Lifecycle) verifyCheckpoint(ctx context.Context, checkpoint *checkpoint
 	return d.verifyTemplate(ctx, checkpoint.Atespace, checkpoint.Template)
 }
 
-func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) (sdk.AllocationObservation, error) {
+func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity, notAfter *metav1.Time) (sdk.AllocationObservation, error) {
 	var observed sdk.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		cm, record, err := d.read(ctx, key)
@@ -353,6 +354,22 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 		observed = record.Observation
 		if record.Failure != "" {
 			return fmt.Errorf("a failed native instance has no data to suspend; Stop retires it")
+		}
+		// The suspension starts when SuspendActor is issued and the Actor
+		// acts on it. Past the authorization's deadline one that has not
+		// started never starts: the journaled intent, if any, is abandoned to
+		// the caller's exact Stop. This runs before suspension-only checks,
+		// which must not block that Stop. The optimistic journal save below
+		// makes this check and the record that the suspension started one
+		// atomic update.
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			started, err := d.suspensionStarted(ctx, record)
+			if err != nil {
+				return err
+			}
+			if !started {
+				return sdk.ErrSuspendDeadlineExceeded
+			}
 		}
 		if record.Operation == "suspend" {
 			if err := d.reserveSuspended(ctx, record); err != nil {
@@ -394,7 +411,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
-			err := d.capture(ctx, cm, record)
+			err := d.capture(ctx, cm, record, notAfter)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				// The capture source is gone, so this capture can never finish.
 				// The failed instance retires through the exact Stop path.
@@ -418,7 +435,25 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 	return observed, err
 }
 
-func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+// suspensionStarted reports whether this instance's journaled suspension
+// started. An issuance the Actor still runs past was never acted on: its
+// outcome is unresolved and is never replayed, so it cannot finish either.
+// Any other Actor state, including its loss, is left to capture.
+func (d *Lifecycle) suspensionStarted(ctx context.Context, record *journalRecord) (bool, error) {
+	if record.Operation != "suspend" || record.Pending == nil {
+		return record.Operation == "suspend", nil
+	}
+	if !record.Pending.SuspendIssued {
+		return false, nil
+	}
+	actor, err := d.actor(ctx, record)
+	if err != nil {
+		return false, err
+	}
+	return actor == nil || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING, nil
+}
+
+func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, notAfter *metav1.Time) error {
 	operation := record.Pending
 	actor, err := d.actor(ctx, record)
 	if err != nil {
@@ -444,9 +479,22 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		if err := d.verifyRetiringWorker(ctx, record); err != nil {
 			return err
 		}
+		// Recheck after the verification calls.
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return sdk.ErrSuspendDeadlineExceeded
+		}
 		operation.SuspendIssued = true
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
+		}
+		// The journal write can consume the rest of the window, so check
+		// once more with nothing but the RPC left before issuance. Withdraw
+		// the issuance marker to keep the unissued intent abandonable. If
+		// that write fails, the marker records an issuance the Actor never
+		// acted on, which suspensionStarted also abandons past the deadline.
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			operation.SuspendIssued = false
+			return errors.Join(sdk.ErrSuspendDeadlineExceeded, d.save(ctx, cm, record))
 		}
 		// Synchronous durability returns only after the snapshot is uploaded,
 		// so CreateTag copies it without changing the Actor.

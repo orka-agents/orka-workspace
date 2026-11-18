@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	"github.com/orka-agents/orka-workspace/conformance"
@@ -13,6 +14,7 @@ import (
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -247,6 +249,50 @@ func TestSequenceAndOptionalSuspensionConformance(t *testing.T) {
 	}
 }
 
+func TestSuspendDeadlineConformance(t *testing.T) {
+	c, request := fixture(t)
+	if err := conformance.CheckSuspendDeadline(t.Context(), func() workspaceprovider.Lifecycle { return New(c) }, request); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// intentWriteDelay closes the authorization window while the suspend intent
+// is being journaled.
+type intentWriteDelay struct {
+	client.Client
+	expire func()
+}
+
+func (c *intentWriteDelay) Update(ctx context.Context, object client.Object, options ...client.UpdateOption) error {
+	err := c.Client.Update(ctx, object, options...)
+	if cm, ok := object.(*corev1.ConfigMap); ok && err == nil && strings.Contains(cm.Data[journalDataKey], `"operation":"suspend"`) && c.expire != nil {
+		c.expire()
+		c.expire = nil
+	}
+	return err
+}
+
+func TestSuspendIntentJournaledAfterDeadlineIsNotPublished(t *testing.T) {
+	c, request := fixture(t)
+	ready, err := New(c).EnsureAllocation(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := metav1.NewTime(time.Now().Add(time.Hour))
+	late := &intentWriteDelay{Client: c, expire: func() { window = metav1.NewTime(time.Now().Add(-time.Hour)) }}
+	if _, err := New(late).SuspendInstance(t.Context(), request.Key, ready.Identity, &window); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		t.Fatalf("suspension published after its intent missed the deadline: %v", err)
+	}
+	// A retry treats the late intent as not started.
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity, &window); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		t.Fatalf("late suspend intent was resumed as an on-time start: %v", err)
+	}
+	stopped, err := New(c).StopInstance(t.Context(), request.Key, ready.Identity)
+	if err != nil || stopped.State != workspaceprovider.AllocationStopped || stopped.RetainedData != nil {
+		t.Fatalf("late suspend intent blocked exact Stop or retained data: %+v %v", stopped, err)
+	}
+}
+
 func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 	for _, write := range []int{1, 2} {
 		t.Run(fmt.Sprint(write), func(t *testing.T) {
@@ -255,7 +301,7 @@ func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := New(&faultClient{Client: c, failAt: write, commit: true}).SuspendInstance(t.Context(), request.Key, ready.Identity); err == nil {
+			if _, err := New(&faultClient{Client: c, failAt: write, commit: true}).SuspendInstance(t.Context(), request.Key, ready.Identity, nil); err == nil {
 				t.Fatal("expected lost response")
 			}
 			pending, err := New(c).EnsureAllocation(t.Context(), request)
@@ -265,7 +311,7 @@ func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 			if pending.State == workspaceprovider.AllocationReady || pending.Startup != nil {
 				t.Fatal("suspension intent retained startup readiness")
 			}
-			suspended, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			suspended, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -284,7 +330,7 @@ func TestInvalidSequenceTransitionsDoNotChangePredecessor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			stopped, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			stopped, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -110,6 +110,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			// allocation from lost durable evidence.
 			operationErr = driver.proveNoAllocation(ctx, key)
 		}
+		suspendDeadlineExceeded := false
 		if operationErr == nil {
 			switch {
 			case deleted || quarantined:
@@ -129,7 +130,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 				}
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || (current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend):
 				if !missing && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementSuspend) == nil {
-					observed, operationErr = driver.SuspendInstance(ctx, key, observed.Identity)
+					observed, suspendDeadlineExceeded, operationErr = workspaceprovider.SuspendOrStop(ctx, driver, key, observed.Identity, current.Spec.Retirement)
 				}
 			case !missing && current.Spec.Retirement != nil && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
@@ -196,6 +197,9 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 			case failure != "" && !quarantined:
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateFailed
+			case suspendDeadlineExceeded:
+				// Stopped without data: never Suspended, and no longer suspending.
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && observed.State == workspaceprovider.AllocationStopped && observed.RetainedData != nil:
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
@@ -213,7 +217,11 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			(!failedRetirementAuthorized(workload, &observed, current.Spec.Retirement, missing) || observed.State == workspaceprovider.AllocationStopped)
 		pending = !disabled && operationErr == nil && !ready && !failedIdle && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
-		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
+		dataPlaneReason, dataPlaneMessage := conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired")
+		if suspendDeadlineExceeded {
+			dataPlaneReason, dataPlaneMessage = string(workspacev1alpha1.ReasonSuspendDeadlineExceeded), workspaceprovider.SuspendDeadlineExceededMessage
+		}
+		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: dataPlaneReason, Message: dataPlaneMessage, ObservedGeneration: current.Generation})
 		setLifecycleMilestoneConditions(current, observed, missing, operationErr, failure)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})

@@ -162,7 +162,7 @@ func TestStopExactPodAfterOwnershipMetadataLossWaitsForAbsence(t *testing.T) {
 	if err := c.Update(t.Context(), pod); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); !errors.Is(err, workspaceprovider.ErrStaleIdentity) {
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); !errors.Is(err, workspaceprovider.ErrStaleIdentity) {
 		t.Fatalf("ownership loss relaxed data-suspension attestation: %v", err)
 	}
 	guarded := &exactPodDeleteClient{Client: c, uid: record.Pod.UID}
@@ -221,7 +221,7 @@ func TestStopRefusesReplacementPodUID(t *testing.T) {
 func TestPendingSuspensionCanEscalateToDeleteWithoutRetainedClaim(t *testing.T) {
 	c, request := fixture(t, true)
 	first := ready(t, c, request)
-	observed, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity)
+	observed, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 	if err != nil || observed.State != workspaceprovider.AllocationPending {
 		t.Fatalf("suspension did not remain pending: %#v, %v", observed, err)
 	}
