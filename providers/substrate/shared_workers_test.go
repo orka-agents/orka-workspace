@@ -1810,3 +1810,46 @@ func TestSharedPoolSizedByARuntimeOverrideStaysAdmitting(t *testing.T) {
 		t.Fatal("a pool with a stale shape kept admitting")
 	}
 }
+
+func TestSharedEvidenceStopJournalFailureTakesTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// The journal write that records the suspended snapshot fails after the
+	// evidence suspend took effect.
+	failed := false
+	lossy := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if cm, ok := obj.(*corev1.ConfigMap); ok && !failed && strings.Contains(cm.Data[journalDataKey], `"snapshotDigest"`) {
+			failed = true
+			return errors.New("journal write unavailable")
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	for range 6 {
+		tick()
+		if _, err := sharedDriver(lossy, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if failed {
+			break
+		}
+	}
+	if !failed {
+		t.Fatal("fixture did not fail the snapshot journal write")
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.SharedWorker.Proof != nil {
+		t.Fatalf("a failed journal write after the evidence suspend did not persist the strong path: %#v", record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the pool's retirement did not start on the failing pass")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if native.suspendCalls != 1 || stopped.SharedWorker.Proof != nil || !stopped.WorkloadAbsent {
+		t.Fatalf("the Stop replayed the suspend or fell back to interim evidence: calls=%d", native.suspendCalls)
+	}
+}

@@ -1322,6 +1322,12 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		}
 		if reason == "" && shared.Proof == nil {
 			proven, doubt, err := d.advanceSharedInterim(ctx, cm, record, actor)
+			if err != nil && !apierrors.IsConflict(err) {
+				// Any failure after the evidence suspend's intent (including
+				// a journal write after the suspend took effect) is doubt; a
+				// write conflict is retried.
+				doubt, err = "the evidence-only retirement could not be recorded: "+err.Error(), nil
+			}
 			if err != nil || (!proven && doubt == "") {
 				return err
 			}

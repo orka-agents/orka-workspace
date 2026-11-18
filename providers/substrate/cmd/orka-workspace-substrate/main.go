@@ -100,8 +100,10 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 }
 
 // controllerSetups registers lifecycle controllers only with native control.
+// The Kubernetes-only shared worker bounds loop always runs, so existing
+// shared pools stay bounded while native configuration is broken.
 func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient) []func(ctrl.Manager) error {
-	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager}
+	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
 		return setups
 	}

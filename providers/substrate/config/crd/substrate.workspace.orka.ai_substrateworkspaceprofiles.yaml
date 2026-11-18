@@ -87,6 +87,10 @@ spec:
                       rule: '!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime)
                         >= duration(''3h'') && duration(self.maxWorkerLifetime) <=
                         duration(''24h''))'
+                    - message: maxWorkerLifetime must be a whole number of seconds
+                      rule: '!has(self.maxWorkerLifetime) || duration(self.maxWorkerLifetime)
+                        == duration(string(duration(self.maxWorkerLifetime).getSeconds())
+                        + ''s'')'
                 type: object
               retention:
                 description: |-
