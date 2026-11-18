@@ -1075,6 +1075,8 @@ func (d *Lifecycle) markSharedStrong(ctx context.Context, cm *corev1.ConfigMap, 
 	if record.SharedWorker.Strong != "" {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	record.SharedWorker.Strong = reason
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement takes the strong path", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
 	return d.save(ctx, cm, record)
@@ -1089,6 +1091,8 @@ func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Uns
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
 		ledger.State, ledger.Reason = state, reason
 		if err := setSharedLedger(pool, ledger); err != nil {
@@ -1461,6 +1465,8 @@ func (d *Lifecycle) captureSharedReplacement(ctx context.Context, cm *corev1.Con
 // strongSharedAbsence retires the record's pool and reports true once the
 // pool is gone and every fenced worker Pod UID is absent.
 func (d *Lifecycle) strongSharedAbsence(ctx context.Context, record *journalRecord) (bool, error) {
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	shared := record.SharedWorker
 	pool, err := d.getSharedPool(ctx, record)
 	poolGone := apierrors.IsNotFound(err)
@@ -1630,8 +1636,11 @@ func (d *Lifecycle) abandonSharedToPrivate(ctx context.Context, cm *corev1.Confi
 	return d.ensureRuntimePool(ctx, cm, record)
 }
 
-// sharedPoolHostsSuspect reports whether any workspace holding a slot in the
-// pool is tainted, quarantined or failed.
+// sharedPoolHostsSuspect reports whether the pool must be strongly retired
+// because of a hosted allocation, reading only Kubernetes: a hosted journal
+// that recorded the strong path or an instance failure, or a hosted
+// workspace that is tainted, quarantined or failed. Admission, the leader
+// sweep (before any native read) and the bounds loop all use it.
 func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger) (bool, error) {
 	for _, entry := range ledger.Entries {
 		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
@@ -1641,10 +1650,12 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 		if !found || record == nil {
 			continue
 		}
-		// A recorded instance failure is suspect before the workspace itself
-		// reports Failed.
-		if record.Failure != "" && record.SharedWorker != nil && record.SharedWorker.Pool == pool.GetName() {
-			return true, nil
+		if shared := record.SharedWorker; shared != nil && shared.Pool == pool.GetName() && (shared.UID == "" || shared.UID == string(pool.GetUID())) && !shared.Released {
+			// A recorded strong path or instance failure is suspect before
+			// the workspace itself reports Failed.
+			if shared.Strong != "" || record.Failure != "" {
+				return true, nil
+			}
 		}
 		workspace := &api.ExecutionWorkspace{}
 		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
@@ -1743,6 +1754,8 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 	if shared == nil || shared.UID == "" {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	pool, err := d.getSharedPool(ctx, record)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -1758,7 +1771,13 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 
 // sharedDoubt records the strong path for this record and starts retiring
 // its pool at once. Nothing uncertain is ever replayed.
+//
+// A strong trigger often follows a native call that ran past the request's
+// deadline, so it is persisted, and the retirement started, under a fresh
+// bounded context detached from the caller's cancellation.
 func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
 		return err
 	}
@@ -1774,4 +1793,15 @@ func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, recor
 // deactivates the tunnel.
 func (c Config) egressSettle() time.Duration {
 	return max(c.gatewayPolicyCacheTTL(), dnsRelayPolicyTTL) + sharedEgressSettleMargin
+}
+
+// sharedCleanupTimeout bounds persisting a strong trigger and starting the
+// pool's retirement after the caller's own context has ended.
+const sharedCleanupTimeout = 30 * time.Second
+
+// strongCleanupContext detaches a strong-retirement step from the caller's
+// cancellation (keeping its values) and bounds it on its own. It uses only
+// Kubernetes, so it cannot be postponed by the native API either.
+func strongCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), sharedCleanupTimeout)
 }

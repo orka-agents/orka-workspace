@@ -493,6 +493,11 @@ func nativeBootRejected(err error) bool {
 // withdrawn; physical cleanup waits for Core's exact Stop authorization.
 func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) (sdk.AllocationObservation, error) {
 	if record.Failure == "" {
+		// A failure often follows a native call that outlived the request;
+		// it is a strong trigger on a shared worker, so it is persisted under
+		// a fresh bounded context.
+		ctx, cancel := strongCleanupContext(ctx)
+		defer cancel()
 		record.Failure = reason
 		record.Observation = pendingObservation(record)
 		if err := d.save(ctx, cm, record); err != nil {

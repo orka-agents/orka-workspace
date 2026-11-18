@@ -84,8 +84,9 @@ type nativeFixture struct {
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
 	failEgressUpdate int
 	// block makes Worker and template reads wait for their context, as a
-	// stalled native control plane.
-	block bool
+	// stalled native control plane; blockSuspend and blockGetActor do the
+	// same for SuspendActor and GetActor.
+	block, blockSuspend, blockGetActor bool
 	// failGetTemplate, failCreateTag and failGetTag fail the next calls
 	// before they take effect.
 	failGetTemplate, failCreateTag, failGetTag int
@@ -199,7 +200,11 @@ func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorT
 	}
 	return out, nil
 }
-func (f *nativeFixture) GetActor(_ context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+func (f *nativeFixture) GetActor(ctx context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+	if f.blockGetActor {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.failGetActor > 0 {
 		f.failGetActor--
 		return nil, status.Error(codes.Unavailable, "actor read unavailable")
@@ -336,8 +341,12 @@ func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	}
 	v.Status.WorkerAssignment = nil
 }
-func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
 	f.suspendCalls++
+	if f.blockSuspend {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.failSuspendBeforeEffect {
 		f.failSuspendBeforeEffect = false
 		return nil, status.Error(codes.Unavailable, "suspend not applied")

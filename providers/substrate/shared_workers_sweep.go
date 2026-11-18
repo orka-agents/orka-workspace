@@ -61,9 +61,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				state, reason := sharedPersistedRetirement(pool)
 				errs = append(errs, d.retireSharedPool(ctx, pool, state, reason))
 			case d.sharedStrongMarked(ctx, pool):
-				// A journal persisted the strong path, possibly crashing before
-				// it deleted the pool; finish that deletion here.
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation's journal selected the strong path"))
+				// A hosted journal persisted the strong path or a failure
+				// (possibly crashing before it deleted the pool), or a hosted
+				// workspace became suspect; act on it with no native read.
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect"))
 			case !now.Before(retireAt):
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
 			}
@@ -284,6 +285,12 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	if !now.Before(sharedRetireAt(pool, ledger)) || !r.Config.DedicatedInstall {
 		// enforceSharedBounds already retired it, without native reads.
 		return nil
+	}
+	// Kubernetes-only suspicion comes before any native read in this pass.
+	if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil {
+		return err
+	} else if suspect {
+		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
 	}
 	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels()) {
 		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
@@ -527,21 +534,15 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 	return record, true, nil
 }
 
-// sharedStrongMarked reports whether any hosted allocation's exact journal
-// record selected the strong path. It reads only Kubernetes.
+// sharedStrongMarked reports, reading only Kubernetes, whether a hosted
+// allocation requires the pool's strong retirement (see
+// sharedPoolHostsSuspect). An unreadable journal or workspace is reported on
+// the next pass; it never blocks the other bounds.
 func (d *Lifecycle) sharedStrongMarked(ctx context.Context, pool *unstructured.Unstructured) bool {
 	ledger, err := readSharedLedger(pool)
 	if err != nil {
 		return false
 	}
-	for _, entry := range ledger.Entries {
-		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
-		if err != nil || !found || record == nil || record.SharedWorker == nil {
-			continue
-		}
-		if record.SharedWorker.Pool == pool.GetName() && record.SharedWorker.UID == string(pool.GetUID()) && (record.SharedWorker.Strong != "" || record.Failure != "") {
-			return true
-		}
-	}
-	return false
+	suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger)
+	return err == nil && suspect
 }

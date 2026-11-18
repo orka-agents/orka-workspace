@@ -1523,3 +1523,124 @@ func TestSharedStrongMarkerWinsOverAJournaledInterimProof(t *testing.T) {
 		t.Fatal("the interim proof shortcut skipped pool deletion and the absence proof")
 	}
 }
+
+func TestSharedStrongTriggersPersistAfterTheRequestContextExpires(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block func(*nativeFixture)
+	}{
+		{"suspend outlives the request", func(native *nativeFixture) { native.blockSuspend = true }},
+		{"actor read outlives the request", func(native *nativeFixture) { native.blockGetActor = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 2)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			// Persist the suspension intent; the suspend is issued on a later
+			// pass, once the revoked egress has settled.
+			if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if native.suspendCalls != 0 {
+				t.Fatal("fixture issued the suspend before egress settled")
+			}
+			tc.block(native)
+			for range 3 {
+				tick()
+				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				_, err := sharedDriver(contextAwareClient(c), native).SuspendInstance(ctx, first.Key, a.Identity)
+				cancel()
+				if err == nil {
+					continue
+				}
+				if _, record, _ := sharedDriver(c, native).read(t.Context(), first.Key); record.SharedWorker.Strong != "" {
+					break
+				}
+			}
+			_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.SharedWorker.Strong == "" {
+				t.Fatal("a strong trigger after the request deadline was not persisted")
+			}
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("the pool's retirement did not start after the request deadline")
+			}
+			if native.suspendCalls > 1 {
+				t.Fatalf("SuspendActor was replayed: %d calls", native.suspendCalls)
+			}
+		})
+	}
+}
+
+func TestSharedSuspectWorkspaceRetiresThePoolWhileNativeIsDown(t *testing.T) {
+	for _, change := range []string{"taint", "quarantine", "failed"} {
+		t.Run(change, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 2)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			_, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			workspace := &api.ExecutionWorkspace{}
+			if err := c.Get(t.Context(), clientKey(second.Key), workspace); err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "taint":
+				workspace.Annotations[operatorTaintAnnotation] = "{}"
+			case "quarantine":
+				workspace.Spec.DesiredState = api.ExecutionWorkspaceDesiredQuarantined
+			}
+			if err := c.Update(t.Context(), workspace); err != nil {
+				t.Fatal(err)
+			}
+			if change == "failed" {
+				workspace.Status.State = api.ExecutionWorkspaceStateFailed
+				if err := c.Status().Update(t.Context(), workspace); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Every native call stalls; the sweep's leading pass and the
+			// independent bounds loop act on Kubernetes alone.
+			native.block = true
+			swept := sharedReplenisher(c, native)
+			swept.SweepDeadline = 50 * time.Millisecond
+			_ = swept.Sweep(t.Context())
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("a pool hosting a suspect workspace kept running while the native API was down")
+			}
+		})
+	}
+}
+
+// contextAwareClient fails Kubernetes calls whose context has ended, as a
+// real API client does; the fake client ignores contexts.
+func contextAwareClient(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.List(ctx, list, opts...)
+		},
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+}
