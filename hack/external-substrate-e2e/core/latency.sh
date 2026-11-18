@@ -85,6 +85,8 @@ follow_workers() {
 }
 follow_workers &
 follower=$!
+# The host's load average, which skews every phase on a shared machine.
+(while [[ ! -e "${run_dir}/.done" ]]; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$(cut -d' ' -f1-3 /proc/loadavg)" >>"${run_dir}/loadavg.log"; sleep 30; done) &
 trap 'touch "${run_dir}/.done"; kill "${follower}" 2>/dev/null || true; jobs -p | xargs -r kill 2>/dev/null || true' EXIT
 
 jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "${LATENCY_WINDOW:-2m}" \
