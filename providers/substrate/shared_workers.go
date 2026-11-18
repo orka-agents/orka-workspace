@@ -1302,10 +1302,12 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 				return err
 			}
 		}
-		// A journaled interim proof is sufficient on its own; later doubt about
-		// the pool does not reopen it.
-		reason := ""
-		if shared.Proof == nil {
+		// A persisted strong marker always wins, even over a journaled interim
+		// proof (for example one saved just before a crash): pool deletion and
+		// the absence proof must finish. Otherwise a journaled interim proof is
+		// sufficient on its own, and later doubt about the pool does not reopen it.
+		reason := shared.Strong
+		if reason == "" && shared.Proof == nil {
 			var err error
 			if reason, err = d.sharedStrongReason(ctx, cm, record); err != nil {
 				return err
@@ -1346,6 +1348,14 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 			return err
 		}
 		return nil
+	}
+	if shared.Strong != "" && !shared.Released {
+		// Finish a persisted strong retirement before the slot (and with it
+		// the marker the bounds loop reads) is released.
+		gone, err := d.strongSharedAbsence(ctx, record)
+		if err != nil || !gone {
+			return err
+		}
 	}
 	if err := d.releaseSharedSlot(ctx, cm, record); err != nil {
 		return err
@@ -1526,6 +1536,18 @@ func (d *Lifecycle) releaseSharedSlot(ctx context.Context, cm *corev1.ConfigMap,
 	shared := record.SharedWorker
 	if shared.Released {
 		return nil
+	}
+	if shared.Strong != "" && shared.UID != "" {
+		// The entry keeps the strong marker visible to the bounds loop, so it
+		// is released only once the pool is gone and every fenced worker Pod
+		// is proven absent.
+		gone, err := d.strongSharedAbsence(ctx, record)
+		if err != nil {
+			return err
+		}
+		if !gone {
+			return fmt.Errorf("waiting for the strongly retired shared worker to be proven absent before releasing its slot")
+		}
 	}
 	if shared.UID != "" {
 		marker := claimMarker(cm, record)

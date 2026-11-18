@@ -1469,3 +1469,57 @@ func TestSharedJournalFailureIsSuspectBeforeTheWorkspaceReportsFailed(t *testing
 		t.Fatal("a pool hosting a failed instance kept running")
 	}
 }
+
+func TestSharedStrongMarkerWinsOverAJournaledInterimProof(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// Drive the Stop until its interim proof is journaled.
+	for range 12 {
+		tick()
+		if _, err := sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if _, record, _ := sharedDriver(c, native).read(t.Context(), first.Key); record.SharedWorker.Proof != nil {
+			break
+		}
+	}
+	// Model a crash after the proof, before WorkloadAbsent, then a later Actor
+	// read failure that persisted Strong, and a retirement that failed before
+	// closing the pool's ledger.
+	cm, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Proof == nil {
+		t.Fatal("fixture did not journal an interim proof")
+	}
+	record.WorkloadAbsent = false
+	record.Observation.State = sdk.AllocationPending
+	record.SharedWorker.Strong = "the Actor could not be read during retirement"
+	if err := sharedDriver(c, native).save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("fixture lost the pool before the strong path ran")
+	}
+	// A direct release cannot drop the entry while the strong path is open:
+	// it drives the pool's deletion instead and refuses until the Pod is gone.
+	if err := sharedDriver(c, native).releaseSharedSlot(t.Context(), cm, record); err == nil {
+		t.Fatal("a slot with an unfinished strong marker was released")
+	}
+	if _, current, _ := sharedDriver(c, native).read(t.Context(), first.Key); current.SharedWorker.Released {
+		t.Fatal("the journal released a slot whose strong retirement had not finished")
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the refused release did not drive the pool's deletion")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if stopped.SharedWorker.Strong == "" || !stopped.SharedWorker.Released {
+		t.Fatalf("the strong retirement did not finish: %#v", stopped.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the interim proof shortcut skipped pool deletion and the absence proof")
+	}
+}
