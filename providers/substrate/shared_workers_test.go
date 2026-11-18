@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1682,5 +1683,130 @@ func TestSharedPoolCreateRetryRechecksTheTemplateInventory(t *testing.T) {
 	sharedReady(t, c, native, first)
 	if len(sharedPools(t, c)) != 1 {
 		t.Fatal("a clean inventory did not allow the retried creation")
+	}
+}
+
+func TestSharedUndecodableHostedJournalIsDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(t.Context(), journalKey(first.Key), cm); err != nil {
+		t.Fatal(err)
+	}
+	cm.Data = map[string]string{journalDataKey: "{"}
+	if err := c.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+	// Admission never places an Actor beside an allocation whose Strong and
+	// Failure markers cannot be read.
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, recordB := sharedReady(t, c, native, second)
+	if recordB.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("an Actor joined a pool hosting an undecodable journal")
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a pool hosting an undecodable journal was not strongly retired")
+	}
+}
+
+func TestSharedDeadlineKeepsSubSecondLifetimePrecision(t *testing.T) {
+	scope := sharedScope{Namespace: "tenant", Atespace: "native", ProfileUID: "p", ProfileHash: "h", SourceUID: "s", Shape: "x", CPUMillicores: 1, MemoryBytes: 1, MaxActors: 2, Lifetime: metav1.Duration{Duration: 3*time.Hour + 500*time.Millisecond}}
+	ledger := &sharedLedger{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.NewTime(time.Now().UTC().Truncate(time.Second)), State: sharedAdmitting, Entries: []sharedLedgerEntry{}}
+	pool := poolObject()
+	pool.SetCreationTimestamp(ledger.BornAt)
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	setSharedDeadline(pool, ledger)
+	if _, _, evidence := sharedBoundsOf(pool); !evidence {
+		t.Fatalf("a fractional lifetime's deadline annotation %q is inconsistent with its ledger", pool.GetAnnotations()[sharedDeadlineAnnotation])
+	}
+	// Validation rejects sub-second lifetimes outright.
+	item := &profile.SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant"}, Spec: profile.SubstrateWorkspaceProfileSpec{TemplateRef: profile.SubstrateTemplateReference{Name: "base"}, Suspend: &profile.SubstrateSuspendPolicy{Mode: profile.SubstrateSuspendModeDataOnly}, Placement: &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{MaxActorsPerWorker: 2, MaxWorkerLifetime: &metav1.Duration{Duration: 3*time.Hour + 500*time.Millisecond}}}}}
+	if err := item.Validate(); err == nil {
+		t.Fatal("a sub-second maxWorkerLifetime was accepted")
+	}
+}
+
+func TestSharedSelectorMatchingRequiresKeyPresence(t *testing.T) {
+	worker := map[string]string{sharedPoolLabel: "abc"}
+	for _, tc := range []struct {
+		selector map[string]string
+		match    bool
+	}{
+		{nil, true},
+		{map[string]string{}, true},
+		{map[string]string{sharedPoolLabel: "abc"}, true},
+		{map[string]string{sharedPoolLabel: "other"}, false},
+		{map[string]string{"dedicated": ""}, false},
+		{map[string]string{sharedPoolLabel: "abc", "dedicated": ""}, false},
+	} {
+		if got := selectorMatches(tc.selector, worker); got != tc.match {
+			t.Fatalf("selectorMatches(%v) = %v, want %v", tc.selector, got, tc.match)
+		}
+	}
+	if !selectorMatches(map[string]string{"dedicated": ""}, map[string]string{"dedicated": ""}) {
+		t.Fatal("a present empty-valued label did not match")
+	}
+	// A foreign template selecting an absent key with an empty value does not
+	// quarantine a shared pool.
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.templates["foreign/dedicated"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "dedicated"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"dedicated": ""}}}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, record.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a template that cannot reach the pool changed its state to %s", ledger.State)
+	}
+}
+
+func TestSharedPoolSizedByARuntimeOverrideStaysAdmitting(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	override := func(request sdk.WorkloadRequest) sdk.WorkloadRequest {
+		request.Runtime = request.Runtime.DeepCopy()
+		limits := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")}
+		request.Runtime.Template.Spec.Containers[0].Resources.Limits = limits
+		request.Resources = corev1.ResourceRequirements{Limits: limits}
+		request.Revision, _ = sdk.WorkloadRevision(request)
+		if err := admit(c)(t.Context(), request); err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}
+	first = override(first)
+	_, a := sharedReady(t, c, native, first)
+	if a.SharedWorker.Scope.CPUMillicores != 500 || a.SharedWorker.Scope.MemoryBytes != 256<<20 {
+		t.Fatalf("the runtime override did not size the shared scope: %#v", a.SharedWorker.Scope)
+	}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, a.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a valid runtime-sized shared pool was closed: %s %s", ledger.State, ledger.Reason)
+	}
+	second := override(sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding))
+	_, b := sharedReady(t, c, native, second)
+	if b.SharedWorker.Pool != a.SharedWorker.Pool {
+		t.Fatal("a runtime-sized shared pool was not reused")
+	}
+	// A pool whose recorded size no longer matches the current operator pool
+	// still closes.
+	pool, ledger := poolLedger(t, c, a.SharedWorker.Pool)
+	ledger.Scope.Shape = "sha256:stale"
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, a.SharedWorker.Pool); ledger.State == sharedAdmitting {
+		t.Fatal("a pool with a stale shape kept admitting")
 	}
 }

@@ -412,7 +412,7 @@ func minTime(a, b time.Time) time.Time {
 // sharedRecordedDeadline reads the creation-time deadline annotation.
 func sharedRecordedDeadline(pool *unstructured.Unstructured) (time.Time, bool) {
 	raw := pool.GetAnnotations()[sharedDeadlineAnnotation]
-	deadline, err := time.Parse(time.RFC3339, raw)
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
 	return deadline, err == nil && raw != ""
 }
 
@@ -422,7 +422,7 @@ func setSharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
-	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339)
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339Nano)
 	pool.SetAnnotations(annotations)
 }
 
@@ -1647,6 +1647,11 @@ func (d *Lifecycle) abandonSharedToPrivate(ctx context.Context, cm *corev1.Confi
 func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger) (bool, error) {
 	for _, entry := range ledger.Entries {
 		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if errors.Is(err, errSharedJournalUndecodable) {
+			// Its Strong and Failure markers and its workspace cannot be
+			// checked, so it blocks admission and retires the pool.
+			return true, nil
+		}
 		if err != nil {
 			return false, err
 		}
@@ -1723,9 +1728,14 @@ func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels m
 
 // selectorMatches reports whether a label selector, including an empty one,
 // selects a worker with these labels.
+//
+// Like upstream's labels.SelectorFromSet, a selected key must be present, so
+// a selector for `key: ""` does not match a worker without that key. An empty
+// selector still matches every worker. Upstream selectors have only
+// matchLabels.
 func selectorMatches(selector, workerLabels map[string]string) bool {
 	for key, value := range selector {
-		if workerLabels[key] != value {
+		if actual, present := workerLabels[key]; !present || actual != value {
 			return false
 		}
 	}

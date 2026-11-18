@@ -333,8 +333,8 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		closing = "the shared worker's admission window ended"
 	case shape == nil || shape.scope.Namespace != ledger.Scope.Namespace:
 		closing = "the shared worker's profile is gone or no longer opts in"
-	case shape.scope != ledger.Scope || shape.source.GetNamespace() != pool.GetNamespace():
-		closing = "the shared worker's operator pool, profile or Actor size changed"
+	case !sharedScopeCurrent(shape, ledger.Scope) || shape.source.GetNamespace() != pool.GetNamespace():
+		closing = "the shared worker's operator pool or profile changed"
 	}
 	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers)
 	if err != nil {
@@ -450,6 +450,11 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 	var orphans []string
 	for _, entry := range ledger.Entries {
 		record, journalFound, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if errors.Is(err, errSharedJournalUndecodable) {
+			// Never collected, and doubt: its markers cannot be read.
+			suspect = true
+			continue
+		}
 		if err != nil {
 			return false, nil, err
 		}
@@ -493,6 +498,11 @@ func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
 	return state != ""
 }
 
+// errSharedJournalUndecodable marks a hosted entry whose exact journal (or
+// archived) record exists but cannot be decoded. Its Strong and Failure
+// markers and its workspace are unreadable, so it is doubt.
+var errSharedJournalUndecodable = errors.New("a hosted shared worker journal cannot be decoded")
+
 // sharedEntryRecord decodes the exact journal record a ledger marker names.
 // found is false when the journal is missing or replaced; record is nil when
 // it exists but does not decode.
@@ -516,7 +526,11 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 		return nil, false, nil
 	}
 	record, ok := decodeClaimRecord(journal)
-	if !ok || record.Request.Sequence < sequence {
+	if !ok {
+		return nil, true, errSharedJournalUndecodable
+	}
+	if record.Request.Sequence < sequence {
+		// The journal has not reached that sequence: not proof of anything.
 		return nil, true, nil
 	}
 	if record.Request.Sequence > sequence {
@@ -528,7 +542,7 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 			return nil, false, err
 		}
 		if record, ok = decodeClaimRecord(archived); !ok || record.Request.Sequence != sequence {
-			return nil, true, nil
+			return nil, true, errSharedJournalUndecodable
 		}
 	}
 	return record, true, nil
@@ -545,4 +559,26 @@ func (d *Lifecycle) sharedStrongMarked(ctx context.Context, pool *unstructured.U
 	}
 	suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger)
 	return err == nil && suspect
+}
+
+// sharedScopeCurrent reports whether a pool's scope still matches its profile
+// and the current operator pool. A runtime may override the template's Actor
+// size, so the pool is checked at the Actor size its ledger records: the
+// current operator pool is rebuilt at that size and its shape compared. The
+// template-sized shape is used only for warm provisioning.
+func sharedScopeCurrent(shape *sharedProfileShape, scope sharedScope) bool {
+	expected := shape.scope
+	expected.CPUMillicores, expected.MemoryBytes, expected.Shape = scope.CPUMillicores, scope.MemoryBytes, scope.Shape
+	if expected != scope {
+		return false
+	}
+	if scope.CPUMillicores == shape.scope.CPUMillicores && scope.MemoryBytes == shape.scope.MemoryBytes {
+		return scope.Shape == shape.scope.Shape
+	}
+	spec, err := buildPrivatePoolSpec(shape.source, scope.CPUMillicores, scope.MemoryBytes, spareBirth(spareNamePrefix+"shape"))
+	if err != nil {
+		return false
+	}
+	digest, err := runtimePoolRestoreDigest(spec, false)
+	return err == nil && digest == scope.Shape
 }
