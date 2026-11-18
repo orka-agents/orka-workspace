@@ -27,6 +27,7 @@ func main() {
 	var leader bool
 	var leaderNamespace string
 	var config provider.Config
+	var maxConcurrentReconciles int
 	flag.BoolVar(&leader, "leader-elect", true, "elect one active provider")
 	flag.StringVar(&leaderNamespace, "leader-election-namespace", "orka-workspace-system", "namespace of provider leader Lease")
 	flag.StringVar(&config.APIEndpoint, "native-api-endpoint", "api.ate-system.svc:443", "pinned Substrate control TLS endpoint")
@@ -43,6 +44,7 @@ func main() {
 	flag.BoolVar(&config.DedicatedInstall, "substrate-dedicated-install", false, "assert that only this Orka creates Actors and ActorTemplates on the Agent Substrate install; required before any profile may share workers (ADR 0008)")
 	flag.DurationVar(&config.EgressPolicyCacheTTL, "substrate-egress-policy-cache-ttl", 10*time.Second, "must equal the Agent Substrate egress gateway's --egress-policy-cache-ttl; shared workers wait longer than it after revoking egress before suspending an Actor")
 	flag.StringVar(&config.EgressCredentialProvider, "egress-credential-provider", "", "credential provider class the Substrate egress gateway was installed with (only k8s.io); empty disables egress credential injection")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", provider.DefaultMaxConcurrentReconciles, fmt.Sprintf("ExecutionWorkspaces reconciled in parallel, from 1 to %d; one workspace is never reconciled twice at once", provider.MaxMaxConcurrentReconciles))
 	flag.Func("egress-credential-namespace", "namespace, besides each workload's own, whose Secrets egress credential rules may name; repeatable (Orka core needs its runtime namespace)", func(value string) error {
 		config.EgressCredentialNamespaces = append(config.EgressCredentialNamespaces, strings.TrimSpace(value))
 		return nil
@@ -54,14 +56,18 @@ func main() {
 	// Configuration errors, including invalid egress credentials, never exit
 	// before run: config.Validate covers them, and run degrades to the
 	// provider status reconciler and the Kubernetes-only shared worker bounds
-	// so existing shared pools stay bounded. Only flag parsing fails fast,
+	// so existing shared pools stay bounded. Only flag parsing and flag ranges fail fast,
 	// which a previously working install with the same arguments cannot hit.
-	if err := run(leader, leaderNamespace, config); err != nil {
+	if err := provider.ValidateMaxConcurrentReconciles(maxConcurrentReconciles); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := run(leader, leaderNamespace, config, maxConcurrentReconciles); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
-func run(leader bool, leaderNamespace string, config provider.Config) error {
+func run(leader bool, leaderNamespace string, config provider.Config, maxConcurrentReconciles int) error {
 	// Without acknowledged native control, run only the provider reconciler so
 	// it withdraws any stale advertisement, and the Kubernetes-only shared
 	// worker bounds loop, instead of crash-looping.
@@ -83,7 +89,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	if err != nil {
 		return err
 	}
-	for _, setup := range controllerSetups(c, config, native, unavailable) {
+	for _, setup := range controllerSetups(c, config, native, unavailable, maxConcurrentReconciles) {
 		if err := setup(mgr); err != nil {
 			return err
 		}
@@ -129,7 +135,7 @@ func nativeControl(config provider.Config) (native pb.ControlClient, unavailable
 // The Kubernetes-only shared worker bounds loop always runs, so existing
 // shared pools stay bounded while native configuration or connection is
 // broken.
-func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, nativeUnavailable string) []func(ctrl.Manager) error {
+func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, nativeUnavailable string, maxConcurrentReconciles int) []func(ctrl.Manager) error {
 	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config, NativeUnavailable: nativeUnavailable}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
 		// No native sweep runs, and no lifecycle controller admits anything;
@@ -138,7 +144,7 @@ func controllerSetups(c client.Client, config provider.Config, native pb.Control
 		provider.SetNativeDegraded(nativeUnavailable)
 		return setups
 	}
-	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
+	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config, MaxConcurrentReconciles: maxConcurrentReconciles}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
 }
 
 const nativeRedialInterval = 30 * time.Second

@@ -896,6 +896,8 @@ func TestSharedProofRetriesAChangingWorkerThenTakesTheStrongPath(t *testing.T) {
 func TestSharedWorkerWaitsForASettledEpochAndRetiresARestartedWorker(t *testing.T) {
 	c, native, first, binding := sharedFixture(t, 2)
 	d := sharedDriver(c, native)
+	// The worker is born before its registered epoch is observed.
+	native.unsettledEpoch = true
 	var record *journalRecord
 	for range 16 {
 		if _, err := native.ListWorkers(t.Context(), &pb.ListWorkersRequest{}); err != nil {
@@ -917,6 +919,7 @@ func TestSharedWorkerWaitsForASettledEpochAndRetiresARestartedWorker(t *testing.
 	if record.BootRequested || native.boots != 0 {
 		t.Fatal("a shared worker booted an Actor before its registered epoch was observed")
 	}
+	native.unsettledEpoch = false
 	for _, worker := range native.workers {
 		worker.Status.ObservedEpoch = worker.Status.RegisteredEpoch
 	}
@@ -1155,11 +1158,16 @@ func TestSharedSuspectNeighbourStopsAnUnbootedClaim(t *testing.T) {
 	c, native, first, binding := sharedFixture(t, 2)
 	_, recordA := sharedReady(t, c, native, first)
 	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
-	// B claims its slot, creates its template and Actor, and pauses before
-	// Resume while its Actor UID enters the ledger.
-	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), second); err != nil {
-		t.Fatal(err)
+	// B claims its slot, creates its template and Actor, enters its Actor UID
+	// in the ledger, and stops before booting: its Resume is refused before
+	// it takes effect.
+	native.beforeResume = func(context.Context, *pb.Actor) error {
+		return status.Error(codes.ResourceExhausted, "no capacity yet")
 	}
+	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), second); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("the paused boot was not refused: %v", err)
+	}
+	native.beforeResume = nil
 	_, recordB, err := sharedDriver(c, native).read(t.Context(), second.Key)
 	if err != nil {
 		t.Fatal(err)
