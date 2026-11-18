@@ -107,7 +107,7 @@ require_finished() {
 teardown() {
   kubectl delete validatingwebhookconfiguration external-substrate-core --ignore-not-found
   kubectl delete namespace "${provider_namespace}" --ignore-not-found --wait=true --timeout=5m
-  for name in external-substrate-core external-substrate-core-fixture external-substrate-core-proof orka-workspace-substrate; do
+  for name in external-substrate-core external-substrate-core-fixture external-substrate-core-proof external-substrate-core-tokenreview orka-workspace-substrate; do
     kubectl delete clusterrolebinding "${name}" --ignore-not-found
     kubectl delete clusterrole "${name}" --ignore-not-found
   done
@@ -176,6 +176,64 @@ mkdir -p "${run_dir}/image"
 chmod 700 "${run_dir}"
 printf 'Native Core proof cleanup artifacts: %s\n' "${run_dir}"
 
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/image/native-data-proof" ./core
+docker build -f hack/external-substrate-e2e/core/proof.Dockerfile -t "localhost:5002/orka/native-core-proof:cleanup-${run_id}" "${run_dir}/image"
+docker push "localhost:5002/orka/native-core-proof:cleanup-${run_id}"
+cleanup_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-core-proof:cleanup-${run_id}")"
+
+# Session member Tasks (core/latency.sh) keep their frozen authority until
+# Session cleanup records their runtime cleanup receipts, so their Sessions
+# are deleted first through Core's public API. Core only lets an identity of
+# the run namespace act there, so a dedicated ServiceAccount in it holds
+# exactly Task read and Session delete; the run namespace removes it.
+if kubectl -n "${namespace}" get tasks.core.orka.ai -o json | jq -e 'any(.items[]; .spec.sessionRef.name // "" | length > 0)' >/dev/null; then
+  # Core authenticates API callers by TokenReview, which the released chart
+  # grants (config/rbac/metrics_auth_role.yaml) but the proof's Core role
+  # omits. Runs installed before install.py rendered it get it here.
+  jq -n --arg ns "${namespace}" '{apiVersion:"v1",kind:"List",items:[
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"ClusterRole",metadata:{name:"external-substrate-core-tokenreview"},
+      rules:[{apiGroups:["authentication.k8s.io"],resources:["tokenreviews"],verbs:["create"]}]},
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"ClusterRoleBinding",metadata:{name:"external-substrate-core-tokenreview"},
+      roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"ClusterRole",name:"external-substrate-core-tokenreview"},
+      subjects:[{kind:"ServiceAccount",name:"orka-controller-manager",namespace:$ns}]}]}' | kubectl apply -f -
+  session_job="native-core-sessions-${run_id}"
+  jq -n --arg ns "${namespace}" --arg name "${session_job}" --arg image "${cleanup_image}" '
+    {apiVersion:"v1",kind:"List",items:[
+      {apiVersion:"v1",kind:"ServiceAccount",metadata:{name:"native-core-session-cleanup",namespace:$ns}},
+      {apiVersion:"rbac.authorization.k8s.io/v1",kind:"Role",metadata:{name:"native-core-session-cleanup",namespace:$ns},rules:[
+        {apiGroups:["core.orka.ai"],resources:["tasks"],verbs:["get","list"]},
+        {apiGroups:["core.orka.ai"],resources:["sessions"],verbs:["get","delete"]}]},
+      {apiVersion:"rbac.authorization.k8s.io/v1",kind:"RoleBinding",metadata:{name:"native-core-session-cleanup",namespace:$ns},
+        roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:"native-core-session-cleanup"},
+        subjects:[{kind:"ServiceAccount",name:"native-core-session-cleanup",namespace:$ns}]},
+      {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:$ns,labels:{"orka.workspace.e2e/cleanup":"native-core-sessions"}},spec:{
+        backoffLimit:0,activeDeadlineSeconds:900,template:{metadata:{labels:{"orka.workspace.e2e/cleanup":"native-core-sessions"}},spec:{
+          serviceAccountName:"native-core-session-cleanup",restartPolicy:"Never",
+          securityContext:{runAsNonRoot:true,runAsUser:65532,runAsGroup:65532,seccompProfile:{type:"RuntimeDefault"}},
+          containers:[{name:"sessions",image:$image,imagePullPolicy:"IfNotPresent",
+            securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},
+            env:[{name:"SESSION_CLEANUP",value:"1"},{name:"POD_NAMESPACE",value:$ns},
+              {name:"CORE_API_URL",value:("http://external-substrate-core." + $ns + ".svc.cluster.local:8080")}]}]}}}}]}' |
+    kubectl apply -f -
+  start="$(date +%s)"
+  while true; do
+    session_state="$(kubectl -n "${namespace}" --request-timeout=15s get job "${session_job}" -o json)"
+    if jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True")' <<<"${session_state}" >/dev/null; then
+      kubectl -n "${namespace}" logs "job/${session_job}" | tee "${run_dir}/sessions.log"
+      printf 'Session cleanup failed; everything is retained for inspection.\n' >&2
+      exit 1
+    fi
+    if jq -e 'any(.status.conditions[]?; .type == "Complete" and .status == "True")' <<<"${session_state}" >/dev/null; then
+      kubectl -n "${namespace}" logs "job/${session_job}" | tee "${run_dir}/sessions.log"
+      break
+    fi
+    (( $(date +%s) - start <= 900 )) || exit 1
+    sleep 2
+  done
+fi
+
 # Tasks first, so Core settles and retires their RuntimePools and workspaces,
 # then whatever a failed run left behind, through the same controllers. Session
 # turns finish deleting only once their Session is archived (archive_sessions).
@@ -206,12 +264,6 @@ printf 'The provider released every journal and catalog in %s.\n' "${namespace}"
 # The proof's own native objects: the infrastructure template and Atespace.
 # The Job runs as the proof's bootstrap-owner identity and refuses to delete
 # any provider-owned Actor, Data Tag or derived template that remains.
-arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
-case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
-CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C hack/external-substrate-e2e build -p 4 -trimpath -o "${run_dir}/image/native-data-proof" ./core
-docker build -f hack/external-substrate-e2e/core/proof.Dockerfile -t "localhost:5002/orka/native-core-proof:cleanup-${run_id}" "${run_dir}/image"
-docker push "localhost:5002/orka/native-core-proof:cleanup-${run_id}"
-cleanup_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-core-proof:cleanup-${run_id}")"
 job_name="native-core-cleanup-${run_id}"
 test "$(kubectl get namespace "${namespace}" -o jsonpath='{.metadata.uid}')" = "${namespace_uid}"
 jq --arg name "${job_name}" --arg image "${cleanup_image}" --arg atespace "${owned_atespace}" --arg template "${owned_template}" '
