@@ -242,11 +242,23 @@ workspace settlement receipt). Results go to
 timing lines only of Core (`ACP turn timings`, `ACP workspace runtime
 started/stopped`), the provider (`Substrate runtime ready/stopped`) and the
 live-followed worker Pods (`ACP runtime session created`), and the joined
-`report.json` and `summary.md` (median, range and count per phase). Secret
+`report.json` and `summary.md` (median, range and count per phase), including
+each worker Pod's creation, container start and boot milestones relative to
+Task creation. Secret
 data, attachment token hashes and bootstrap nonces are never read into them.
 The deterministic agent sleeps 2s per prompt, which `promptStream` includes.
-A failed measurement keeps its objects for inspection; cleanup below retires
-them with the run and refuses while a measurement Job still runs.
+The measurement client is built from the checkout, so a harness change needs
+no new proof run. A failed measurement keeps its objects for inspection;
+cleanup below retires them with the run and refuses while a measurement Job
+still runs.
+
+Session member Tasks keep their frozen authority until Session cleanup records
+their runtime cleanup receipts, so cleanup first deletes every referenced
+Session through Core's public API (`DELETE /api/v1/sessions/<name>`) from a Job
+whose dedicated ServiceAccount in the run namespace may only read Tasks and
+delete Sessions. Core authenticates it by TokenReview, which the released chart
+grants and the proof's Core role omits; the proof renders, and cleanup ensures
+and removes, a `tokenreviews` `create` grant for Core's ServiceAccount.
 
 The run namespace is fixed, so a finished run (passed or failed) must be
 retired before the next one:
