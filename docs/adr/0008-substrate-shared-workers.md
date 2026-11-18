@@ -238,7 +238,13 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Hard retirement.** It is never blocked by a ledger write.
   - Every strong retirement issues the UID-preconditioned Delete first, on its own fresh bounded context. A deletionTimestamp already stops admission and startup.
   - The retirement state and reason are written afterwards, best effort, with a separate 5 s timeout. Neither the result nor the duration of that write can affect the Delete.
-  - A bounds pass first does every mandatory action: each due Delete and escalation, re-reading the clock per pool. Bookkeeping writes then run within a 30 s total budget, so they can never delay a Delete or an escalation, however many pools fall due together.
+  - A bounds pass works in phases:
+    1. It decides every action, re-reading the clock per pool.
+    2. It issues every due escalation, each Pod delete on its own short context.
+    3. It issues the pool Deletes concurrently, at most 8 at a time, so one slow DELETE never holds up the others.
+    4. It runs the bookkeeping writes within a 30 s total budget.
+
+    Escalation also runs in its own 10 s loop that never waits on a pool Delete, so a slow pass cannot push a worker Pod's escalation past its deadline.
   - No durable write gates a mandatory deletion. A strong marker or instance failure that cannot be saved still has its pool's deletion attempted, and the persistence error is returned. A deleting pool or an absent worker Pod is itself strong evidence on every later pass, so the interim path is never taken afterwards.
   - Escalation does not wait for that deletion to have started.
   - Every variable-length ledger field is size-bounded, including the fenced worker's identity.
