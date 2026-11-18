@@ -51,12 +51,20 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		if suspend && record.Failure != "" {
 			return fmt.Errorf("a failed runtime Pod has no data to suspend; Stop retires it")
 		}
-		// Past the authorization's deadline a suspension that has not been
-		// journaled never starts; the caller stops the exact instance instead.
-		// The journal save below uses optimistic concurrency, and the Sandbox
-		// update that issues the suspension rechecks the deadline.
-		if suspend && record.Operation != "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
-			return workspaceprovider.ErrSuspendDeadlineExceeded
+		// Past the authorization's deadline a suspension that has not reached
+		// the Sandbox never starts; the caller stops the exact instance
+		// instead. This runs before suspension-only validation, which must not
+		// block that Stop. The journal save below uses optimistic concurrency,
+		// and the Sandbox update that issues the suspension rechecks the
+		// deadline.
+		if suspend && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			issued, err := d.suspensionIssued(ctx, record)
+			if err != nil {
+				return err
+			}
+			if !issued {
+				return workspaceprovider.ErrSuspendDeadlineExceeded
+			}
 		}
 		if suspend {
 			if err := d.resolveRetention(ctx, record); err != nil {
@@ -241,6 +249,23 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		return nil
 	})
 	return observed, err
+}
+
+// suspensionIssued reports whether this sequence's journaled suspension
+// reached the Sandbox, which is when it starts.
+func (d *Lifecycle) suspensionIssued(ctx context.Context, record *journalRecord) (bool, error) {
+	if record.Operation != "suspend" {
+		return false, nil
+	}
+	sb, err := d.readSandbox(ctx, record, false)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended &&
+		sb.Annotations[nativeOperationAnnotation] == strconv.FormatInt(record.Request.Sequence, 10)+":suspend", nil
 }
 
 // Stop uses the committed Pod UID even if ownership metadata has drifted. The

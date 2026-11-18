@@ -197,6 +197,7 @@ func TestRetirementNotAfterOnlyNarrowsSuspendAuthorization(t *testing.T) {
 		{name: "Delete keeps a carried deadline", previous: retirement(deletion, &deadline), next: retirement(deletion, &deadline)},
 		{name: "Delete clears a carried deadline", previous: retirement(deletion, &deadline), next: retirement(deletion, nil)},
 		{name: "create Stop with a deadline", next: retirement(stop, &deadline), create: true, rejection: "notAfter bounds only a Suspend authorization"},
+		{name: "create Delete with a deadline", next: retirement(deletion, &deadline), create: true, rejection: "written only with Suspend"},
 		{name: "authorize Stop with a deadline", next: retirement(stop, &deadline), rejection: "notAfter bounds only a Suspend authorization"},
 		{name: "authorize Delete with a deadline", next: retirement(deletion, &deadline), rejection: "written only with Suspend"},
 		{name: "remove the deadline", previous: retirement(suspend, &deadline), next: retirement(suspend, nil), rejection: "cannot be removed or extended"},

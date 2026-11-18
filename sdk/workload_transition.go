@@ -135,7 +135,8 @@ func SuspendDeadlineExceeded(notAfter *metav1.Time, now time.Time) bool {
 
 // SuspendDeadlineExceededMessage accompanies ReasonSuspendDeadlineExceeded on
 // the DataPlaneReady condition.
-const SuspendDeadlineExceededMessage = "suspend authorization expired before suspension started; the instance was stopped without retaining data"
+// It does not claim termination; the allocation state reports that.
+const SuspendDeadlineExceededMessage = "suspend authorization expired before suspension started; the instance is retired through Stop and its data is not retained"
 
 // SuspendableLifecycle is a provider that can both stop and suspend.
 type SuspendableLifecycle interface {

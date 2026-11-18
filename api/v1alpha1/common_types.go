@@ -227,8 +227,9 @@ const (
 	ReasonQuarantined          ExecutionWorkspaceConditionReason = "Quarantined"
 	ReasonLifetimeExceeded     ExecutionWorkspaceConditionReason = "LifetimeExceeded"
 	// ReasonSuspendDeadlineExceeded reports that a Suspend authorization's
-	// notAfter passed before suspension started. The provider stopped the
-	// exact instance instead and published no retained data.
+	// notAfter passed before suspension started. The provider retires the
+	// exact instance through Stop instead and publishes no retained data;
+	// the allocation state reports when termination is confirmed.
 	ReasonSuspendDeadlineExceeded ExecutionWorkspaceConditionReason = "SuspendDeadlineExceeded"
 )
 

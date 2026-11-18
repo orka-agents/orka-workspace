@@ -443,7 +443,8 @@ func CheckSuspendDeadline(ctx context.Context, factory func() workspaceprovider.
 		return fmt.Errorf("expired suspend authorization was not refused after the fallback stop: %v", err)
 	}
 	observed, err := factory().Observe(ctx, request.Key)
-	if err != nil || observed.Identity != ready.Identity || observed.State != workspaceprovider.AllocationStopped || observed.RetainedData != nil || observed.Startup != nil {
+	if err != nil || observed.Key != request.Key || observed.Sequence != request.Sequence || observed.Identity != ready.Identity ||
+		observed.State != workspaceprovider.AllocationStopped || observed.RetainedData != nil || observed.Startup != nil {
 		return fmt.Errorf("stopped instance after an expired suspend authorization was reported suspended or changed: %v", err)
 	}
 	policy := workspacev1alpha1.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspacev1alpha1.WorkspaceDeletionActionDelete, PersistentVolumes: workspacev1alpha1.WorkspaceDeletionActionDelete, Checkpoints: workspacev1alpha1.WorkspaceDeletionActionDelete}

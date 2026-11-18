@@ -155,8 +155,9 @@ Provider journals remain until workspace finalization. Retained checkpoint
 artifacts have their own references and must be released separately.
 
 A data-preserving `Suspend` authorization can carry `spec.retirement.notAfter`.
-Core sets it to the worker eviction deadline when it authorizes Suspend during
-an eviction, because it cannot withdraw the authorization afterwards. A provider
+Core cannot withdraw the authorization once written, so it is expected to set
+`notAfter` to the worker eviction deadline when it authorizes Suspend during an
+eviction. That Orka Core wiring follows in a release that adopts this API. A provider
 must not start a suspension after that time, less
 `sdk.SuspendDeadlineClockSkew` (5 seconds) for a clock that trails Core's.
 Check the deadline with the provider's own clock in the same optimistic journal

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -364,6 +366,14 @@ func (c *lostSandboxSuspend) Update(ctx context.Context, object client.Object, o
 }
 
 func TestJournaledSuspensionIsNotIssuedAfterDeadline(t *testing.T) {
+	for _, drift := range []bool{false, true} {
+		t.Run(fmt.Sprint("pod ownership drift=", drift), func(t *testing.T) {
+			testJournaledSuspensionIsNotIssuedAfterDeadline(t, drift)
+		})
+	}
+}
+
+func testJournaledSuspensionIsNotIssuedAfterDeadline(t *testing.T, drift bool) {
 	c, request := fixture(t, true)
 	first := ready(t, c, request)
 	window := metav1.NewTime(time.Now().Add(time.Hour))
@@ -371,8 +381,20 @@ func TestJournaledSuspensionIsNotIssuedAfterDeadline(t *testing.T) {
 		t.Fatal("lost Sandbox update succeeded")
 	}
 	_, record, err := New(c).read(t.Context(), request.Key)
-	if err != nil || record.Operation != "suspend" {
+	if err != nil || record.Operation != "suspend" || record.Pod == nil {
 		t.Fatalf("suspension intent was not journaled: %v", err)
+	}
+	if drift {
+		// Suspension-only Pod ownership checks now fail; they must not block
+		// the deadline fallback to the exact-UID Stop.
+		pod := &corev1.Pod{}
+		if err := c.Get(t.Context(), types.NamespacedName{Namespace: record.Pod.Namespace, Name: record.Pod.Name}, pod); err != nil {
+			t.Fatal(err)
+		}
+		pod.OwnerReferences = nil
+		if err := c.Update(t.Context(), pod); err != nil {
+			t.Fatal(err)
+		}
 	}
 	window = metav1.NewTime(time.Now().Add(-time.Hour))
 	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {

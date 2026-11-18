@@ -10557,10 +10557,12 @@ spec:
                 : self.retirement.action == ''Delete'')'
             - message: retirement.notAfter is written only with Suspend; deletion
                 may only keep it unchanged
+              optionalOldSelf: true
               rule: '!has(self.retirement) || !has(self.retirement.notAfter) || self.retirement.action
-                == ''Suspend'' || (has(oldSelf.retirement) && oldSelf.retirement.sequence
-                == self.retirement.sequence && has(oldSelf.retirement.notAfter) &&
-                self.retirement.notAfter == oldSelf.retirement.notAfter)'
+                == ''Suspend'' || (oldSelf.hasValue() && has(oldSelf.value().retirement)
+                && oldSelf.value().retirement.sequence == self.retirement.sequence
+                && has(oldSelf.value().retirement.notAfter) && self.retirement.notAfter
+                == oldSelf.value().retirement.notAfter)'
           status:
             description: |-
               ExecutionWorkspaceStatus defines adapter-observed state. Exactly one provider adapter owns this status;
