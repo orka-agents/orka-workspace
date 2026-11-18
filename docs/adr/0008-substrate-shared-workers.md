@@ -217,10 +217,18 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Strong retirement starts** at `maxWorkerLifetime − 3600 s − 5 min`. That leaves the worker Pod's whole termination grace, which contains the worker's 30-minute drain and Orka core's 30-minute eviction window, plus a margin.
 - **Admission closes** one hour before that, which is why the minimum lifetime is 3h.
 - **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof.
-- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call, is registered even when the provider's native configuration is missing or invalid, or native control cannot be reached (the provider then advertises nothing), and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
-- **Robust evidence.** Each pool's hard deadline is also written once, at creation, in the `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches. The effective deadline is the earlier of that annotation and the ledger's birth plus lifetime.
-  - Unreadable or inconsistent lifetime evidence is doubt: a corrupt ledger, or a missing, malformed or mismatched deadline. The pool is then strongly retired at once.
-  - Its escalation is bounded by the recorded deadline, or by creation plus the minimum lifetime, so the bound is never lengthened.
+- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call, is registered even when the provider's native configuration is missing or invalid (including invalid egress credentials), or native control cannot be reached (the provider then advertises nothing), and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
+- **Independent provenance.** The pool's mutable annotations alone never set the bound. The effective deadline is the earliest of:
+  - the ledger's birth plus lifetime;
+  - the creation-time `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches;
+  - the pool's server-set `metadata.creationTimestamp` plus the shortest lifetime frozen in any journal or archived record that recorded the pool's UID;
+  - that creation time plus the 24h maximum, an absolute ceiling.
+- **Doubt.** Unreadable or inconsistent lifetime evidence is doubt, and the pool is then strongly retired at once. That covers a corrupt ledger; a missing, malformed or mismatched deadline; or a ledger scope that disagrees with a journal's frozen scope. Its escalation is bounded by the shortest of these bounds, so a rewrite of both annotations can never lengthen it.
+- **Discovery.** It does not depend on the removable label. The bounds loop lists every WorkerPool and recognizes shared pools by the label, the ledger or deadline annotation, or the `ate-shared-` name. A pool with shared evidence but without its intact provider-owned label is doubt and is strongly retired.
+- **Hard retirement.** It is never blocked by a ledger write.
+  - Lifetime, doubt, persisted states, missing labels and a withdrawn dedicated assertion record the state when they can, but always issue the UID-preconditioned Delete.
+  - Escalation does not wait for that deletion to have started.
+  - Ledger fields are size-bounded, so any valid ledger leaves room for its retirement write.
 - **Other reasons to close admission early.** Admission also closes when the operator pool's image or shape changes, the profile disappears, or the template inventory cannot be verified.
 - **Limits.** The bound assumes a responsive kubelet. The Pod's absence on a partitioned node cannot be proven, and its instances then never report termination.
 
