@@ -75,7 +75,9 @@ follow_workers() {
       fi
       [[ "${seen}" == *" ${pod} "* ]] && continue
       seen="${seen}${pod} "
-      (kubectl -n "${namespace}" logs -f --pod-running-timeout=5m "pod/${pod}" 2>/dev/null |
+      # Spare and shared worker Pods outlive the run, so each follower's PID
+      # is recorded and stopped on exit.
+      ({ kubectl -n "${namespace}" logs -f --pod-running-timeout=5m "pod/${pod}" 2>/dev/null & echo $! >>"${run_dir}/.followers"; wait; } |
         jq -R -c --unbuffered --arg pod "${pod}" --arg pattern "^(${worker_messages})$" 'fromjson? | select(type == "object" and ((.msg // "") | test($pattern))) |
           {pod: $pod, time, msg, runtimeSessionID, nativeRestore, totalMs, stagesMs, adapterMs, actorUID: .labels["ate.actor.uid"]?} | with_entries(select(.value != null))' \
         >"${run_dir}/workers/${pod}.log" || true) &
@@ -87,7 +89,8 @@ follow_workers &
 follower=$!
 # The host's load average, which skews every phase on a shared machine.
 (while [[ ! -e "${run_dir}/.done" ]]; do printf '%s %s\n' "$(date -u +%H:%M:%S)" "$(cut -d' ' -f1-3 /proc/loadavg)" >>"${run_dir}/loadavg.log"; sleep 30; done) &
-trap 'touch "${run_dir}/.done"; kill "${follower}" 2>/dev/null || true; jobs -p | xargs -r kill 2>/dev/null || true' EXIT
+trap 'touch "${run_dir}/.done"; kill "${follower}" 2>/dev/null || true; jobs -p | xargs -r kill 2>/dev/null || true
+  [[ -f "${run_dir}/.followers" ]] && xargs -r kill <"${run_dir}/.followers" 2>/dev/null || true' EXIT
 
 jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "${LATENCY_WINDOW:-2m}" \
   --arg scenarios "${LATENCY_SCENARIOS:-detach,warm}" --arg sequence "${sequence}" --arg image "${client_image}" '

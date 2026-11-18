@@ -247,6 +247,28 @@ each worker Pod's creation, container start and boot milestones relative to
 Task creation. Secret
 data, attachment token hashes and bootstrap nonces are never read into them.
 The deterministic agent sleeps 2s per prompt, which `promptStream` includes.
+Two more scenarios cover the native provider's worker placement:
+
+- `spare` (provider ADR 0007): a no-window profile with
+  `substrate.workspace.orka.ai/spare-workers: LATENCY_SPARE_WORKERS` (default 1).
+  Each turn must run on a spare listed before it: same WorkerPool and Pod UIDs,
+  Pod born before the Task and never restarted, claim marker present, and the
+  native Worker carrying the claimed pool's labels; the spares must then be
+  replenished.
+- `shared` (provider ADR 0008, needs the proof run with
+  `SUBSTRATE_DEDICATED_INSTALL=1`, which starts the provider with
+  `--substrate-dedicated-install`): a windowed profile with
+  `placement.sharedWorkers` (`LATENCY_SHARED_ACTORS`, default 4, and
+  `LATENCY_SHARED_LIFETIME`, default 3h) and `LATENCY_SHARED_SPARES` warm free
+  slots (default 2). `LATENCY_SHARED_SESSIONS` (default 2) Sessions take a
+  concurrent first turn and must share one worker Pod listed in its ledger.
+  While Session A's window expires and its Actor is suspended per Actor,
+  Session B takes a warm turn on the same, never restarted, worker Pod; A's
+  egress must read back deny-all before its suspension is observed, A must
+  leave the ledger with a new Tag, and A then resumes onto a shared slot.
+- `scope`: a second shared profile in the same namespace must never place its
+  Actor on the first profile's workers.
+
 The measurement client is built from the checkout, so a harness change needs
 no new proof run. A failed measurement keeps its objects for inspection;
 cleanup below retires them with the run and refuses while a measurement Job
