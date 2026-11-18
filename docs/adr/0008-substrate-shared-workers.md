@@ -197,6 +197,8 @@ These take the strong path:
 - **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
   - a hosted entry's journal holds the marker or a recorded instance failure, or cannot be decoded (its markers are then unreadable, which is doubt, and also blocks admission);
   - a booted entry (one with an Actor UID, or an assigned Actor) whose exact journal does not hold that slot under the same Actor name and UID. Such an entry would hide whose markers apply, so it is doubt.
+    - Doubt holds only if a pool read taken after the journal still shows the entry. A release removes the entry before its journal records `Released`, so this never mistakes a concurrent release for doubt.
+    - Every retirement it triggers is preconditioned on that pool snapshot's resourceVersion.
   - a hosted workspace is operator-tainted, quarantined or `Failed`;
   - its ledger was saved as `Retiring` or `Quarantined`.
 
@@ -215,7 +217,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Strong retirement starts** at `maxWorkerLifetime − 3600 s − 5 min`. That leaves the worker Pod's whole termination grace, which contains the worker's 30-minute drain and Orka core's 30-minute eviction window, plus a margin.
 - **Admission closes** one hour before that, which is why the minimum lifetime is 3h.
 - **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof.
-- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call, is registered even when the provider's native configuration is missing or invalid, and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
+- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call, is registered even when the provider's native configuration is missing or invalid, or native control cannot be reached (the provider then advertises nothing), and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
 - **Robust evidence.** Each pool's hard deadline is also written once, at creation, in the `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches. The effective deadline is the earlier of that annotation and the ledger's birth plus lifetime.
   - Unreadable or inconsistent lifetime evidence is doubt: a corrupt ledger, or a missing, malformed or mismatched deadline. The pool is then strongly retired at once.
   - Its escalation is bounded by the recorded deadline, or by creation plus the minimum lifetime, so the bound is never lengthened.
