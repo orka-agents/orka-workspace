@@ -76,7 +76,7 @@ paired with revocation of everything a leaked sandbox could use.
 
 - **A profile field, so opting in needs a new profile.** `SubstrateWorkspaceProfile.spec.placement.sharedWorkers` is:
   - `maxActorsPerWorker`: required, from 2 to 16;
-  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h, in whole seconds.
+  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h, written in whole hours, minutes or seconds (no fractions or sub-second units, at most 32 characters). The API server enforces this with a cheap pattern rule.
 - **Hashed and immutable.** The spec is immutable and hashed by `sdk.ParametersProfileHash`. Sharing changes the security model, so it belongs in the frozen spec, never in a mutable annotation.
 - **Today's behavior when absent.** An absent field keeps ADRs 0006 and 0007 on the allocation path: same private pool, same proof, same API calls. Existing profile hashes do not change. The leader sweep adds one Kubernetes list of shared pools per pass, so it can enforce lifetimes left by deleted profiles. It makes no native call while no profile opts in and no shared pool exists.
 - **Validation.** The field requires `suspend.mode: DataOnly`, checked by CEL and by `Validate`.
