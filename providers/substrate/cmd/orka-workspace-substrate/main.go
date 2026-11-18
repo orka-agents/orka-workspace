@@ -51,10 +51,11 @@ func main() {
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&options)))
-	if err := config.ValidateEgressCredentials(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
+	// Configuration errors, including invalid egress credentials, never exit
+	// before run: config.Validate covers them, and run degrades to the
+	// provider status reconciler and the Kubernetes-only shared worker bounds
+	// so existing shared pools stay bounded. Only flag parsing fails fast,
+	// which a previously working install with the same arguments cannot hit.
 	if err := run(leader, leaderNamespace, config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -64,7 +65,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	// Without acknowledged native control, run only the provider reconciler so
 	// it withdraws any stale advertisement, and the Kubernetes-only shared
 	// worker bounds loop, instead of crash-looping.
-	native, unavailable, closer := nativeControl(config)
+	native, unavailable, closer, redial := nativeControl(config)
 	if closer != nil {
 		defer closer.Close()
 	}
@@ -87,7 +88,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 			return err
 		}
 	}
-	if unavailable != "" {
+	if redial {
 		// A failed dial may be transient, such as TLS material mounted late.
 		// Keep retrying; once native control is reachable, stop so the
 		// restarted process runs every lifecycle controller.
@@ -108,17 +109,20 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 // one whose dial fails (for example unreadable TLS material), degrades the
 // same way: it is logged, no native client is returned, and the reason is
 // reported so the provider status withdraws its advertisement.
-func nativeControl(config provider.Config) (pb.ControlClient, string, io.Closer) {
+//
+// redial is true only for a failed dial, which may be transient; an invalid
+// configuration (including invalid egress credentials) is not retried.
+func nativeControl(config provider.Config) (native pb.ControlClient, unavailable string, closer io.Closer, redial bool) {
 	if err := config.Validate(); err != nil {
 		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
-		return nil, "", nil
+		return nil, "native control is not configured: " + err.Error(), nil, false
 	}
 	conn, err := provider.Dial(config)
 	if err != nil {
 		ctrl.Log.Error(err, "native control could not be reached; withdrawing the provider advertisement and running only Kubernetes-only shared worker bounds")
-		return nil, "native control could not be reached: " + err.Error(), nil
+		return nil, "native control could not be reached: " + err.Error(), nil, true
 	}
-	return pb.NewControlClient(conn), "", conn
+	return pb.NewControlClient(conn), "", conn, false
 }
 
 // controllerSetups registers lifecycle controllers only with native control.

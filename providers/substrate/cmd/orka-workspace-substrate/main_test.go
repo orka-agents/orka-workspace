@@ -43,8 +43,8 @@ func TestValidConfigWhoseDialFailsKeepsStatusAndSharedBounds(t *testing.T) {
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	native, unavailable, closer := nativeControl(config)
-	if native != nil || closer != nil || unavailable == "" {
+	native, unavailable, closer, redial := nativeControl(config)
+	if native != nil || closer != nil || unavailable == "" || !redial {
 		t.Fatalf("a failed dial did not degrade: native=%v reason=%q", native, unavailable)
 	}
 	if setups := controllerSetups(nil, config, native, unavailable); len(setups) != 2 {
@@ -76,5 +76,19 @@ func TestDegradedProviderRestartsOnceNativeControlIsReachable(t *testing.T) {
 	never := nativeRedialer{interval: time.Millisecond, dial: func() (io.Closer, error) { return nil, errors.New("unreachable") }}
 	if err := never.Start(ctx); err != nil {
 		t.Fatalf("a stopped manager made the redialer fail: %v", err)
+	}
+}
+
+func TestInvalidEgressCredentialsDegradeWithoutRedial(t *testing.T) {
+	config := provider.Config{APIEndpoint: "api.ate-system.svc:443", CAFile: "/run/substrate-serving-ca/trust-bundle.pem", BearerTokenFile: "/run/substrate-token/token", RouterEndpoint: "https://atenet-router.ate-system.svc:443", RouterCAFile: "/run/substrate-serving-ca/trust-bundle.pem", RouterCertFile: "/run/substrate-podidentity/credential-bundle.pem", RouterKeyFile: "/run/substrate-podidentity/credential-bundle.pem", EgressCredentialProvider: "vault.example.com"}
+	if config.ValidateEgressCredentials() == nil {
+		t.Fatal("fixture egress credentials are valid")
+	}
+	native, unavailable, closer, redial := nativeControl(config)
+	if native != nil || closer != nil || unavailable == "" || redial {
+		t.Fatalf("invalid egress credentials did not degrade without redialing: native=%v reason=%q redial=%v", native, unavailable, redial)
+	}
+	if setups := controllerSetups(nil, config, native, unavailable); len(setups) != 2 {
+		t.Fatalf("invalid egress credentials registered %d controllers, want provider status and the Kubernetes-only shared worker bounds loop", len(setups))
 	}
 }
