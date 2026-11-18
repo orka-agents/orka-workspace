@@ -55,6 +55,11 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
 			case !evidence:
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
+			case sharedRetirementPersisted(pool):
+				// A retirement state saved before a crash, or before a native
+				// sweep ran out of time, is unconditional deletion intent.
+				state, reason := sharedPersistedRetirement(pool)
+				errs = append(errs, d.retireSharedPool(ctx, pool, state, reason))
 			case d.sharedStrongMarked(ctx, pool):
 				// A journal persisted the strong path, possibly crashing before
 				// it deleted the pool; finish that deletion here.
@@ -459,11 +464,26 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 			}
 			return false, nil, err
 		}
-		if workspace.UID == record.Request.Key.WorkspaceUID && workspaceSuspect(workspace) {
+		if record.Failure != "" || workspace.UID == record.Request.Key.WorkspaceUID && workspaceSuspect(workspace) {
 			suspect = true
 		}
 	}
 	return suspect, orphans, nil
+}
+
+// sharedPersistedRetirement returns the pool's saved retirement state, if it
+// is Retiring or Quarantined.
+func sharedPersistedRetirement(pool *unstructured.Unstructured) (string, string) {
+	ledger, err := readSharedLedger(pool)
+	if err != nil || (ledger.State != sharedRetiring && ledger.State != sharedQuarantined) {
+		return "", ""
+	}
+	return ledger.State, ledger.Reason
+}
+
+func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
+	state, _ := sharedPersistedRetirement(pool)
+	return state != ""
 }
 
 // sharedEntryRecord decodes the exact journal record a ledger marker names.
@@ -519,7 +539,7 @@ func (d *Lifecycle) sharedStrongMarked(ctx context.Context, pool *unstructured.U
 		if err != nil || !found || record == nil || record.SharedWorker == nil {
 			continue
 		}
-		if record.SharedWorker.Pool == pool.GetName() && record.SharedWorker.UID == string(pool.GetUID()) && record.SharedWorker.Strong != "" {
+		if record.SharedWorker.Pool == pool.GetName() && record.SharedWorker.UID == string(pool.GetUID()) && (record.SharedWorker.Strong != "" || record.Failure != "") {
 			return true
 		}
 	}

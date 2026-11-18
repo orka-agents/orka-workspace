@@ -1382,8 +1382,13 @@ func (d *Lifecycle) advanceSharedInterim(ctx context.Context, cm *corev1.ConfigM
 		if err := d.save(ctx, cm, record); err != nil {
 			return false, "", err
 		}
-		_, err = d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
-		return false, "", err
+		// A rejected or timed-out evidence suspend may or may not have taken
+		// effect, so it is doubt: the strong path is persisted and the pool's
+		// retirement starts before returning, and it is never reissued.
+		if _, err = d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}}); err != nil {
+			return false, "the evidence-only suspend failed: " + status.Code(err).String(), nil
+		}
+		return false, "", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDING:
 		return false, "", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDED:
@@ -1613,6 +1618,11 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 		}
 		if !found || record == nil {
 			continue
+		}
+		// A recorded instance failure is suspect before the workspace itself
+		// reports Failed.
+		if record.Failure != "" && record.SharedWorker != nil && record.SharedWorker.Pool == pool.GetName() {
+			return true, nil
 		}
 		workspace := &api.ExecutionWorkspace{}
 		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {

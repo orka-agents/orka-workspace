@@ -1388,3 +1388,84 @@ func TestSharedEgressSettleFollowsTheDeclaredGatewayTTL(t *testing.T) {
 		t.Fatalf("SuspendActor calls after the settle window = %d", native.suspendCalls)
 	}
 }
+
+func TestSharedPersistedRetirementStateIsDeletionIntentForTheBoundsLoop(t *testing.T) {
+	for _, state := range []string{sharedQuarantined, sharedRetiring} {
+		t.Run(state, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			// A sweep saved the state, then crashed (or ran out of time) before
+			// deleting the pool; no journal carries a strong marker.
+			pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+			ledger.State, ledger.Reason = state, "the shared worker hosts an Actor outside its ledger"
+			if err := setSharedLedger(pool, ledger); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Update(t.Context(), pool); err != nil {
+				t.Fatal(err)
+			}
+			native.nativeDown = true
+			if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatalf("a persisted %s state did not drive the pool's deletion", state)
+			}
+		})
+	}
+}
+
+func TestSharedRejectedEvidenceSuspendTakesTheStrongPathAtOnce(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failSuspendBeforeEffect = true
+	for range 4 {
+		tick()
+		if _, err := sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if native.suspendCalls == 1 {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.suspendCalls != 1 || record.SharedWorker.Strong == "" || record.SharedWorker.Proof != nil {
+		t.Fatalf("a rejected evidence suspend did not persist the strong path: calls=%d %#v", native.suspendCalls, record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the pool's retirement did not start before the failed Stop pass returned")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if native.suspendCalls != 1 || !stopped.WorkloadAbsent || stopped.SharedWorker.Proof != nil {
+		t.Fatalf("the evidence suspend was replayed or proven by interim evidence: calls=%d", native.suspendCalls)
+	}
+}
+
+func TestSharedJournalFailureIsSuspectBeforeTheWorkspaceReportsFailed(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	cm, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Failure = nativeActorStopped
+	if err := sharedDriver(c, native).save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	// Admission never places another Actor beside the failed instance.
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, recordB := sharedReady(t, c, native, second)
+	if recordB.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("an Actor was placed beside an instance whose journal recorded a failure")
+	}
+	// The Kubernetes-only bounds loop and the sweep both retire the pool.
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a pool hosting a failed instance kept running")
+	}
+}
