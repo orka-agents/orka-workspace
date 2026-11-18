@@ -310,7 +310,7 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 	for _, policy := range []map[string]any{
 		{"maxActorsPerWorker": int64(2)},
 		{"maxActorsPerWorker": int64(16), "maxWorkerLifetime": "24h"},
-		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "1h"},
+		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "3h"},
 	} {
 		object := shared(policy)
 		if errs := schema.validate(t, object, nil); len(errs) != 0 {
@@ -325,8 +325,8 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 	for name, object := range map[string]map[string]any{
 		"one actor":           shared(map[string]any{"maxActorsPerWorker": int64(1)}),
 		"seventeen actors":    shared(map[string]any{"maxActorsPerWorker": int64(17)}),
-		"missing actors":      shared(map[string]any{"maxWorkerLifetime": "2h"}),
-		"short lifetime":      shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "59m"}),
+		"missing actors":      shared(map[string]any{"maxWorkerLifetime": "4h"}),
+		"short lifetime":      shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "2h59m"}),
 		"long lifetime":       shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "24h0m1s"}),
 		"without data-only":   {"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "placement": map[string]any{"sharedWorkers": map[string]any{"maxActorsPerWorker": int64(2)}}}},
 		"unparsable lifetime": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "soon"}),

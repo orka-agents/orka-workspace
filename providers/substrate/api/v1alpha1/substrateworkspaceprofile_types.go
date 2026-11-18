@@ -72,7 +72,7 @@ const MaxSuspendAfterDetach = time.Hour
 // share one gVisor worker, which is recycled after maxWorkerLifetime. Taking
 // this field changes the profile hash: sharing changes the security model, so
 // it can only be adopted by creating a new profile.
-// +kubebuilder:validation:XValidation:rule="!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime) >= duration('1h') && duration(self.maxWorkerLifetime) <= duration('24h'))",message="maxWorkerLifetime must be at least 1h and at most 24h"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime) >= duration('3h') && duration(self.maxWorkerLifetime) <= duration('24h'))",message="maxWorkerLifetime must be at least 3h and at most 24h"
 type SharedWorkersPolicy struct {
 	// MaxActorsPerWorker is the number of Actors one shared worker is sized
 	// for and admits.
@@ -80,10 +80,11 @@ type SharedWorkersPolicy struct {
 	// +kubebuilder:validation:Maximum=16
 	MaxActorsPerWorker int32 `json:"maxActorsPerWorker"`
 
-	// MaxWorkerLifetime bounds how long a shared worker lives. It stops
-	// admitting Actors before then and is deleted, with exact worker Pod
-	// absence proof for every Actor it still hosts, when it is reached.
-	// Defaults to 24h, which is also the maximum.
+	// MaxWorkerLifetime is a hard bound on how long a shared worker Pod,
+	// and any sandbox memory it holds, exists. Its strong retirement starts
+	// early enough for the worker Pod's full termination grace to elapse
+	// before the bound, and admission closes an hour before that. From 3h to
+	// 24h; defaults to 24h.
 	// +optional
 	MaxWorkerLifetime *metav1.Duration `json:"maxWorkerLifetime,omitempty"`
 }
@@ -102,7 +103,10 @@ const (
 	MaxSharedActorsPerWorker = 16
 	// MinSharedWorkerLifetime and MaxSharedWorkerLifetime bound
 	// sharedWorkers.maxWorkerLifetime; the maximum is also the default.
-	MinSharedWorkerLifetime = time.Hour
+	// The minimum leaves room for an hour of admission before the strong
+	// retirement that starts one worker Pod termination grace (1h upstream)
+	// plus a margin before the lifetime ends.
+	MinSharedWorkerLifetime = 3 * time.Hour
 	MaxSharedWorkerLifetime = 24 * time.Hour
 )
 

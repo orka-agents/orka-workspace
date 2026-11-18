@@ -75,6 +75,20 @@ type nativeFixture struct {
 	lingering map[string]*pb.ActorAssignment
 	// failGetWorker fails the next GetWorker calls.
 	failGetWorker int
+	// failSuspendBeforeEffect rejects the next SuspendActor before it takes
+	// effect; suspendCalls counts every SuspendActor request.
+	failSuspendBeforeEffect bool
+	suspendCalls            int
+	// failGetActor fails the next GetActor calls.
+	failGetActor int
+	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
+	failEgressUpdate int
+	// block makes Worker and template reads wait for their context, as a
+	// stalled native control plane.
+	block bool
+	// failGetTemplate, failCreateTag and failGetTag fail the next calls
+	// before they take effect.
+	failGetTemplate, failCreateTag, failGetTag int
 	// staleOnce reports these assignments in only the next listing of their
 	// worker, as a listing taken just before a retirement released them.
 	staleOnce map[string]*pb.ActorAssignment
@@ -129,7 +143,15 @@ func applyNativeTemplateDefaults(t *pb.ActorTemplate) {
 		}
 	}
 }
-func (f *nativeFixture) GetActorTemplate(_ context.Context, req *pb.GetActorTemplateRequest, _ ...grpc.CallOption) (*pb.ActorTemplate, error) {
+func (f *nativeFixture) GetActorTemplate(ctx context.Context, req *pb.GetActorTemplateRequest, _ ...grpc.CallOption) (*pb.ActorTemplate, error) {
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.failGetTemplate > 0 {
+		f.failGetTemplate--
+		return nil, status.Error(codes.Unavailable, "template read unavailable")
+	}
 	v := f.templates[refKey(req.ActorTemplate)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "template absent")
@@ -163,7 +185,25 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	delete(f.templates, key)
 	return cloneTemplate(v), f.effect("deleteTemplate")
 }
+func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
+	out := &pb.ListActorTemplatesResponse{}
+	for _, template := range f.templates {
+		out.ActorTemplates = append(out.ActorTemplates, cloneTemplate(template))
+	}
+	return out, nil
+}
 func (f *nativeFixture) GetActor(_ context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+	if f.failGetActor > 0 {
+		f.failGetActor--
+		return nil, status.Error(codes.Unavailable, "actor read unavailable")
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -297,6 +337,11 @@ func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	v.Status.WorkerAssignment = nil
 }
 func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+	f.suspendCalls++
+	if f.failSuspendBeforeEffect {
+		f.failSuspendBeforeEffect = false
+		return nil, status.Error(codes.Unavailable, "suspend not applied")
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -372,6 +417,10 @@ func (f *nativeFixture) CreateActorEgressPolicy(_ context.Context, req *pb.Creat
 	return proto.Clone(v).(*pb.EgressPolicy), f.effect("egress")
 }
 func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.UpdateActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	if f.failEgressUpdate > 0 {
+		f.failEgressUpdate--
+		return nil, status.Error(codes.Unavailable, "egress update unavailable")
+	}
 	key := refKey(req.Actor)
 	v := f.egress[key]
 	if v == nil {
@@ -416,6 +465,10 @@ func nativeWorkerCapacity(pool unstructured.Unstructured) (*pb.WorkerResources, 
 	return &pb.WorkerResources{CpuMillicores: cpu.MilliValue(), MemoryBytes: memory.Value() - 64<<20, Actors: 1000}, nil
 }
 func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersRequest, _ ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.nativeDown {
 		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
 	}
@@ -488,6 +541,10 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 	return out, nil
 }
 func (f *nativeFixture) CreateTag(_ context.Context, req *pb.CreateTagRequest, _ ...grpc.CallOption) (*pb.Tag, error) {
+	if f.failCreateTag > 0 {
+		f.failCreateTag--
+		return nil, status.Error(codes.Unavailable, "tag create unavailable")
+	}
 	key := metaKey(req.Tag.Metadata)
 	if f.tags[key] != nil {
 		return nil, status.Error(codes.AlreadyExists, "exists")
@@ -514,6 +571,10 @@ func (f *nativeFixture) CreateTag(_ context.Context, req *pb.CreateTagRequest, _
 	return proto.Clone(v).(*pb.Tag), f.effect("tag")
 }
 func (f *nativeFixture) GetTag(_ context.Context, req *pb.GetTagRequest, _ ...grpc.CallOption) (*pb.Tag, error) {
+	if f.failGetTag > 0 {
+		f.failGetTag--
+		return nil, status.Error(codes.Unavailable, "tag read unavailable")
+	}
 	v := f.tags[refKey(req.Tag)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")

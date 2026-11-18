@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -277,7 +278,7 @@ func validateJournalStructure(record *journalRecord) error {
 	if spare := record.SpareWorker; spare != nil && (spare.Name != record.RuntimePool.Name || spare.UID == "" || spare.ProfileUID == "" || spare.Birth == "" || record.RuntimePool.CreateIssued || record.RuntimePool.UID != "" && (record.RuntimePool.UID != spare.UID || spare.Released || !spare.ClaimIssued)) {
 		return sdk.ErrStaleIdentity
 	}
-	if shared := record.SharedWorker; shared != nil && (record.SpareWorker != nil || record.RuntimePool.CreateIssued || record.RuntimePoolDeleting || shared.Pool == "" || shared.Pool != record.RuntimePool.Name || shared.Label == "" || shared.SpecDigest != record.RuntimePool.Digest || shared.UID != record.RuntimePool.UID || !shared.Scope.valid() || record.RuntimePoolLabels[sharedPoolLabel] != shared.Label) {
+	if shared := record.SharedWorker; shared != nil && (record.SpareWorker != nil || record.RuntimePool.CreateIssued || record.RuntimePoolDeleting || shared.Pool == "" || shared.Pool != record.RuntimePool.Name || shared.Label == "" || shared.SpecDigest != record.RuntimePool.Digest || shared.UID != record.RuntimePool.UID || !shared.Scope.valid() || !maps.Equal(record.RuntimePoolLabels, sharedLabels(shared.Label))) {
 		return sdk.ErrStaleIdentity
 	}
 	if len(record.RetirementWorkers) > 16 {
@@ -487,5 +488,9 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	// The spare count is a mutable annotation outside the profile hash; an
 	// invalid value disables spares and the replenisher reports it.
 	spares, _ := spareWorkerCount(object.Annotations)
-	return d.prepareRuntimePool(ctx, record, spares, object.UID, sharedPolicyFor(object, workspace, record))
+	shared, err := d.sharedPolicyFor(object, workspace, record)
+	if err != nil {
+		return err
+	}
+	return d.prepareRuntimePool(ctx, record, spares, object.UID, shared)
 }

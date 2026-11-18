@@ -44,8 +44,12 @@ const (
 	sharedPoolLabel = "substrate.workspace.orka.ai/shared-pool"
 	// sharedLedgerAnnotation is the pool's resourceVersion-protected ledger.
 	sharedLedgerAnnotation = "substrate.workspace.orka.ai/shared-ledger"
-	sharedLedgerVersion    = "substrate.workspace.shared-ledger.v1"
-	sharedPoolPrefix       = "ate-shared-"
+	// sharedDeadlineAnnotation is the pool's hard lifetime deadline (RFC 3339),
+	// written once at creation and never by a ledger update, so a corrupted or
+	// rewritten ledger can never extend the bound.
+	sharedDeadlineAnnotation = "substrate.workspace.orka.ai/shared-deadline"
+	sharedLedgerVersion      = "substrate.workspace.shared-ledger.v1"
+	sharedPoolPrefix         = "ate-shared-"
 	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
 	sharedIdleGrace = 5 * time.Minute
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
@@ -56,7 +60,37 @@ const (
 	// operatorTaintAnnotation is Orka core's durable operator-access marker
 	// on an ExecutionWorkspace (Orka ADR 0044).
 	operatorTaintAnnotation = "acp.workspace.orka.ai/operator-tainted"
+	// workerPodTerminationGrace is the termination grace Agent Substrate
+	// v1.0.0 hardcodes on every worker Pod
+	// (cmd/atecontroller/internal/controllers/workerpool_apply.go,
+	// workerTerminationGracePeriodSeconds). The worker drains its Actors for
+	// at most 30 minutes of it (cmd/ateworker-gvisor/main.go,
+	// workloadGracePeriod).
+	workerPodTerminationGrace = 3600 * time.Second
+	// sharedRetireMargin is kept between the end of the worker Pod's grace
+	// and maxWorkerLifetime; at lifetime minus this margin a worker Pod that
+	// still exists is re-deleted with a one-second grace.
+	sharedRetireMargin = 5 * time.Minute
+	// sharedAdmissionLead closes admission this long before strong retirement
+	// begins, so a newly admitted Actor has time to run.
+	sharedAdmissionLead = time.Hour
+	// dnsRelayPolicyTTL is the worker DNS relay's fixed policy cache
+	// (internal/atunnel/egresspolicy.go, egressPolicyTTL).
+	dnsRelayPolicyTTL = 5 * time.Second
+	// sharedEgressSettleMargin is added to the longest policy cache.
+	sharedEgressSettleMargin = 5 * time.Second
+	// sharedEgressSettle is the settle window with the default gateway TTL.
+	sharedEgressSettle = upstreamEgressPolicyCacheTTL + sharedEgressSettleMargin
+	// sharedEscalationGrace is the grace of the escalating re-delete. One
+	// second, not zero: a zero grace removes the Pod object without the
+	// kubelet confirming its containers stopped, which would forge the
+	// absence proof.
+	sharedEscalationGrace int64 = 1
 )
+
+// errSharedWorkersNotDedicated refuses a shared-worker profile on a provider
+// whose operator has not asserted a dedicated Substrate install.
+var errSharedWorkersNotDedicated = errors.New("SubstrateWorkspaceProfile requests sharedWorkers, but this provider was not started with --substrate-dedicated-install; shared workers are only allowed on an Agent Substrate install dedicated to this Orka")
 
 // Ledger admission states. Draining admits no new claims but lets existing
 // claimants boot; Retiring and Quarantined pools are being deleted.
@@ -159,11 +193,16 @@ type sharedPlacement struct {
 	Create       json.RawMessage `json:"create,omitempty"`
 	CreateIssued bool            `json:"createIssued,omitempty"`
 	ClaimIssued  bool            `json:"claimIssued,omitempty"`
-	// EgressRevoked records the verified deny-all egress before suspension.
-	EgressRevoked bool                    `json:"egressRevoked,omitempty"`
-	Suspend       *sharedSuspendFence     `json:"suspend,omitempty"`
-	Proof         *sharedTerminationProof `json:"proof,omitempty"`
-	ProofAttempts int                     `json:"proofAttempts,omitempty"`
+	// OperatorLabels are the operator pool's labels, kept as resume and
+	// checkpoint provenance; the shared pool itself never carries them.
+	OperatorLabels map[string]string `json:"operatorLabels,omitempty"`
+	// EgressRevoked records the verified deny-all egress before suspension,
+	// and EgressRevokedAt when it was first stored.
+	EgressRevoked   bool                    `json:"egressRevoked,omitempty"`
+	EgressRevokedAt *metav1.MicroTime       `json:"egressRevokedAt,omitempty"`
+	Suspend         *sharedSuspendFence     `json:"suspend,omitempty"`
+	Proof           *sharedTerminationProof `json:"proof,omitempty"`
+	ProofAttempts   int                     `json:"proofAttempts,omitempty"`
 	// Strong is why retirement takes the strong Pod-absence path. Once set,
 	// it is never cleared.
 	Strong   string `json:"strong,omitempty"`
@@ -193,23 +232,30 @@ func actorKey(record *journalRecord) string { return record.Atespace + "/" + rec
 // allocation may share. Everything that is not data-only and gateway-credentialed,
 // every restore from a public checkpoint, and every tainted, quarantined or
 // failed workspace keeps the private single-Actor path.
-func sharedPolicyFor(object *profile.SubstrateWorkspaceProfile, workspace *api.ExecutionWorkspace, record *journalRecord) *profile.SharedWorkersPolicy {
+//
+// A profile that opts in on a provider without --substrate-dedicated-install is
+// refused outright: placement upstream checks no tenant, so only an install
+// dedicated to this Orka may share.
+func (d *Lifecycle) sharedPolicyFor(object *profile.SubstrateWorkspaceProfile, workspace *api.ExecutionWorkspace, record *journalRecord) (*profile.SharedWorkersPolicy, error) {
 	if object.Spec.Placement == nil || object.Spec.Placement.SharedWorkers == nil {
-		return nil
+		return nil, nil
+	}
+	if !d.config.DedicatedInstall {
+		return nil, errSharedWorkersNotDedicated
 	}
 	request := record.Request
 	if !record.SuspendEnabled || request.RestoreFrom != nil || request.Runtime == nil {
-		return nil
+		return nil, nil
 	}
 	// The provider-proxy token must never enter a shared sandbox: a leaked
 	// sandbox may keep it in memory after its Actor stopped.
 	if !request.Runtime.Egress.HasCredentialInjection() || !slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
-		return nil
+		return nil, nil
 	}
 	if workspaceSuspect(workspace) {
-		return nil
+		return nil, nil
 	}
-	return object.Spec.Placement.SharedWorkers
+	return object.Spec.Placement.SharedWorkers, nil
 }
 
 // workspaceSuspect reports a tainted, quarantined or failed workspace.
@@ -246,12 +292,12 @@ func (d *Lifecycle) prepareSharedPlacement(record *journalRecord, source *unstru
 	// The operator's own labels are taken while the record still carries
 	// its private birth labels.
 	operator := operatorPoolLabels(record)
-	record.SharedWorker = &sharedPlacement{Scope: scope}
-	return d.bindNewSharedPool(record, source, operator)
+	record.SharedWorker = &sharedPlacement{Scope: scope, OperatorLabels: operator}
+	return d.bindNewSharedPool(record, source)
 }
 
 // bindNewSharedPool rebinds the record to a fresh pool of its own.
-func (d *Lifecycle) bindNewSharedPool(record *journalRecord, source *unstructured.Unstructured, operator map[string]string) error {
+func (d *Lifecycle) bindNewSharedPool(record *journalRecord, source *unstructured.Unstructured) error {
 	name, err := randomName(sharedPoolPrefix)
 	if err != nil {
 		return err
@@ -265,23 +311,23 @@ func (d *Lifecycle) bindNewSharedPool(record *journalRecord, source *unstructure
 		return err
 	}
 	shared := record.SharedWorker
-	*shared = sharedPlacement{Scope: shared.Scope, Pool: name, Label: label, SpecDigest: digest(spec), Create: spec}
-	return bindSharedPool(record, operator)
+	*shared = sharedPlacement{Scope: shared.Scope, OperatorLabels: shared.OperatorLabels, Pool: name, Label: label, SpecDigest: digest(spec), Create: spec}
+	return bindSharedPool(record)
 }
 
-// bindSharedPool sets the record's pool reference, its pool labels (the
-// operator's plus the shared label), and the template's worker selector.
-func bindSharedPool(record *journalRecord, operator map[string]string) error {
+// bindSharedPool sets the record's pool reference, its pool labels, and the
+// template's worker selector. Agent Substrate copies WorkerPool labels onto
+// Workers and schedules only by those labels
+// (cmd/atecontroller/internal/workersync/syncer.go,
+// cmd/ateapi/internal/scheduling/scheduling.go), so a shared pool carries
+// only the provider-owned random label, never the operator pool's labels a
+// foreign template might select. Sandbox class and config, image and
+// scheduling come from the copied spec, not from labels.
+func bindSharedPool(record *journalRecord) error {
 	shared := record.SharedWorker
 	record.RuntimePool = nativeReference{Name: shared.Pool, UID: shared.UID, Digest: shared.SpecDigest}
-	record.RuntimePoolLabels = maps.Clone(operator)
-	if record.RuntimePoolLabels == nil {
-		record.RuntimePoolLabels = map[string]string{}
-	}
-	maps.Copy(record.RuntimePoolLabels, sharedLabels(shared.Label))
-	selector := maps.Clone(record.SourceSelector)
-	maps.Copy(selector, sharedLabels(shared.Label))
-	record.TemplateSpec.WorkerSelector = &pb.Selector{MatchLabels: selector}
+	record.RuntimePoolLabels = sharedLabels(shared.Label)
+	record.TemplateSpec.WorkerSelector = &pb.Selector{MatchLabels: sharedLabels(shared.Label)}
 	var err error
 	record.Template.Digest, err = templateDigest(record.TemplateSpec)
 	return err
@@ -342,16 +388,60 @@ func sharedBorn(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time
 	return born
 }
 
-// sharedAdmissionEnds is when a pool stops admitting new claims: the
-// lifetime less a drain window of one hour, or half the lifetime if shorter.
-func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
-	lifetime := ledger.Scope.Lifetime.Duration
-	return sharedBorn(pool, ledger).Add(lifetime - min(time.Hour, lifetime/2))
+// sharedDeadline is the hard bound: the worker Pod is gone by then. It is the
+// earliest of the ledger's birth plus lifetime and the creation-time deadline
+// annotation; a missing or unreadable annotation bounds the pool by its
+// creation plus the minimum lifetime, so it never lengthens the bound.
+func sharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	deadline := sharedBorn(pool, ledger).Add(ledger.Scope.Lifetime.Duration)
+	if recorded, ok := sharedRecordedDeadline(pool); !ok {
+		deadline = minTime(deadline, pool.GetCreationTimestamp().Add(profile.MinSharedWorkerLifetime))
+	} else {
+		deadline = minTime(deadline, recorded)
+	}
+	return deadline
 }
 
-// sharedRetireAt is when the pool is retired with the strong path.
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// sharedRecordedDeadline reads the creation-time deadline annotation.
+func sharedRecordedDeadline(pool *unstructured.Unstructured) (time.Time, bool) {
+	raw := pool.GetAnnotations()[sharedDeadlineAnnotation]
+	deadline, err := time.Parse(time.RFC3339, raw)
+	return deadline, err == nil && raw != ""
+}
+
+// setSharedDeadline writes a new pool's deadline annotation.
+func setSharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) {
+	annotations := maps.Clone(pool.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339)
+	pool.SetAnnotations(annotations)
+}
+
+// sharedRetireAt is when strong retirement begins: early enough for the
+// worker Pod's whole termination grace, which contains the worker's drain,
+// to end a margin before the deadline.
 func sharedRetireAt(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
-	return sharedBorn(pool, ledger).Add(ledger.Scope.Lifetime.Duration)
+	return sharedDeadline(pool, ledger).Add(-workerPodTerminationGrace - sharedRetireMargin)
+}
+
+// sharedEscalateAt is when a worker Pod that still exists is re-deleted with
+// a one-second grace.
+func sharedEscalateAt(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	return sharedDeadline(pool, ledger).Add(-sharedRetireMargin)
+}
+
+// sharedAdmissionEnds is when a pool stops admitting new claims.
+func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	return sharedRetireAt(pool, ledger).Add(-sharedAdmissionLead)
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
@@ -382,6 +472,9 @@ func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (
 	if ledger.Scope != shared.Scope {
 		return nil, fmt.Errorf("shared worker ledger scope differs from this allocation: %w", sdk.ErrStaleIdentity)
 	}
+	if recorded, ok := sharedRecordedDeadline(pool); !ok || !recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
+		return nil, fmt.Errorf("shared worker lifetime evidence is missing or inconsistent: %w", sdk.ErrStaleIdentity)
+	}
 	return ledger, nil
 }
 
@@ -410,9 +503,10 @@ func (d *Lifecycle) selectSharedPool(ctx context.Context, record *journalRecord,
 			continue
 		}
 		label := pool.GetLabels()[sharedPoolLabel]
-		expected := maps.Clone(operatorPoolLabels(record))
-		maps.Copy(expected, sharedLabels(label))
-		if label == "" || !maps.Equal(pool.GetLabels(), expected) {
+		if label == "" || !maps.Equal(pool.GetLabels(), sharedLabels(label)) {
+			continue
+		}
+		if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil || suspect {
 			continue
 		}
 		spec, err := buildSharedPoolSpec(source, ledger.Scope, label)
@@ -447,7 +541,22 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		_, err := d.verifySharedRuntimePool(ctx, cm, record, true)
 		return err
 	}
+	if !d.config.DedicatedInstall {
+		return errSharedWorkersNotDedicated
+	}
 	movable := !record.Template.CreateIssued && !shared.CreateIssued
+	if movable {
+		// The workspace may have become tainted, quarantined or failed since
+		// its allocation was prepared; before any template exists it simply
+		// takes the private single-Actor path.
+		workspace := &api.ExecutionWorkspace{}
+		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+			return err
+		}
+		if workspaceSuspect(workspace) {
+			return d.abandonSharedToPrivate(ctx, cm, record, "the workspace became tainted, quarantined or failed")
+		}
+	}
 	source := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, source); err != nil {
 		return err
@@ -463,8 +572,8 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if candidate != nil {
 			label := candidate.GetLabels()[sharedPoolLabel]
 			specDigest, _ := poolSpecDigest(candidate)
-			*shared = sharedPlacement{Scope: shared.Scope, Pool: candidate.GetName(), Label: label, SpecDigest: specDigest}
-			if err := bindSharedPool(record, operatorPoolLabels(record)); err != nil {
+			*shared = sharedPlacement{Scope: shared.Scope, OperatorLabels: shared.OperatorLabels, Pool: candidate.GetName(), Label: label, SpecDigest: specDigest}
+			if err := bindSharedPool(record); err != nil {
 				return err
 			}
 			if err := d.save(ctx, cm, record); err != nil {
@@ -476,7 +585,7 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if !movable {
 			return fmt.Errorf("shared worker slot is unavailable after native creation (%s): %w", reason, sdk.ErrStaleIdentity)
 		}
-		if err := d.bindNewSharedPool(record, source, operatorPoolLabels(record)); err != nil {
+		if err := d.bindNewSharedPool(record, source); err != nil {
 			return err
 		}
 		ctrl.LoggerFrom(ctx).Info("Substrate shared worker slot not claimed; creating a new shared worker", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
@@ -488,6 +597,9 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 			return abandon("the shared worker disappeared")
 		}
 		if !shared.CreateIssued {
+			if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), nil); err != nil {
+				return err
+			}
 			shared.CreateIssued = true
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
@@ -506,6 +618,7 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if err := setSharedLedger(created, ledger); err != nil {
 			return err
 		}
+		setSharedDeadline(created, ledger)
 		err = d.client.Create(ctx, created)
 		if apierrors.IsAlreadyExists(err) {
 			created = poolObject()
@@ -534,6 +647,14 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		}
 		if slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.Actor == actorKey(record) }) {
 			return abandon("the shared worker already lists this Actor")
+		}
+		if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil {
+			return err
+		} else if suspect {
+			return abandon("the shared worker hosts a tainted, quarantined or failed workspace")
+		}
+		if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), pool); err != nil {
+			return err
 		}
 		if !shared.ClaimIssued {
 			shared.ClaimIssued = true
@@ -737,6 +858,9 @@ func (d *Lifecycle) sharedAssignmentsInLedger(ctx context.Context, record *journ
 //
 //nolint:gocyclo // Every pre-Resume fence is checked in order.
 func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	if !d.config.DedicatedInstall {
+		return false, errSharedWorkersNotDedicated
+	}
 	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
 		return false, err
 	}
@@ -751,6 +875,27 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 	}
 	if ledger.State != sharedAdmitting && ledger.State != sharedDraining || !sharedNow().Before(sharedRetireAt(pool, ledger)) {
 		return false, fmt.Errorf("shared worker is past its lifetime or retiring: %w", sdk.ErrStaleIdentity)
+	}
+	// Re-checked immediately before Resume, never only when the allocation was
+	// prepared: the template already selects this pool, so suspicion here
+	// fails closed instead of moving the record.
+	workspace := &api.ExecutionWorkspace{}
+	if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+		return false, err
+	}
+	if workspaceSuspect(workspace) {
+		return false, fmt.Errorf("the workspace became tainted, quarantined or failed before its shared boot: %w", sdk.ErrStaleIdentity)
+	}
+	if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil {
+		return false, err
+	} else if suspect {
+		if err := d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker hosts a tainted, quarantined or failed workspace"); err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("the shared worker hosts a tainted, quarantined or failed workspace: %w", sdk.ErrStaleIdentity)
+	}
+	if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, record.RuntimePoolLabels, pool); err != nil {
+		return false, err
 	}
 	selected, err := d.privatePoolWorker(ctx, record)
 	if err != nil || selected == nil {
@@ -975,6 +1120,7 @@ func (d *Lifecycle) revokeSharedEgress(ctx context.Context, cm *corev1.ConfigMap
 		return err
 	}
 	record.SharedWorker.EgressRevoked = true
+	stamp(&record.SharedWorker.EgressRevokedAt)
 	return d.save(ctx, cm, record)
 }
 
@@ -997,29 +1143,41 @@ func (d *Lifecycle) verifyEgressDenyAll(ctx context.Context, record *journalReco
 	return nil
 }
 
-// prepareSharedSuspend runs before SuspendActor on a shared worker. It checks
-// the fenced worker and ledger (doubt marks the strong path, but data capture
-// still proceeds), revokes egress, and records the suspend fence.
-func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) error {
+// prepareSharedSuspend runs before SuspendActor on a shared worker and
+// reports whether SuspendActor may be issued now. Any doubt (including an
+// unreadable worker, ledger or workspace, or a failed egress revocation)
+// selects the strong path and starts retiring the pool at once; the data
+// capture still proceeds. On the interim path the verified deny-all egress
+// must have been stored for sharedEgressSettle first, so gateway and DNS relay
+// caches no longer hold the admitted allowlist.
+func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (bool, error) {
 	shared := record.SharedWorker
-	if reason, err := d.sharedStrongReason(ctx, cm, record); err != nil {
-		return err
-	} else if reason != "" {
-		if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
-			return err
-		}
-	} else if err := d.verifyRetiringSharedWorker(ctx, record); err != nil {
-		if err := d.markSharedStrong(ctx, cm, record, "the shared worker could not be verified before suspension: "+err.Error()); err != nil {
-			return err
+	reason, err := d.sharedStrongReason(ctx, cm, record)
+	if err != nil {
+		reason = "the shared worker could not be verified before suspension: " + err.Error()
+	}
+	if reason == "" {
+		if err := d.verifyRetiringSharedWorker(ctx, record); err != nil {
+			reason = "the shared worker could not be verified before suspension: " + err.Error()
 		}
 	}
-	if err := d.revokeSharedEgress(ctx, cm, record); err != nil {
-		return err
+	if reason == "" {
+		if err := d.revokeSharedEgress(ctx, cm, record); err != nil {
+			reason = "egress could not be revoked before suspension: " + err.Error()
+		}
+	}
+	if reason != "" {
+		if err := d.sharedDoubt(ctx, cm, record, reason); err != nil {
+			return false, err
+		}
+	}
+	if shared.Strong == "" && sharedNow().Before(shared.EgressRevokedAt.Add(d.config.egressSettle())) {
+		return false, nil
 	}
 	if shared.Suspend == nil || !shared.Suspend.Issued {
 		shared.Suspend = &sharedSuspendFence{Issued: true, PriorVersion: actor.GetMetadata().GetVersion(), PriorGeneration: actor.GetStatus().GetLastAssignedGeneration(), PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
 	}
-	return nil
+	return true, nil
 }
 
 // sharedSuspendFenceOf returns the issued shared suspend fence, if any.
@@ -1043,6 +1201,10 @@ func (d *Lifecycle) verifyRetiringSharedWorker(ctx context.Context, record *jour
 	}
 	if !sharedWorkerIdentityMatches(worker, f) || worker.GetStatus().GetRegisteredEpoch() != f.Epoch {
 		return sdk.ErrStaleIdentity
+	}
+	// MarkWorkerUnavailable changes only the state, never identity or epoch.
+	if worker.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
+		return fmt.Errorf("the fenced shared worker is %s", worker.GetStatus().GetState())
 	}
 	if err := verifySingleActorWorkerShape(record, worker, true); err != nil {
 		return err
@@ -1077,6 +1239,9 @@ func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.Confi
 	if !sharedWorkerIdentityMatches(before, f) || before.GetStatus().GetRegisteredEpoch() != f.Epoch || before.GetStatus().GetObservedEpoch() != f.Epoch {
 		return nil, "the fenced worker's identity or epoch changed"
 	}
+	if before.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
+		return nil, "the fenced worker is " + before.GetStatus().GetState().String()
+	}
 	assigned, _, err := d.sharedAssignmentsInLedger(ctx, record, f.Name)
 	if err != nil {
 		return nil, "the fenced worker's assignments are in doubt: " + err.Error()
@@ -1090,6 +1255,9 @@ func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.Confi
 	}
 	if !sharedWorkerIdentityMatches(after, f) || after.GetStatus().GetRegisteredEpoch() != f.Epoch || after.GetStatus().GetObservedEpoch() != f.Epoch {
 		return nil, "the fenced worker's identity or epoch changed during the proof"
+	}
+	if after.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
+		return nil, "the fenced worker is " + after.GetStatus().GetState().String()
 	}
 	if after.GetMetadata().GetVersion() != before.GetMetadata().GetVersion() {
 		if shared.ProofAttempts+1 >= sharedMaxProofAttempts {
@@ -1200,18 +1368,27 @@ func (d *Lifecycle) advanceSharedInterim(ctx context.Context, cm *corev1.ConfigM
 		}
 		// A Stop issues the same synchronous VOLUMES suspend, only as
 		// termination evidence; no Tag is kept.
-		if err := d.prepareSharedSuspend(ctx, cm, record, actor); err != nil {
+		ready, err := d.prepareSharedSuspend(ctx, cm, record, actor)
+		if err != nil {
 			return false, "", err
 		}
 		if shared.Strong != "" {
 			return false, shared.Strong, nil
 		}
+		if !ready {
+			return false, "", nil
+		}
 		stamp(&record.Timing.SuspendIssuedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return false, "", err
 		}
-		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
-		return false, "", err
+		// A rejected or timed-out evidence suspend may or may not have taken
+		// effect, so it is doubt: the strong path is persisted and the pool's
+		// retirement starts before returning, and it is never reissued.
+		if _, err = d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}}); err != nil {
+			return false, "the evidence-only suspend failed: " + status.Code(err).String(), nil
+		}
+		return false, "", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDING:
 		return false, "", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDED:
@@ -1410,4 +1587,169 @@ func terminationProof(record *journalRecord) string {
 	default:
 		return ""
 	}
+}
+
+// abandonSharedToPrivate moves a record whose template does not exist yet to
+// the private single-Actor pool it would have used without sharing. A claim
+// that still lands later is an orphan the leader collects.
+func (d *Lifecycle) abandonSharedToPrivate(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	if record.Template.CreateIssued || record.SharedWorker.CreateIssued || record.Actor.CreateIssued {
+		return fmt.Errorf("a shared placement cannot move to a private worker after native creation")
+	}
+	operator := record.SharedWorker.OperatorLabels
+	record.SharedWorker = nil
+	if err := bindPrivatePool(record, record.Actor.Name+"-workers", operator); err != nil {
+		return err
+	}
+	ctrl.LoggerFrom(ctx).Info("Substrate allocation takes a private worker instead of a shared one", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
+	if err := d.save(ctx, cm, record); err != nil {
+		return err
+	}
+	return d.ensureRuntimePool(ctx, cm, record)
+}
+
+// sharedPoolHostsSuspect reports whether any workspace holding a slot in the
+// pool is tainted, quarantined or failed.
+func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger) (bool, error) {
+	for _, entry := range ledger.Entries {
+		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if err != nil {
+			return false, err
+		}
+		if !found || record == nil {
+			continue
+		}
+		// A recorded instance failure is suspect before the workspace itself
+		// reports Failed.
+		if record.Failure != "" && record.SharedWorker != nil && record.SharedWorker.Pool == pool.GetName() {
+			return true, nil
+		}
+		workspace := &api.ExecutionWorkspace{}
+		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if workspace.UID == record.Request.Key.WorkspaceUID && workspaceSuspect(workspace) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// errForeignTemplate reports an ActorTemplate outside the shared pool's
+// Atespace that could be placed on it.
+var errForeignTemplate = errors.New("an ActorTemplate outside the shared worker's Atespace could be placed on it; shared admission is closed")
+
+// foreignTemplateMatches lists every ActorTemplate on the install (the
+// provider holds global viewer) and reports whether one outside atespace has
+// an empty worker selector or one the pool's labels satisfy. Upstream
+// placement matches only labels (cmd/ateapi/internal/scheduling), so such a
+// template could land a foreign Actor on the shared worker.
+func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string, poolLabels map[string]string) (bool, error) {
+	templates, err := d.listAllActorTemplates(ctx)
+	if err != nil {
+		return false, err
+	}
+	return templatesReach(templates, atespace, poolLabels), nil
+}
+
+// listAllActorTemplates lists ActorTemplates in every Atespace.
+func (d *Lifecycle) listAllActorTemplates(ctx context.Context) ([]*pb.ActorTemplate, error) {
+	var out []*pb.ActorTemplate
+	page := ""
+	seen := map[string]bool{}
+	for {
+		response, err := d.control.ListActorTemplates(ctx, &pb.ListActorTemplatesRequest{Options: &pb.ListOptions{PageSize: 1000, PageToken: page}})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, response.GetActorTemplates()...)
+		page = response.GetNextPageToken()
+		if page == "" {
+			return out, nil
+		}
+		if seen[page] || len(seen) >= 100 {
+			return nil, fmt.Errorf("native template pagination repeated a token or exceeded its bound")
+		}
+		seen[page] = true
+	}
+}
+
+// templatesReach reports a template outside atespace whose worker selector,
+// empty or not, a worker with these labels satisfies.
+func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string) bool {
+	return slices.ContainsFunc(templates, func(template *pb.ActorTemplate) bool {
+		return template.GetMetadata().GetAtespace() != atespace && selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels)
+	})
+}
+
+// selectorMatches reports whether a label selector, including an empty one,
+// selects a worker with these labels.
+func selectorMatches(selector, workerLabels map[string]string) bool {
+	for key, value := range selector {
+		if workerLabels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// refuseForeignTemplates fails closed when a foreign template could reach
+// the pool, quarantining and strongly retiring an existing pool.
+func (d *Lifecycle) refuseForeignTemplates(ctx context.Context, atespace string, poolLabels map[string]string, pool *unstructured.Unstructured) error {
+	match, err := d.foreignTemplateMatches(ctx, atespace, poolLabels)
+	if err != nil {
+		return err
+	}
+	if !match {
+		return nil
+	}
+	if pool != nil {
+		if err := d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error()); err != nil {
+			return errors.Join(errForeignTemplate, err)
+		}
+	}
+	return errForeignTemplate
+}
+
+// initiateSharedStrongRetirement starts the record pool's strong retirement
+// using Kubernetes alone, so no native read can postpone it.
+func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *journalRecord) error {
+	shared := record.SharedWorker
+	if shared == nil || shared.UID == "" {
+		return nil
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if string(pool.GetUID()) != shared.UID {
+		return nil
+	}
+	return d.retireSharedPool(ctx, pool, sharedRetiring, shared.Strong)
+}
+
+// sharedDoubt records the strong path for this record and starts retiring
+// its pool at once. Nothing uncertain is ever replayed.
+func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
+		return err
+	}
+	return d.initiateSharedStrongRetirement(ctx, record)
+}
+
+// egressSettle is how long deny-all egress must be stored before
+// SuspendActor: longer than both the egress gateway's declared policy cache
+// (--substrate-egress-policy-cache-ttl, which must equal the gateway's
+// --egress-policy-cache-ttl) and the worker DNS relay's 5s cache. Upstream
+// reports no enforcement acknowledgement to wait for instead. Cache expiry
+// only governs new requests; already-admitted streams end when the checkpoint
+// deactivates the tunnel.
+func (c Config) egressSettle() time.Duration {
+	return max(c.gatewayPolicyCacheTTL(), dnsRelayPolicyTTL) + sharedEgressSettleMargin
 }
