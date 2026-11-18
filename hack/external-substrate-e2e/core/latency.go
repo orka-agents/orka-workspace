@@ -53,6 +53,8 @@ type latency struct {
 	violations []string
 	// sharedWorkspaces names workspaces placed on shared workers.
 	sharedWorkspaces map[string]bool
+	// onAccepted, when set, runs once per turn when its prompt is accepted.
+	onAccepted func(t *turn)
 }
 
 // emit prints one machine-readable event and keeps it for the final report.
@@ -124,6 +126,15 @@ func (l *latency) createTurn(ctx context.Context, name, session, class string, c
 		}
 		if t.AcceptedMs < 0 && acceptedOrLater[state] {
 			t.AcceptedMs = elapsed
+			if l.onAccepted != nil {
+				// The runtime is serving this prompt now; a no-window detach
+				// may retire it as soon as the Task settles.
+				t.Workspace = str(task, "status", "executionWorkspace", "workspaceRef", "name")
+				if t.Workspace == "" {
+					t.Workspace = task.GetLabels()["acp.workspace.orka.ai/execution-workspace"]
+				}
+				l.onAccepted(t)
+			}
 		}
 		if phase == "Failed" || phase == "Cancelled" {
 			return false, fmt.Errorf("Task %s became %s: %s %s", name, phase, str(task, "status", "execution", "reason"), str(task, "status", "execution", "message"))

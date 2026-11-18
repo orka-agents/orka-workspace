@@ -152,19 +152,34 @@ func unclaimedSpares(pools []workerPool, profileUID string) []workerPool {
 // the turn: same pool UID and Pod UID, Pod born before the Task, never
 // restarted, and the native Worker carrying the claimed pool's labels. It
 // then times the replenishment back to the requested count.
-func (l *latency) checkSpareClaim(ctx context.Context, scenario string, rep int, ordinal string, t *turn, before []workerPool, profileUID string, want int) error {
+// claimView is what a running turn's Actor was placed on, captured while
+// the prompt runs: a no-window detach retires the Actor right after.
+type claimView struct {
+	pool   string
+	labels map[string]string
+	pools  []workerPool
+	err    error
+}
+
+func (l *latency) captureClaim(ctx context.Context, t *turn) *claimView {
+	view := &claimView{}
 	process, err := l.processName(ctx, t.Workspace)
-	if err != nil {
-		return err
+	if err == nil {
+		view.pool, view.labels, err = l.actorWorker(ctx, process)
 	}
-	poolName, workerLabels, err := l.actorWorker(ctx, process)
-	if err != nil {
-		return err
+	if err == nil {
+		view.pools, err = l.workerPools(ctx)
 	}
-	pools, err := l.workerPools(ctx)
-	if err != nil {
-		return err
+	view.err = err
+	return view
+}
+
+func (l *latency) checkSpareClaim(ctx context.Context, scenario string, rep int, ordinal string, t *turn, before []workerPool, profileUID string, want int, view *claimView) error {
+	if view == nil || view.err != nil {
+		l.violate("%s %s spare claim could not be observed while running: %v", scenario, t.Name, view)
+		return nil
 	}
+	poolName, workerLabels, pools := view.pool, view.labels, view.pools
 	var claimed *workerPool
 	for i := range pools {
 		if pools[i].Name == poolName {
@@ -205,7 +220,7 @@ func (l *latency) checkSpareClaim(ctx context.Context, scenario string, rep int,
 	started := time.Now()
 	deadline, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	err = wait(deadline, func() (bool, error) {
+	err := wait(deadline, func() (bool, error) {
 		current, err := l.workerPools(deadline)
 		if err != nil {
 			return false, err
@@ -252,8 +267,11 @@ func (l *latency) waitSpares(ctx context.Context, profileUID string, want int) (
 
 // spareScenario is detachScenario on a profile with spare workers.
 func (l *latency) spareScenario(ctx context.Context, rep int, profileUID string, want int) (map[string]any, error) {
+	views := map[string]*claimView{}
+	l.onAccepted = func(t *turn) { views[t.Name] = l.captureClaim(ctx, t) }
+	defer func() { l.onAccepted = nil }()
 	return l.detachLike(ctx, "spare", "lat-spare", rep, func(ordinal string, t *turn, before []workerPool) error {
-		return l.checkSpareClaim(ctx, "spare", rep, ordinal, t, before, profileUID, want)
+		return l.checkSpareClaim(ctx, "spare", rep, ordinal, t, before, profileUID, want, views[t.Name])
 	}, func() ([]workerPool, error) { return l.waitSpares(ctx, profileUID, want) })
 }
 
