@@ -85,11 +85,15 @@ paired with revocation of everything a leaked sandbox could use.
 
 - **The operator's assertion.** Sharing is allowed only when the provider runs with `--substrate-dedicated-install` (default false). The flag asserts that no tenant other than this Orka creates Actors or ActorTemplates on the Agent Substrate install.
 - **Without the flag.** An allocation whose profile opts in is refused with an error that reaches the workspace's `Provisioned` condition. The leader logs the refusal for each such profile, and strongly retires any shared pool that exists.
-- **Verified even with the flag.** The provider holds global viewer and lists every ActorTemplate. Any template outside a shared pool's Atespace whose worker selector is empty, or is satisfied by the pool's labels, fails closed: the pool is quarantined and strongly retired, and the admission is refused. This check runs:
+- **Verified even with the flag.** The provider holds global viewer and lists every ActorTemplate. A template is foreign if its worker selector is empty or is satisfied by a shared pool's labels, and either:
+  - it is outside the pool's Atespace; or
+  - it is inside that Atespace but is not a derived template this provider recorded (in a journal, an archived record, or a checkpoint catalog), with the recorded UID once known.
+
+  Any foreign template fails closed: the pool is quarantined and strongly retired, and the admission is refused. This check runs:
   - before a slot is claimed or a pool is created;
   - immediately before each Resume;
   - on every leader sweep.
-- **Inside the pool's own Atespace.** The ledger's assignment check (below) guards placement there.
+- **Placed Actors.** The ledger's assignment check (below) also catches any Actor that lands on a shared worker without a ledger entry.
 - **Provider-owned labels only.** A shared pool carries only `substrate.workspace.orka.ai/shared-pool: <random>`, a value that is journaled and chosen per pool. It carries none of the operator pool's labels, which a foreign template might select. The derived template selects exactly that label.
   - Upstream reads WorkerPool metadata labels only to copy them onto Workers for scheduling.
   - Image, sandbox class, pinned SandboxConfig, Pod template and scheduling all come from the copied spec.
@@ -223,12 +227,19 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - the creation-time `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches;
   - the pool's server-set `metadata.creationTimestamp` plus the shortest lifetime frozen in any journal or archived record that recorded the pool's UID;
   - that creation time plus the 24h maximum, an absolute ceiling.
+
+  If the journal inventory cannot be listed, provenance is unavailable. That is doubt, and every pool is then bounded by its creation time plus the 3h minimum, never by its annotations.
 - **Doubt.** Unreadable or inconsistent lifetime evidence is doubt, and the pool is then strongly retired at once. That covers a corrupt ledger; a missing, malformed or mismatched deadline; or a ledger scope that disagrees with a journal's frozen scope. Its escalation is bounded by the shortest of these bounds, so a rewrite of both annotations can never lengthen it.
-- **Discovery.** It does not depend on the removable label. The bounds loop lists every WorkerPool and recognizes shared pools by the label, the ledger or deadline annotation, or the `ate-shared-` name. A pool with shared evidence but without its intact provider-owned label is doubt and is strongly retired.
+- **Discovery.** It does not depend on the removable label.
+  - The bounds loop lists every WorkerPool and recognizes shared pools by provider-written evidence only: the label, the ledger or deadline annotation, or a provider journal or archived record that recorded the pool's UID.
+  - A name alone is never evidence, so an operator pool named `ate-shared-...` is never touched.
+  - A pool with shared evidence but without its intact provider-owned label is doubt and is strongly retired.
+- **Recorded markers.** An unreleased strong marker or failure in any journal that recorded a pool's UID retires the pool, whatever the mutable entry list says.
 - **Hard retirement.** It is never blocked by a ledger write.
   - Lifetime, doubt, persisted states, missing labels and a withdrawn dedicated assertion record the state when they can, but always issue the UID-preconditioned Delete.
   - Escalation does not wait for that deletion to have started.
-  - Ledger fields are size-bounded, so any valid ledger leaves room for its retirement write.
+  - Every variable-length ledger field is size-bounded, including the fenced worker's identity, and an accepted ledger also leaves explicit headroom. Any valid ledger therefore has room for its retirement write.
+  - A strong retirement's ledger write stops the Delete only on a conflict, so the decision is re-judged against the changed pool; any other write failure never blocks it.
 - **Other reasons to close admission early.** Admission also closes when the operator pool's image or shape changes, the profile disappears, or the template inventory cannot be verified.
 - **Limits.** The bound assumes a responsive kubelet. The Pod's absence on a partitioned node cannot be proven, and its instances then never report termination.
 
@@ -261,7 +272,9 @@ The ready and stopped timing logs report `workerSource: shared`. The stopped log
 
 - **Faster starts, fewer Pods.** Up to 16 Actors of one namespace and profile share one warm worker Pod, and a resume onto a pool with a free slot skips worker birth.
 - **Weaker evidence.** This is weaker than ADRs 0006 and 0031. A per-Actor stop is proven by control-plane bookkeeping plus revocation, not by the sandbox's exit.
-- **Residual risk: a leaked sandbox.** If the best-effort teardown failed, that sandbox's memory may persist on the node until the worker Pod is gone, at most `maxWorkerLifetime` with a responsive kubelet.
+- **Residual risk: a leaked sandbox.** If the best-effort teardown failed, that sandbox's memory may persist on the node until the worker Pod is gone.
+  - The `maxWorkerLifetime` bound holds only while the provider's bounds loop can reach the Kubernetes API to delete the pool and re-delete its Pod, and while the kubelet honours that deletion.
+  - A provider or API server outage that spans the retirement deadline extends the leak until both recover. The bounds loop then retires the pool on its next pass, because the deadline is read from Kubernetes state, not from memory.
   - That memory includes workspace data and the instance's credentials. Core makes those credentials unusable asynchronously, as described above.
   - The sandbox has no tunnel and deny-all egress.
 - **Residual risk: stale egress and DNS.**
