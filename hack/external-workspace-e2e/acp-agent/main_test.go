@@ -96,3 +96,15 @@ func TestProviderProbeSendsTheSessionCredentialAndMode(t *testing.T) {
 		t.Fatalf("probe request = %q %v", got.authorization, got.body)
 	}
 }
+
+func TestProviderProbeFailsOnANonSuccessStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	t.Setenv("CODEX_CONFIG", `{"model":"gpt-5.4","model_provider":"orka","model_providers":{"orka":{"base_url":"`+server.URL+`/_orka/provider/r/v1"}}}`)
+	t.Setenv("CODEX_API_KEY", "session-credential")
+	if code, err := providerProbe("new", fixtureThreadID); err == nil || code != http.StatusUnauthorized {
+		t.Fatalf("probe = %d %v, want a 401 error", code, err)
+	}
+}

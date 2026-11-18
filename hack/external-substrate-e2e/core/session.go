@@ -41,6 +41,7 @@ const (
 // Authorization class, plus the agent's session reports on injected requests.
 type providerObservations struct {
 	Injected    int      `json:"injected"`
+	Refused     int      `json:"refused"`
 	Placeholder int      `json:"placeholder"`
 	Missing     int      `json:"missing"`
 	Other       int      `json:"other"`
@@ -83,6 +84,9 @@ func (p *proof) waitProviderRequests(ctx context.Context, want int) (providerObs
 		}
 		if seen.Placeholder != 0 || seen.Missing != 0 || seen.Other != 0 {
 			return false, fmt.Errorf("provider proxy received a request without the injected token: %+v", seen)
+		}
+		if seen.Refused != 0 {
+			return false, fmt.Errorf("provider proxy refused an injected request that was not the agent's Responses call: %+v", seen)
 		}
 		if seen.Injected > want {
 			return false, fmt.Errorf("provider proxy received more injected requests than prompts: %+v", seen)
@@ -146,6 +150,9 @@ type telemetryReady struct {
 // soon as Core reports that it left supervisor telemetry out.
 func observeTelemetryReady(pool *unstructured.Unstructured, seen *telemetryReady) error {
 	conditions, _, _ := unstructured.NestedSlice(pool.Object, "status", "conditions")
+	// Each observation replaces the last: a pool that no longer reports the
+	// condition must not keep an earlier True.
+	*seen = telemetryReady{RuntimePool: pool.GetName()}
 	for _, item := range conditions {
 		c, ok := item.(map[string]any)
 		if !ok || c["type"] != "TelemetryReady" {

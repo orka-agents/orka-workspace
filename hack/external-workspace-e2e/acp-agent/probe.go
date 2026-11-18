@@ -88,6 +88,7 @@ func codexProvider(config string) (model, baseURL string, err error) {
 // providerProbe sends one Responses request with the session's proxy
 // credential. The report names only the session mode and ID; the upstream
 // fixture records it so a proof can tell a resumed session from a new one.
+// A non-2xx response is an error, so the agent fails the turn.
 func providerProbe(mode, sessionID string) (int, error) {
 	model, baseURL, err := codexProvider(os.Getenv("CODEX_CONFIG"))
 	if err != nil {
@@ -115,5 +116,8 @@ func providerProbe(mode, sessionID string) (int, error) {
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return response.StatusCode, fmt.Errorf("provider probe HTTP %d", response.StatusCode)
+	}
 	return response.StatusCode, nil
 }

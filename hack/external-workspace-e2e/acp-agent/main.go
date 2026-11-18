@@ -152,11 +152,15 @@ func main() {
 			text := "External workspace fixture completed."
 			prompt := promptText(scanner.Bytes())
 			if strings.Contains(prompt, providerProbeMarker) {
-				if code, err := providerProbe(sessionMode, sessionID); err != nil {
-					text += " Provider probe failed."
-				} else {
-					text += fmt.Sprintf(" Provider probe HTTP %d.", code)
+				code, err := providerProbe(sessionMode, sessionID)
+				if err != nil {
+					// Fail the turn: a proof must not pass on a failed probe.
+					if len(message.ID) != 0 {
+						write(map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32603, "message": "provider probe failed"}})
+					}
+					continue
 				}
+				text += fmt.Sprintf(" Provider probe HTTP %d.", code)
 			}
 			time.Sleep(holdDuration(prompt))
 			write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": text}}}})

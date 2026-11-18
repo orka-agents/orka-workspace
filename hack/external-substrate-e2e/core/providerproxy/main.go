@@ -31,11 +31,14 @@ type observations struct {
 	mu sync.Mutex
 	// Injected counts requests bearing exactly Core's provider token.
 	Injected int `json:"injected"`
+	// Refused counts injected requests that were not the agent's Responses
+	// call (POST /v1/responses) and so were answered 401.
+	Refused int `json:"refused"`
 	// Placeholder counts requests that still carried the runtime placeholder.
 	Placeholder int `json:"placeholder"`
 	Missing     int `json:"missing"`
 	Other       int `json:"other"`
-	// Sessions lists the agent's session reports on injected requests.
+	// Sessions lists the agent's session reports on accepted requests.
 	Sessions []string `json:"sessions"`
 }
 
@@ -61,39 +64,7 @@ func main() {
 		log.Fatal("TOKEN_FILE names no provider token")
 	}
 	seen := &observations{Sessions: []string{}}
-	api := http.NewServeMux()
-	api.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		class := classify(r.Header.Get("Authorization"), token)
-		var body struct {
-			Model    string            `json:"model"`
-			Metadata map[string]string `json:"metadata"`
-		}
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
-		seen.mu.Lock()
-		switch class {
-		case "injected":
-			seen.Injected++
-			if report := body.Metadata["orka_fixture"]; sessionReport.MatchString(report) && len(seen.Sessions) < 32 {
-				seen.Sessions = append(seen.Sessions, report)
-			}
-		case "placeholder":
-			seen.Placeholder++
-		case "missing":
-			seen.Missing++
-		default:
-			seen.Other++
-		}
-		seen.mu.Unlock()
-		log.Printf("provider request method=%s path=%s authorization=%s", r.Method, r.URL.Path, class)
-		w.Header().Set("Content-Type", "application/json")
-		if class != "injected" || r.Method != http.MethodPost || r.URL.Path != "/v1/responses" {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"message":"fixture provider proxy refused the request","type":"invalid_request_error"}}`))
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_orka_fixture", "object": "response", "status": "completed", "model": body.Model,
-			"output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "fixture"}}}}})
-	})
+	api := seen.handler(token)
 	observe := http.NewServeMux()
 	observe.HandleFunc("/observations", func(w http.ResponseWriter, _ *http.Request) {
 		seen.mu.Lock()
@@ -106,4 +77,44 @@ func main() {
 		log.Fatal((&http.Server{Addr: ":8081", Handler: observe, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe())
 	}()
 	log.Fatal((&http.Server{Addr: ":8080", Handler: api, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe())
+}
+
+// handler serves the provider origin. Only the agent's Responses call with
+// Core's token is answered 200 and records its session report.
+func (seen *observations) handler(token []byte) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		class := classify(r.Header.Get("Authorization"), token)
+		var body struct {
+			Model    string            `json:"model"`
+			Metadata map[string]string `json:"metadata"`
+		}
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		accepted := class == "injected" && r.Method == http.MethodPost && r.URL.Path == "/v1/responses"
+		seen.mu.Lock()
+		switch class {
+		case "injected":
+			seen.Injected++
+			if !accepted {
+				seen.Refused++
+			} else if report := body.Metadata["orka_fixture"]; sessionReport.MatchString(report) && len(seen.Sessions) < 32 {
+				seen.Sessions = append(seen.Sessions, report)
+			}
+		case "placeholder":
+			seen.Placeholder++
+		case "missing":
+			seen.Missing++
+		default:
+			seen.Other++
+		}
+		seen.mu.Unlock()
+		log.Printf("provider request method=%s path=%s authorization=%s", r.Method, r.URL.Path, class)
+		w.Header().Set("Content-Type", "application/json")
+		if !accepted {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"fixture provider proxy refused the request","type":"invalid_request_error"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_orka_fixture", "object": "response", "status": "completed", "model": body.Model,
+			"output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "fixture"}}}}})
+	})
 }

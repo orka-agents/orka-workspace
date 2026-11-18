@@ -6,6 +6,19 @@
 set -uo pipefail
 out="${1:-${PWD}/bin/diagnostics-$(date -u +%Y%m%d%H%M%S)}"
 redact_file="${2:-}"
+# Bounded so a stalled API server cannot hold a caller's EXIT handler: every
+# API request times out after 15 seconds, and the whole collection after
+# DIAGNOSTICS_DEADLINE_SECONDS (default 300). Evidence is written file by file,
+# so a deadline keeps what was collected and returns control to the caller.
+if [[ -z "${ORKA_DIAGNOSTICS_BOUNDED:-}" ]] && command -v timeout >/dev/null 2>&1; then
+  ORKA_DIAGNOSTICS_BOUNDED=1 timeout --kill-after=10s "${DIAGNOSTICS_DEADLINE_SECONDS:-300}" bash "${BASH_SOURCE[0]}" "${out}" "${redact_file}"
+  code=$?
+  if (( code == 124 || code == 137 )); then
+    printf 'Diagnostics deadline reached; partial evidence kept in %s\n' "${out}" >&2
+  fi
+  exit "${code}"
+fi
+kubectl() { command kubectl --request-timeout=15s "$@"; }
 case "$(kubectl config current-context)" in
   kind-orka-workspace-*-external-su-*) ;;
   *) printf 'Refusing unexpected scoped cluster context\n' >&2; exit 1 ;;

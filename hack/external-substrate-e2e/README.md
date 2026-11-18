@@ -293,12 +293,15 @@ preflight; reinstall it on a fresh cluster.
 The listener-less provider-proxy Service is replaced by a fixture origin
 (`core/providerproxy`). It accepts a request only when `Authorization` is
 `Bearer ` plus Core's provider token, which it reads from the same fixture
-Secret Core does, and reports only counts per class (injected, Orka's public
-placeholder, missing, other) and the agent's session report on port 8081,
+Secret Core does, and answers 200 only to `POST /v1/responses`. It reports only
+counts per class (injected, injected but refused for its method or path, Orka's
+public placeholder, missing, other) and, for accepted calls, the agent's
+session report on port 8081,
 which Core does not admit to runtime egress. The deterministic agent makes a
 model request only when its prompt carries `orka-fixture:provider-probe`: one
 Responses call through the supervisor's session provider proxy, which forwards
-it upstream with the bootstrap placeholder bearer. The proof requires:
+it upstream with the bootstrap placeholder bearer. A probe that fails or gets a
+non-2xx response fails the agent's turn. The proof requires:
 
 - Core's workload request carries exactly one `replaceHeaders` rule: HTTP, the
   provider-proxy host and port 8080, `Authorization`, prefix `Bearer `, and the
@@ -308,8 +311,9 @@ it upstream with the bootstrap placeholder bearer. The proof requires:
   `http` rule for that host and port replacing `Authorization` with prefix
   `Bearer ` and `credentialUri`
   `ate-secret://k8s.io/default/<namespace>/<secret>/token`.
-- Packet level: the origin received the prompt's request with Core's token and
-  never a placeholder, missing or other bearer. The runtime never held the
+- Packet level: the origin accepted the prompt's Responses call with Core's
+  token, refused no injected request, and never saw a placeholder, missing or
+  other bearer. The runtime never held the
   token, so only the gateway can have injected it.
 
 ### Tracing
