@@ -44,9 +44,16 @@ teardown() {
   kubectl -n ate-system rollout status deployment/k8s-credential-provider --timeout=180s
   kubectl -n "${client_namespace}" delete job "${namespace}" --ignore-not-found
   kubectl -n "${client_namespace}" delete job -l orka.workspace.e2e/cleanup=native-core --ignore-not-found
+  kubectl -n "${client_namespace}" delete job -l orka.workspace.e2e/latency=native-core --ignore-not-found
 }
 
 job="$(proof_job_json)"
+# A latency measurement (core/latency.sh) still creating Tasks must finish first.
+if kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o json |
+  jq -e 'any(.items[]; all(.status.conditions[]?; .status != "True" or (.type != "Complete" and .type != "Failed")))' >/dev/null; then
+  printf 'A Core latency Job has not finished; refusing to retire a running measurement.\n' >&2
+  exit 1
+fi
 # Only a confirmed absence counts; any other API error stops here (set -e).
 if [[ -z "$(kubectl get namespace "${namespace}" -o name --ignore-not-found)" ]]; then
   # Resume only after a cleanup that released and retired this exact run: it
