@@ -335,6 +335,21 @@ func (l *latency) instanceGone(ctx context.Context, atespace string, s *snapshot
 	return true
 }
 
+// newTags returns the native Tag UIDs in after that before lacked.
+func newTags(before, after *snapshot) []string {
+	known := map[string]bool{}
+	for _, uid := range before.Tags {
+		known[uid] = true
+	}
+	added := []string{}
+	for _, uid := range after.Tags {
+		if !known[uid] {
+			added = append(added, uid)
+		}
+	}
+	return added
+}
+
 func (l *latency) logTurn(scenario string, rep int, ordinal string, t *turn, before, after *snapshot) {
 	l.emit("turn", map[string]any{"scenario": scenario, "rep": rep, "turn": ordinal, "task": t, "workspaceBefore": before, "workspaceAfter": after})
 }
@@ -364,7 +379,7 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if _, present := suspended.Annotations["suspend-at"]; present {
 		l.violate("window-unset workspace carries a suspend-at deadline")
 	}
-	if len(suspended.Tags) == 0 {
+	if len(newTags(afterT1, suspended)) == 0 {
 		l.violate("suspension of %s produced no native Tag", t1.Workspace)
 	}
 	t2, err := l.createTurn(ctx, session+"-t2", session, "lat-detach", false)
@@ -445,7 +460,7 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		"poolCredentialsUnchanged": len(warm1.PoolSecrets) > 0 && fmt.Sprint(warm1.PoolSecrets) == fmt.Sprint(warm2.PoolSecrets),
 		"sameSessionNewGeneration": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["runtimeSessionGeneration"] != t1.Identity["runtimeSessionGeneration"] && t2.Identity["promptID"] != t1.Identity["promptID"],
 		"newAttachmentEpoch":       warm2.AttachmentEpoch > warm1.AttachmentEpoch,
-		"noNewTag":                 len(warm2.Tags) == len(warm1.Tags),
+		"noNewTag":                 len(newTags(warm1, warm2)) == 0,
 	}
 	l.emit("warmAttach", map[string]any{"scenario": "warm", "rep": rep, "checks": direct})
 	for check, ok := range direct {
@@ -491,7 +506,9 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 	expiryLateness := time.Since(deadline)
 	l.emit("suspended", map[string]any{"scenario": "warm", "rep": rep, "after": "window", "workspace": t2.Workspace,
 		"observedAfterDeadlineMs": ms(expiryLateness), "snapshot": suspended})
-	if len(suspended.Tags) <= len(warm2.Tags) {
+	// Idle retention can collect older workspaces' Tags meanwhile, so the
+	// expiry is checked for a Tag UID that did not exist before.
+	if len(newTags(warm2, suspended)) == 0 {
 		l.violate("window expiry suspended %s without a new native Tag", t2.Workspace)
 	}
 	if _, present := suspended.Annotations["suspend-at"]; present {
