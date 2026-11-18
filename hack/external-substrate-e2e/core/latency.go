@@ -40,6 +40,7 @@ const (
 	annotationSessionCommitted   = "acp.workspace.orka.ai/durable-session-committed"
 	annotationWorkloadPublished  = "acp.workspace.orka.ai/workload-published-at"
 	annotationRetirementAuth     = "acp.workspace.orka.ai/retirement-authorized-at"
+	annotationStopRequested      = "acp.workspace.orka.ai/stop-requested-at"
 	runtimePoolUIDLabel          = "orka.ai/runtime-pool-uid"
 	latencyPollInterval          = 100 * time.Millisecond
 )
@@ -212,7 +213,7 @@ func (l *latency) snapshot(ctx context.Context, w *api.ExecutionWorkspace, poolN
 	if r := w.Spec.Retirement; r != nil {
 		s.Retirement = fmt.Sprintf("%d/%s", r.Sequence, r.Action)
 	}
-	for _, key := range []string{annotationSuspendAt, annotationSuspendAfterDetach, annotationSuspendPending, annotationLastDetached, annotationDetachAction, annotationWorkloadPublished, annotationRetirementAuth} {
+	for _, key := range []string{annotationSuspendAt, annotationSuspendAfterDetach, annotationSuspendPending, annotationLastDetached, annotationDetachAction, annotationWorkloadPublished, annotationRetirementAuth, annotationStopRequested} {
 		if value, ok := w.Annotations[key]; ok {
 			s.Annotations[strings.TrimPrefix(key, "acp.workspace.orka.ai/")] = value
 		}
@@ -351,13 +352,37 @@ func newTags(before, after *snapshot) []string {
 }
 
 func (l *latency) logTurn(scenario string, rep int, ordinal string, t *turn, before, after *snapshot) {
-	l.emit("turn", map[string]any{"scenario": scenario, "rep": rep, "turn": ordinal, "task": t, "workspaceBefore": before, "workspaceAfter": after})
+	kind := map[string]string{"t1": "cold", "t2": "warm", "t3": "resume"}[ordinal]
+	l.logTurnKind(scenario, rep, ordinal, kind, t, before, after)
+}
+
+// logTurnKind records one turn; kind (cold, resume, warm, ...) groups it.
+func (l *latency) logTurnKind(scenario string, rep int, ordinal, kind string, t *turn, before, after *snapshot) {
+	l.emit("turn", map[string]any{"scenario": scenario, "rep": rep, "turn": ordinal, "kind": kind, "task": t, "workspaceBefore": before, "workspaceAfter": after})
 }
 
 // detachScenario: the profile has no warm window, so every detach suspends.
 func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, error) {
-	session := fmt.Sprintf("lat-detach-%d", rep)
-	t1, err := l.createTurn(ctx, session+"-t1", session, "lat-detach", true)
+	return l.detachLike(ctx, "detach", "lat-detach", rep, nil, nil)
+}
+
+// detachLike runs a cold turn, its suspension on detach, and a turn resumed
+// from the Tag on class. Before each turn prepare (when set) waits for and
+// lists the warm capacity, which check then verifies the turn used.
+func (l *latency) detachLike(ctx context.Context, scenario, class string, rep int,
+	check func(ordinal string, t *turn, before []workerPool) error, prepare func() ([]workerPool, error)) (map[string]any, error) {
+	session := fmt.Sprintf("lat-%s-%d", scenario, rep)
+	before := func() ([]workerPool, error) {
+		if prepare == nil {
+			return nil, nil
+		}
+		return prepare()
+	}
+	capacity, err := before()
+	if err != nil {
+		return nil, err
+	}
+	t1, err := l.createTurn(ctx, session+"-t1", session, class, true)
 	if err != nil {
 		return nil, err
 	}
@@ -370,19 +395,27 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
-	l.logTurn("detach", rep, "t1", t1, nil, afterT1)
+	l.logTurnKind(scenario, rep, "t1", "cold", t1, nil, afterT1)
+	if check != nil {
+		if err := check("t1", t1, capacity); err != nil {
+			return nil, err
+		}
+	}
 	suspended, waited, err := l.waitSuspended(ctx, t1.Workspace, pool, afterT1, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}
-	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t1", "workspace": t1.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": suspended})
+	l.emit("suspended", map[string]any{"scenario": scenario, "rep": rep, "after": "t1", "workspace": t1.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": suspended})
 	if _, present := suspended.Annotations["suspend-at"]; present {
 		l.violate("window-unset workspace carries a suspend-at deadline")
 	}
 	if len(newTags(afterT1, suspended)) == 0 {
 		l.violate("suspension of %s produced no native Tag", t1.Workspace)
 	}
-	t2, err := l.createTurn(ctx, session+"-t2", session, "lat-detach", false)
+	if capacity, err = before(); err != nil {
+		return nil, err
+	}
+	t2, err := l.createTurn(ctx, session+"-t2", session, class, false)
 	if err != nil {
 		return nil, err
 	}
@@ -393,16 +426,21 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
-	l.logTurn("detach", rep, "t2", t2, suspended, afterT2)
+	l.logTurnKind(scenario, rep, "t2", "resume", t2, suspended, afterT2)
 	if t2.Workspace != t1.Workspace || afterT2.Sequence != afterT1.Sequence+1 || !afterT2.ResumePath || afterT2.ActorUID == afterT1.ActorUID ||
 		t2.Identity["runtimeInstanceID"] == t1.Identity["runtimeInstanceID"] {
 		l.violate("continuation %s did not resume the same workspace from its Tag on a new sequence and Actor", t2.Name)
+	}
+	if check != nil {
+		if err := check("t2", t2, capacity); err != nil {
+			return nil, err
+		}
 	}
 	final, waited, err := l.waitSuspended(ctx, t2.Workspace, t2.Identity["runtimePoolName"], afterT2, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}
-	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t2", "workspace": t2.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": final})
+	l.emit("suspended", map[string]any{"scenario": scenario, "rep": rep, "after": "t2", "workspace": t2.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": final})
 	return map[string]any{"session": session, "workspace": t1.Workspace, "t1": t1, "t2": t2, "resumedSequence": afterT2.Sequence}, nil
 }
 
@@ -543,14 +581,21 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		"windowExpiryObservedAfterDeadlineMs": ms(expiryLateness)}, nil
 }
 
-func (l *latency) ensureClass(ctx context.Context, name string, window *metav1.Duration) error {
+// classOptions are the profile inputs a scenario varies.
+type classOptions struct {
+	window      *metav1.Duration
+	annotations map[string]string
+	placement   *profile.SubstratePlacementPolicy
+}
+
+func (l *latency) ensureClass(ctx context.Context, name string, options classOptions) error {
 	retention := (*profile.RetentionPolicy)(nil)
-	if window != nil {
-		retention = &profile.RetentionPolicy{SuspendAfterDetach: window}
+	if options.window != nil {
+		retention = &profile.RetentionPolicy{SuspendAfterDetach: options.window}
 	}
-	parameters := &profile.SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: l.namespace, Name: name},
+	parameters := &profile.SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: l.namespace, Name: name, Annotations: options.annotations},
 		Spec: profile.SubstrateWorkspaceProfileSpec{TemplateRef: profile.SubstrateTemplateReference{Namespace: l.namespace, Name: "infrastructure"},
-			Suspend: &profile.SubstrateSuspendPolicy{Mode: profile.SubstrateSuspendModeDataOnly}, Retention: retention}}
+			Suspend: &profile.SubstrateSuspendPolicy{Mode: profile.SubstrateSuspendModeDataOnly}, Retention: retention, Placement: options.placement}}
 	if err := l.c.Create(ctx, parameters); err != nil {
 		return fmt.Errorf("create profile %s: %w", name, err)
 	}
@@ -610,18 +655,53 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 	report := map[string]any{"namespace": p.namespace, "window": l.window.String(), "repeats": repeats, "scenarios": scenarios}
 	results := map[string][]map[string]any{}
 	for _, scenario := range scenarios {
-		var class string
+		window := &metav1.Duration{Duration: l.window}
+		spares := envInt("LATENCY_SPARE_WORKERS", 1)
+		sharedSlots := envInt("LATENCY_SHARED_SPARES", 2)
+		shared := &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{MaxActorsPerWorker: int32(envInt("LATENCY_SHARED_ACTORS", 3))}}
+		var run func(rep int) (map[string]any, error)
 		switch scenario {
 		case "detach":
-			class = "lat-detach"
-			if err := l.ensureClassOnce(ctx, class, nil); err != nil {
+			if err := l.ensureClassOnce(ctx, "lat-detach", classOptions{}); err != nil {
 				return nil, err
 			}
+			run = func(rep int) (map[string]any, error) { return l.detachScenario(ctx, rep) }
 		case "warm":
-			class = "lat-warm"
-			if err := l.ensureClassOnce(ctx, class, &metav1.Duration{Duration: l.window}); err != nil {
+			if err := l.ensureClassOnce(ctx, "lat-warm", classOptions{window: window}); err != nil {
 				return nil, err
 			}
+			run = func(rep int) (map[string]any, error) { return l.warmScenario(ctx, rep) }
+		case "spare":
+			// Provider ADR 0007: private spares, no window.
+			if err := l.ensureClassOnce(ctx, "lat-spare", classOptions{annotations: map[string]string{spareWorkersAnnotation: strconv.Itoa(spares)}}); err != nil {
+				return nil, err
+			}
+			uid, err := l.profileUID(ctx, "lat-spare")
+			if err != nil {
+				return nil, err
+			}
+			run = func(rep int) (map[string]any, error) { return l.spareScenario(ctx, rep, uid, spares) }
+		case "shared":
+			// Provider ADR 0008: shared workers with warm free slots and a window.
+			if err := l.ensureClassOnce(ctx, "lat-shared", classOptions{window: window, placement: shared,
+				annotations: map[string]string{spareWorkersAnnotation: strconv.Itoa(sharedSlots)}}); err != nil {
+				return nil, err
+			}
+			uid, err := l.profileUID(ctx, "lat-shared")
+			if err != nil {
+				return nil, err
+			}
+			run = func(rep int) (map[string]any, error) { return l.sharedScenario(ctx, rep, uid, 2) }
+		case "scope":
+			// A second shared profile in the same namespace is another scope.
+			if err := l.ensureClassOnce(ctx, "lat-shared-scope", classOptions{placement: shared}); err != nil {
+				return nil, err
+			}
+			uid, err := l.profileUID(ctx, "lat-shared-scope")
+			if err != nil {
+				return nil, err
+			}
+			run = func(rep int) (map[string]any, error) { return l.scopeScenario(ctx, rep, uid) }
 		default:
 			return nil, fmt.Errorf("unknown latency scenario %q", scenario)
 		}
@@ -632,13 +712,7 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 				n, _ := strconv.Atoi(suffix)
 				id = n*100 + rep
 			}
-			var result map[string]any
-			var err error
-			if scenario == "detach" {
-				result, err = l.detachScenario(ctx, id)
-			} else {
-				result, err = l.warmScenario(ctx, id)
-			}
+			result, err := run(id)
 			if err != nil {
 				report["events"] = l.events
 				encoded, _ := json.Marshal(report)
@@ -661,12 +735,29 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 
 // ensureClassOnce creates the profile/class pair unless an earlier run in
 // this namespace already did; an existing pair must already be Ready.
-func (l *latency) ensureClassOnce(ctx context.Context, name string, window *metav1.Duration) error {
+func (l *latency) ensureClassOnce(ctx context.Context, name string, options classOptions) error {
 	existing := &api.ExecutionWorkspaceClass{}
 	if err := l.c.Get(ctx, client.ObjectKey{Namespace: l.namespace, Name: name}, existing); err == nil {
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
-	return l.ensureClass(ctx, name, window)
+	return l.ensureClass(ctx, name, options)
+}
+
+func (l *latency) profileUID(ctx context.Context, name string) (string, error) {
+	parameters := &profile.SubstrateWorkspaceProfile{}
+	if err := l.c.Get(ctx, client.ObjectKey{Namespace: l.namespace, Name: name}, parameters); err != nil {
+		return "", err
+	}
+	return string(parameters.UID), nil
+}
+
+func envInt(name string, fallback int) int {
+	if raw := os.Getenv(name); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil {
+			return value
+		}
+	}
+	return fallback
 }

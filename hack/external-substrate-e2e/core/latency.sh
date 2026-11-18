@@ -63,7 +63,9 @@ worker_messages='ateworker booting|Registered worker|Reported worker sandbox run
 follow_workers() {
   local seen=" " started=" "
   while [[ ! -e "${run_dir}/.done" ]]; do
-    pods="$(kubectl -n "${namespace}" get pods -l substrate.workspace.orka.ai/allocation-id -o json 2>/dev/null || true)"
+    # Private, spare and shared worker Pods all belong to provider WorkerPools
+    # named ate-*; shared and unclaimed spare Pods carry no allocation label.
+    pods="$(kubectl -n "${namespace}" get pods -o json 2>/dev/null | jq '{items: [.items[] | select(.metadata.name | startswith("ate-"))]}' 2>/dev/null || true)"
     for pod in $(jq -r '.items[]?.metadata.name' <<<"${pods}" 2>/dev/null); do
       if [[ "${started}" != *" ${pod} "* ]] && jq -e --arg pod "${pod}" '.items[] | select(.metadata.name == $pod) | .status.containerStatuses[0].state.running.startedAt // empty' <<<"${pods}" >/dev/null 2>&1; then
         started="${started}${pod} "
@@ -117,7 +119,7 @@ kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="
   grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
 # Every provider replica: only the elected leader reconciles and logs.
 kubectl -n "${provider_namespace}" logs -l app=orka-workspace-substrate --tail=-1 --max-log-requests=10 --since-time="${since}" |
-  grep -E 'Substrate runtime (ready|stopped)' >"${run_dir}/provider-timings.log" || true
+  grep -E 'Substrate runtime (ready|stopped)|[Ss]pare|[Ss]hared (worker|pool)|quarantin' >"${run_dir}/provider-timings.log" || true
 kubectl -n "${namespace}" get events -o json |
   jq -c '[.items[] | select(.reason | test("WarmDetach|WarmWindow|Suspend|Retention"; "i")) | {reason, message, object: .involvedObject.name, first: .firstTimestamp, last: .lastTimestamp, count}]' \
   >"${run_dir}/events.json" || true

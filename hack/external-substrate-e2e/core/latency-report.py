@@ -157,6 +157,7 @@ def turn_sample(event):
         if ready:
             sample.update(ms_fields(ready[-1], 'providerReady.'))
             evidence['providerPath'] = ready[-1].get('path')
+            evidence['workerSource'] = ready[-1].get('workerSource')
     # The supervisor names each RuntimeSession generation
     # runtime-<RuntimeSession UID>-g<generation>; a Session keeps its UID
     # across turns. Without a recorded generation, the turn's own time window
@@ -178,7 +179,14 @@ def turn_sample(event):
         if created_at is not None and at is not None:
             sample['supervisor.sessionCreatedSinceTaskCreatedMs'] = int((at - created_at) * 1000)
     if started_new and after.get('workerPod'):
-        sample.update(worker_timeline(after['workerPod'].split('/', 1)[-1], when(task.get('createdAt'))))
+        pod = after['workerPod'].split('/', 1)[-1]
+        born, created_at = when(pods.get(pod, {}).get('created')), when(task.get('createdAt'))
+        # A spare or shared worker Pod predates the Task; its boot milestones
+        # belong to an earlier start, so only a Pod born for this turn counts.
+        if born is not None and created_at is not None and born + 1 >= created_at:
+            sample.update(worker_timeline(pod, created_at))
+        elif born is not None and created_at is not None:
+            sample['worker.podAgeAtTaskCreateMs'] = int((created_at - born) * 1000)
     return {key: value for key, value in sample.items() if value is not None}, evidence
 
 
@@ -195,32 +203,46 @@ def stop_sample(event, sequence):
         sample.update(ms_fields(stopped[-1], 'coreStop.'))
     if workspace_stopped:
         sample.update(ms_fields(workspace_stopped[-1], 'providerStop.'))
+        for key in ('workerSource', 'terminationProof', 'operation'):
+            if workspace_stopped[-1].get(key):
+                sample['label.' + key] = workspace_stopped[-1][key]
     for key in ('observedAfterSettleMs', 'observedAfterDeadlineMs'):
         if key in event:
             sample['client.' + key] = event[key]
     return sample
 
 
-groups = {'cold (turn 1)': [], 'resume from Tag, window unset (turn 2)': [], 'warm-window follow-up (turn 2)': [],
-          'resume from Tag after window expiry (turn 3)': []}
-stops = {'suspend on detach, window unset': [], 'suspend at window expiry': []}
+TURN_LABELS = {('detach', 'cold'): 'private: cold', ('detach', 'resume'): 'private: resume from Tag, window unset',
+               ('warm', 'cold'): 'private: cold', ('warm', 'warm'): 'private: warm-window follow-up',
+               ('warm', 'resume'): 'private: resume from Tag after window expiry',
+               ('spare', 'cold'): 'spare: cold', ('spare', 'resume'): 'spare: resume from Tag',
+               ('shared', 'cold'): 'shared: cold (2 concurrent Sessions)', ('shared', 'warm'): 'shared: warm-window follow-up',
+               ('shared', 'warm-during-neighbour-suspend'): 'shared: warm turn while neighbour suspends',
+               ('shared', 'resume'): 'shared: resume from Tag', ('scope', 'cold'): 'shared, other profile: cold'}
+STOP_LABELS = {'detach': 'private: suspend on detach, window unset', 'warm': 'private: suspend at window expiry',
+               'spare': 'spare: suspend on detach, window unset', 'shared': 'shared: per-Actor suspend at window expiry',
+               'scope': 'shared, other profile: suspend on detach'}
+groups, stops = {}, {}
 evidence = []
 last_sequence = {}
 for event in events:
     if event['event'] == 'turn':
         sample, info = turn_sample(event)
-        key = {'t1': 'cold (turn 1)', 't2': 'resume from Tag, window unset (turn 2)' if event['scenario'] == 'detach' else 'warm-window follow-up (turn 2)',
-               't3': 'resume from Tag after window expiry (turn 3)'}[event['turn']]
-        groups[key].append(sample)
+        kind = event.get('kind') or {'t1': 'cold', 't2': 'resume' if event['scenario'] == 'detach' else 'warm', 't3': 'resume'}[event['turn']]
+        key = TURN_LABELS.get((event['scenario'], kind), '%s: %s' % (event['scenario'], kind))
+        if info.get('workerSource'):
+            sample['label.workerSource'] = info['workerSource']
+        groups.setdefault(key, []).append(sample)
         evidence.append({'scenario': event['scenario'], 'rep': event['rep'], 'turn': event['turn'], 'task': event['task']['name'], **info,
                          'runtimeInstanceID': event['task']['identity']['runtimeInstanceID'], 'actorUID': event['workspaceAfter'].get('actorUID')})
         last_sequence[event['task']['workspace']] = event['workspaceAfter']['sequence']
     elif event['event'] == 'suspended':
         sequence = last_sequence.get(event['workspace'])
-        key = 'suspend at window expiry' if event['scenario'] == 'warm' else 'suspend on detach, window unset'
+        key = STOP_LABELS.get(event['scenario'], event['scenario'] + ': suspend')
         if event.get('after') in ('t1', 't2', 'window'):
-            stops[key].append(stop_sample(event, sequence))
-    elif event['event'] in ('warmAttach', 'windowHeld', 'violation'):
+            stops.setdefault(key, []).append(stop_sample(event, sequence))
+    elif event['event'] in ('warmAttach', 'windowHeld', 'violation', 'spareClaim', 'spareReplenished', 'sharedBefore',
+                            'sharedPlacement', 'sharedSuspend', 'sharedResume', 'scopeIsolation'):
         evidence.append(event)
 
 
@@ -228,6 +250,13 @@ def summarize(samples):
     keys = sorted({key for sample in samples for key in sample})
     summary = {}
     for key in keys:
+        if key.startswith('label.'):
+            counts = {}
+            for sample in samples:
+                if key in sample:
+                    counts[sample[key]] = counts.get(sample[key], 0) + 1
+            summary[key] = {'counts': counts}
+            continue
         values = [sample[key] for sample in samples if isinstance(sample.get(key), (int, float))]
         if values:
             summary[key] = {'n': len(values), 'median': statistics.median(values), 'min': min(values), 'max': max(values), 'values': values}
@@ -244,6 +273,8 @@ def cell(summary, key):
     value = summary.get(key)
     if not value:
         return '-'
+    if 'counts' in value:
+        return ', '.join('%s×%d' % (name, count) for name, count in sorted(value['counts'].items()))
     if value['n'] == 1:
         return '%d' % value['median']
     return '%d (%d–%d, n=%d)' % (value['median'], value['min'], value['max'], value['n'])
@@ -260,14 +291,22 @@ for title, table in (('Turns', report['turns']), ('Stops', report['stops'])):
     for key in keys:
         out.append('| %s | %s |' % (key, ' | '.join(cell(table[name], key) for name in names)))
     out.append('')
-checks = [event for event in evidence if event.get('event') == 'warmAttach']
-if checks:
-    out.append('## Warm attach checks')
+checked = [event for event in evidence if isinstance(event.get('checks'), dict)]
+if checked:
+    out.append('## Live checks')
     out.append('')
-    for event in checks:
+    for event in checked:
         failed = [name for name, ok in event['checks'].items() if not ok]
-        out.append('- repetition %s: %d/%d passed%s' % (event['rep'], len(event['checks']) - len(failed), len(event['checks']),
-                                                    (' (failed: %s)' % ', '.join(failed)) if failed else ''))
+        out.append('- %s %s %s%s: %d/%d passed%s' % (event['event'], event.get('scenario', ''), event['rep'],
+                                                   (' ' + event['turn']) if event.get('turn') else '',
+                                                   len(event['checks']) - len(failed), len(event['checks']),
+                                                   (' (failed: %s)' % ', '.join(failed)) if failed else ''))
+    for event in evidence:
+        if event.get('event') == 'spareReplenished':
+            out.append('- spare replenished, repetition %s after %s: %s ms (%s)' % (event['rep'], event['turn'], event['afterSettleMs'], 'ok' if event['ok'] else 'NOT replenished'))
+        if event.get('event') == 'sharedSuspend':
+            out.append('- shared %s: egress deny-all %s ms and suspension %s ms after the suspend request' % (
+                event['rep'], event['denyAllAfterSuspendRequestMs'], event['suspendedObservedAfterRequestMs']))
     out.append('')
 held = [event for event in evidence if event.get('event') == 'windowHeld']
 for event in held:
