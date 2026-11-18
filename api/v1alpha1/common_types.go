@@ -226,6 +226,10 @@ const (
 	ReasonCleanupFailed        ExecutionWorkspaceConditionReason = "CleanupFailed"
 	ReasonQuarantined          ExecutionWorkspaceConditionReason = "Quarantined"
 	ReasonLifetimeExceeded     ExecutionWorkspaceConditionReason = "LifetimeExceeded"
+	// ReasonSuspendDeadlineExceeded reports that a Suspend authorization's
+	// notAfter passed before suspension started. The provider stopped the
+	// exact instance instead and published no retained data.
+	ReasonSuspendDeadlineExceeded ExecutionWorkspaceConditionReason = "SuspendDeadlineExceeded"
 )
 
 // SecretReference is a local Secret reference used for connection and attachment credentials.

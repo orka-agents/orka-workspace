@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const LifecycleContractV1 = workspacev1alpha1.LifecycleContractV1
@@ -36,6 +37,9 @@ var (
 	ErrRequestConflict      = workspacev1alpha1.ErrRequestConflict
 	ErrInstanceRunning      = errors.New("instance has not stopped")
 	ErrWorkspaceNotAdmitted = errors.New("workspace is not currently admitted by Orka core")
+	// ErrSuspendDeadlineExceeded reports that a Suspend authorization expired
+	// before the provider started the suspension, so no data was preserved.
+	ErrSuspendDeadlineExceeded = errors.New("suspend authorization expired before suspension started")
 )
 
 func WorkloadRevision(request WorkloadRequest) (string, error) {
@@ -80,6 +84,14 @@ func AttachmentEpochAcknowledgement(workspace *workspacev1alpha1.ExecutionWorksp
 // confirm termination of the exact instance before publishing retained lineage.
 // EnsureAllocation consumes that lineage on a later numbered request, cold boots
 // with fresh public bootstrap material, and keeps previous retirement tombstones.
+//
+// notAfter is the authorization's WorkloadRetirement.NotAfter; nil means no
+// deadline. When SuspendDeadlineExceeded reports it passed and no suspension
+// of this instance has started, SuspendInstance must not start one: it returns
+// ErrSuspendDeadlineExceeded without changing the instance, including on
+// every retry after the caller's fallback Stop. The deadline check and the
+// durable record that a suspension started must be one atomic journal update.
+// A suspension that started before the deadline continues to completion.
 type SuspensionController interface {
-	SuspendInstance(context.Context, AllocationKey, InstanceIdentity) (AllocationObservation, error)
+	SuspendInstance(ctx context.Context, key AllocationKey, identity InstanceIdentity, notAfter *metav1.Time) (AllocationObservation, error)
 }

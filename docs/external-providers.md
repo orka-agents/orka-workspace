@@ -154,6 +154,26 @@ its finalizers. A missing response or changed identity leaves cleanup pending.
 Provider journals remain until workspace finalization. Retained checkpoint
 artifacts have their own references and must be released separately.
 
+A data-preserving `Suspend` authorization can carry `spec.retirement.notAfter`.
+Core sets it to the worker eviction deadline when it authorizes Suspend during
+an eviction, because it cannot withdraw the authorization afterwards. A provider
+must not start a suspension after that time, less
+`sdk.SuspendDeadlineClockSkew` (5 seconds) for a clock that trails Core's.
+Check the deadline with the provider's own clock in the same optimistic journal
+update that records the suspension as started, and check it again immediately
+before issuing the backend suspend. A suspension started in time finishes even
+after the deadline passes. An issued suspension the backend never acted on has
+an unresolved outcome and is never replayed, so past the deadline it is treated
+as not started. One that has not started returns
+`sdk.ErrSuspendDeadlineExceeded`, on every retry; `sdk.SuspendOrStop` then stops
+the exact instance. The stopped allocation publishes no `retainedData`, the
+workspace is never reported `Suspended`, and `DataPlaneReady` carries reason
+`SuspendDeadlineExceeded`. Core treats that as a stop without preserved data.
+`notAfter` never accompanies `Stop`. While the action stays `Suspend`, Core can
+add the deadline or move it earlier, but never remove or extend it. Superseding
+the authorization with `Delete` may keep the deadline unchanged or clear it;
+`Delete` ignores it.
+
 Drain and retire legacy allocations under the previous Orka release before
 installing the new RuntimePool schema or replacing the controller. The removal
 release has no in-tree ACP cleanup implementation. Its startup gate names every

@@ -433,7 +433,7 @@ func TestNativeWorkerForeignLabelsAndCapacityBlockReadinessAndTeardown(t *testin
 			if _, err := driver(c, native).Observe(t.Context(), request.Key); err == nil {
 				t.Fatal("changed worker ownership or capacity reported Ready")
 			}
-			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+			if _, err := driver(c, native).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 				t.Fatal("changed worker ownership or capacity allowed capture")
 			}
 			if _, err := driver(c, native).StopInstance(t.Context(), request.Key, first.Identity); err == nil {

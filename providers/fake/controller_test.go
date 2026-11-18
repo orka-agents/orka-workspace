@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	fakev1alpha1 "github.com/orka-agents/orka-workspace/providers/fake/api/v1alpha1"
@@ -185,5 +186,59 @@ func TestProviderPreservesCoreOwnedConditions(t *testing.T) {
 				t.Fatalf("unsupported capability advertised: %q", feature)
 			}
 		}
+	}
+}
+
+func TestReconcileStopsInsteadOfSuspendingAfterAuthorizationDeadline(t *testing.T) {
+	for name, offset := range map[string]time.Duration{"expired": -time.Hour, "within clock skew": workspaceprovider.SuspendDeadlineClockSkew / 2, "open": time.Hour} {
+		t.Run(name, func(t *testing.T) {
+			c, request := fixture(t)
+			workspace := workspaceFor(t, c, request.Key)
+			class := &workspacev1alpha1.ExecutionWorkspaceClass{ObjectMeta: metav1.ObjectMeta{Namespace: workspace.Namespace, Name: workspace.Spec.ClassBinding.Name, UID: workspace.Spec.ClassBinding.UID}}
+			if err := c.Create(t.Context(), class); err != nil {
+				t.Fatal(err)
+			}
+			workspace.Spec.Workload = &request
+			if err := c.Update(t.Context(), workspace); err != nil {
+				t.Fatal(err)
+			}
+			r := &FakeExecutionWorkspaceReconciler{Client: c}
+			reconcileRequest := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(workspace)}
+			if _, err := r.Reconcile(t.Context(), reconcileRequest); err != nil {
+				t.Fatal(err)
+			}
+			ready, err := New(c).Observe(t.Context(), request.Key)
+			if err != nil || ready.State != workspaceprovider.AllocationReady {
+				t.Fatalf("fixture did not become ready: %v", err)
+			}
+			workspace = workspaceFor(t, c, request.Key)
+			notAfter := metav1.NewTime(time.Now().Add(offset))
+			workspace.Spec.Retirement = &workspacev1alpha1.WorkloadRetirement{Sequence: request.Sequence, Identity: ready.Identity, Action: workspacev1alpha1.WorkloadRetirementSuspend, NotAfter: &notAfter}
+			workspace.Generation++
+			if err := c.Update(t.Context(), workspace); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if _, err := r.Reconcile(t.Context(), reconcileRequest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			workspace = workspaceFor(t, c, request.Key)
+			allocation := workspace.Status.Allocation
+			condition := workspaceprovider.FindCondition(workspace.Status.Conditions, string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady))
+			if allocation == nil || allocation.State != workspaceprovider.AllocationStopped || allocation.Identity != ready.Identity || condition == nil || condition.Status != metav1.ConditionFalse {
+				t.Fatalf("authorized retirement did not stop the exact instance: %+v %+v", allocation, condition)
+			}
+			exceeded := condition.Reason == string(workspacev1alpha1.ReasonSuspendDeadlineExceeded)
+			if offset > workspaceprovider.SuspendDeadlineClockSkew {
+				if allocation.RetainedData == nil || exceeded {
+					t.Fatalf("suspension inside its window did not retain data: %+v %+v", allocation, condition)
+				}
+				return
+			}
+			if allocation.RetainedData != nil || !exceeded || workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspended {
+				t.Fatalf("late suspend authorization was not stopped and reported: %+v %+v state=%s", allocation, condition, workspace.Status.State)
+			}
+		})
 	}
 }

@@ -3,9 +3,14 @@
 package workspaceprovider
 
 import (
-	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestWorkloadReplacementRequiresExactTerminatedPredecessor(t *testing.T) {
@@ -137,5 +142,74 @@ func TestRetirementAuthorizationBindsSequenceInstanceAndAction(t *testing.T) {
 	authorization.Sequence++
 	if err := ValidateWorkloadRetirement(&request, &observation, &authorization, workspacev1alpha1.WorkloadRetirementDelete); err == nil {
 		t.Fatal("foreign sequence authorized deletion")
+	}
+}
+
+func TestSuspendDeadlineExceededAllowsForClockSkew(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	for name, test := range map[string]struct {
+		notAfter *metav1.Time
+		exceeded bool
+	}{
+		"no deadline":         {},
+		"open window":         {notAfter: &metav1.Time{Time: now.Add(SuspendDeadlineClockSkew + time.Second)}},
+		"within clock skew":   {notAfter: &metav1.Time{Time: now.Add(SuspendDeadlineClockSkew - time.Second)}, exceeded: true},
+		"at skewed deadline":  {notAfter: &metav1.Time{Time: now.Add(SuspendDeadlineClockSkew)}, exceeded: true},
+		"after the deadline":  {notAfter: &metav1.Time{Time: now.Add(-time.Second)}, exceeded: true},
+		"exactly at deadline": {notAfter: &metav1.Time{Time: now}, exceeded: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := SuspendDeadlineExceeded(test.notAfter, now); got != test.exceeded {
+				t.Fatalf("SuspendDeadlineExceeded = %t, want %t", got, test.exceeded)
+			}
+		})
+	}
+}
+
+type deadlineDriver struct {
+	Lifecycle
+	suspendErr error
+	stops      int
+	stopped    AllocationObservation
+}
+
+func (d *deadlineDriver) SuspendInstance(context.Context, AllocationKey, InstanceIdentity, *metav1.Time) (AllocationObservation, error) {
+	return AllocationObservation{}, d.suspendErr
+}
+
+func (d *deadlineDriver) StopInstance(context.Context, AllocationKey, InstanceIdentity) (AllocationObservation, error) {
+	d.stops++
+	return d.stopped, nil
+}
+
+func TestSuspendOrStopFallsBackOnlyForAnExpiredAuthorization(t *testing.T) {
+	request := workloadFixture()
+	identity := InstanceIdentity{AllocationID: "allocation", InstanceID: "instance", RequestRevision: request.Revision}
+	stopped := AllocationObservation{Sequence: request.Sequence, Key: request.Key, Identity: identity, State: AllocationStopped}
+	suspend := &WorkloadRetirement{Sequence: request.Sequence, Identity: identity, Action: workspacev1alpha1.WorkloadRetirementSuspend}
+
+	driver := &deadlineDriver{suspendErr: ErrSuspendDeadlineExceeded, stopped: stopped}
+	observed, exceeded, err := SuspendOrStop(t.Context(), driver, request.Key, identity, suspend)
+	if err != nil || !exceeded || driver.stops != 1 || observed != stopped {
+		t.Fatalf("expired authorization did not fall back to exact Stop: exceeded=%t stops=%d err=%v", exceeded, driver.stops, err)
+	}
+
+	driver = &deadlineDriver{suspendErr: errors.New("backend unavailable"), stopped: stopped}
+	if _, exceeded, err := SuspendOrStop(t.Context(), driver, request.Key, identity, suspend); err == nil || exceeded || driver.stops != 0 {
+		t.Fatalf("an unrelated suspension error stopped the instance: exceeded=%t stops=%d err=%v", exceeded, driver.stops, err)
+	}
+
+	retained := stopped
+	retained.RetainedData = &RetainedDataReference{ID: "data", SourceInstance: identity, ProofSHA256: "sha256:" + strings.Repeat("b", 64)}
+	driver = &deadlineDriver{suspendErr: ErrSuspendDeadlineExceeded, stopped: retained}
+	if _, exceeded, err := SuspendOrStop(t.Context(), driver, request.Key, identity, suspend); err == nil || !exceeded {
+		t.Fatalf("fallback stop that claimed retained data was accepted: %v", err)
+	}
+
+	for _, authorization := range []*WorkloadRetirement{nil, {Sequence: request.Sequence, Identity: identity, Action: workspacev1alpha1.WorkloadRetirementDelete}} {
+		driver = &deadlineDriver{stopped: stopped}
+		if _, _, err := SuspendOrStop(t.Context(), driver, request.Key, identity, authorization); err == nil || driver.stops != 0 {
+			t.Fatalf("non-Suspend authorization reached the provider: %v", err)
+		}
 	}
 }

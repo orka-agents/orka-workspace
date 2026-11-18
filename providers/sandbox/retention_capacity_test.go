@@ -94,7 +94,7 @@ func TestSandboxSuspendedCapacityZeroAndPendingOccupancy(t *testing.T) {
 			request = cappedSandboxRequest(t, c, request, limit)
 			first := ready(t, c, request)
 			if limit == 0 {
-				if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+				if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 					t.Fatal("zero cap admitted suspension")
 				}
 				requireSandboxRunning(t, c, request)
@@ -102,17 +102,17 @@ func TestSandboxSuspendedCapacityZeroAndPendingOccupancy(t *testing.T) {
 			}
 			other := anotherSandboxRequest(t, c, request, "other", "")
 			second := ready(t, c, other)
-			pending, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity)
+			pending, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 			if err != nil || pending.State != workspaceprovider.AllocationPending {
 				t.Fatalf("first suspension did not reserve before completion: %v", err)
 			}
-			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 				t.Fatal("pending suspension did not consume the class cap")
 			}
 			requireSandboxRunning(t, c, other)
 			independent := anotherSandboxRequest(t, c, request, "independent", "another-class")
 			third := ready(t, c, independent)
-			if _, err := New(c).SuspendInstance(t.Context(), independent.Key, third.Identity); err != nil {
+			if _, err := New(c).SuspendInstance(t.Context(), independent.Key, third.Identity, nil); err != nil {
 				t.Fatalf("sharing a profile incorrectly shared another class's cap: %v", err)
 			}
 		})
@@ -127,7 +127,7 @@ func TestSandboxResumeReleasesCapacityWithoutDeletingStorage(t *testing.T) {
 	_, before, _ := New(c).read(t.Context(), request.Key)
 	other := anotherSandboxRequest(t, c, request, "other", "")
 	second := ready(t, c, other)
-	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 		t.Fatal("occupied slot admitted another suspension")
 	}
 	next := continuation(request, retired)
@@ -139,7 +139,7 @@ func TestSandboxResumeReleasesCapacityWithoutDeletingStorage(t *testing.T) {
 	if resumed.Identity.InstanceID == first.Identity.InstanceID || *after.Storage != *before.Storage {
 		t.Fatal("resume did not preserve storage with a new runtime instance")
 	}
-	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err != nil {
+	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err != nil {
 		t.Fatalf("running resumed workspace still consumed suspended capacity: %v", err)
 	}
 }
@@ -187,10 +187,10 @@ func TestSandboxRetentionFreezesProfileAndBackfillsRunningLegacyJournal(t *testi
 					t.Fatal(err)
 				}
 			}
-			if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err != nil {
+			if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err != nil {
 				t.Fatalf("bound profile retention could not be used: %v", err)
 			}
-			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 				t.Fatal("profile retention was not preserved")
 			}
 		})
@@ -245,7 +245,7 @@ func TestSandboxSuspendedCapacityCASAcrossIndependentDrivers(t *testing.T) {
 		id      workspaceprovider.InstanceIdentity
 	}{{next, first.Identity}, {other, second.Identity}} {
 		go func() {
-			_, err := New(barrier).SuspendInstance(t.Context(), attempt.request.Key, attempt.id)
+			_, err := New(barrier).SuspendInstance(t.Context(), attempt.request.Key, attempt.id, nil)
 			errors <- err
 		}()
 	}
@@ -310,7 +310,7 @@ func TestSandboxDelayedResumeReleasePreservesNewSuspension(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		_, err = New(c).SuspendInstance(t.Context(), next.Key, current.Observation.Identity)
+		_, err = New(c).SuspendInstance(t.Context(), next.Key, current.Observation.Identity, nil)
 		return err
 	}
 	for range 5 {
@@ -324,7 +324,7 @@ func TestSandboxDelayedResumeReleasePreservesNewSuspension(t *testing.T) {
 	if !race.done {
 		t.Fatal("resume never attempted to release its prior slot")
 	}
-	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 		t.Fatal("delayed prior-sequence release removed the new suspension's slot")
 	}
 	if _, err := New(c).Observe(t.Context(), next.Key); err != nil {
@@ -365,7 +365,7 @@ func TestSandboxDeletedSuspendRetryDoesNotResolveMissingLegacyProfile(t *testing
 	if err := c.Delete(t.Context(), profile); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity)
+	observed, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 	if err != nil || observed.State != workspaceprovider.AllocationDeleted {
 		t.Fatalf("terminal retry resolved a removed profile: state=%s err=%v", observed.State, err)
 	}
@@ -408,7 +408,7 @@ func TestSandboxMissingAndLegacyOccupancyFailClosedUntilCleanup(t *testing.T) {
 			if _, err := New(c).Observe(t.Context(), request.Key); err == nil {
 				t.Fatal("unreserved retained lineage was published")
 			}
-			if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+			if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 				t.Fatal("unreserved suspension was accepted on retry")
 			}
 			next := continuation(request, retired)
@@ -420,7 +420,7 @@ func TestSandboxMissingAndLegacyOccupancyFailClosedUntilCleanup(t *testing.T) {
 			}
 			other := anotherSandboxRequest(t, c, request, "other", "")
 			second := ready(t, c, other)
-			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 				t.Fatal("existing unreserved occupancy was ignored for a new suspension")
 			}
 			requireSandboxRunning(t, c, other)
@@ -428,7 +428,7 @@ func TestSandboxMissingAndLegacyOccupancyFailClosedUntilCleanup(t *testing.T) {
 				t.Fatalf("lost occupancy record prevented exact stop: %v", err)
 			}
 			deleteSandboxAllocation(t, c, request, first.Identity)
-			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err != nil {
+			if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err != nil {
 				t.Fatalf("drained old occupancy still blocked its class: %v", err)
 			}
 		})
@@ -459,14 +459,14 @@ func TestSandboxReservationResponseLossKeepsCapacityAndCanRetry(t *testing.T) {
 	other := anotherSandboxRequest(t, c, request, "other", "")
 	second := ready(t, c, other)
 	lost := &lostRetentionResponse{Client: c}
-	if _, err := New(lost).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil || !lost.done {
+	if _, err := New(lost).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil || !lost.done {
 		t.Fatal("reservation response was not lost")
 	}
 	requireSandboxRunning(t, c, request)
-	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err == nil {
+	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err == nil {
 		t.Fatal("uncertain reservation was reused by another workspace")
 	}
-	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err != nil {
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err != nil {
 		t.Fatalf("retry could not recover its exact committed reservation: %v", err)
 	}
 }
@@ -477,7 +477,7 @@ func TestSandboxCleanupReleasesReservationWhoseIntentResponseWasLost(t *testing.
 	first := ready(t, c, request)
 	other := anotherSandboxRequest(t, c, request, "other", "")
 	second := ready(t, c, other)
-	if _, err := New(&lostRetentionResponse{Client: c}).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+	if _, err := New(&lostRetentionResponse{Client: c}).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 		t.Fatal("reservation response was not lost")
 	}
 	stopped := false
@@ -495,7 +495,7 @@ func TestSandboxCleanupReleasesReservationWhoseIntentResponseWasLost(t *testing.
 		t.Fatal("exact stop did not complete")
 	}
 	deleteSandboxAllocation(t, c, request, first.Identity)
-	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity); err != nil {
+	if _, err := New(c).SuspendInstance(t.Context(), other.Key, second.Identity, nil); err != nil {
 		t.Fatalf("completed deletion leaked an uncertain reservation: %v", err)
 	}
 }

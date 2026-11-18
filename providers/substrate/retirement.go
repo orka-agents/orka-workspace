@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -340,7 +341,7 @@ func (d *Lifecycle) verifyCheckpoint(ctx context.Context, checkpoint *checkpoint
 	return d.verifyTemplate(ctx, checkpoint.Atespace, checkpoint.Template)
 }
 
-func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) (sdk.AllocationObservation, error) {
+func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity, notAfter *metav1.Time) (sdk.AllocationObservation, error) {
 	var observed sdk.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		cm, record, err := d.read(ctx, key)
@@ -353,6 +354,14 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 		observed = record.Observation
 		if record.Failure != "" {
 			return fmt.Errorf("a failed native instance has no data to suspend; Stop retires it")
+		}
+		// The suspension starts when SuspendActor is issued. Past the
+		// authorization's deadline an unissued one never starts: the
+		// journaled intent, if any, is abandoned to the caller's exact Stop.
+		// The optimistic journal save below makes this check and the record
+		// that the suspension started one atomic update.
+		if (record.Operation != "suspend" || (record.Pending != nil && !record.Pending.SuspendIssued)) && sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return sdk.ErrSuspendDeadlineExceeded
 		}
 		if record.Operation == "suspend" {
 			if err := d.reserveSuspended(ctx, record); err != nil {
@@ -394,7 +403,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
-			err := d.capture(ctx, cm, record)
+			err := d.capture(ctx, cm, record, notAfter)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				// The capture source is gone, so this capture can never finish.
 				// The failed instance retires through the exact Stop path.
@@ -418,7 +427,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 	return observed, err
 }
 
-func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, notAfter *metav1.Time) error {
 	operation := record.Pending
 	actor, err := d.actor(ctx, record)
 	if err != nil {
@@ -444,9 +453,22 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		if err := d.verifyRetiringWorker(ctx, record); err != nil {
 			return err
 		}
+		// Recheck after the verification calls.
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return sdk.ErrSuspendDeadlineExceeded
+		}
 		operation.SuspendIssued = true
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
+		}
+		// The journal write can consume the rest of the window, so check
+		// once more with nothing but the RPC left before issuance. Withdraw
+		// the issuance marker to keep the unissued intent abandonable. If
+		// that write fails, the marker records an issuance without progress,
+		// which past the deadline also falls back to the exact Stop below.
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			operation.SuspendIssued = false
+			return errors.Join(sdk.ErrSuspendDeadlineExceeded, d.save(ctx, cm, record))
 		}
 		// Synchronous durability returns only after the snapshot is uploaded,
 		// so CreateTag copies it without changing the Actor.
@@ -458,6 +480,12 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		return nil
 	}
 	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
+		if sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			// An issuance the Actor never acted on is unresolved and is never
+			// replayed. Past the deadline it cannot finish in time either, so
+			// the exact Stop retires the instance without retained data.
+			return sdk.ErrSuspendDeadlineExceeded
+		}
 		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
 	}
 	snapshot := latestSnapshot(actor)

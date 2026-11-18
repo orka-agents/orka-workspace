@@ -247,6 +247,13 @@ func TestSequenceAndOptionalSuspensionConformance(t *testing.T) {
 	}
 }
 
+func TestSuspendDeadlineConformance(t *testing.T) {
+	c, request := fixture(t)
+	if err := conformance.CheckSuspendDeadline(t.Context(), func() workspaceprovider.Lifecycle { return New(c) }, request); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 	for _, write := range []int{1, 2} {
 		t.Run(fmt.Sprint(write), func(t *testing.T) {
@@ -255,7 +262,7 @@ func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := New(&faultClient{Client: c, failAt: write, commit: true}).SuspendInstance(t.Context(), request.Key, ready.Identity); err == nil {
+			if _, err := New(&faultClient{Client: c, failAt: write, commit: true}).SuspendInstance(t.Context(), request.Key, ready.Identity, nil); err == nil {
 				t.Fatal("expected lost response")
 			}
 			pending, err := New(c).EnsureAllocation(t.Context(), request)
@@ -265,7 +272,7 @@ func TestSuspensionRecoversAfterLostIntentOrCompletion(t *testing.T) {
 			if pending.State == workspaceprovider.AllocationReady || pending.Startup != nil {
 				t.Fatal("suspension intent retained startup readiness")
 			}
-			suspended, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			suspended, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -284,7 +291,7 @@ func TestInvalidSequenceTransitionsDoNotChangePredecessor(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			stopped, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity)
+			stopped, err := New(c).SuspendInstance(t.Context(), request.Key, ready.Identity, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

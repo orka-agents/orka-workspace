@@ -131,6 +131,7 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				retirementPending = true
 			}
 		}
+		suspendDeadlineExceeded := false
 		if operationErr == nil && !retirementPending {
 			switch {
 			case deleted || quarantined:
@@ -142,7 +143,7 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				}
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended || (current.Spec.Retirement != nil && current.Spec.Retirement.Action == workspacev1alpha1.WorkloadRetirementSuspend):
 				if !missing {
-					observed, operationErr = driver.SuspendInstance(ctx, key, observed.Identity)
+					observed, suspendDeadlineExceeded, operationErr = workspaceprovider.SuspendOrStop(ctx, driver, key, observed.Identity, current.Spec.Retirement)
 				}
 			case current.Spec.Retirement != nil && !missing:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
@@ -198,6 +199,9 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateDeleting
 			case quarantined && (missing || observed.State == workspaceprovider.AllocationStopped || observed.State == workspaceprovider.AllocationDeleted):
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateQuarantined
+			case suspendDeadlineExceeded:
+				// Stopped without data: never Suspended, and no longer suspending.
+				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStatePending
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && observed.State == workspaceprovider.AllocationStopped && observed.RetainedData != nil:
 				current.Status.State = workspacev1alpha1.ExecutionWorkspaceStateSuspended
 			case current.Spec.DesiredState == workspacev1alpha1.ExecutionWorkspaceDesiredSuspended:
@@ -212,7 +216,11 @@ func (r *FakeExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Contex
 		}
 		pending = !disabled && operationErr == nil && !ready && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateDeleted && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateSuspended && current.Status.State != workspacev1alpha1.ExecutionWorkspaceStateQuarantined
 		dataPlaneReady := ready && !deleted && !quarantined && current.Spec.DesiredState != workspacev1alpha1.ExecutionWorkspaceDesiredSuspended && current.Spec.Retirement == nil
-		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), Message: chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired"), ObservedGeneration: current.Generation})
+		dataPlaneReason, dataPlaneMessage := conditionReason(dataPlaneReady, string(workspacev1alpha1.ReasonProgressing)), chooseMessage(dataPlaneReady, "allocated instance is available for core bootstrap and verification", "allocation is pending or retired")
+		if suspendDeadlineExceeded {
+			dataPlaneReason, dataPlaneMessage = string(workspacev1alpha1.ReasonSuspendDeadlineExceeded), workspaceprovider.SuspendDeadlineExceededMessage
+		}
+		workspaceprovider.SetCondition(&current.Status.Conditions, metav1.Condition{Type: string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady), Status: conditionStatus(dataPlaneReady), Reason: dataPlaneReason, Message: dataPlaneMessage, ObservedGeneration: current.Generation})
 		setLifecycleMilestoneConditions(current, observed, missing, operationErr)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})

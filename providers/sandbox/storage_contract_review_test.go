@@ -275,7 +275,7 @@ func TestSandboxTemplateBehaviorPolicyDriftWithdrawsStartup(t *testing.T) {
 					t.Fatalf("template behavior drift was re-admitted: %+v, %v", observed, err)
 				}
 				if persistent {
-					if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity); err == nil {
+					if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, nil); err == nil {
 						t.Fatal("template behavior drift allowed retained-data suspension")
 					}
 					sb := &sandboxv1beta1.Sandbox{}

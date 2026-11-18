@@ -12,6 +12,7 @@ import (
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Check consumes one fresh admitted fixture through deletion. Each factory call
@@ -261,8 +262,13 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 		if !ok {
 			return fmt.Errorf("provider has no suspension capability")
 		}
+		// Start the suspension inside its window, then keep retrying after the
+		// window closed: a suspension started in time must still finish.
+		window := metav1.NewTime(time.Now().Add(time.Hour))
 		retired, err = until(ctx, func() (workspaceprovider.AllocationObservation, error) {
-			return driver.SuspendInstance(ctx, request.Key, first.Identity)
+			observed, err := driver.SuspendInstance(ctx, request.Key, first.Identity, &window)
+			window = expiredSuspendWindow()
+			return observed, err
 		}, workspaceprovider.AllocationStopped)
 	} else {
 		retired, err = until(ctx, func() (workspaceprovider.AllocationObservation, error) {
@@ -278,6 +284,11 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	if suspend {
 		if retired.RetainedData == nil || !retired.RetainedData.Valid() || retired.RetainedData.SourceInstance != first.Identity {
 			return fmt.Errorf("suspension lacks verified retained lineage")
+		}
+		expired := expiredSuspendWindow()
+		again, err := factory().(workspaceprovider.SuspensionController).SuspendInstance(ctx, request.Key, first.Identity, &expired)
+		if err != nil || again.State != workspaceprovider.AllocationStopped || again.RetainedData == nil || *again.RetainedData != *retired.RetainedData {
+			return fmt.Errorf("a suspension completed in time was not stable after its window closed: %v", err)
 		}
 	}
 	next = nextRequest(request, first.Identity, retired.RetainedData)
@@ -312,7 +323,7 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 			if !ok {
 				return workspaceprovider.AllocationObservation{}, fmt.Errorf("provider has no suspension capability")
 			}
-			return driver.SuspendInstance(ctx, next.Key, second.Identity)
+			return driver.SuspendInstance(ctx, next.Key, second.Identity, nil)
 		}
 		return factory().StopInstance(ctx, next.Key, second.Identity)
 	}, workspaceprovider.AllocationStopped)
@@ -355,6 +366,92 @@ func checkContinuation(ctx context.Context, factory func() workspaceprovider.Lif
 	}
 	if deleted.Key != next.Key || deleted.Sequence != next.Sequence || deleted.Identity != second.Identity || deleted.Startup != nil {
 		return fmt.Errorf("continuation cleanup changed its exact predecessor fence")
+	}
+	return workspaceprovider.ValidateDeletedDisposition(deleted.Disposition, policy)
+}
+
+// expiredSuspendWindow is well past any provider's clock skew allowance.
+func expiredSuspendWindow() metav1.Time {
+	return metav1.NewTime(time.Now().Add(-time.Hour))
+}
+
+// CheckSuspendDeadline consumes a fresh fixture whose provider observes core's
+// Suspend authorization only after its NotAfter. The provider must refuse to
+// start the suspension with ErrSuspendDeadlineExceeded, leave the exact
+// instance untouched, and keep refusing after the fallback Stop. The instance
+// must end stopped with no retained data, so it is never reported suspended.
+func CheckSuspendDeadline(ctx context.Context, factory func() workspaceprovider.Lifecycle, request workspaceprovider.WorkloadRequest) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+	suspendable := func() (workspaceprovider.SuspendableLifecycle, error) {
+		driver, ok := factory().(workspaceprovider.SuspendableLifecycle)
+		if !ok {
+			return nil, fmt.Errorf("provider has no suspension capability")
+		}
+		return driver, nil
+	}
+	ready, err := until(ctx, func() (workspaceprovider.AllocationObservation, error) {
+		return factory().EnsureAllocation(ctx, request)
+	}, workspaceprovider.AllocationReady)
+	if err != nil {
+		return err
+	}
+	if err := workspaceprovider.ValidateStartup(request, ready); err != nil {
+		return err
+	}
+	driver, err := suspendable()
+	if err != nil {
+		return err
+	}
+	expired := expiredSuspendWindow()
+	if _, err := driver.SuspendInstance(ctx, request.Key, ready.Identity, &expired); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		return fmt.Errorf("suspension started after its authorization expired: %v", err)
+	}
+	// Refusal must not have begun any retirement: the instance still serves.
+	if err := sameReady(ctx, factory(), request, ready.Identity); err != nil {
+		return fmt.Errorf("refused late suspension changed the instance: %w", err)
+	}
+	authorization := &workspaceprovider.WorkloadRetirement{Sequence: request.Sequence, Identity: ready.Identity, Action: workspacev1alpha1.WorkloadRetirementSuspend, NotAfter: &expired}
+	var exceeded bool
+	stopped, err := until(ctx, func() (workspaceprovider.AllocationObservation, error) {
+		driver, err := suspendable()
+		if err != nil {
+			return workspaceprovider.AllocationObservation{}, err
+		}
+		observed, deadline, err := workspaceprovider.SuspendOrStop(ctx, driver, request.Key, ready.Identity, authorization)
+		exceeded = deadline
+		return observed, err
+	}, workspaceprovider.AllocationStopped)
+	if err != nil {
+		return fmt.Errorf("fallback stop after an expired suspend authorization: %w", err)
+	}
+	if !exceeded {
+		return fmt.Errorf("an expired suspend authorization was not reported as exceeded")
+	}
+	if stopped.Key != request.Key || stopped.Sequence != request.Sequence || stopped.Identity != ready.Identity || stopped.Startup != nil || stopped.RetainedData != nil {
+		return fmt.Errorf("fallback stop changed the exact fence or published retained data")
+	}
+	// A restarted provider still refuses and reports the same stopped instance.
+	driver, err = suspendable()
+	if err != nil {
+		return err
+	}
+	if _, err := driver.SuspendInstance(ctx, request.Key, ready.Identity, &expired); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		return fmt.Errorf("expired suspend authorization was not refused after the fallback stop: %v", err)
+	}
+	observed, err := factory().Observe(ctx, request.Key)
+	if err != nil || observed.Identity != ready.Identity || observed.State != workspaceprovider.AllocationStopped || observed.RetainedData != nil || observed.Startup != nil {
+		return fmt.Errorf("stopped instance after an expired suspend authorization was reported suspended or changed: %v", err)
+	}
+	policy := workspacev1alpha1.ExecutionWorkspaceDeletionPolicy{ProviderResources: workspacev1alpha1.WorkspaceDeletionActionDelete, PersistentVolumes: workspacev1alpha1.WorkspaceDeletionActionDelete, Checkpoints: workspacev1alpha1.WorkspaceDeletionActionDelete}
+	deleted, err := until(ctx, func() (workspaceprovider.AllocationObservation, error) {
+		return factory().DeleteAllocation(ctx, request.Key, ready.Identity, policy)
+	}, workspaceprovider.AllocationDeleted)
+	if err != nil {
+		return err
 	}
 	return workspaceprovider.ValidateDeletedDisposition(deleted.Disposition, policy)
 }

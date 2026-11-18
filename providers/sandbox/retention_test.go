@@ -18,7 +18,7 @@ import (
 func suspended(t *testing.T, c client.Client, request workspaceprovider.WorkloadRequest, first workspaceprovider.AllocationObservation) workspaceprovider.AllocationObservation {
 	t.Helper()
 	for range 5 {
-		observed, err := (&simulatedLifecycle{New(c)}).SuspendInstance(t.Context(), request.Key, first.Identity)
+		observed, err := (&simulatedLifecycle{New(c)}).SuspendInstance(t.Context(), request.Key, first.Identity, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

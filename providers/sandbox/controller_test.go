@@ -1,9 +1,11 @@
 package sandbox
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/sandbox/api/v1alpha1"
@@ -302,5 +304,98 @@ func TestExplicitSuspendDuringReadyPreservesDataForRollover(t *testing.T) {
 	}
 	if record.Operation != "suspend" {
 		t.Fatal("ready-state suspend did not preserve data for the next sequence")
+	}
+}
+
+func TestReadySuspendAuthorizationObservedAfterDeadlineStops(t *testing.T) {
+	c, request := fixture(t, true)
+	first := ready(t, c, request)
+	key := types.NamespacedName{Namespace: request.Key.Namespace, Name: request.Key.Name}
+	workspace := &workspacev1alpha1.ExecutionWorkspace{}
+	if err := c.Get(t.Context(), key, workspace); err != nil {
+		t.Fatal(err)
+	}
+	notAfter := metav1.NewTime(time.Now().Add(-time.Hour))
+	workspace.Spec.Retirement = &workspacev1alpha1.WorkloadRetirement{Sequence: 1, Identity: first.Identity, Action: workspacev1alpha1.WorkloadRetirementSuspend, NotAfter: &notAfter}
+	workspace.Generation++
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	r := &ExecutionWorkspaceReconciler{Client: c}
+	for range 12 {
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		if err := nativeTick(t.Context(), c); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Get(t.Context(), key, workspace); err != nil {
+			t.Fatal(err)
+		}
+		if workspace.Status.Allocation != nil && workspace.Status.Allocation.State == workspaceprovider.AllocationStopped {
+			break
+		}
+	}
+	_, record, err := New(c).read(t.Context(), request.Key)
+	if err != nil || record.Operation != "stop" {
+		t.Fatalf("late authorization started a suspension: %v", err)
+	}
+	allocation := workspace.Status.Allocation
+	condition := workspaceprovider.FindCondition(workspace.Status.Conditions, string(workspacev1alpha1.ConditionWorkspaceDataPlaneReady))
+	if allocation == nil || allocation.State != workspaceprovider.AllocationStopped || allocation.RetainedData != nil || allocation.Identity != first.Identity ||
+		condition == nil || condition.Reason != string(workspacev1alpha1.ReasonSuspendDeadlineExceeded) || workspace.Status.State == workspacev1alpha1.ExecutionWorkspaceStateSuspended {
+		t.Fatalf("late authorization was not stopped without data and reported: %+v %+v state=%s", allocation, condition, workspace.Status.State)
+	}
+}
+
+// lostSandboxSuspend fails the first Sandbox update, as if the provider
+// stopped after journaling a suspension but before issuing it.
+type lostSandboxSuspend struct {
+	client.Client
+	failed bool
+}
+
+func (c *lostSandboxSuspend) Update(ctx context.Context, object client.Object, options ...client.UpdateOption) error {
+	if _, ok := object.(*sandboxv1beta1.Sandbox); ok && !c.failed {
+		c.failed = true
+		return errors.New("provider stopped before issuing the suspension")
+	}
+	return c.Client.Update(ctx, object, options...)
+}
+
+func TestJournaledSuspensionIsNotIssuedAfterDeadline(t *testing.T) {
+	c, request := fixture(t, true)
+	first := ready(t, c, request)
+	window := metav1.NewTime(time.Now().Add(time.Hour))
+	if _, err := New(&lostSandboxSuspend{Client: c}).SuspendInstance(t.Context(), request.Key, first.Identity, &window); err == nil {
+		t.Fatal("lost Sandbox update succeeded")
+	}
+	_, record, err := New(c).read(t.Context(), request.Key)
+	if err != nil || record.Operation != "suspend" {
+		t.Fatalf("suspension intent was not journaled: %v", err)
+	}
+	window = metav1.NewTime(time.Now().Add(-time.Hour))
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		t.Fatalf("journaled suspension was issued after its deadline: %v", err)
+	}
+	sb, err := New(c).sandbox(t.Context(), record)
+	if err != nil || sb.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeRunning {
+		t.Fatalf("late suspension changed the Sandbox: %v", err)
+	}
+	var stopped workspaceprovider.AllocationObservation
+	for range 12 {
+		stopped, err = (&simulatedLifecycle{New(c)}).StopInstance(t.Context(), request.Key, first.Identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stopped.State == workspaceprovider.AllocationStopped {
+			break
+		}
+	}
+	if stopped.State != workspaceprovider.AllocationStopped || stopped.Identity != first.Identity || stopped.RetainedData != nil {
+		t.Fatalf("abandoned suspension blocked exact Stop or claimed retained data: %+v", stopped)
+	}
+	if _, err := New(c).SuspendInstance(t.Context(), request.Key, first.Identity, &window); !errors.Is(err, workspaceprovider.ErrSuspendDeadlineExceeded) {
+		t.Fatalf("stopped instance accepted a late suspension: %v", err)
 	}
 }

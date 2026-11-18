@@ -35,6 +35,10 @@ type continuationStore struct {
 	history        map[int64]sdk.AllocationObservation
 	forgedAttempts int
 	ignoreLineage  bool
+	ignoreDeadline bool
+	abandonStarted bool
+	asyncSuspend   bool
+	suspending     bool
 	replacement    bool
 	staleStopFence bool
 	deleted        bool
@@ -109,7 +113,24 @@ func (s *continuationStore) StopInstance(_ context.Context, key sdk.AllocationKe
 	return s.observed, nil
 }
 
-func (s *continuationStore) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) (sdk.AllocationObservation, error) {
+func (s *continuationStore) SuspendInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity, notAfter *metav1.Time) (sdk.AllocationObservation, error) {
+	if key != s.observed.Key || identity != s.observed.Identity {
+		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
+	}
+	started := s.suspending || (s.observed.State == sdk.AllocationStopped && s.observed.RetainedData != nil)
+	if !started || s.abandonStarted {
+		if !s.ignoreDeadline && sdk.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return sdk.AllocationObservation{}, sdk.ErrSuspendDeadlineExceeded
+		}
+	}
+	if s.asyncSuspend && !started {
+		// The first call only starts the capture; a retry completes it.
+		s.suspending = true
+		s.observed.State = sdk.AllocationPending
+		s.observed.Startup = nil
+		return s.observed, nil
+	}
+	s.suspending = false
 	if _, err := s.StopInstance(ctx, key, identity); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
@@ -249,5 +270,52 @@ func TestReplacementConformanceRejectsInexactSuccessorStopFence(t *testing.T) {
 	err := CheckReplacement(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store))
 	if err == nil || !strings.Contains(err.Error(), "successor termination changed its exact fence") {
 		t.Fatalf("inexact successor stop fence passed replacement conformance: %v", err)
+	}
+}
+
+func TestSuspendDeadlineConformance(t *testing.T) {
+	store := continuationFixture()
+	if err := CheckSuspendDeadline(t.Context(), func() sdk.Lifecycle { return store }, store.admitted); err != nil {
+		t.Fatal(err)
+	}
+	if !store.deleted || store.observed.RetainedData != nil {
+		t.Fatalf("late suspend authorization did not end in an exact stop and cleanup: %+v", store.observed)
+	}
+}
+
+func TestSuspendDeadlineConformanceRejectsProviderThatIgnoresNotAfter(t *testing.T) {
+	store := continuationFixture()
+	store.ignoreDeadline = true
+	err := CheckSuspendDeadline(t.Context(), func() sdk.Lifecycle { return store }, store.admitted)
+	if err == nil || !strings.Contains(err.Error(), "suspension started after its authorization expired") {
+		t.Fatalf("provider that suspends past notAfter passed deadline conformance: %v", err)
+	}
+	if store.observed.RetainedData == nil {
+		t.Fatal("negative control did not suspend")
+	}
+}
+
+func TestSuspensionConformanceRejectsProviderThatAbandonsStartedSuspension(t *testing.T) {
+	for name, test := range map[string]struct {
+		async     bool
+		rejection string
+	}{
+		"completed":                          {rejection: "completed in time was not stable after its window closed"},
+		"in progress when the window closes": {async: true, rejection: sdk.ErrSuspendDeadlineExceeded.Error()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := continuationFixture()
+			store.asyncSuspend = test.async
+			if err := CheckSuspension(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store)); err != nil {
+				t.Fatalf("exact suspension fixture failed: %v", err)
+			}
+			store = continuationFixture()
+			store.asyncSuspend = test.async
+			store.abandonStarted = true
+			err := CheckSuspension(t.Context(), func() sdk.Lifecycle { return store }, store.admitted, continuationAdmission(t, store))
+			if err == nil || !strings.Contains(err.Error(), test.rejection) || (test.async && strings.Contains(err.Error(), "completed in time")) {
+				t.Fatalf("provider that refuses a suspension started in time passed suspension conformance: %v", err)
+			}
+		})
 	}
 }

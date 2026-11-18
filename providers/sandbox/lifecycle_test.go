@@ -329,8 +329,8 @@ func (d *simulatedLifecycle) StopInstance(ctx context.Context, key workspaceprov
 	o, e := d.Lifecycle.StopInstance(ctx, key, id)
 	return d.tick(ctx, o, e)
 }
-func (d *simulatedLifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, id workspaceprovider.InstanceIdentity) (workspaceprovider.AllocationObservation, error) {
-	o, e := d.Lifecycle.SuspendInstance(ctx, key, id)
+func (d *simulatedLifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, id workspaceprovider.InstanceIdentity, notAfter *metav1.Time) (workspaceprovider.AllocationObservation, error) {
+	o, e := d.Lifecycle.SuspendInstance(ctx, key, id, notAfter)
 	return d.tick(ctx, o, e)
 }
 func (d *simulatedLifecycle) DeleteAllocation(ctx context.Context, key workspaceprovider.AllocationKey, id workspaceprovider.InstanceIdentity, p workspacev1alpha1.ExecutionWorkspaceDeletionPolicy) (workspaceprovider.AllocationObservation, error) {
@@ -363,6 +363,13 @@ func TestLifecycleConformance(t *testing.T) {
 func TestDataSuspensionConformance(t *testing.T) {
 	c, request := fixture(t, true)
 	if err := conformance.CheckSuspension(t.Context(), func() workspaceprovider.Lifecycle { return &simulatedLifecycle{New(c)} }, request, admit(t, c)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSuspendDeadlineConformance(t *testing.T) {
+	c, request := fixture(t, true)
+	if err := conformance.CheckSuspendDeadline(t.Context(), func() workspaceprovider.Lifecycle { return &simulatedLifecycle{New(c)} }, request); err != nil {
 		t.Fatal(err)
 	}
 }

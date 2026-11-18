@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
@@ -19,14 +20,14 @@ import (
 )
 
 func (d *Lifecycle) StopInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity) (workspaceprovider.AllocationObservation, error) {
-	return d.retire(ctx, key, identity, false)
+	return d.retire(ctx, key, identity, false, nil)
 }
 
-func (d *Lifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity) (workspaceprovider.AllocationObservation, error) {
-	return d.retire(ctx, key, identity, true)
+func (d *Lifecycle) SuspendInstance(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, notAfter *metav1.Time) (workspaceprovider.AllocationObservation, error) {
+	return d.retire(ctx, key, identity, true, notAfter)
 }
 
-func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, suspend bool) (workspaceprovider.AllocationObservation, error) {
+func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.AllocationKey, identity workspaceprovider.InstanceIdentity, suspend bool, notAfter *metav1.Time) (workspaceprovider.AllocationObservation, error) {
 	var observed workspaceprovider.AllocationObservation
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		cm, record, err := d.read(ctx, key)
@@ -49,6 +50,13 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		observed = record.Observation
 		if suspend && record.Failure != "" {
 			return fmt.Errorf("a failed runtime Pod has no data to suspend; Stop retires it")
+		}
+		// Past the authorization's deadline a suspension that has not been
+		// journaled never starts; the caller stops the exact instance instead.
+		// The journal save below uses optimistic concurrency, and the Sandbox
+		// update that issues the suspension rechecks the deadline.
+		if suspend && record.Operation != "suspend" && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+			return workspaceprovider.ErrSuspendDeadlineExceeded
 		}
 		if suspend {
 			if err := d.resolveRetention(ctx, record); err != nil {
@@ -150,6 +158,12 @@ func (d *Lifecycle) retire(ctx context.Context, key workspaceprovider.Allocation
 		if sb != nil && sb.UID != "" {
 			marker := strconv.FormatInt(record.Request.Sequence, 10) + ":" + operation
 			if sb.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended || sb.Annotations[nativeOperationAnnotation] != marker {
+				// The backend suspension starts with this update. A journaled
+				// intent not yet issued here never issues after the deadline;
+				// the caller's exact Stop supersedes it.
+				if suspend && workspaceprovider.SuspendDeadlineExceeded(notAfter, time.Now()) {
+					return workspaceprovider.ErrSuspendDeadlineExceeded
+				}
 				sb.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
 				if sb.Annotations == nil {
 					sb.Annotations = map[string]string{}

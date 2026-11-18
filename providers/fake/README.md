@@ -38,7 +38,8 @@ go run ./fake/cmd/orka-workspace-fake --conformance
 ```
 
 The standalone conformance mode runs allocation/deletion, sequence replacement,
-and simulated suspension against isolated Kubernetes fake clients. Unit tests
+simulated suspension, and a Suspend authorization observed only after its
+`notAfter` against isolated Kubernetes fake clients. Unit tests
 also exercise Pod creation, exact UID/spec checks, lost responses, disappearance,
 API outages, and attachment acknowledgement during failed startup.
 
