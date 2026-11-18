@@ -242,6 +242,48 @@ and `external-substrate-core-session` (the Session), started in that order
 against the same Core, both with telemetry. The second starts only after the
 first passed; traces are verified after both.
 
+### Session latency and the warm-detach window
+
+After a passed proof, and before its cleanup, the same Core, provider and
+proof identity can measure session-reused, `DataOnly`, Suspend-on-detach
+latency and Orka ADR 0055's warm-detach window:
+
+```sh
+LATENCY_REPEATS=3 LATENCY_WINDOW=2m LATENCY_SCENARIOS=detach,warm \
+  bash scripts/external-substrate-core-e2e.sh latency
+```
+
+The Job (`native-core-latency-<UTC timestamp>`, label
+`orka.workspace.e2e/latency=native-core`) creates two profile/class pairs in
+the run namespace through the public APIs: `lat-detach` without a window and
+`lat-warm` with `retention.suspendAfterDetach` set to `LATENCY_WINDOW`. Both
+allow only Session reuse and Suspend, with a 30m idle timeout and a 1h
+lifetime. For each repetition it runs, one at a time:
+
+- `detach`: a cold turn 1, the suspension on detach, and turn 2 resumed from
+  the Tag; then that turn's suspension.
+- `warm`: a cold turn 1 and, once it settled warm, turn 2 inside the window,
+  which must reuse the same workload sequence and revision, provider instance,
+  Actor UID, worker Pod, runtime instance, supervisor boot and pool credential
+  Secret versions, with a new RuntimeSession and attachment epoch and no new
+  Tag. The RuntimePool must keep its replicas and the Actor its worker while
+  turn 2's own window runs; retention must then suspend with a new Tag, and
+  turn 3 resumes from it. The last window also expires before the next
+  repetition.
+
+Every Task is timed by the client from just before Create (first observation
+of each execution state and phase, prompt acceptance, `Succeeded`, and the
+workspace settlement receipt). Results go to
+`bin/external-substrate-core-latency-<UTC timestamp>/`: `latency.log`, the
+timing lines only of Core (`ACP turn timings`, `ACP workspace runtime
+started/stopped`), the provider (`Substrate runtime ready/stopped`) and the
+live-followed worker Pods (`ACP runtime session created`), and the joined
+`report.json` and `summary.md` (median, range and count per phase). Secret
+data, attachment token hashes and bootstrap nonces are never read into them.
+The deterministic agent sleeps 2s per prompt, which `promptStream` includes.
+A failed measurement keeps its objects for inspection; cleanup below retires
+them with the run and refuses while a measurement Job still runs.
+
 The run namespace is fixed, so a finished run (passed or failed) must be
 retired before the next one:
 
