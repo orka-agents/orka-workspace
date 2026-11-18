@@ -1036,8 +1036,13 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		if !found {
 			return false, sdk.ErrStaleIdentity
 		}
-		// The write is stored, so the remaining checks run in this pass. They
-		// re-read the ledger and assignments themselves.
+		// The write is stored, so the remaining checks run in this pass. The
+		// write may have landed on a ledger that a neighbour or the sweeper
+		// moved to Retiring or Quarantined after the validation above, so
+		// the pool is verified again before anything leads to Resume.
+		if _, err := d.verifySharedRuntimePool(ctx, cm, record, false); err != nil {
+			return false, err
+		}
 	}
 	assigned, count, err := d.sharedAssignmentsInLedger(ctx, record, selected.GetMetadata().GetName())
 	if err != nil {
