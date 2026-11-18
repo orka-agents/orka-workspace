@@ -63,6 +63,50 @@ def message(entry):
 core = lines(run / 'core-timings.log')
 provider = lines(run / 'provider-timings.log')
 supervisor = [entry for path in sorted((run / 'workers').glob('*.log')) for entry in lines(path)]
+pods = {entry['pod']: entry for entry in lines(run / 'workers' / 'pods.jsonl') if entry.get('pod')}
+
+
+def when(text):
+    """Parse an RFC3339 time with up to nanoseconds and any offset into epoch seconds."""
+    from datetime import datetime
+    if not text:
+        return None
+    match = re.match(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$', text)
+    if not match:
+        return None
+    whole, fraction, zone = match.groups()
+    value = datetime.fromisoformat(whole + ('+00:00' if zone == 'Z' else zone)).timestamp()
+    return value + (float('0.' + fraction) if fraction else 0.0)
+
+
+# Worker and supervisor boot milestones, in order; each phase is named by its end.
+WORKER_STEPS = [('workerBooting', 'ateworker booting'), ('workerRegistered', 'Registered worker'),
+                ('sandboxRuntimesReported', 'Reported worker sandbox runtimes'), ('readinessRecovered', 'Readiness check recovered'),
+                ('runscCreate', 'About to run runsc create'), ('awaitingBootstrap', 'awaiting controller credential bootstrap'),
+                ('bootstrapComplete', 'credential bootstrap complete'), ('supervisorListening', 'ACP supervisor listening')]
+
+
+def worker_timeline(pod_name, created_at):
+    """Phases of one worker Pod's boot, plus their offsets from Task creation."""
+    entries = [entry for entry in supervisor if entry.get('pod') == pod_name]
+    first = {}
+    for entry in entries:
+        for key, text in WORKER_STEPS:
+            if message(entry) == text and key not in first:
+                first[key] = when(entry.get('time'))
+    meta = pods.get(pod_name, {})
+    marks = [('podCreated', when(meta.get('created'))), ('containerStarted', when(meta.get('started')))] + [(key, first.get(key)) for key, _ in WORKER_STEPS]
+    sample, previous = {}, None
+    for key, at in marks:
+        if at is None:
+            continue
+        if created_at is not None:
+            sample['worker.sinceTaskCreated.' + key + 'Ms'] = int((at - created_at) * 1000)
+        if previous is not None:
+            # Named by the milestone the step ends at.
+            sample['worker.step.%sMs' % key] = int((at - previous[1]) * 1000)
+        previous = (key, at)
+    return sample
 events, final = [], None
 for line in (run / 'latency.log').read_text().splitlines():
     if line.startswith('LATENCY_EVENT '):
@@ -72,7 +116,13 @@ for line in (run / 'latency.log').read_text().splitlines():
 
 
 def ms_fields(entry, prefix):
-    return {prefix + key: number(value) for key, value in entry.items() if key.endswith('Ms') and number(value) is not None}
+    values = {}
+    for key, value in entry.items():
+        if isinstance(value, dict) and key.endswith('Ms'):
+            values.update({prefix + key[:-2] + '.' + inner + 'Ms': number(item) for inner, item in value.items() if number(item) is not None})
+        elif key.endswith('Ms') and number(value) is not None:
+            values[prefix + key] = number(value)
+    return values
 
 
 def find(entries, text, **match):
@@ -88,6 +138,9 @@ def find(entries, text, **match):
 def turn_sample(event):
     task, after = event['task'], event['workspaceAfter']
     sample = {'clientAcceptedMs': task['acceptedMs'], 'clientDoneMs': task['doneMs'], 'clientSettledMs': task.get('settledMs')}
+    # Client-observed first sighting of the pre-dispatch execution states.
+    for state in ('Queued', 'Reserved', 'SessionStarting', 'Submitting'):
+        sample['clientState.%sMs' % state] = task['statesFirstSeenMs'].get('state:' + state)
     timings = [entry for entry in find(core, 'ACP turn timings', task=task['name']) if str(entry.get('promptAccepted')).lower() == 'true']
     if timings:
         sample.update(ms_fields(timings[-1], 'turn.'))
@@ -104,10 +157,16 @@ def turn_sample(event):
         if ready:
             sample.update(ms_fields(ready[-1], 'providerReady.'))
             evidence['providerPath'] = ready[-1].get('path')
-    session = task['identity']['runtimeSessionUID']
-    created = [entry for entry in supervisor if 'ACP runtime session created' in message(entry) and session and session in str(entry.get('runtimeSessionID', ''))]
+    # The supervisor names the RuntimeSession runtime-session-<Task UID>-g<n>.
+    created = [entry for entry in supervisor if message(entry) == 'ACP runtime session created' and task['uid'] in str(entry.get('runtimeSessionID', ''))]
     if created:
         sample.update(ms_fields(created[-1], 'supervisor.'))
+        created_at = when(task.get('createdAt'))
+        at = when(created[-1].get('time'))
+        if created_at is not None and at is not None:
+            sample['supervisor.sessionCreatedSinceTaskCreatedMs'] = int((at - created_at) * 1000)
+    if started_new and after.get('workerPod'):
+        sample.update(worker_timeline(after['workerPod'].split('/', 1)[-1], when(task.get('createdAt'))))
     return {key: value for key, value in sample.items() if value is not None}, evidence
 
 
@@ -149,7 +208,7 @@ for event in events:
         key = 'suspend at window expiry' if event['scenario'] == 'warm' else 'suspend on detach, window unset'
         if event.get('after') in ('t1', 't2', 'window'):
             stops[key].append(stop_sample(event, sequence))
-    elif event['event'] in ('warmAttach', 'windowHeld'):
+    elif event['event'] in ('warmAttach', 'windowHeld', 'violation'):
         evidence.append(event)
 
 
@@ -189,6 +248,20 @@ for title, table in (('Turns', report['turns']), ('Stops', report['stops'])):
     for key in keys:
         out.append('| %s | %s |' % (key, ' | '.join(cell(table[name], key) for name in names)))
     out.append('')
+checks = [event for event in evidence if event.get('event') == 'warmAttach']
+if checks:
+    out.append('## Warm attach checks')
+    out.append('')
+    for event in checks:
+        failed = [name for name, ok in event['checks'].items() if not ok]
+        out.append('- repetition %s: %d/%d passed%s' % (event['rep'], len(event['checks']) - len(failed), len(event['checks']),
+                                                    (' (failed: %s)' % ', '.join(failed)) if failed else ''))
+    out.append('')
+held = [event for event in evidence if event.get('event') == 'windowHeld']
+for event in held:
+    replicas = sorted({sample['pool'].get('desiredReplicas') for sample in event['samples']})
+    out.append('- window %s: %d samples, pool desiredReplicas %s, Actor and worker present in all: %s' % (
+        event['rep'], len(event['samples']), replicas, all(s['actorExists'] and s['workerPodExists'] for s in event['samples'])))
 (run / 'summary.md').write_text('\n'.join(out) + '\n')
 print('\n'.join(out))
 if final is None:

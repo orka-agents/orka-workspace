@@ -137,6 +137,10 @@ func (l *latency) createTurn(ctx context.Context, name, session, class string, c
 	for _, field := range []string{"runtimePoolName", "runtimePoolUID", "runtimeInstanceID", "runtimeSessionUID", "runtimeSessionSupervisorBootID", "promptID"} {
 		t.Identity[field] = str(task, "status", "execution", field)
 	}
+	// One Session keeps its RuntimeSession UID across turns; each turn creates
+	// a new generation of it (supervisor runtime-session-<Task UID>-g<n>).
+	generation, _, _ := unstructured.NestedInt64(task.Object, "status", "execution", "runtimeSessionGeneration")
+	t.Identity["runtimeSessionGeneration"] = strconv.FormatInt(generation, 10)
 	t.Workspace = str(task, "status", "executionWorkspace", "workspaceRef", "name")
 	if t.Workspace == "" {
 		t.Workspace = task.GetLabels()["acp.workspace.orka.ai/execution-workspace"]
@@ -439,7 +443,7 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		"sameSupervisorBoot":       t2.Identity["runtimeSessionSupervisorBootID"] == t1.Identity["runtimeSessionSupervisorBootID"],
 		"samePool":                 t2.Identity["runtimePoolUID"] == t1.Identity["runtimePoolUID"],
 		"poolCredentialsUnchanged": len(warm1.PoolSecrets) > 0 && fmt.Sprint(warm1.PoolSecrets) == fmt.Sprint(warm2.PoolSecrets),
-		"newRuntimeSession":        t2.Identity["runtimeSessionUID"] != t1.Identity["runtimeSessionUID"],
+		"sameSessionNewGeneration": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["runtimeSessionGeneration"] != t1.Identity["runtimeSessionGeneration"] && t2.Identity["promptID"] != t1.Identity["promptID"],
 		"newAttachmentEpoch":       warm2.AttachmentEpoch > warm1.AttachmentEpoch,
 		"noNewTag":                 len(warm2.Tags) == len(warm1.Tags),
 	}

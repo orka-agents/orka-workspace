@@ -39,6 +39,16 @@ run_id="$(date -u +%Y%m%d%H%M%S)"
 run_dir="${PWD}/bin/${namespace}-latency-${run_id}"
 mkdir -p "${run_dir}/workers"
 chmod 700 "${run_dir}"
+# The measurement client is built from this checkout, like the cleanup Job,
+# so a harness change needs no new proof run. It keeps the proof identity.
+arch="$(kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}')"
+case "${arch}" in amd64|arm64) ;; *) printf 'Unsupported node architecture: %s\n' "${arch}" >&2; exit 1 ;; esac
+mkdir -p "${run_dir}/image"
+CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go -C "${fixture_dir}/.." build -p 4 -trimpath -o "${run_dir}/image/native-data-proof" ./core
+docker build -q -f "${fixture_dir}/proof.Dockerfile" -t "localhost:5002/orka/native-core-proof:latency-${run_id}" "${run_dir}/image" >/dev/null
+docker push -q "localhost:5002/orka/native-core-proof:latency-${run_id}" >/dev/null
+client_image="$(docker inspect -f '{{index .RepoDigests 0}}' "localhost:5002/orka/native-core-proof:latency-${run_id}")"
+rm -rf "${run_dir}/image"
 # Later runs against the same proof use fresh Session and Task names.
 sequence="$(kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o name | wc -l)"
 job_name="native-core-latency-${run_id}"
@@ -46,17 +56,27 @@ since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'Native Core latency artifacts: %s\n' "${run_dir}"
 
 # Worker Pods (and their supervisor output) are deleted by every suspension,
-# so their timing lines are followed live. Only ACP supervisor timing lines
-# are kept.
+# so they are followed live. Only the time, message and timing fields of the
+# worker and supervisor boot milestones are kept, plus each Pod's own
+# creation, scheduling and container start times.
+worker_messages='ateworker booting|Registered worker|Reported worker sandbox runtimes|Readiness check failing|Readiness check recovered|About to run runsc create|About to run runsc start|awaiting controller credential bootstrap|Wakeup probe reached 200|credential bootstrap complete|ACP supervisor listening|ACP runtime session created|Received signal; beginning graceful shutdown|Container exited successfully'
 follow_workers() {
-  local seen=" "
+  local seen=" " started=" "
   while [[ ! -e "${run_dir}/.done" ]]; do
-    for pod in $(kubectl -n "${namespace}" get pods -l substrate.workspace.orka.ai/allocation-id -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    pods="$(kubectl -n "${namespace}" get pods -l substrate.workspace.orka.ai/allocation-id -o json 2>/dev/null || true)"
+    for pod in $(jq -r '.items[]?.metadata.name' <<<"${pods}" 2>/dev/null); do
+      if [[ "${started}" != *" ${pod} "* ]] && jq -e --arg pod "${pod}" '.items[] | select(.metadata.name == $pod) | .status.containerStatuses[0].state.running.startedAt // empty' <<<"${pods}" >/dev/null 2>&1; then
+        started="${started}${pod} "
+        jq -c --arg pod "${pod}" '.items[] | select(.metadata.name == $pod) | {pod: .metadata.name, uid: .metadata.uid, created: .metadata.creationTimestamp,
+          scheduled: ([.status.conditions[]? | select(.type == "PodScheduled") | .lastTransitionTime][0]), started: .status.containerStatuses[0].state.running.startedAt}' \
+          <<<"${pods}" >>"${run_dir}/workers/pods.jsonl"
+      fi
       [[ "${seen}" == *" ${pod} "* ]] && continue
       seen="${seen}${pod} "
-      (kubectl -n "${namespace}" logs -f --all-containers --prefix --pod-running-timeout=5m "pod/${pod}" 2>/dev/null |
-        grep --line-buffered -E 'ACP runtime session created|ACP runtime session start|runtime session timings|supervisor (boot|ready|started)' \
-          >"${run_dir}/workers/${pod}.log" || true) &
+      (kubectl -n "${namespace}" logs -f --pod-running-timeout=5m "pod/${pod}" 2>/dev/null |
+        jq -R -c --unbuffered --arg pod "${pod}" --arg pattern "^(${worker_messages})$" 'fromjson? | select(type == "object" and ((.msg // "") | test($pattern))) |
+          {pod: $pod, time, msg, runtimeSessionID, nativeRestore, totalMs, stagesMs, adapterMs, actorUID: .labels["ate.actor.uid"]?} | with_entries(select(.value != null))' \
+        >"${run_dir}/workers/${pod}.log" || true) &
     done
     sleep 1
   done
@@ -66,10 +86,11 @@ follower=$!
 trap 'touch "${run_dir}/.done"; kill "${follower}" 2>/dev/null || true; jobs -p | xargs -r kill 2>/dev/null || true' EXIT
 
 jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "${LATENCY_WINDOW:-2m}" \
-  --arg scenarios "${LATENCY_SCENARIOS:-detach,warm}" --arg sequence "${sequence}" '
+  --arg scenarios "${LATENCY_SCENARIOS:-detach,warm}" --arg sequence "${sequence}" --arg image "${client_image}" '
   {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:.metadata.namespace,labels:{"orka.workspace.e2e/latency":"native-core"}},spec:{
     backoffLimit:0,activeDeadlineSeconds:5400,template:.spec.template}} |
   .spec.template.metadata = {labels:{"orka.workspace.e2e/latency":"native-core"}} |
+  .spec.template.spec.containers[0].image = $image |
   .spec.template.spec.containers[0].env += [{name:"LATENCY_MEASURE",value:"1"},{name:"LATENCY_REPEATS",value:$repeats},
     {name:"LATENCY_WINDOW",value:$window},{name:"LATENCY_SCENARIOS",value:$scenarios},{name:"LATENCY_RUN_ID",value:$sequence}]' <<<"${job}" |
   kubectl create -f -
@@ -88,13 +109,14 @@ while true; do
   sleep 5
 done
 kubectl -n "${client_namespace}" logs "job/${job_name}" >"${run_dir}/latency.log" || true
-grep -E '^(PASS|LATENCY_EVENT|NATIVE_CORE_LATENCY|native Core)' "${run_dir}/latency.log" | grep -v '^LATENCY_EVENT' || true
+grep -E '^native Core' "${run_dir}/latency.log" || true
 touch "${run_dir}/.done"
 sleep 2
 # Timing lines only; everything else stays in the cluster.
 kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="${since}" |
   grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
-kubectl -n "${provider_namespace}" logs deployment/orka-workspace-substrate --since-time="${since}" |
+# Every provider replica: only the elected leader reconciles and logs.
+kubectl -n "${provider_namespace}" logs -l app=orka-workspace-substrate --tail=-1 --max-log-requests=10 --since-time="${since}" |
   grep -E 'Substrate runtime (ready|stopped)' >"${run_dir}/provider-timings.log" || true
 kubectl -n "${namespace}" get events -o json |
   jq -c '[.items[] | select(.reason | test("WarmDetach|WarmWindow|Suspend|Retention"; "i")) | {reason, message, object: .involvedObject.name, first: .firstTimestamp, last: .lastTimestamp, count}]' \
