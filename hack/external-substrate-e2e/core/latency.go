@@ -658,7 +658,13 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 		window := &metav1.Duration{Duration: l.window}
 		spares := envInt("LATENCY_SPARE_WORKERS", 1)
 		sharedSlots := envInt("LATENCY_SHARED_SPARES", 2)
-		shared := &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{MaxActorsPerWorker: int32(envInt("LATENCY_SHARED_ACTORS", 3))}}
+		lifetime, err := time.ParseDuration(envString("LATENCY_SHARED_LIFETIME", "3h"))
+		if err != nil {
+			return nil, fmt.Errorf("LATENCY_SHARED_LIFETIME: %w", err)
+		}
+		shared := &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{
+			MaxActorsPerWorker: int32(envInt("LATENCY_SHARED_ACTORS", 4)), MaxWorkerLifetime: &metav1.Duration{Duration: lifetime}}}
+		sharedSessions := envInt("LATENCY_SHARED_SESSIONS", 2)
 		var run func(rep int) (map[string]any, error)
 		switch scenario {
 		case "detach":
@@ -691,7 +697,7 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 			if err != nil {
 				return nil, err
 			}
-			run = func(rep int) (map[string]any, error) { return l.sharedScenario(ctx, rep, uid, 2) }
+			run = func(rep int) (map[string]any, error) { return l.sharedScenario(ctx, rep, uid, sharedSessions) }
 		case "scope":
 			// A second shared profile in the same namespace is another scope.
 			if err := l.ensureClassOnce(ctx, "lat-shared-scope", classOptions{placement: shared}); err != nil {
@@ -751,6 +757,13 @@ func (l *latency) profileUID(ctx context.Context, name string) (string, error) {
 		return "", err
 	}
 	return string(parameters.UID), nil
+}
+
+func envString(name, fallback string) string {
+	if raw := os.Getenv(name); raw != "" {
+		return raw
+	}
+	return fallback
 }
 
 func envInt(name string, fallback int) int {

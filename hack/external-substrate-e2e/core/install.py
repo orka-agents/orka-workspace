@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render an isolated Core/provider Task proof using the existing Core fixture."""
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -160,6 +161,11 @@ for obj in provider_objects:
         # the provider may attest credential injection. Core keeps its provider
         # Secret in the workload namespace; no extra namespace is listed.
         container["args"].append("--egress-credential-provider=k8s.io")
+        # This kindctl cluster's Agent Substrate install serves only this run,
+        # which provider ADR 0008 requires before any profile shares workers.
+        # The gateway TTL flag keeps its default, the gateway's own default.
+        if os.environ.get("SUBSTRATE_DEDICATED_INSTALL") == "1":
+            container["args"].append("--substrate-dedicated-install")
     objects.append(obj)
 
 # Applying a List silently replaces an earlier object with a later same-identity

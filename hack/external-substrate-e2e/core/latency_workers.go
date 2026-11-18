@@ -391,15 +391,22 @@ func (l *latency) concurrentTurns(ctx context.Context, class string, specs [][2]
 // a shared worker. Session A's warm window expires and its Actor is
 // suspended per Actor while Session B keeps taking turns on the same worker
 // Pod; A then resumes from its Tag onto a free shared slot.
-func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string, slots int) (map[string]any, error) {
+func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string, sessions int) (map[string]any, error) {
 	scenario, class := "shared", "lat-shared"
 	sessionA, sessionB := fmt.Sprintf("lat-shared-%d-a", rep), fmt.Sprintf("lat-shared-%d-b", rep)
-	free, err := l.waitFreeSharedSlot(ctx, profileUID, slots)
+	free, err := l.waitFreeSharedSlot(ctx, profileUID, sessions)
 	if err != nil {
-		l.violate("no warm free shared slot before repetition %d: %v", rep, err)
+		l.violate("no warm shared pool with %d free slots before repetition %d: %v", sessions, rep, err)
 	}
 	l.emit("sharedBefore", map[string]any{"scenario": scenario, "rep": rep, "freePool": free})
-	turns, err := l.concurrentTurns(ctx, class, [][2]string{{sessionA + "-t1", sessionA}, {sessionB + "-t1", sessionB}}, true)
+	// Sessions beyond A and B only take a concurrent first turn, filling
+	// more slots of the same worker; their windows then expire with A's.
+	specs := [][2]string{{sessionA + "-t1", sessionA}, {sessionB + "-t1", sessionB}}
+	for i := 2; i < sessions; i++ {
+		extra := fmt.Sprintf("lat-shared-%d-%c", rep, 'a'+i)
+		specs = append(specs, [2]string{extra + "-t1", extra})
+	}
+	turns, err := l.concurrentTurns(ctx, class, specs, true)
 	if err != nil {
 		return nil, err
 	}
@@ -420,8 +427,15 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 	if err != nil {
 		return nil, err
 	}
+	allSame, actorUIDs := true, []string{}
+	for _, t := range turns {
+		allSame = allSame && snapshots[t.Name].WorkerPodUID == sa.WorkerPodUID
+		actorUIDs = append(actorUIDs, snapshots[t.Name].ActorUID)
+	}
 	shareChecks := map[string]bool{
 		"sameWorkerPod":    sa.WorkerPodUID != "" && sa.WorkerPodUID == sb.WorkerPodUID,
+		"allOnOneWorker":   allSame,
+		"ledgerListsAll":   ledgerHolds(pool, actorUIDs...),
 		"sharedPool":       pool.SharedPool != "" && pool.Ledger != nil,
 		"ledgerListsBoth":  ledgerHolds(pool, sa.ActorUID, sb.ActorUID),
 		"ledgerNamespace":  pool.Ledger != nil && pool.Ledger.Scope.Namespace == l.namespace,
@@ -429,7 +443,11 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 		"warmSlotWasFree":  free != nil && free.UID == pool.UID,
 		"neverRestartedA1": len(pool.Pods) == 1 && pool.Pods[0].Restarts == 0,
 	}
-	l.emit("sharedPlacement", map[string]any{"scenario": scenario, "rep": rep, "checks": shareChecks, "pool": pool})
+	entries := 0
+	if pool.Ledger != nil {
+		entries = len(pool.Ledger.Entries)
+	}
+	l.emit("sharedPlacement", map[string]any{"scenario": scenario, "rep": rep, "checks": shareChecks, "pool": pool, "actorsOnWorker": entries, "sessions": len(turns)})
 	for check, ok := range shareChecks {
 		if !ok {
 			l.violate("shared repetition %d placement failed %s", rep, check)
@@ -562,11 +580,18 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 			l.violate("shared repetition %d resume failed %s", rep, check)
 		}
 	}
-	// Let both windows expire so the next repetition starts from idle Actors.
-	for _, last := range []struct {
+	// Let every window expire so the next repetition starts from idle Actors.
+	lasts := []struct {
 		t *turn
 		s *snapshot
-	}{{a2, sa2}, {b3, sb3}} {
+	}{{a2, sa2}, {b3, sb3}}
+	for _, t := range turns[2:] {
+		lasts = append(lasts, struct {
+			t *turn
+			s *snapshot
+		}{t, snapshots[t.Name]})
+	}
+	for _, last := range lasts {
 		if final, waited, err := l.waitSuspended(ctx, last.t.Workspace, last.t.Identity["runtimePoolName"], last.s, l.window+5*time.Minute); err != nil {
 			return nil, err
 		} else {

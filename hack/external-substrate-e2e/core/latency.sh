@@ -121,7 +121,7 @@ kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="
   grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
 # Every provider replica: only the elected leader reconciles and logs.
 kubectl -n "${provider_namespace}" logs -l app=orka-workspace-substrate --tail=-1 --max-log-requests=10 --since-time="${since}" |
-  grep -E 'Substrate runtime (ready|stopped)|[Ss]pare|[Ss]hared (worker|pool)|quarantin' >"${run_dir}/provider-timings.log" || true
+  grep -E 'Substrate runtime (ready|stopped)|[Ss]pare|[Ss]hared (worker|pool)|private worker instead|strong|bounds|quarantin|dedicated' >"${run_dir}/provider-timings.log" || true
 kubectl -n "${namespace}" get events -o json |
   jq -c '[.items[] | select(.reason | test("WarmDetach|WarmWindow|Suspend|Retention"; "i")) | {reason, message, object: .involvedObject.name, first: .firstTimestamp, last: .lastTimestamp, count}]' \
   >"${run_dir}/events.json" || true
