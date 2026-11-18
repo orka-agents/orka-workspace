@@ -141,6 +141,11 @@ def turn_sample(event):
     # Client-observed first sighting of the pre-dispatch execution states.
     for state in ('Queued', 'Reserved', 'SessionStarting', 'Submitting'):
         sample['clientState.%sMs' % state] = task['statesFirstSeenMs'].get('state:' + state)
+    for key, value in (task.get('attach') or {}).items():
+        sample['clientAttach.' + key] = value
+    predispatch = find(core, 'ACP pre-dispatch timings', task=task['name'])
+    if predispatch:
+        sample.update(ms_fields(predispatch[-1], 'predispatch.'))
     timings = [entry for entry in find(core, 'ACP turn timings', task=task['name']) if str(entry.get('promptAccepted')).lower() == 'true']
     if timings:
         sample.update(ms_fields(timings[-1], 'turn.'))
@@ -187,6 +192,11 @@ def turn_sample(event):
             sample.update(worker_timeline(pod, created_at))
         elif born is not None and created_at is not None:
             sample['worker.podAgeAtTaskCreateMs'] = int((created_at - born) * 1000)
+    # Core's materialization runs from publication to DataPlaneReady; the
+    # provider's total from its own allocation start to Ready. The difference
+    # is mostly the wait before the provider starts the allocation.
+    if 'coreStart.providerMaterializationMs' in sample and 'providerReady.totalMs' in sample:
+        sample['derived.publishToProviderStartMs'] = sample['coreStart.providerMaterializationMs'] - sample['providerReady.totalMs']
     return {key: value for key, value in sample.items() if value is not None}, evidence
 
 
@@ -263,7 +273,12 @@ def summarize(samples):
     return summary
 
 
-report = {'turns': {name: summarize(samples) for name, samples in groups.items()},
+# Dispatcher scans that reserved a Task or ran long (Core logs them at debug).
+scans = [ms_fields(entry, 'scan.') for entry in core if 'ACP dispatch scan timings' in message(entry)]
+scan_groups = {'scans that reserved a Task': [s for s, e in zip(scans, [e for e in core if 'ACP dispatch scan timings' in message(e)]) if str(e.get('reserved')) not in ('0', 'None')],
+               'slow scans without a reservation': [s for s, e in zip(scans, [e for e in core if 'ACP dispatch scan timings' in message(e)]) if str(e.get('reserved')) in ('0', 'None')]}
+report = {'scans': {name: summarize(samples) for name, samples in scan_groups.items()},
+          'turns': {name: summarize(samples) for name, samples in groups.items()},
           'stops': {name: summarize(samples) for name, samples in stops.items()},
           'evidence': evidence, 'final': final}
 (run / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -281,7 +296,7 @@ def cell(summary, key):
 
 
 out = ['# Substrate workspace latency (ms, median (min–max, n))', '']
-for title, table in (('Turns', report['turns']), ('Stops', report['stops'])):
+for title, table in (('Turns', report['turns']), ('Stops', report['stops']), ('Dispatcher scans', report['scans'])):
     names = list(table)
     keys = sorted({key for name in names for key in table[name]})
     out.append('## ' + title)

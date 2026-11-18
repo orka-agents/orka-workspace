@@ -475,6 +475,7 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 		}
 	}
 	// B takes a warm turn right away, so its window outlives A's.
+	attach := l.watchAttach(ctx, b1.Workspace, sb.AttachmentEpoch)
 	b2, err := l.createTurn(ctx, sessionB+"-t2", sessionB, class, false)
 	if err != nil {
 		return nil, err
@@ -487,6 +488,7 @@ func (l *latency) sharedScenario(ctx context.Context, rep int, profileUID string
 	if err != nil {
 		return nil, err
 	}
+	b2.Attach = attach.result(b2.CreatedAt)
 	l.logTurnKind(scenario, rep, "b-t2", "warm", b2, sb, sb2)
 	// Watch A's egress and wait for retention to begin its suspension.
 	processA, err := l.processName(ctx, a1.Workspace)

@@ -122,7 +122,12 @@ touch "${run_dir}/.done"
 sleep 2
 # Timing lines only; everything else stays in the cluster.
 kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="${since}" |
-  grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
+  grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|ACP pre-dispatch timings|ACP dispatch scan timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
+# Core's and the provider's rendered tuning flags, for the record.
+kubectl -n "${namespace}" get deployment external-substrate-core -o json |
+  jq -c '[.spec.template.spec.containers[0].args[] | select(test("concurrent|zap-log-level"))]' >"${run_dir}/core-flags.json" || true
+kubectl -n "${provider_namespace}" get deployment orka-workspace-substrate -o json |
+  jq -c '[.spec.template.spec.containers[0].args[] | select(test("concurrent|dedicated|ttl"))]' >"${run_dir}/provider-flags.json" || true
 # Every provider replica: only the elected leader reconciles and logs.
 kubectl -n "${provider_namespace}" logs -l app=orka-workspace-substrate --tail=-1 --max-log-requests=10 --since-time="${since}" |
   grep -E 'Substrate runtime (ready|stopped)|[Ss]pare|[Ss]hared (worker|pool)|private worker instead|strong|bounds|quarantin|dedicated' >"${run_dir}/provider-timings.log" || true

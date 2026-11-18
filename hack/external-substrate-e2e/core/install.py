@@ -45,6 +45,12 @@ for obj in objects:
             "--substrate-api-key-file=/run/substrate-client/credential-bundle.pem",
             "--substrate-api-ca-file=/run/substrate-server/trust-bundle.pem",
             "--substrate-router-url=https://atenet-router.ate-system.svc:443"])
+        # Optional Core tuning for latency runs (core/latency.sh), recorded in
+        # the rendered Deployment: Task reconcile concurrency and log level.
+        if os.environ.get("ORKA_TASK_MAX_CONCURRENT_RECONCILES"):
+            manager["args"].append("--task-max-concurrent-reconciles=" + os.environ["ORKA_TASK_MAX_CONCURRENT_RECONCILES"])
+        if os.environ.get("ORKA_CORE_LOG_LEVEL"):
+            manager["args"].append("--zap-log-level=" + os.environ["ORKA_CORE_LOG_LEVEL"])
         manager.setdefault("volumeMounts", []).extend([
             {"name": "substrate-client", "mountPath": "/run/substrate-client", "readOnly": True},
             {"name": "substrate-server", "mountPath": "/run/substrate-server", "readOnly": True}])

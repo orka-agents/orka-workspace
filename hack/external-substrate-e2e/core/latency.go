@@ -15,6 +15,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -94,6 +95,10 @@ type turn struct {
 	SettledMs  int64             `json:"settledMs,omitempty"`
 	Identity   map[string]string `json:"identity"`
 	Workspace  string            `json:"workspace"`
+	// Attach is the client-observed warm attach on the workspace: when Core
+	// requested the attachment, when the provider observed that generation,
+	// and when it acknowledged the epoch, in ms since Create.
+	Attach map[string]int64 `json:"attach,omitempty"`
 }
 
 var acceptedOrLater = map[string]bool{"Accepted": true, "Running": true, "Settling": true, "Succeeded": true}
@@ -489,6 +494,7 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		l.violate("RuntimePool dropped its replicas inside the warm window: %v", warm1.Pool)
 	}
 	// Turn 2 inside the window.
+	attach := l.watchAttach(ctx, t1.Workspace, warm1.AttachmentEpoch)
 	t2, err := l.createTurn(ctx, session+"-t2", session, "lat-warm", false)
 	if err != nil {
 		return nil, err
@@ -500,6 +506,7 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 	if err != nil {
 		return nil, err
 	}
+	t2.Attach = attach.result(t2.CreatedAt)
 	l.logTurn("warm", rep, "t2", t2, warm1, warm2)
 	direct := map[string]bool{
 		"sameWorkspace":            t2.Workspace == t1.Workspace,
@@ -789,4 +796,63 @@ func envInt(name string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// attachWatch records, from the workspace itself, when Core requested a new
+// attachment epoch, when the provider observed that generation, and when it
+// acknowledged the epoch.
+type attachWatch struct {
+	mu     sync.Mutex
+	marks  map[string]time.Time
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (l *latency) watchAttach(ctx context.Context, name string, epochBefore int64) *attachWatch {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	w := &attachWatch{marks: map[string]time.Time{}, cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		var generation int64
+		for ctx.Err() == nil {
+			current, err := l.workspace(ctx, name)
+			now := time.Now()
+			if err == nil {
+				w.mu.Lock()
+				if _, seen := w.marks["attachRequested"]; !seen && current.Spec.Attachment != nil && current.Spec.AttachmentEpoch > epochBefore {
+					w.marks["attachRequested"], generation = now, current.Generation
+				}
+				if _, seen := w.marks["attachRequested"]; seen {
+					if _, observed := w.marks["generationObserved"]; !observed && current.Status.ObservedGeneration >= generation {
+						w.marks["generationObserved"] = now
+					}
+					if _, acknowledged := w.marks["attachAcknowledged"]; !acknowledged && current.Status.AttachedEpoch >= current.Spec.AttachmentEpoch && current.Spec.AttachmentEpoch > epochBefore {
+						w.marks["attachAcknowledged"] = now
+					}
+				}
+				complete := len(w.marks) == 3
+				w.mu.Unlock()
+				if complete {
+					return
+				}
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}()
+	return w
+}
+
+func (w *attachWatch) result(start time.Time) map[string]int64 {
+	w.cancel()
+	<-w.done
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := map[string]int64{}
+	for key, at := range w.marks {
+		out[key+"Ms"] = ms(at.Sub(start))
+	}
+	return out
 }
