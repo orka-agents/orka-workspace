@@ -470,9 +470,12 @@ func TestSharedWorkerMaxLifetimeDrainsAndRetiresWithPodAbsence(t *testing.T) {
 		t.Fatal("an allocation joined a draining pool")
 	}
 	setNow(t, born.Add(24*time.Hour))
-	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
-		t.Fatal(err)
+	// The lifetime bound holds even while the native control plane fails.
+	native.nativeDown = true
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err == nil {
+		t.Fatal("fixture control plane did not fail")
 	}
+	native.nativeDown = false
 	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
 		t.Fatal("a pool past its lifetime was not retired")
 	}

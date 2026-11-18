@@ -173,6 +173,11 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
 		return d.retireSharedPool(ctx, pool, ledger.State, ledger.Reason)
 	}
+	// The lifetime bound needs only Kubernetes, so an unavailable native
+	// control plane can never postpone it.
+	if !now.Before(sharedRetireAt(pool, ledger)) {
+		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached its maximum lifetime")
+	}
 	poolWorkers, err := workers.pool(ctx, pool)
 	if err != nil {
 		return err
@@ -203,9 +208,6 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 			}
 			return d.retireSharedPool(ctx, current, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
 		}
-	}
-	if !now.Before(sharedRetireAt(pool, ledger)) {
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached its maximum lifetime")
 	}
 	closing := ""
 	shape := shapes[ledger.Scope.ProfileUID]

@@ -75,6 +75,8 @@ type nativeFixture struct {
 	lingering map[string]*pb.ActorAssignment
 	// failGetWorker fails the next GetWorker calls.
 	failGetWorker int
+	// nativeDown fails every Worker read, as an unavailable control plane.
+	nativeDown bool
 	// churnWorker bumps a Worker's version on every read, as concurrent
 	// placements on a shared worker do.
 	churnWorker string
@@ -411,6 +413,9 @@ func nativeWorkerCapacity(pool unstructured.Unstructured) (*pb.WorkerResources, 
 	return &pb.WorkerResources{CpuMillicores: cpu.MilliValue(), MemoryBytes: memory.Value() - 64<<20, Actors: 1000}, nil
 }
 func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersRequest, _ ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
@@ -452,6 +457,9 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 	return out, nil
 }
 func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
 	if f.failAfter == "assignments" {
 		f.failAfter = ""
 		return nil, status.Error(codes.Unavailable, "assignment listing unavailable")
