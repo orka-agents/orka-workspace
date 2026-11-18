@@ -157,8 +157,20 @@ def turn_sample(event):
         if ready:
             sample.update(ms_fields(ready[-1], 'providerReady.'))
             evidence['providerPath'] = ready[-1].get('path')
-    # The supervisor names the RuntimeSession runtime-session-<Task UID>-g<n>.
-    created = [entry for entry in supervisor if message(entry) == 'ACP runtime session created' and task['uid'] in str(entry.get('runtimeSessionID', ''))]
+    # The supervisor names each RuntimeSession generation
+    # runtime-<RuntimeSession UID>-g<generation>; a Session keeps its UID
+    # across turns. Without a recorded generation, the turn's own time window
+    # selects it.
+    identity = task['identity']
+    created = [entry for entry in supervisor if message(entry) == 'ACP runtime session created' and
+               identity['runtimeSessionUID'] and identity['runtimeSessionUID'] in str(entry.get('runtimeSessionID', ''))]
+    if identity.get('runtimeSessionGeneration'):
+        created = [entry for entry in created if str(entry.get('runtimeSessionID', '')).endswith('-g' + identity['runtimeSessionGeneration'])]
+    else:
+        begin, end = when(task.get('createdAt')), when(task.get('createdAt'))
+        if begin is not None:
+            end = begin + task['doneMs'] / 1000.0
+            created = [entry for entry in created if (when(entry.get('time')) or 0) >= begin and (when(entry.get('time')) or 0) <= end]
     if created:
         sample.update(ms_fields(created[-1], 'supervisor.'))
         created_at = when(task.get('createdAt'))
