@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,8 +85,9 @@ type nativeFixture struct {
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
 	failEgressUpdate int
 	// block makes Worker and template reads wait for their context, as a
-	// stalled native control plane.
-	block bool
+	// stalled native control plane; blockSuspend and blockGetActor do the
+	// same for SuspendActor and GetActor.
+	block, blockSuspend, blockGetActor bool
 	// failGetTemplate, failCreateTag and failGetTag fail the next calls
 	// before they take effect.
 	failGetTemplate, failCreateTag, failGetTag int
@@ -97,6 +99,9 @@ type nativeFixture struct {
 	// churnWorker bumps a Worker's version on every read, as concurrent
 	// placements on a shared worker do.
 	churnWorker string
+	// registering births new Workers still registering (UNAVAILABLE), and
+	// unsettledEpoch births them before their registered epoch is observed.
+	registering, unsettledEpoch bool
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -199,7 +204,11 @@ func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorT
 	}
 	return out, nil
 }
-func (f *nativeFixture) GetActor(_ context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+func (f *nativeFixture) GetActor(ctx context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+	if f.blockGetActor {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.failGetActor > 0 {
 		f.failGetActor--
 		return nil, status.Error(codes.Unavailable, "actor read unavailable")
@@ -336,8 +345,12 @@ func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	}
 	v.Status.WorkerAssignment = nil
 }
-func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
 	f.suspendCalls++
+	if f.blockSuspend {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if f.failSuspendBeforeEffect {
 		f.failSuspendBeforeEffect = false
 		return nil, status.Error(codes.Unavailable, "suspend not applied")
@@ -505,6 +518,12 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 			return nil, err
 		}
 		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor", DefaultRuntime: &pb.WorkerSandboxRuntime{Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
+		if f.registering {
+			f.workers[name].Status.State = pb.WorkerState_WORKER_STATE_UNAVAILABLE
+		}
+		if f.unsettledEpoch {
+			f.workers[name].Status.ObservedEpoch = 0
+		}
 	}
 	out := &pb.ListWorkersResponse{}
 	for _, worker := range f.workers {
@@ -684,11 +703,10 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
 	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}, "status": map[string]any{"sandboxClasses": []any{resolvedSandboxClassStatus(fixtureSandboxConfig)}}}}
-	uid := 0
+	var uid atomic.Int64
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider, workspace, parameter, pool).WithStatusSubresource(workspace, provider, &api.ExecutionWorkspaceCheckpoint{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if obj.GetUID() == "" {
-			uid++
-			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid)))
+			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid.Add(1))))
 		}
 		return c.Create(ctx, obj, opts...)
 	}}).Build()

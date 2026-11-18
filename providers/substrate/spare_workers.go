@@ -436,15 +436,26 @@ const defaultSweepDeadline = time.Minute
 // sharedBoundsPeriod is how often shared worker lifetime bounds are enforced.
 const sharedBoundsPeriod = 10 * time.Second
 
-// SetupWithManager runs the replenisher, and separately the shared worker
-// bounds loop, on the elected leader.
-func (r *SpareWorkerReplenisher) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		r.RunSharedBounds(ctx, sharedBoundsPeriod)
+// SharedWorkerBounds runs the Kubernetes-only shared worker bounds loop on
+// the elected leader. It needs no native control, so it is registered even
+// when native configuration is missing or invalid, and existing shared pools
+// keep their lifetime and persisted-retirement enforcement.
+type SharedWorkerBounds struct {
+	client.Client
+	Config Config
+}
+
+// SetupWithManager registers the bounds loop as a leader-elected runnable.
+func (b *SharedWorkerBounds) SetupWithManager(mgr ctrl.Manager) error {
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedBounds(ctx, sharedBoundsPeriod)
 		return nil
-	})); err != nil {
-		return err
-	}
+	}))
+}
+
+// SetupWithManager runs the replenisher on the elected leader. The shared
+// worker bounds loop is registered separately (SharedWorkerBounds).
+func (r *SpareWorkerReplenisher) SetupWithManager(mgr ctrl.Manager) error {
 	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		ticker := time.NewTicker(spareResyncPeriod)
 		defer ticker.Stop()

@@ -61,9 +61,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				state, reason := sharedPersistedRetirement(pool)
 				errs = append(errs, d.retireSharedPool(ctx, pool, state, reason))
 			case d.sharedStrongMarked(ctx, pool):
-				// A journal persisted the strong path, possibly crashing before
-				// it deleted the pool; finish that deletion here.
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation's journal selected the strong path"))
+				// A hosted journal persisted the strong path or a failure
+				// (possibly crashing before it deleted the pool), or a hosted
+				// workspace became suspect; act on it with no native read.
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect"))
 			case !now.Before(retireAt):
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
 			}
@@ -186,11 +187,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	}
 	for uid, shape := range shapes {
 		for free[uid] < shape.warm {
-			if templatesReach(templates, shape.scope.Atespace, map[string]string{sharedPoolLabel: ""}) {
-				errs = append(errs, errForeignTemplate)
-				break
-			}
-			if err := d.createWarmSharedPool(ctx, shape); err != nil {
+			if err := d.createWarmSharedPool(ctx, shape, templates); err != nil {
 				errs = append(errs, err)
 				break
 			}
@@ -232,7 +229,7 @@ func (d *Lifecycle) profileSharedShape(ctx context.Context, item *profile.Substr
 }
 
 // createWarmSharedPool creates an empty admitting shared pool.
-func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape) error {
+func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape, templates []*pb.ActorTemplate) error {
 	name, err := randomName(sharedPoolPrefix)
 	if err != nil {
 		return err
@@ -240,6 +237,11 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 	label, err := randomLabel()
 	if err != nil {
 		return err
+	}
+	// Checked against this pool's real labels: an empty selector, or one the
+	// generated label satisfies, still fails closed.
+	if templatesReach(templates, shape.scope.Atespace, sharedLabels(label)) {
+		return errForeignTemplate
 	}
 	spec, err := buildSharedPoolSpec(shape.source, shape.scope, label)
 	if err != nil {
@@ -285,6 +287,12 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		// enforceSharedBounds already retired it, without native reads.
 		return nil
 	}
+	// Kubernetes-only suspicion comes before any native read in this pass.
+	if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil {
+		return err
+	} else if suspect {
+		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
+	}
 	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels()) {
 		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
 	}
@@ -326,8 +334,8 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		closing = "the shared worker's admission window ended"
 	case shape == nil || shape.scope.Namespace != ledger.Scope.Namespace:
 		closing = "the shared worker's profile is gone or no longer opts in"
-	case shape.scope != ledger.Scope || shape.source.GetNamespace() != pool.GetNamespace():
-		closing = "the shared worker's operator pool, profile or Actor size changed"
+	case !sharedScopeCurrent(shape, ledger.Scope) || shape.source.GetNamespace() != pool.GetNamespace():
+		closing = "the shared worker's operator pool or profile changed"
 	}
 	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers)
 	if err != nil {
@@ -443,16 +451,23 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 	var orphans []string
 	for _, entry := range ledger.Entries {
 		record, journalFound, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if errors.Is(err, errSharedJournalUndecodable) {
+			// Never collected, and doubt: its markers cannot be read.
+			suspect = true
+			continue
+		}
 		if err != nil {
 			return false, nil, err
 		}
 		if !journalFound || record == nil {
 			continue
 		}
-		held := record.SharedWorker != nil && !record.SharedWorker.Released && record.SharedWorker.Pool == pool.GetName() &&
-			(record.SharedWorker.UID == "" || record.SharedWorker.UID == string(pool.GetUID())) && record.Placement.Namespace == pool.GetNamespace() && actorKey(record) == entry.Actor
-		if !held {
-			if !assigned[entry.Actor] {
+		if !sharedEntryHeld(record, pool, entry) {
+			// An assigned or booted entry its exact journal disowns hides
+			// whose markers apply: doubt, never silently kept or collected.
+			if assigned[entry.Actor] || entry.ActorUID != "" {
+				suspect = true
+			} else {
 				orphans = append(orphans, entry.Journal)
 			}
 			continue
@@ -486,6 +501,11 @@ func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
 	return state != ""
 }
 
+// errSharedJournalUndecodable marks a hosted entry whose exact journal (or
+// archived) record exists but cannot be decoded. Its Strong and Failure
+// markers and its workspace are unreadable, so it is doubt.
+var errSharedJournalUndecodable = errors.New("a hosted shared worker journal cannot be decoded")
+
 // sharedEntryRecord decodes the exact journal record a ledger marker names.
 // found is false when the journal is missing or replaced; record is nil when
 // it exists but does not decode.
@@ -509,7 +529,11 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 		return nil, false, nil
 	}
 	record, ok := decodeClaimRecord(journal)
-	if !ok || record.Request.Sequence < sequence {
+	if !ok {
+		return nil, true, errSharedJournalUndecodable
+	}
+	if record.Request.Sequence < sequence {
+		// The journal has not reached that sequence: not proof of anything.
 		return nil, true, nil
 	}
 	if record.Request.Sequence > sequence {
@@ -521,27 +545,43 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 			return nil, false, err
 		}
 		if record, ok = decodeClaimRecord(archived); !ok || record.Request.Sequence != sequence {
-			return nil, true, nil
+			return nil, true, errSharedJournalUndecodable
 		}
 	}
 	return record, true, nil
 }
 
-// sharedStrongMarked reports whether any hosted allocation's exact journal
-// record selected the strong path. It reads only Kubernetes.
+// sharedStrongMarked reports, reading only Kubernetes, whether a hosted
+// allocation requires the pool's strong retirement (see
+// sharedPoolHostsSuspect). An unreadable journal or workspace is reported on
+// the next pass; it never blocks the other bounds.
 func (d *Lifecycle) sharedStrongMarked(ctx context.Context, pool *unstructured.Unstructured) bool {
 	ledger, err := readSharedLedger(pool)
 	if err != nil {
 		return false
 	}
-	for _, entry := range ledger.Entries {
-		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
-		if err != nil || !found || record == nil || record.SharedWorker == nil {
-			continue
-		}
-		if record.SharedWorker.Pool == pool.GetName() && record.SharedWorker.UID == string(pool.GetUID()) && (record.SharedWorker.Strong != "" || record.Failure != "") {
-			return true
-		}
+	suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger)
+	return err == nil && suspect
+}
+
+// sharedScopeCurrent reports whether a pool's scope still matches its profile
+// and the current operator pool. A runtime may override the template's Actor
+// size, so the pool is checked at the Actor size its ledger records: the
+// current operator pool is rebuilt at that size and its shape compared. The
+// template-sized shape is used only for warm provisioning.
+func sharedScopeCurrent(shape *sharedProfileShape, scope sharedScope) bool {
+	expected := shape.scope
+	expected.CPUMillicores, expected.MemoryBytes, expected.Shape = scope.CPUMillicores, scope.MemoryBytes, scope.Shape
+	if expected != scope {
+		return false
 	}
-	return false
+	if scope.CPUMillicores == shape.scope.CPUMillicores && scope.MemoryBytes == shape.scope.MemoryBytes {
+		return scope.Shape == shape.scope.Shape
+	}
+	spec, err := buildPrivatePoolSpec(shape.source, scope.CPUMillicores, scope.MemoryBytes, spareBirth(spareNamePrefix+"shape"))
+	if err != nil {
+		return false
+	}
+	digest, err := runtimePoolRestoreDigest(spec, false)
+	return err == nil && digest == scope.Shape
 }

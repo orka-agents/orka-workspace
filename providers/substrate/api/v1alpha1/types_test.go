@@ -311,6 +311,8 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 		{"maxActorsPerWorker": int64(2)},
 		{"maxActorsPerWorker": int64(16), "maxWorkerLifetime": "24h"},
 		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "3h"},
+		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "10800s"},
+		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "4.5h"},
 	} {
 		object := shared(policy)
 		if errs := schema.validate(t, object, nil); len(errs) != 0 {
@@ -330,6 +332,11 @@ func TestGeneratedSharedWorkersSchema(t *testing.T) {
 		"long lifetime":       shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "24h0m1s"}),
 		"without data-only":   {"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "placement": map[string]any{"sharedWorkers": map[string]any{"maxActorsPerWorker": int64(2)}}}},
 		"unparsable lifetime": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "soon"}),
+		// Validate rejects sub-second lifetimes, so the schema must too: a
+		// frozen profile every allocation refuses would be immutable.
+		"fractional seconds":    shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "10800.5s"}),
+		"fractional components": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "3h0m0.5s"}),
+		"sub-millisecond":       shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "3h0m0.0005s"}),
 	} {
 		if len(schema.validate(t, object, nil)) == 0 {
 			t.Fatalf("%s accepted by generated schema", name)

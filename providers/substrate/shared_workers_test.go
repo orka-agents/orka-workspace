@@ -16,9 +16,12 @@ import (
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -837,6 +840,8 @@ func TestSharedProofRetriesAChangingWorkerThenTakesTheStrongPath(t *testing.T) {
 func TestSharedWorkerWaitsForASettledEpochAndRetiresARestartedWorker(t *testing.T) {
 	c, native, first, binding := sharedFixture(t, 2)
 	d := sharedDriver(c, native)
+	// The worker is born before its registered epoch is observed.
+	native.unsettledEpoch = true
 	var record *journalRecord
 	for range 16 {
 		if _, err := native.ListWorkers(t.Context(), &pb.ListWorkersRequest{}); err != nil {
@@ -858,6 +863,7 @@ func TestSharedWorkerWaitsForASettledEpochAndRetiresARestartedWorker(t *testing.
 	if record.BootRequested || native.boots != 0 {
 		t.Fatal("a shared worker booted an Actor before its registered epoch was observed")
 	}
+	native.unsettledEpoch = false
 	for _, worker := range native.workers {
 		worker.Status.ObservedEpoch = worker.Status.RegisteredEpoch
 	}
@@ -1098,11 +1104,16 @@ func TestSharedSuspectNeighbourStopsAnUnbootedClaim(t *testing.T) {
 	c, native, first, binding := sharedFixture(t, 2)
 	_, recordA := sharedReady(t, c, native, first)
 	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
-	// B claims its slot, creates its template and Actor, and pauses before
-	// Resume while its Actor UID enters the ledger.
-	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), second); err != nil {
-		t.Fatal(err)
+	// B claims its slot, creates its template and Actor, enters its Actor UID
+	// in the ledger, and stops before booting: its Resume is refused before
+	// it takes effect.
+	native.beforeResume = func(context.Context, *pb.Actor) error {
+		return status.Error(codes.ResourceExhausted, "no capacity yet")
 	}
+	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), second); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("the paused boot was not refused: %v", err)
+	}
+	native.beforeResume = nil
 	_, recordB, err := sharedDriver(c, native).read(t.Context(), second.Key)
 	if err != nil {
 		t.Fatal(err)
@@ -1467,5 +1478,542 @@ func TestSharedJournalFailureIsSuspectBeforeTheWorkspaceReportsFailed(t *testing
 	}
 	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
 		t.Fatal("a pool hosting a failed instance kept running")
+	}
+}
+
+func TestSharedStrongMarkerWinsOverAJournaledInterimProof(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// Drive the Stop until its interim proof is journaled.
+	for range 12 {
+		tick()
+		if _, err := sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if _, record, _ := sharedDriver(c, native).read(t.Context(), first.Key); record.SharedWorker.Proof != nil {
+			break
+		}
+	}
+	// Model a crash after the proof, before WorkloadAbsent, then a later Actor
+	// read failure that persisted Strong, and a retirement that failed before
+	// closing the pool's ledger.
+	cm, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Proof == nil {
+		t.Fatal("fixture did not journal an interim proof")
+	}
+	record.WorkloadAbsent = false
+	record.Observation.State = sdk.AllocationPending
+	record.SharedWorker.Strong = "the Actor could not be read during retirement"
+	if err := sharedDriver(c, native).save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("fixture lost the pool before the strong path ran")
+	}
+	// A direct release cannot drop the entry while the strong path is open:
+	// it drives the pool's deletion instead and refuses until the Pod is gone.
+	if err := sharedDriver(c, native).releaseSharedSlot(t.Context(), cm, record); err == nil {
+		t.Fatal("a slot with an unfinished strong marker was released")
+	}
+	if _, current, _ := sharedDriver(c, native).read(t.Context(), first.Key); current.SharedWorker.Released {
+		t.Fatal("the journal released a slot whose strong retirement had not finished")
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the refused release did not drive the pool's deletion")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if stopped.SharedWorker.Strong == "" || !stopped.SharedWorker.Released {
+		t.Fatalf("the strong retirement did not finish: %#v", stopped.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the interim proof shortcut skipped pool deletion and the absence proof")
+	}
+}
+
+func TestSharedStrongTriggersPersistAfterTheRequestContextExpires(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block func(*nativeFixture)
+	}{
+		{"suspend outlives the request", func(native *nativeFixture) { native.blockSuspend = true }},
+		{"actor read outlives the request", func(native *nativeFixture) { native.blockGetActor = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 2)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			// Persist the suspension intent; the suspend is issued on a later
+			// pass, once the revoked egress has settled.
+			if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if native.suspendCalls != 0 {
+				t.Fatal("fixture issued the suspend before egress settled")
+			}
+			tc.block(native)
+			for range 3 {
+				tick()
+				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				_, err := sharedDriver(contextAwareClient(c), native).SuspendInstance(ctx, first.Key, a.Identity)
+				cancel()
+				if err == nil {
+					continue
+				}
+				if _, record, _ := sharedDriver(c, native).read(t.Context(), first.Key); record.SharedWorker.Strong != "" {
+					break
+				}
+			}
+			_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.SharedWorker.Strong == "" {
+				t.Fatal("a strong trigger after the request deadline was not persisted")
+			}
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("the pool's retirement did not start after the request deadline")
+			}
+			if native.suspendCalls > 1 {
+				t.Fatalf("SuspendActor was replayed: %d calls", native.suspendCalls)
+			}
+		})
+	}
+}
+
+func TestSharedSuspectWorkspaceRetiresThePoolWhileNativeIsDown(t *testing.T) {
+	for _, change := range []string{"taint", "quarantine", "failed"} {
+		t.Run(change, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 2)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			_, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			workspace := &api.ExecutionWorkspace{}
+			if err := c.Get(t.Context(), clientKey(second.Key), workspace); err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "taint":
+				workspace.Annotations[operatorTaintAnnotation] = "{}"
+			case "quarantine":
+				workspace.Spec.DesiredState = api.ExecutionWorkspaceDesiredQuarantined
+			}
+			if err := c.Update(t.Context(), workspace); err != nil {
+				t.Fatal(err)
+			}
+			if change == "failed" {
+				workspace.Status.State = api.ExecutionWorkspaceStateFailed
+				if err := c.Status().Update(t.Context(), workspace); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Every native call stalls; the sweep's leading pass and the
+			// independent bounds loop act on Kubernetes alone.
+			native.block = true
+			swept := sharedReplenisher(c, native)
+			swept.SweepDeadline = 50 * time.Millisecond
+			_ = swept.Sweep(t.Context())
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("a pool hosting a suspect workspace kept running while the native API was down")
+			}
+		})
+	}
+}
+
+// contextAwareClient fails Kubernetes calls whose context has ended, as a
+// real API client does; the fake client ignores contexts.
+func contextAwareClient(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.List(ctx, list, opts...)
+		},
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+}
+
+func TestSharedPoolCreateRetryRechecksTheTemplateInventory(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	createFailed := false
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Create: func(ctx context.Context, inner client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+		if _, shared := obj.GetLabels()[sharedPoolLabel]; shared && !createFailed {
+			createFailed = true
+			return errors.New("injected pool create failure")
+		}
+		return inner.Create(ctx, obj, opts...)
+	}})
+	for range 16 {
+		if _, err := sharedDriver(failing, native).EnsureAllocation(t.Context(), first); err != nil || createFailed {
+			break
+		}
+	}
+	if !createFailed {
+		t.Fatal("the shared pool Create was never attempted")
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker == nil || !record.SharedWorker.CreateIssued || len(sharedPools(t, c)) != 0 {
+		t.Fatal("the failed Create did not leave an issued creation with no pool")
+	}
+	// A foreign empty-selector template appears before the retry.
+	native.templates["foreign/open"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "open"}}
+	if _, err := sharedDriver(c, native).EnsureAllocation(t.Context(), first); !errors.Is(err, errForeignTemplate) {
+		t.Fatalf("a creation retry skipped the template inventory: %v", err)
+	}
+	if len(sharedPools(t, c)) != 0 {
+		t.Fatal("a creation retry created a pool a foreign template could reach")
+	}
+	delete(native.templates, "foreign/open")
+	sharedReady(t, c, native, first)
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a clean inventory did not allow the retried creation")
+	}
+}
+
+func TestSharedUndecodableHostedJournalIsDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(t.Context(), journalKey(first.Key), cm); err != nil {
+		t.Fatal(err)
+	}
+	cm.Data = map[string]string{journalDataKey: "{"}
+	if err := c.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+	// Admission never places an Actor beside an allocation whose Strong and
+	// Failure markers cannot be read.
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, recordB := sharedReady(t, c, native, second)
+	if recordB.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("an Actor joined a pool hosting an undecodable journal")
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a pool hosting an undecodable journal was not strongly retired")
+	}
+}
+
+func TestSharedDeadlineKeepsSubSecondLifetimePrecision(t *testing.T) {
+	scope := sharedScope{Namespace: "tenant", Atespace: "native", ProfileUID: "p", ProfileHash: "h", SourceUID: "s", Shape: "x", CPUMillicores: 1, MemoryBytes: 1, MaxActors: 2, Lifetime: metav1.Duration{Duration: 3*time.Hour + 500*time.Millisecond}}
+	ledger := &sharedLedger{Version: sharedLedgerVersion, Scope: scope, BornAt: metav1.NewTime(time.Now().UTC().Truncate(time.Second)), State: sharedAdmitting, Entries: []sharedLedgerEntry{}}
+	pool := poolObject()
+	pool.SetCreationTimestamp(ledger.BornAt)
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	setSharedDeadline(pool, ledger)
+	if _, _, evidence := sharedBoundsOf(pool); !evidence {
+		t.Fatalf("a fractional lifetime's deadline annotation %q is inconsistent with its ledger", pool.GetAnnotations()[sharedDeadlineAnnotation])
+	}
+	// Validation rejects sub-second lifetimes outright.
+	item := &profile.SubstrateWorkspaceProfile{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant"}, Spec: profile.SubstrateWorkspaceProfileSpec{TemplateRef: profile.SubstrateTemplateReference{Name: "base"}, Suspend: &profile.SubstrateSuspendPolicy{Mode: profile.SubstrateSuspendModeDataOnly}, Placement: &profile.SubstratePlacementPolicy{SharedWorkers: &profile.SharedWorkersPolicy{MaxActorsPerWorker: 2, MaxWorkerLifetime: &metav1.Duration{Duration: 3*time.Hour + 500*time.Millisecond}}}}}
+	if err := item.Validate(); err == nil {
+		t.Fatal("a sub-second maxWorkerLifetime was accepted")
+	}
+}
+
+func TestSharedSelectorMatchingRequiresKeyPresence(t *testing.T) {
+	worker := map[string]string{sharedPoolLabel: "abc"}
+	for _, tc := range []struct {
+		selector map[string]string
+		match    bool
+	}{
+		{nil, true},
+		{map[string]string{}, true},
+		{map[string]string{sharedPoolLabel: "abc"}, true},
+		{map[string]string{sharedPoolLabel: "other"}, false},
+		{map[string]string{"dedicated": ""}, false},
+		{map[string]string{sharedPoolLabel: "abc", "dedicated": ""}, false},
+	} {
+		if got := selectorMatches(tc.selector, worker); got != tc.match {
+			t.Fatalf("selectorMatches(%v) = %v, want %v", tc.selector, got, tc.match)
+		}
+	}
+	if !selectorMatches(map[string]string{"dedicated": ""}, map[string]string{"dedicated": ""}) {
+		t.Fatal("a present empty-valued label did not match")
+	}
+	// A foreign template selecting an absent key with an empty value does not
+	// quarantine a shared pool.
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.templates["foreign/dedicated"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "dedicated"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{"dedicated": ""}}}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, record.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a template that cannot reach the pool changed its state to %s", ledger.State)
+	}
+}
+
+func TestSharedPoolSizedByARuntimeOverrideStaysAdmitting(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	override := func(request sdk.WorkloadRequest) sdk.WorkloadRequest {
+		request.Runtime = request.Runtime.DeepCopy()
+		limits := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")}
+		request.Runtime.Template.Spec.Containers[0].Resources.Limits = limits
+		request.Resources = corev1.ResourceRequirements{Limits: limits}
+		request.Revision, _ = sdk.WorkloadRevision(request)
+		if err := admit(c)(t.Context(), request); err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}
+	first = override(first)
+	_, a := sharedReady(t, c, native, first)
+	if a.SharedWorker.Scope.CPUMillicores != 500 || a.SharedWorker.Scope.MemoryBytes != 256<<20 {
+		t.Fatalf("the runtime override did not size the shared scope: %#v", a.SharedWorker.Scope)
+	}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, a.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a valid runtime-sized shared pool was closed: %s %s", ledger.State, ledger.Reason)
+	}
+	second := override(sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding))
+	_, b := sharedReady(t, c, native, second)
+	if b.SharedWorker.Pool != a.SharedWorker.Pool {
+		t.Fatal("a runtime-sized shared pool was not reused")
+	}
+	// A pool whose recorded size no longer matches the current operator pool
+	// still closes.
+	pool, ledger := poolLedger(t, c, a.SharedWorker.Pool)
+	ledger.Scope.Shape = "sha256:stale"
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ledger := poolLedger(t, c, a.SharedWorker.Pool); ledger.State == sharedAdmitting {
+		t.Fatal("a pool with a stale shape kept admitting")
+	}
+}
+
+func TestSharedEvidenceStopJournalFailureTakesTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// The journal write that records the suspended snapshot fails after the
+	// evidence suspend took effect.
+	failed := false
+	lossy := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if cm, ok := obj.(*corev1.ConfigMap); ok && !failed && strings.Contains(cm.Data[journalDataKey], `"snapshotDigest"`) {
+			failed = true
+			return errors.New("journal write unavailable")
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	for range 6 {
+		tick()
+		if _, err := sharedDriver(lossy, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+		if failed {
+			break
+		}
+	}
+	if !failed {
+		t.Fatal("fixture did not fail the snapshot journal write")
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.SharedWorker.Proof != nil {
+		t.Fatalf("a failed journal write after the evidence suspend did not persist the strong path: %#v", record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the pool's retirement did not start on the failing pass")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if native.suspendCalls != 1 || stopped.SharedWorker.Proof != nil || !stopped.WorkloadAbsent {
+		t.Fatalf("the Stop replayed the suspend or fell back to interim evidence: calls=%d", native.suspendCalls)
+	}
+}
+
+func TestSharedUnverifiableStopTakesTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The shared pool cannot be read during the Stop's verification.
+	failures := 1
+	flaky := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" && key.Name == recordA.SharedWorker.Pool && failures > 0 {
+			failures--
+			return apierrors.NewInternalError(errors.New("pool read unavailable"))
+		}
+		return w.Get(ctx, key, obj, opts...)
+	}})
+	tick()
+	_, _ = sharedDriver(flaky, native).StopInstance(t.Context(), first.Key, a.Identity)
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failures != 0 || record.SharedWorker.Strong == "" {
+		t.Fatalf("an unverifiable Stop did not persist the strong path: %#v", record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("an unverifiable Stop did not start the pool's deletion")
+	}
+	if native.suspendCalls != 0 {
+		t.Fatal("an unverifiable Stop issued the evidence suspend")
+	}
+}
+
+func TestSharedLedgerEntryDisownedByItsJournalIsDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	// A healthy private allocation whose journal holds no shared slot.
+	private := sharedWorkspace(t, c, first, "tenant", "private", "private-uid", binding)
+	private.Runtime.Egress = fixtureEgress()
+	private.Runtime.RequiredFeatures = nil
+	private.Revision, _ = sdk.WorkloadRevision(private)
+	if err := admit(c)(t.Context(), private); err != nil {
+		t.Fatal(err)
+	}
+	sharedReady(t, c, native, private)
+	other := &corev1.ConfigMap{}
+	if err := c.Get(t.Context(), journalKey(private.Key), other); err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite A's entry to name the private journal, keeping A's Actor.
+	pool, ledger := poolLedger(t, c, recordA.SharedWorker.Pool)
+	ledger.Entries[0].Journal = other.Namespace + "/" + other.Name + "/" + string(other.UID) + "/1"
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	if suspect, err := sharedDriver(c, native).sharedPoolHostsSuspect(t.Context(), pool, ledger); err != nil || !suspect {
+		t.Fatalf("admission accepted a booted entry its journal disowns: %v %v", suspect, err)
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a pool hiding an Actor behind another allocation's journal was not retired")
+	}
+}
+
+func TestSharedInvalidSnapshotAfterStrongAbsenceBecomesInstanceLoss(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+		t.Fatal(err)
+	}
+	native.suspendFidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.Failure == "" || record.Checkpoint != nil {
+		t.Fatalf("invalid evidence after proven absence did not become an honest instance loss: failure=%q checkpoint=%v", record.Failure, record.Checkpoint)
+	}
+	if podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the instance was reported lost before its worker Pod was proven absent")
+	}
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if stopped.Observation.RetainedData != nil || native.suspendCalls != 1 {
+		t.Fatalf("the lost instance's Stop invented retained data or replayed the suspend: calls=%d", native.suspendCalls)
+	}
+}
+
+func TestSharedWarmCreationIgnoresATemplateForAnEmptyPoolLabel(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	// A generated shared label is never empty, so this cannot reach a pool.
+	native.templates["foreign/empty-value"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "empty-value"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{sharedPoolLabel: ""}}}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a template that can never reach a shared pool blocked warm provisioning")
+	}
+}
+
+func TestSharedPoolRetiredBeforeTheActorUIDWriteIsNeverResumed(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	retired := false
+	// A neighbour or the sweeper retires the pool between this allocation's
+	// validation and its Actor UID write, which then lands on the newer,
+	// Retiring ledger.
+	racing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, inner client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		pool, ok := obj.(*unstructured.Unstructured)
+		if _, shared := obj.GetLabels()[sharedPoolLabel]; ok && shared && !retired {
+			if ledger, err := readSharedLedger(pool); err == nil && ledger.State == sharedAdmitting && len(ledger.Entries) == 1 && ledger.Entries[0].ActorUID != "" {
+				ledger.State = sharedRetiring
+				if err := setSharedLedger(pool, ledger); err != nil {
+					return err
+				}
+				retired = true
+			}
+		}
+		return inner.Update(ctx, obj, opts...)
+	}})
+	var lastErr error
+	for range 16 {
+		_, lastErr = sharedDriver(racing, native).EnsureAllocation(t.Context(), first)
+		if retired {
+			break
+		}
+	}
+	if !retired {
+		t.Fatalf("the Actor UID write was never reached: %v", lastErr)
+	}
+	if !errors.Is(lastErr, sdk.ErrStaleIdentity) {
+		t.Fatalf("the pass that wrote the Actor UID to a retiring pool continued: %v", lastErr)
+	}
+	for range 4 {
+		_, _ = sharedDriver(c, native).EnsureAllocation(t.Context(), first)
+	}
+	if native.boots != 0 {
+		t.Fatalf("an Actor was resumed on a pool retired before its Actor UID write (boots=%d)", native.boots)
 	}
 }

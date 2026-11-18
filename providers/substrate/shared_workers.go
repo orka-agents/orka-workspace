@@ -11,6 +11,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -52,6 +53,9 @@ const (
 	sharedPoolPrefix         = "ate-shared-"
 	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
 	sharedIdleGrace = 5 * time.Minute
+	// sharedClaimAttempts bounds slot claims that lose a ledger write race
+	// within one pass.
+	sharedClaimAttempts = 5
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
 	// changing worker version; then the strong path applies.
 	sharedMaxProofAttempts = 5
@@ -412,7 +416,7 @@ func minTime(a, b time.Time) time.Time {
 // sharedRecordedDeadline reads the creation-time deadline annotation.
 func sharedRecordedDeadline(pool *unstructured.Unstructured) (time.Time, bool) {
 	raw := pool.GetAnnotations()[sharedDeadlineAnnotation]
-	deadline, err := time.Parse(time.RFC3339, raw)
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
 	return deadline, err == nil && raw != ""
 }
 
@@ -422,7 +426,7 @@ func setSharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
-	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339)
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339Nano)
 	pool.SetAnnotations(annotations)
 }
 
@@ -546,6 +550,16 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	}
 	movable := !record.Template.CreateIssued && !shared.CreateIssued
 	if movable {
+		// Workspaces reconcile in parallel. Choosing between joining a pool
+		// and creating one is serialized per scope in this process, so a
+		// burst of cold starts fills one pool instead of each creating its
+		// own. Correctness never depends on it: every claim is still a
+		// resourceVersion-preconditioned ledger write.
+		unlock, err := sharedScopeLocks.lock(ctx, shared.Scope)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		// The workspace may have become tainted, quarantined or failed since
 		// its allocation was prepared; before any template exists it simply
 		// takes the private single-Actor path.
@@ -596,10 +610,13 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if shared.Create == nil {
 			return abandon("the shared worker disappeared")
 		}
+		// Every creation attempt, including a retry after a crash or a failed
+		// Create, needs a complete inventory that no foreign template could
+		// reach the new pool. The issuance marker never stands in for it.
+		if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), nil); err != nil {
+			return err
+		}
 		if !shared.CreateIssued {
-			if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, sharedLabels(shared.Label), nil); err != nil {
-				return err
-			}
 			shared.CreateIssued = true
 			if err := d.save(ctx, cm, record); err != nil {
 				return err
@@ -631,14 +648,17 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	} else if err != nil {
 		return err
 	}
-	if pool.GetDeletionTimestamp() != nil {
-		return abandon("the shared worker is deleting")
-	}
-	ledger, err := sharedPoolMatches(pool, record)
-	if err != nil {
-		return abandon("the shared worker no longer matches: " + err.Error())
-	}
-	if ledgerEntry(ledger, marker) == nil {
+	for attempt := 1; ; attempt++ {
+		if pool.GetDeletionTimestamp() != nil {
+			return abandon("the shared worker is deleting")
+		}
+		ledger, err := sharedPoolMatches(pool, record)
+		if err != nil {
+			return abandon("the shared worker no longer matches: " + err.Error())
+		}
+		if ledgerEntry(ledger, marker) != nil {
+			break
+		}
 		if shared.Create != nil {
 			return abandon("the created shared worker does not hold this allocation")
 		}
@@ -669,7 +689,20 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		}
 		// The read resourceVersion is the precondition: a claim never
 		// overfills a pool or lands on one that stopped admitting.
-		if err := d.client.Update(ctx, pool); err != nil {
+		err = d.client.Update(ctx, pool)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(err) || attempt == sharedClaimAttempts {
+			return err
+		}
+		// A neighbour's ledger write won. Re-read the pool and decide again,
+		// from every check above, while this scope is still held.
+		pool = poolObject()
+		if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: shared.Pool}, pool); err != nil {
+			if apierrors.IsNotFound(err) {
+				return abandon("the shared worker disappeared")
+			}
 			return err
 		}
 	}
@@ -677,6 +710,54 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	record.RuntimePool.UID = shared.UID
 	stamp(&record.Timing.WorkerPoolCreatedAt)
 	return d.save(ctx, cm, record)
+}
+
+// sharedScopeLocks serializes shared pool selection and creation per scope.
+var sharedScopeLocks = &scopeLocks{}
+
+// scopeLocks is a set of context-aware mutexes keyed by shared scope. An
+// entry exists only while some caller holds or waits for it.
+type scopeLocks struct {
+	mu      sync.Mutex
+	entries map[sharedScope]*scopeLock
+}
+
+type scopeLock struct {
+	held chan struct{}
+	refs int
+}
+
+// lock waits for scope's mutex or ctx, and returns its release.
+func (l *scopeLocks) lock(ctx context.Context, scope sharedScope) (func(), error) {
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = map[sharedScope]*scopeLock{}
+	}
+	entry := l.entries[scope]
+	if entry == nil {
+		entry = &scopeLock{held: make(chan struct{}, 1)}
+		l.entries[scope] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+	select {
+	case entry.held <- struct{}{}:
+		return func() {
+			<-entry.held
+			l.release(scope, entry)
+		}, nil
+	case <-ctx.Done():
+		l.release(scope, entry)
+		return nil, ctx.Err()
+	}
+}
+
+func (l *scopeLocks) release(scope sharedScope, entry *scopeLock) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if entry.refs--; entry.refs == 0 {
+		delete(l.entries, scope)
+	}
 }
 
 // verifySharedRuntimePool re-reads the bound pool and its ledger. Observation
@@ -955,7 +1036,13 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		if !found {
 			return false, sdk.ErrStaleIdentity
 		}
-		return false, nil
+		// The write is stored, so the remaining checks run in this pass. The
+		// write may have landed on a ledger that a neighbour or the sweeper
+		// moved to Retiring or Quarantined after the validation above, so
+		// the pool is verified again before anything leads to Resume.
+		if _, err := d.verifySharedRuntimePool(ctx, cm, record, false); err != nil {
+			return false, err
+		}
 	}
 	assigned, count, err := d.sharedAssignmentsInLedger(ctx, record, selected.GetMetadata().GetName())
 	if err != nil {
@@ -1075,6 +1162,8 @@ func (d *Lifecycle) markSharedStrong(ctx context.Context, cm *corev1.ConfigMap, 
 	if record.SharedWorker.Strong != "" {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	record.SharedWorker.Strong = reason
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement takes the strong path", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
 	return d.save(ctx, cm, record)
@@ -1089,6 +1178,8 @@ func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Uns
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
 		ledger.State, ledger.Reason = state, reason
 		if err := setSharedLedger(pool, ledger); err != nil {
@@ -1299,20 +1390,34 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 	if record.BootRequested && !record.WorkloadAbsent {
 		if actor != nil && actor.GetStatus().GetWorkerAssignment() != nil && (record.Worker == nil || !sharedAssignmentMatches(actor.GetStatus().GetWorkerAssignment(), record.Worker)) {
 			if err := d.captureSharedReplacement(ctx, cm, record, actor); err != nil {
-				return err
+				if apierrors.IsConflict(err) {
+					return err
+				}
+				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor's replacement worker could not be recorded"))
 			}
 		}
-		// A journaled interim proof is sufficient on its own; later doubt about
-		// the pool does not reopen it.
-		reason := ""
-		if shared.Proof == nil {
+		// A persisted strong marker always wins, even over a journaled interim
+		// proof (for example one saved just before a crash): pool deletion and
+		// the absence proof must finish. Otherwise a journaled interim proof is
+		// sufficient on its own, and later doubt about the pool does not reopen it.
+		reason := shared.Strong
+		if reason == "" && shared.Proof == nil {
 			var err error
 			if reason, err = d.sharedStrongReason(ctx, cm, record); err != nil {
-				return err
+				// Unverifiable before the proof is doubt: persist it and start
+				// the pool's deletion (under the detached cleanup context)
+				// rather than leave no intent for the bounds loop to recover.
+				reason = "the shared worker could not be verified during retirement: " + err.Error()
 			}
 		}
 		if reason == "" && shared.Proof == nil {
 			proven, doubt, err := d.advanceSharedInterim(ctx, cm, record, actor)
+			if err != nil && !apierrors.IsConflict(err) {
+				// Any failure after the evidence suspend's intent (including
+				// a journal write after the suspend took effect) is doubt; a
+				// write conflict is retried.
+				doubt, err = "the evidence-only retirement could not be recorded: "+err.Error(), nil
+			}
 			if err != nil || (!proven && doubt == "") {
 				return err
 			}
@@ -1346,6 +1451,14 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 			return err
 		}
 		return nil
+	}
+	if shared.Strong != "" && !shared.Released {
+		// Finish a persisted strong retirement before the slot (and with it
+		// the marker the bounds loop reads) is released.
+		gone, err := d.strongSharedAbsence(ctx, record)
+		if err != nil || !gone {
+			return err
+		}
 	}
 	if err := d.releaseSharedSlot(ctx, cm, record); err != nil {
 		return err
@@ -1451,6 +1564,8 @@ func (d *Lifecycle) captureSharedReplacement(ctx context.Context, cm *corev1.Con
 // strongSharedAbsence retires the record's pool and reports true once the
 // pool is gone and every fenced worker Pod UID is absent.
 func (d *Lifecycle) strongSharedAbsence(ctx context.Context, record *journalRecord) (bool, error) {
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	shared := record.SharedWorker
 	pool, err := d.getSharedPool(ctx, record)
 	poolGone := apierrors.IsNotFound(err)
@@ -1526,6 +1641,18 @@ func (d *Lifecycle) releaseSharedSlot(ctx context.Context, cm *corev1.ConfigMap,
 	shared := record.SharedWorker
 	if shared.Released {
 		return nil
+	}
+	if shared.Strong != "" && shared.UID != "" {
+		// The entry keeps the strong marker visible to the bounds loop, so it
+		// is released only once the pool is gone and every fenced worker Pod
+		// is proven absent.
+		gone, err := d.strongSharedAbsence(ctx, record)
+		if err != nil {
+			return err
+		}
+		if !gone {
+			return fmt.Errorf("waiting for the strongly retired shared worker to be proven absent before releasing its slot")
+		}
 	}
 	if shared.UID != "" {
 		marker := claimMarker(cm, record)
@@ -1608,20 +1735,36 @@ func (d *Lifecycle) abandonSharedToPrivate(ctx context.Context, cm *corev1.Confi
 	return d.ensureRuntimePool(ctx, cm, record)
 }
 
-// sharedPoolHostsSuspect reports whether any workspace holding a slot in the
-// pool is tainted, quarantined or failed.
+// sharedPoolHostsSuspect reports whether the pool must be strongly retired
+// because of a hosted allocation, reading only Kubernetes: a hosted journal
+// that recorded the strong path or an instance failure, or a hosted
+// workspace that is tainted, quarantined or failed. Admission, the leader
+// sweep (before any native read) and the bounds loop all use it.
 func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger) (bool, error) {
 	for _, entry := range ledger.Entries {
 		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if errors.Is(err, errSharedJournalUndecodable) {
+			// Its Strong and Failure markers and its workspace cannot be
+			// checked, so it blocks admission and retires the pool.
+			return true, nil
+		}
 		if err != nil {
 			return false, err
 		}
-		if !found || record == nil {
+		held := found && record != nil && sharedEntryHeld(record, pool, entry)
+		if !held {
+			// An entry that names an Actor UID is a booted slot. If its exact
+			// journal does not hold it, under that Actor's name and UID, the
+			// entry hides whose markers apply: doubt. A claim without an Actor
+			// UID can be an abandoned orphan and is neutral.
+			if entry.ActorUID != "" {
+				return true, nil
+			}
 			continue
 		}
-		// A recorded instance failure is suspect before the workspace itself
-		// reports Failed.
-		if record.Failure != "" && record.SharedWorker != nil && record.SharedWorker.Pool == pool.GetName() {
+		// A recorded strong path or instance failure is suspect before the
+		// workspace itself reports Failed.
+		if record.SharedWorker.Strong != "" || record.Failure != "" {
 			return true, nil
 		}
 		workspace := &api.ExecutionWorkspace{}
@@ -1687,9 +1830,14 @@ func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels m
 
 // selectorMatches reports whether a label selector, including an empty one,
 // selects a worker with these labels.
+//
+// Like upstream's labels.SelectorFromSet, a selected key must be present, so
+// a selector for `key: ""` does not match a worker without that key. An empty
+// selector still matches every worker. Upstream selectors have only
+// matchLabels.
 func selectorMatches(selector, workerLabels map[string]string) bool {
 	for key, value := range selector {
-		if workerLabels[key] != value {
+		if actual, present := workerLabels[key]; !present || actual != value {
 			return false
 		}
 	}
@@ -1721,6 +1869,8 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 	if shared == nil || shared.UID == "" {
 		return nil
 	}
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	pool, err := d.getSharedPool(ctx, record)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -1736,7 +1886,13 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 
 // sharedDoubt records the strong path for this record and starts retiring
 // its pool at once. Nothing uncertain is ever replayed.
+//
+// A strong trigger often follows a native call that ran past the request's
+// deadline, so it is persisted, and the retirement started, under a fresh
+// bounded context detached from the caller's cancellation.
 func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	ctx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
 		return err
 	}
@@ -1752,4 +1908,24 @@ func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, recor
 // deactivates the tunnel.
 func (c Config) egressSettle() time.Duration {
 	return max(c.gatewayPolicyCacheTTL(), dnsRelayPolicyTTL) + sharedEgressSettleMargin
+}
+
+// sharedCleanupTimeout bounds persisting a strong trigger and starting the
+// pool's retirement after the caller's own context has ended.
+const sharedCleanupTimeout = 30 * time.Second
+
+// strongCleanupContext detaches a strong-retirement step from the caller's
+// cancellation (keeping its values) and bounds it on its own. It uses only
+// Kubernetes, so it cannot be postponed by the native API either.
+func strongCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), sharedCleanupTimeout)
+}
+
+// sharedEntryHeld reports whether an entry's exact journal record holds this
+// pool's slot for the same Actor: name, and UID once the entry records one.
+func sharedEntryHeld(record *journalRecord, pool *unstructured.Unstructured, entry sharedLedgerEntry) bool {
+	shared := record.SharedWorker
+	return shared != nil && !shared.Released && shared.Pool == pool.GetName() &&
+		(shared.UID == "" || shared.UID == string(pool.GetUID())) && record.Placement.Namespace == pool.GetNamespace() &&
+		actorKey(record) == entry.Actor && (entry.ActorUID == "" || entry.ActorUID == record.Actor.UID)
 }

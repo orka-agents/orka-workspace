@@ -364,7 +364,13 @@ func (d *Lifecycle) ensureNative(ctx context.Context, cm *corev1.ConfigMap, reco
 		if _, err := d.control.UpdateActor(ctx, &pb.UpdateActorRequest{Actor: update}); err != nil {
 			return err
 		}
-		return nil
+		// Continue in this pass from a fresh, fully verified read rather than
+		// waiting for the next poll. Anything but the exact Actor, now on the
+		// rotated template, is left to the next pass, which re-evaluates it
+		// from the start.
+		if actor, err = d.actor(ctx, record); err != nil || actor == nil || actor.GetActorTemplate().GetName() != record.Template.Name {
+			return err
+		}
 	}
 	if !record.BootRequested {
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED {
@@ -493,6 +499,11 @@ func nativeBootRejected(err error) bool {
 // withdrawn; physical cleanup waits for Core's exact Stop authorization.
 func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) (sdk.AllocationObservation, error) {
 	if record.Failure == "" {
+		// A failure often follows a native call that outlived the request;
+		// it is a strong trigger on a shared worker, so it is persisted under
+		// a fresh bounded context.
+		ctx, cancel := strongCleanupContext(ctx)
+		defer cancel()
 		record.Failure = reason
 		record.Observation = pendingObservation(record)
 		if err := d.save(ctx, cm, record); err != nil {

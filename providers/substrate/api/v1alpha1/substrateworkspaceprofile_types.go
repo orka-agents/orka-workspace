@@ -73,6 +73,7 @@ const MaxSuspendAfterDetach = time.Hour
 // this field changes the profile hash: sharing changes the security model, so
 // it can only be adopted by creating a new profile.
 // +kubebuilder:validation:XValidation:rule="!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime) >= duration('3h') && duration(self.maxWorkerLifetime) <= duration('24h'))",message="maxWorkerLifetime must be at least 3h and at most 24h"
+// +kubebuilder:validation:XValidation:rule="!has(self.maxWorkerLifetime) || duration(self.maxWorkerLifetime) == duration(string(duration(self.maxWorkerLifetime).getSeconds()) + 's')",message="maxWorkerLifetime must be a whole number of seconds"
 type SharedWorkersPolicy struct {
 	// MaxActorsPerWorker is the number of Actors one shared worker is sized
 	// for and admits.

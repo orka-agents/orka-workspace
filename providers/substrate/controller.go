@@ -2,6 +2,7 @@ package substrate
 
 import (
 	"context"
+	"fmt"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -76,30 +78,67 @@ func (r *ProviderReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).For(&workspacev1alpha1.ExecutionWorkspaceProvider{}).WithEventFilter(predicate.And(workspaceprovider.ControllerNamePredicate(ControllerName), predicate.GenerationChangedPredicate{})).Named("substrate-execution-workspace-provider").Complete(r)
 }
 
+// Workspace reconcile concurrency. The workqueue never runs two reconciles
+// of one workspace at once; reconciles of different workspaces share only
+// thread-safe clients and resourceVersion-preconditioned writes (spare
+// claims, shared ledgers, the suspended-occupancy ledger), so they may run
+// in parallel. Each pass makes several blocking native calls, so a single
+// worker serializes concurrent cold starts behind each other.
+const (
+	DefaultMaxConcurrentReconciles = 8
+	MaxMaxConcurrentReconciles     = 32
+)
+
+// ValidateMaxConcurrentReconciles bounds the workspace reconcile concurrency.
+func ValidateMaxConcurrentReconciles(n int) error {
+	if n < 1 || n > MaxMaxConcurrentReconciles {
+		return fmt.Errorf("--max-concurrent-reconciles must be from 1 to %d", MaxMaxConcurrentReconciles)
+	}
+	return nil
+}
+
 type ExecutionWorkspaceReconciler struct {
 	client.Client
 	Control pb.ControlClient
 	Config  Config
+	// MaxConcurrentReconciles bounds parallel reconciles of different
+	// workspaces; zero selects DefaultMaxConcurrentReconciles.
+	MaxConcurrentReconciles int
+
+	polls pendingPolls
 }
 
 func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	workspace := &workspacev1alpha1.ExecutionWorkspace{}
 	if err := r.Get(ctx, req.NamespacedName, workspace); err != nil {
+		r.polls.reset(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
 	if err := r.Get(ctx, types.NamespacedName{Name: workspace.Spec.ProviderBinding.Name}, provider); err != nil {
+		r.polls.reset(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if provider.UID != workspace.Spec.ProviderBinding.UID || provider.Spec.ControllerName != ControllerName {
+		r.polls.reset(req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 	return r.reconcileLifecycle(ctx, workspace)
+}
+
+func (r *ExecutionWorkspaceReconciler) maxConcurrentReconciles() int {
+	if r.MaxConcurrentReconciles <= 0 {
+		return DefaultMaxConcurrentReconciles
+	}
+	return r.MaxConcurrentReconciles
 }
 
 func (r *ExecutionWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := (&JournalProtectionReconciler{Client: r.Client}).SetupWithManager(mgr); err != nil {
 		return err
 	}
-	return ctrl.NewControllerManagedBy(mgr).For(&workspacev1alpha1.ExecutionWorkspace{}).WithEventFilter(predicate.GenerationChangedPredicate{}).Named("substrate-execution-workspace").Complete(r)
+	if err := ValidateMaxConcurrentReconciles(r.maxConcurrentReconciles()); err != nil {
+		return err
+	}
+	return ctrl.NewControllerManagedBy(mgr).For(&workspacev1alpha1.ExecutionWorkspace{}).WithEventFilter(predicate.GenerationChangedPredicate{}).WithOptions(controller.Options{MaxConcurrentReconciles: r.maxConcurrentReconciles()}).Named("substrate-execution-workspace").Complete(r)
 }

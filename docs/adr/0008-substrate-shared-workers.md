@@ -76,7 +76,7 @@ paired with revocation of everything a leaked sandbox could use.
 
 - **A profile field, so opting in needs a new profile.** `SubstrateWorkspaceProfile.spec.placement.sharedWorkers` is:
   - `maxActorsPerWorker`: required, from 2 to 16;
-  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h.
+  - `maxWorkerLifetime`: optional, default 24h, at least 3h and at most 24h, in whole seconds.
 - **Hashed and immutable.** The spec is immutable and hashed by `sdk.ParametersProfileHash`. Sharing changes the security model, so it belongs in the frozen spec, never in a mutable annotation.
 - **Today's behavior when absent.** An absent field keeps ADRs 0006 and 0007 on the allocation path: same private pool, same proof, same API calls. Existing profile hashes do not change. The leader sweep adds one Kubernetes list of shared pools per pass, so it can enforce lifetimes left by deleted profiles. It makes no native call while no profile opts in and no shared pool exists.
 - **Validation.** The field requires `suspend.mode: DataOnly`, checked by CEL and by `Validate`.
@@ -128,6 +128,7 @@ Anything else takes the private single-Actor path of ADR 0006.
   - one entry per hosted allocation: the journal marker `<namespace>/<name>/<uid>/<sequence>`, the Actor reference, and the Actor UID once it is known.
 - **Writes.** Every write is an Update preconditioned on the read resourceVersion.
 - **Claiming a slot.** An allocation journals its selection and `claimIssued` before it adds its own entry. It binds only after observing that entry. A pool it creates is created with its entry already in the ledger. Selection or claim doubt before the template exists falls back to another pool or a new pool.
+- **Parallel allocations.** Workspaces are reconciled in parallel, so the provider serializes, per scope and within its own process, the choice between joining a pool and creating one; a burst of cold starts then fills a pool before it creates another. A claim that loses a ledger write race re-reads the pool and repeats every admission check, at most five times in one pass, before it falls back. Neither changes what a claim requires: the ledger write's resourceVersion precondition is still what keeps a pool from being overfilled or claimed after it stops admitting.
 - **The Actor UID comes before Resume.** The entry receives the Actor UID before Resume, so an assignment can never precede its ledger entry.
 
 ### Startup
@@ -189,10 +190,18 @@ These take the strong path:
   - a suspend was issued, possibly without taking effect, and the Actor is still `RUNNING` or in any state other than `SUSPENDING` or `SUSPENDED`;
   - the snapshot evidence is invalid;
   - any Tag-capture step fails;
-  - the evidence-only suspend issued by a Stop is rejected or times out. The strong reason is persisted, and the pool's retirement started, before that pass returns.
+  - the evidence-only suspend issued by a Stop is rejected or times out, or any later step of that Stop's interim evidence fails, including a journal write (a write conflict is retried). The strong reason is persisted, and the pool's retirement started, before that pass returns.
 
-  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued. Once the worker Pod is proven absent, that instance is reported lost and retires through Stop, keeping its last checkpoint.
-- **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop also reads each hosted entry's journal and deletes any pool whose journal holds the marker or a recorded instance failure. It also deletes any pool whose ledger was saved as `Retiring` or `Quarantined`. A crash between saving either intent and deleting the pool therefore cannot leave the pool running, even when the native sweep runs out of time.
+  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued.
+  - Once the worker Pod is proven absent, a capture that still fails one of the provider's own evidence checks (not a retryable native or Kubernetes error) is final. That instance is reported lost and retires through Stop, keeping its last verified checkpoint; no Tag is invented.
+  - A Stop whose shared worker, ledger or workspace cannot be verified before its proof also takes the strong path.
+- **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
+  - a hosted entry's journal holds the marker or a recorded instance failure, or cannot be decoded (its markers are then unreadable, which is doubt, and also blocks admission);
+  - a booted entry (one with an Actor UID, or an assigned Actor) whose exact journal does not hold that slot under the same Actor name and UID. Such an entry would hide whose markers apply, so it is doubt.
+  - a hosted workspace is operator-tainted, quarantined or `Failed`;
+  - its ledger was saved as `Retiring` or `Quarantined`.
+
+  A crash between saving any of these intents and deleting the pool therefore cannot leave the pool running, even when the native sweep runs out of time or the native API is down. Every strong trigger (the marker, a failure, a pool's retirement) is persisted, and the pool's deletion started, under a fresh context bounded to 30 s and detached from the request's own deadline, so a native call that outlived the request cannot prevent it.
 - **The Actor or worker is already lost:** the Actor crashed, the worker Pod is terminating or gone, or the pool is deleting, closed for retirement, or no longer holds the entry.
 - **A suspect workspace:**
   - a workspace on the pool becomes operator-tainted, quarantined, or `Failed`, or its instance records a failure in its journal, even before the workspace reports `Failed`. The leader then strongly retires the whole pool, not just closes its admission, and admission never places an Actor on it.
@@ -207,7 +216,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Strong retirement starts** at `maxWorkerLifetime − 3600 s − 5 min`. That leaves the worker Pod's whole termination grace, which contains the worker's 30-minute drain and Orka core's 30-minute eviction window, plus a margin.
 - **Admission closes** one hour before that, which is why the minimum lifetime is 3h.
 - **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof.
-- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
+- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call, is registered even when the provider's native configuration is missing or invalid, and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
 - **Robust evidence.** Each pool's hard deadline is also written once, at creation, in the `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches. The effective deadline is the earlier of that annotation and the ledger's birth plus lifetime.
   - Unreadable or inconsistent lifetime evidence is doubt: a corrupt ledger, or a missing, malformed or mismatched deadline. The pool is then strongly retired at once.
   - Its escalation is bounded by the recorded deadline, or by creation plus the minimum lifetime, so the bound is never lengthened.
@@ -217,7 +226,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
 ### Warm capacity
 
 - **No private spares.** For opted-in profiles, free slots in admitting shared pools are the warm capacity, and ADR 0007 private spares are not created.
-- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it.
+- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it. An emptied pool that the count still needs keeps admitting until its admission closes, so a resume or cold start of the profile normally lands on a running worker. Without the annotation an emptied pool is kept only for the 5-minute idle period below.
 - **Inventory first.** Every pool creation, by an allocation or for warm capacity, requires a successful, complete template inventory showing no foreign template that could reach it. A failed inventory creates nothing.
 - **Collection.** The leader deletes an empty pool once it has been empty for 5 minutes and is not needed for warm slots, or once its admission has closed. Deletion first proves that no Actor is assigned, and carries UID and resourceVersion preconditions.
 - **Orphans.** A ledger entry whose exact journal record no longer holds it, and whose Actor is not assigned, is removed. A missing journal is not proof.
