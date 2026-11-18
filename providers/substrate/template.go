@@ -155,7 +155,8 @@ func (d *Lifecycle) operatorPool(ctx context.Context, base *pb.ActorTemplate) (*
 	pools.Items = slices.DeleteFunc(pools.Items, func(pool unstructured.Unstructured) bool {
 		_, allocation := pool.GetLabels()[workerAllocationLabel]
 		_, instance := pool.GetLabels()[workerInstanceLabel]
-		return allocation || instance
+		_, shared := pool.GetLabels()[sharedPoolLabel]
+		return allocation || instance || shared
 	})
 	if len(pools.Items) != 1 || pools.Items[0].GetUID() == "" {
 		return nil, fmt.Errorf("native selector must identify one exact WorkerPool")
@@ -552,7 +553,7 @@ func (d *Lifecycle) verifyPlacement(ctx context.Context, record *journalRecord) 
 		return sdk.ErrStaleIdentity
 	}
 	for key, value := range record.SourceSelector {
-		if key == workerAllocationLabel || key == workerInstanceLabel {
+		if key == workerAllocationLabel || key == workerInstanceLabel || key == sharedPoolLabel {
 			return sdk.ErrStaleIdentity
 		}
 		if pool.GetLabels()[key] != value {
@@ -570,6 +571,7 @@ func compatibleRestore(previous, next *pb.ActorTemplate) bool {
 		if out.WorkerSelector != nil {
 			delete(out.WorkerSelector.MatchLabels, workerAllocationLabel)
 			delete(out.WorkerSelector.MatchLabels, workerInstanceLabel)
+			delete(out.WorkerSelector.MatchLabels, sharedPoolLabel)
 		}
 		for _, container := range out.Containers {
 			for _, env := range container.Env {

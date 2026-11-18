@@ -66,6 +66,18 @@ type nativeFixture struct {
 	foreignWorkers map[string]bool
 	// staleWorkerLabels delays copying changed WorkerPool labels to Workers.
 	staleWorkerLabels bool
+	// beforeSuspend observes an Actor as SuspendActor is applied.
+	beforeSuspend func(*pb.Actor)
+	// afterSuspend runs once a suspension has been applied.
+	afterSuspend func(*pb.Actor)
+	// lingering keeps reporting these Actors' assignments after release, as
+	// stale control-plane bookkeeping.
+	lingering map[string]*pb.ActorAssignment
+	// failGetWorker fails the next GetWorker calls.
+	failGetWorker int
+	// churnWorker bumps a Worker's version on every read, as concurrent
+	// placements on a shared worker do.
+	churnWorker string
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -223,8 +235,13 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	f.boots++
 	template := f.templates[refKey(v.ActorTemplate)]
 	var w *pb.Worker
+	limits := f.templates[refKey(v.ActorTemplate)].GetResources().GetLimits()
 	for _, candidate := range f.workers {
 		if candidate.Status.State != pb.WorkerState_WORKER_STATE_ACTIVE {
+			continue
+		}
+		// The native scheduler books Actor limits against capacity.
+		if allocated := candidate.Status.GetAllocated(); allocated.GetCpuMillicores()+limits.GetCpuMillicores() > candidate.Status.GetCapacity().GetCpuMillicores() || allocated.GetMemoryBytes()+limits.GetMemoryBytes() > candidate.Status.GetCapacity().GetMemoryBytes() {
 			continue
 		}
 		matches := true
@@ -241,8 +258,9 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	if w == nil {
 		return nil, status.Error(codes.Unavailable, "private worker not prepared")
 	}
-	limits := template.GetResources().GetLimits()
-	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: limits.GetCpuMillicores(), MemoryBytes: limits.GetMemoryBytes(), Actors: 1}
+	allocated := w.Status.GetAllocated()
+	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: allocated.GetCpuMillicores() + limits.GetCpuMillicores(), MemoryBytes: allocated.GetMemoryBytes() + limits.GetMemoryBytes(), Actors: allocated.GetActors() + 1}
+	w.Metadata.Version++
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_RUNNING
 	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}
@@ -266,7 +284,10 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 }
 func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	if w := f.workers[v.Status.GetWorkerAssignment().GetWorker().GetName()]; w != nil {
-		w.Status.Allocated = &pb.WorkerResources{}
+		limits := f.templates[refKey(v.ActorTemplate)].GetResources().GetLimits()
+		allocated := w.Status.GetAllocated()
+		w.Status.Allocated = &pb.WorkerResources{CpuMillicores: max(0, allocated.GetCpuMillicores()-limits.GetCpuMillicores()), MemoryBytes: max(0, allocated.GetMemoryBytes()-limits.GetMemoryBytes()), Actors: max(0, allocated.GetActors()-1)}
+		w.Metadata.Version++
 	}
 	v.Status.WorkerAssignment = nil
 }
@@ -281,6 +302,9 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 	if v.Status.State == pb.ActorState_ACTOR_STATE_SUSPENDED {
 		return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, nil
 	}
+	if f.beforeSuspend != nil {
+		f.beforeSuspend(v)
+	}
 	template := f.templates[refKey(v.ActorTemplate)]
 	fidelity := template.GetSnapshotConfig().GetPreferredFidelity()
 	if f.suspendFidelity != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
@@ -294,6 +318,9 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 	v.Status.LastAssignedGeneration = generation
 	uuid := fmt.Sprintf("snap-%s-%d", v.Metadata.Uid, generation)
 	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}
+	if f.afterSuspend != nil {
+		f.afterSuspend(v)
+	}
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
@@ -353,9 +380,16 @@ func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.Updat
 	return proto.Clone(v).(*pb.EgressPolicy), f.effect("updateEgress")
 }
 func (f *nativeFixture) GetWorker(_ context.Context, req *pb.GetWorkerRequest, _ ...grpc.CallOption) (*pb.Worker, error) {
+	if f.failGetWorker > 0 {
+		f.failGetWorker--
+		return nil, status.Error(codes.Unavailable, "worker read unavailable")
+	}
 	v := f.workers[req.Worker.Name]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
+	}
+	if f.churnWorker == req.Worker.Name {
+		v.Metadata.Version++
 	}
 	return proto.Clone(v).(*pb.Worker), nil
 }
@@ -384,7 +418,7 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		return nil, err
 	}
 	for _, pool := range pools.Items {
-		if pool.GetLabels()[workerInstanceLabel] == "" || pool.GetDeletionTimestamp() != nil {
+		if pool.GetLabels()[workerInstanceLabel] == "" && pool.GetLabels()[sharedPoolLabel] == "" || pool.GetDeletionTimestamp() != nil {
 			continue
 		}
 		name := pool.GetName() + "-worker"
@@ -426,6 +460,11 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 	for _, v := range f.actors {
 		if v.Status.GetWorkerAssignment().GetWorker().GetName() == req.Worker.Name {
 			out.ActorAssignments = append(out.ActorAssignments, &pb.ActorAssignment{Actor: &pb.ObjectRef{Atespace: v.Metadata.Atespace, Name: v.Metadata.Name}, ActorUid: v.Metadata.Uid})
+		}
+	}
+	for name, assignment := range f.lingering {
+		if f.workers[req.Worker.Name] != nil && strings.HasPrefix(name, req.Worker.Name+"|") {
+			out.ActorAssignments = append(out.ActorAssignments, proto.Clone(assignment).(*pb.ActorAssignment))
 		}
 	}
 	if f.foreignAssignment || f.foreignWorkers[req.Worker.Name] {

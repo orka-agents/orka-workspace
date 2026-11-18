@@ -108,6 +108,10 @@ type journalRecord struct {
 	// SpareWorker records a selected pre-created spare WorkerPool. When set,
 	// RuntimePool names the spare and its birth labels are the worker labels.
 	SpareWorker *spareClaim `json:"spareWorker,omitempty"`
+	// SharedWorker records a slot in a shared pool (ADR 0008). When set,
+	// RuntimePool names that pool and RuntimePoolSpec stays the private
+	// single-Actor shape, which is the lineage's resume provenance.
+	SharedWorker *sharedPlacement `json:"sharedWorker,omitempty"`
 	// WorkerImageProvenance records each data-only resume or restore of this
 	// lineage that followed the operator pool to a new worker image.
 	WorkerImageProvenance []workerImageTransition `json:"workerImageProvenance,omitempty"`
@@ -271,6 +275,9 @@ func validateJournalStructure(record *journalRecord) error {
 		return sdk.ErrStaleIdentity
 	}
 	if spare := record.SpareWorker; spare != nil && (spare.Name != record.RuntimePool.Name || spare.UID == "" || spare.ProfileUID == "" || spare.Birth == "" || record.RuntimePool.CreateIssued || record.RuntimePool.UID != "" && (record.RuntimePool.UID != spare.UID || spare.Released || !spare.ClaimIssued)) {
+		return sdk.ErrStaleIdentity
+	}
+	if shared := record.SharedWorker; shared != nil && (record.SpareWorker != nil || record.RuntimePool.CreateIssued || record.RuntimePoolDeleting || shared.Pool == "" || shared.Pool != record.RuntimePool.Name || shared.Label == "" || shared.SpecDigest != record.RuntimePool.Digest || shared.UID != record.RuntimePool.UID || !shared.Scope.valid() || record.RuntimePoolLabels[sharedPoolLabel] != shared.Label) {
 		return sdk.ErrStaleIdentity
 	}
 	if len(record.RetirementWorkers) > 16 {
@@ -480,5 +487,5 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	// The spare count is a mutable annotation outside the profile hash; an
 	// invalid value disables spares and the replenisher reports it.
 	spares, _ := spareWorkerCount(object.Annotations)
-	return d.prepareRuntimePool(ctx, record, spares, object.UID)
+	return d.prepareRuntimePool(ctx, record, spares, object.UID, sharedPolicyFor(object, workspace, record))
 }

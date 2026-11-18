@@ -2,7 +2,6 @@ package substrate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -156,6 +155,9 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 			return err
 		}
 	}
+	if record.SharedWorker != nil {
+		return d.stopShared(ctx, cm, record, actor)
+	}
 	if actor != nil {
 		if err := d.captureRetirementWorker(ctx, cm, record, actor); err != nil {
 			return err
@@ -251,32 +253,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		}
 		return nil
 	}
-	first := record.Observation.State != sdk.AllocationStopped && record.Timing.StoppedAt == nil
-	record.Observation.State = sdk.AllocationStopped
-	record.Observation.Startup = nil
-	if first {
-		stamp(&record.Timing.StoppedAt)
-	}
-	if record.Operation == "suspend" {
-		if record.Checkpoint == nil {
-			return fmt.Errorf("native suspension has no verified Data Tag")
-		}
-		if err := d.verifyCheckpoint(ctx, record.Checkpoint); err != nil {
-			return err
-		}
-		data, err := json.Marshal(record.Checkpoint)
-		if err != nil {
-			return err
-		}
-		record.Observation.RetainedData = &sdk.RetainedDataReference{ID: record.Checkpoint.Tag.Name, SourceInstance: record.Observation.Identity, ProofSHA256: digest(data)}
-	}
-	if err := d.save(ctx, cm, record); err != nil {
-		return err
-	}
-	if first {
-		logRuntimeStopped(ctx, record)
-	}
-	return nil
+	return d.finishStop(ctx, cm, record)
 }
 
 // latestSnapshot returns the Actor's highest-generation snapshot.
@@ -454,7 +431,14 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
 			return fmt.Errorf("native Actor stopped before checkpoint intent was issued")
 		}
-		if err := d.verifyRetiringWorker(ctx, record); err != nil {
+		if record.SharedWorker != nil {
+			// Egress is revoked before the suspend; doubt about the shared
+			// worker only selects the strong termination proof, so the data
+			// capture still proceeds.
+			if err := d.prepareSharedSuspend(ctx, cm, record, actor); err != nil {
+				return err
+			}
+		} else if err := d.verifyRetiringWorker(ctx, record); err != nil {
 			return err
 		}
 		operation.SuspendIssued = true
@@ -482,6 +466,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if operation.SourceSnapshotDigest == "" {
 		operation.SourceSnapshotDigest = hash
 		operation.SourceVersion = actor.GetMetadata().GetVersion()
+		if fence := sharedSuspendFenceOf(record); fence != nil {
+			fence.SnapshotDigest, fence.ObservedVersion = hash, operation.SourceVersion
+		}
 		stamp(&record.Timing.SuspendedObservedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err

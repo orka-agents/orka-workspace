@@ -255,6 +255,67 @@ ownerReference to collect. Each spare costs one idle worker Pod, the Actor size
 plus 64Mi of requests, so `N` spares per profile reserve `N` such Pods. Spares
 need `update` on `workerpools`.
 
+**Shared workers (interim).** A profile may opt in to sharing one gVisor
+worker among up to `N` data-only Actors of one namespace, profile and Actor
+size ([ADR 0008](../../docs/adr/0008-substrate-shared-workers.md), Orka ADR
+0056):
+
+```yaml
+spec:
+  suspend:
+    mode: DataOnly            # required
+  placement:
+    sharedWorkers:
+      maxActorsPerWorker: 4   # 2 to 16
+      maxWorkerLifetime: 12h  # 1h to 24h, default 24h
+```
+
+The field is part of the immutable, hashed spec, so opting in means creating
+a new profile. Without it, nothing above changes.
+
+- **What shares.** Only allocations whose egress injects the provider-proxy
+  credential at the gateway share, so no long-lived provider token enters a
+  shared sandbox. Never shared:
+  - restores from a public checkpoint;
+  - operator-tainted, quarantined, or `Failed` workspaces.
+- **Pools.** A shared pool is a single-replica WorkerPool named
+  `ate-shared-<random>`:
+  - its labels are the operator pool's plus a random
+    `substrate.workspace.orka.ai/shared-pool` value the derived template
+    selects;
+  - it is sized `cpu=N·C, memory=N·M+64Mi`, and has no owner;
+  - its `substrate.workspace.orka.ai/shared-ledger` annotation records the
+    scope, birth, admission state, fenced worker, and each hosted journal and
+    Actor UID. Every write is a resourceVersion-preconditioned Update.
+- **Retirement.** Retiring one Actor touches only that Actor:
+  1. Deny-all egress is applied and verified before `SuspendActor`. A Stop also
+     suspends, as evidence only.
+  2. The Actor must be `SUSPENDED` at a later version with the expected new
+     `VOLUMES` snapshot.
+  3. The fenced worker (same UID, Pod UID, registered and observed epoch, and
+     an unchanged version on re-read) must no longer list it, and must list no
+     Actor outside the ledger.
+  4. Then the Actor is deleted and its slot released.
+- **Doubt.** Any doubt retires the whole pool and proves exact worker Pod UID
+  absence for every hosted Actor, and Orka core suspends the neighbours through
+  worker eviction. Doubt includes:
+  - an assignment that is still present;
+  - an epoch or identity change;
+  - an upstream error;
+  - a terminating worker;
+  - a tainted, quarantined, or failed workspace.
+- **Leader sweep.** A leader-only pass, every 10 seconds:
+  - closes admission an hour before `maxWorkerLifetime` (half of it when
+    shorter than two hours), and retires the pool at `maxWorkerLifetime`;
+  - quarantines a pool that hosts an Actor outside its ledger;
+  - removes entries that their exact journal disowns;
+  - deletes empty pools after 5 minutes.
+- **Warm capacity.** For these profiles the `spare-workers` annotation counts
+  free shared slots to keep warm, and private spares are not created.
+- **Residual risk.** This evidence is weaker than Pod absence. A leaked sandbox
+  keeps its memory, with no tunnel, no egress and revoked credentials, until
+  the worker is recycled. A compromised worker exposes its co-hosted Actors.
+
 ## Workload translation
 
 Orka supplies the immutable public supervisor request. The provider compiles it
@@ -486,7 +547,8 @@ missing, for example in journals written before timing existed.
 `Substrate runtime ready` carries `workspaceNamespace`, `workspaceName`,
 `runtimePool` (the Orka RuntimePool binding), `sequence`, `path` (`cold`, or
 `resume` from a Tag), `workerSource` (`spare` when the private WorkerPool was a
-claimed spare, otherwise `fresh`), and these durations in milliseconds. For a
+claimed spare, `shared` for a shared worker slot, otherwise `fresh`), and these
+durations in milliseconds. For a
 spare, `workerPoolMs` ends when the claim is saved and `workerActiveMs` measures
 only the post-claim checks, not worker birth:
 
@@ -504,7 +566,9 @@ only the post-claim checks, not worker birth:
 
 `Substrate runtime stopped` carries `workspaceNamespace`, `workspaceName`,
 `runtimePool`, `sequence`, `operation` (`stop` or `suspend`), and these
-durations in milliseconds:
+durations in milliseconds. A shared worker adds `workerSource: shared` and
+`terminationProof` (`interim` or `strong`), and `workerTeardownMs` then ends
+when that evidence is journaled:
 
 | Field | From | To |
 | --- | --- | --- |

@@ -483,6 +483,7 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 			}
 		}
 	}
+	errs = append(errs, r.sweepShared(ctx, d, profiles.Items, workers))
 	r.mu.Lock()
 	due := time.Since(r.lastOrphan) >= spareOrphanPeriod
 	if due {
@@ -513,6 +514,10 @@ func (r *SpareWorkerReplenisher) wanted(ctx context.Context, item *profile.Subst
 	}
 	delete(r.invalid, item.UID)
 	if item.DeletionTimestamp != nil || item.Validate() != nil {
+		return 0
+	}
+	if item.Spec.Placement != nil && item.Spec.Placement.SharedWorkers != nil {
+		// Free slots in shared pools are this profile's warm capacity.
 		return 0
 	}
 	return want

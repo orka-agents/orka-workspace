@@ -1,0 +1,1363 @@
+package substrate
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
+	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
+	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
+	sdk "github.com/orka-agents/orka-workspace/sdk"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// Shared workers (provider ADR 0008, Orka ADR 0056) let up to N data-only
+// Actors of one namespace, profile and Actor size share one gVisor worker.
+// Upstream has no per-Actor sandbox-exit attestation, so a per-Actor stop is
+// proven with the owner-approved interim evidence: egress revoked before
+// suspension, the Actor SUSPENDED at a later version with the expected VOLUMES
+// snapshot, and its assignment absent from the same fenced worker at an
+// unchanged epoch and version. The residue is bounded by a maximum worker
+// lifetime, and any doubt takes the strong path: the pool is closed and
+// deleted, and every hosted Actor proves exact worker Pod UID absence.
+const (
+	// sharedPoolLabel carries a shared pool's random, journaled value. The
+	// derived template selects it, so only allocations that claimed a slot in
+	// that pool's ledger can be placed there.
+	sharedPoolLabel = "substrate.workspace.orka.ai/shared-pool"
+	// sharedLedgerAnnotation is the pool's resourceVersion-protected ledger.
+	sharedLedgerAnnotation = "substrate.workspace.orka.ai/shared-ledger"
+	sharedLedgerVersion    = "substrate.workspace.shared-ledger.v1"
+	sharedPoolPrefix       = "ate-shared-"
+	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
+	sharedIdleGrace = 5 * time.Minute
+	// sharedMaxProofAttempts bounds interim proofs that keep observing a
+	// changing worker version; then the strong path applies.
+	sharedMaxProofAttempts = 5
+	// sharedLedgerMaxBytes bounds the ledger annotation.
+	sharedLedgerMaxBytes = 32 << 10
+	// operatorTaintAnnotation is Orka core's durable operator-access marker
+	// on an ExecutionWorkspace (Orka ADR 0044).
+	operatorTaintAnnotation = "acp.workspace.orka.ai/operator-tainted"
+)
+
+// Ledger admission states. Draining admits no new claims but lets existing
+// claimants boot; Retiring and Quarantined pools are being deleted.
+const (
+	sharedAdmitting   = "Admitting"
+	sharedDraining    = "Draining"
+	sharedRetiring    = "Retiring"
+	sharedQuarantined = "Quarantined"
+)
+
+// sharedNow is the provider clock for ledger birth, admission and lifetime.
+var sharedNow = time.Now
+
+// sharedScope is everything a shared pool is confined to. Two allocations
+// share a pool only when their scopes are equal.
+type sharedScope struct {
+	Namespace     string          `json:"namespace"`
+	Atespace      string          `json:"atespace"`
+	ProfileUID    string          `json:"profileUID"`
+	ProfileHash   string          `json:"profileHash"`
+	SourceUID     string          `json:"sourceUID"`
+	Shape         string          `json:"shape"`
+	CPUMillicores int64           `json:"cpuMillicores"`
+	MemoryBytes   int64           `json:"memoryBytes"`
+	MaxActors     int32           `json:"maxActors"`
+	Lifetime      metav1.Duration `json:"lifetime"`
+}
+
+func (s sharedScope) valid() bool {
+	return s.Namespace != "" && s.Atespace != "" && s.ProfileUID != "" && s.ProfileHash != "" && s.SourceUID != "" && s.Shape != "" &&
+		s.CPUMillicores > 0 && s.MemoryBytes > 0 && s.MaxActors >= profile.MinSharedActorsPerWorker && s.MaxActors <= profile.MaxSharedActorsPerWorker &&
+		s.Lifetime.Duration >= profile.MinSharedWorkerLifetime && s.Lifetime.Duration <= profile.MaxSharedWorkerLifetime
+}
+
+// capacity is what a worker sized for MaxActors Actors reports.
+func (s sharedScope) capacity() (cpu, memory int64) {
+	return s.CPUMillicores * int64(s.MaxActors), s.MemoryBytes * int64(s.MaxActors)
+}
+
+// sharedWorkerIdentity is a worker process lifetime: a restart registers a
+// higher epoch and loses every sandbox, so it is a different identity.
+type sharedWorkerIdentity struct {
+	Name   string `json:"name"`
+	UID    string `json:"uid"`
+	PodUID string `json:"podUID"`
+	Epoch  int64  `json:"epoch"`
+}
+
+type sharedLedgerEntry struct {
+	// Journal is the exact journal lifetime and sequence holding the slot.
+	Journal string `json:"journal"`
+	// Actor is <atespace>/<name>; ActorUID is written before Resume, so an
+	// assignment never precedes its entry.
+	Actor    string `json:"actor"`
+	ActorUID string `json:"actorUID,omitempty"`
+}
+
+type sharedLedger struct {
+	Version string      `json:"version"`
+	Scope   sharedScope `json:"scope"`
+	BornAt  metav1.Time `json:"bornAt"`
+	State   string      `json:"state"`
+	Reason  string      `json:"reason,omitempty"`
+	// Worker is the pool's first fenced worker. A different worker in the
+	// pool means its Pod was replaced, which is doubt.
+	Worker     *sharedWorkerIdentity `json:"worker,omitempty"`
+	EmptySince *metav1.Time          `json:"emptySince,omitempty"`
+	Entries    []sharedLedgerEntry   `json:"entries"`
+}
+
+// sharedSuspendFence pins the suspend the interim evidence is about.
+type sharedSuspendFence struct {
+	Issued              bool   `json:"issued,omitempty"`
+	PriorVersion        int64  `json:"priorVersion,omitempty"`
+	PriorGeneration     int32  `json:"priorGeneration,omitempty"`
+	PriorSnapshotDigest string `json:"priorSnapshotDigest,omitempty"`
+	ObservedVersion     int64  `json:"observedVersion,omitempty"`
+	SnapshotDigest      string `json:"snapshotDigest,omitempty"`
+}
+
+// sharedTerminationProof is the journaled interim evidence.
+type sharedTerminationProof struct {
+	WorkerUID     string           `json:"workerUID"`
+	Epoch         int64            `json:"epoch"`
+	WorkerVersion int64            `json:"workerVersion"`
+	ActorVersion  int64            `json:"actorVersion"`
+	At            metav1.MicroTime `json:"at"`
+}
+
+// sharedPlacement is the journal's record of a shared pool slot.
+type sharedPlacement struct {
+	Scope sharedScope `json:"scope"`
+	// Pool and Label identify the selected pool; UID is saved only after
+	// this record's own entry is observed in its ledger.
+	Pool       string `json:"pool"`
+	UID        string `json:"uid,omitempty"`
+	Label      string `json:"label"`
+	SpecDigest string `json:"specDigest"`
+	// Create is the exact specification when this record creates the pool.
+	Create       json.RawMessage `json:"create,omitempty"`
+	CreateIssued bool            `json:"createIssued,omitempty"`
+	ClaimIssued  bool            `json:"claimIssued,omitempty"`
+	// EgressRevoked records the verified deny-all egress before suspension.
+	EgressRevoked bool                    `json:"egressRevoked,omitempty"`
+	Suspend       *sharedSuspendFence     `json:"suspend,omitempty"`
+	Proof         *sharedTerminationProof `json:"proof,omitempty"`
+	ProofAttempts int                     `json:"proofAttempts,omitempty"`
+	// Strong is why retirement takes the strong Pod-absence path. Once set,
+	// it is never cleared.
+	Strong   string `json:"strong,omitempty"`
+	Released bool   `json:"released,omitempty"`
+}
+
+var errSharedEgressRevoked = errors.New("shared worker retirement revokes egress before suspension")
+
+// errSharedLedgerInvalid marks a pool whose ledger annotation cannot be read.
+var errSharedLedgerInvalid = errors.New("shared worker ledger is invalid")
+
+func randomLabel() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(nonce[:]), nil
+}
+
+func sharedLabels(label string) map[string]string {
+	return map[string]string{sharedPoolLabel: label}
+}
+
+func actorKey(record *journalRecord) string { return record.Atespace + "/" + record.Actor.Name }
+
+// sharedPolicyFor returns the profile's shared-worker policy when this
+// allocation may share. Everything that is not data-only and gateway-credentialed,
+// every restore from a public checkpoint, and every tainted, quarantined or
+// failed workspace keeps the private single-Actor path.
+func sharedPolicyFor(object *profile.SubstrateWorkspaceProfile, workspace *api.ExecutionWorkspace, record *journalRecord) *profile.SharedWorkersPolicy {
+	if object.Spec.Placement == nil || object.Spec.Placement.SharedWorkers == nil {
+		return nil
+	}
+	request := record.Request
+	if !record.SuspendEnabled || request.RestoreFrom != nil || request.Runtime == nil {
+		return nil
+	}
+	// The provider-proxy token must never enter a shared sandbox: a leaked
+	// sandbox may keep it in memory after its Actor stopped.
+	if !request.Runtime.Egress.HasCredentialInjection() || !slices.Contains(request.Runtime.RequiredFeatures, api.WorkspaceFeatureEgressCredentialInjection) {
+		return nil
+	}
+	if workspaceSuspect(workspace) {
+		return nil
+	}
+	return object.Spec.Placement.SharedWorkers
+}
+
+// workspaceSuspect reports a tainted, quarantined or failed workspace.
+func workspaceSuspect(workspace *api.ExecutionWorkspace) bool {
+	if _, tainted := workspace.Annotations[operatorTaintAnnotation]; tainted {
+		return true
+	}
+	return workspace.Labels[api.QuarantinedLabel] != "" || workspace.Spec.DesiredState == api.ExecutionWorkspaceDesiredQuarantined ||
+		workspace.Status.State == api.ExecutionWorkspaceStateQuarantined || workspace.Status.State == api.ExecutionWorkspaceStateFailed
+}
+
+// buildSharedPoolSpec is buildPrivatePoolSpec sized for scope.MaxActors.
+func buildSharedPoolSpec(source *unstructured.Unstructured, scope sharedScope, label string) (json.RawMessage, error) {
+	if scope.MaxActors < 1 || scope.CPUMillicores > math.MaxInt64/int64(scope.MaxActors) || scope.MemoryBytes > (math.MaxInt64-gvisorReservedMemoryBytes)/int64(scope.MaxActors) {
+		return nil, fmt.Errorf("shared worker size overflows")
+	}
+	cpu, memory := scope.capacity()
+	return buildPrivatePoolSpec(source, cpu, memory, sharedLabels(label))
+}
+
+// prepareSharedPlacement provisionally binds a new record to a pool it would
+// create itself. ensureSharedRuntimePool may still move it to an existing
+// pool with a free slot before the template exists.
+func (d *Lifecycle) prepareSharedPlacement(record *journalRecord, source *unstructured.Unstructured, policy *profile.SharedWorkersPolicy, profileUID types.UID) error {
+	shape, err := runtimePoolRestoreDigest(record.RuntimePoolSpec, false)
+	if err != nil {
+		return err
+	}
+	cpu, memory := expectedWorkerCapacity(record)
+	scope := sharedScope{Namespace: record.Request.Key.Namespace, Atespace: record.Atespace, ProfileUID: string(profileUID), ProfileHash: record.Request.ParametersBinding.ProfileHash, SourceUID: string(source.GetUID()), Shape: shape, CPUMillicores: cpu, MemoryBytes: memory, MaxActors: policy.MaxActorsPerWorker, Lifetime: metav1.Duration{Duration: policy.WorkerLifetime()}}
+	if !scope.valid() {
+		return fmt.Errorf("shared worker policy is invalid")
+	}
+	// The operator's own labels are taken while the record still carries
+	// its private birth labels.
+	operator := operatorPoolLabels(record)
+	record.SharedWorker = &sharedPlacement{Scope: scope}
+	return d.bindNewSharedPool(record, source, operator)
+}
+
+// bindNewSharedPool rebinds the record to a fresh pool of its own.
+func (d *Lifecycle) bindNewSharedPool(record *journalRecord, source *unstructured.Unstructured, operator map[string]string) error {
+	name, err := randomName(sharedPoolPrefix)
+	if err != nil {
+		return err
+	}
+	label, err := randomLabel()
+	if err != nil {
+		return err
+	}
+	spec, err := buildSharedPoolSpec(source, record.SharedWorker.Scope, label)
+	if err != nil {
+		return err
+	}
+	shared := record.SharedWorker
+	*shared = sharedPlacement{Scope: shared.Scope, Pool: name, Label: label, SpecDigest: digest(spec), Create: spec}
+	return bindSharedPool(record, operator)
+}
+
+// bindSharedPool sets the record's pool reference, its pool labels (the
+// operator's plus the shared label), and the template's worker selector.
+func bindSharedPool(record *journalRecord, operator map[string]string) error {
+	shared := record.SharedWorker
+	record.RuntimePool = nativeReference{Name: shared.Pool, UID: shared.UID, Digest: shared.SpecDigest}
+	record.RuntimePoolLabels = maps.Clone(operator)
+	if record.RuntimePoolLabels == nil {
+		record.RuntimePoolLabels = map[string]string{}
+	}
+	maps.Copy(record.RuntimePoolLabels, sharedLabels(shared.Label))
+	selector := maps.Clone(record.SourceSelector)
+	maps.Copy(selector, sharedLabels(shared.Label))
+	record.TemplateSpec.WorkerSelector = &pb.Selector{MatchLabels: selector}
+	var err error
+	record.Template.Digest, err = templateDigest(record.TemplateSpec)
+	return err
+}
+
+func readSharedLedger(pool *unstructured.Unstructured) (*sharedLedger, error) {
+	raw := pool.GetAnnotations()[sharedLedgerAnnotation]
+	if raw == "" || len(raw) > sharedLedgerMaxBytes {
+		return nil, fmt.Errorf("shared worker ledger is missing or oversized")
+	}
+	ledger := &sharedLedger{}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(ledger); err != nil || ledger.Version != sharedLedgerVersion || !ledger.Scope.valid() || ledger.BornAt.IsZero() {
+		return nil, fmt.Errorf("shared worker ledger is invalid")
+	}
+	switch ledger.State {
+	case sharedAdmitting, sharedDraining, sharedRetiring, sharedQuarantined:
+	default:
+		return nil, fmt.Errorf("shared worker ledger state is invalid")
+	}
+	if len(ledger.Entries) > int(ledger.Scope.MaxActors) {
+		return nil, fmt.Errorf("shared worker ledger exceeds its slots")
+	}
+	seen := map[string]bool{}
+	for _, entry := range ledger.Entries {
+		if entry.Journal == "" || entry.Actor == "" || seen[entry.Journal] || seen["actor:"+entry.Actor] {
+			return nil, fmt.Errorf("shared worker ledger has a duplicate or empty entry")
+		}
+		seen[entry.Journal], seen["actor:"+entry.Actor] = true, true
+	}
+	return ledger, nil
+}
+
+func setSharedLedger(pool *unstructured.Unstructured, ledger *sharedLedger) error {
+	data, err := json.Marshal(ledger)
+	if err != nil {
+		return err
+	}
+	if len(data) > sharedLedgerMaxBytes {
+		return fmt.Errorf("shared worker ledger exceeds its size bound")
+	}
+	annotations := maps.Clone(pool.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[sharedLedgerAnnotation] = string(data)
+	pool.SetAnnotations(annotations)
+	return nil
+}
+
+// sharedBorn is the earlier of the ledger's birth and the pool's creation.
+func sharedBorn(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	born := ledger.BornAt.Time
+	if created := pool.GetCreationTimestamp().Time; !created.IsZero() && created.Before(born) {
+		born = created
+	}
+	return born
+}
+
+// sharedAdmissionEnds is when a pool stops admitting new claims: the
+// lifetime less a drain window of one hour, or half the lifetime if shorter.
+func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	lifetime := ledger.Scope.Lifetime.Duration
+	return sharedBorn(pool, ledger).Add(lifetime - min(time.Hour, lifetime/2))
+}
+
+// sharedRetireAt is when the pool is retired with the strong path.
+func sharedRetireAt(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
+	return sharedBorn(pool, ledger).Add(ledger.Scope.Lifetime.Duration)
+}
+
+func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
+	return pool.GetDeletionTimestamp() == nil && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+}
+
+func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
+	for i := range ledger.Entries {
+		if ledger.Entries[i].Journal == marker {
+			return &ledger.Entries[i]
+		}
+	}
+	return nil
+}
+
+// sharedPoolMatches checks a pool's identity against the record's binding:
+// labels, specification digest, no owner, and a ledger of the same scope.
+func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (*sharedLedger, error) {
+	shared := record.SharedWorker
+	actual, ok := poolSpecDigest(pool)
+	if pool.GetUID() == "" || !ok || actual != shared.SpecDigest || !maps.Equal(pool.GetLabels(), record.RuntimePoolLabels) || len(pool.GetOwnerReferences()) != 0 {
+		return nil, sdk.ErrStaleIdentity
+	}
+	ledger, err := readSharedLedger(pool)
+	if err != nil {
+		return nil, err
+	}
+	if ledger.Scope != shared.Scope {
+		return nil, fmt.Errorf("shared worker ledger scope differs from this allocation: %w", sdk.ErrStaleIdentity)
+	}
+	return ledger, nil
+}
+
+func (d *Lifecycle) getSharedPool(ctx context.Context, record *journalRecord) (*unstructured.Unstructured, error) {
+	pool := poolObject()
+	err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.SharedWorker.Pool}, pool)
+	return pool, err
+}
+
+// selectSharedPool returns an admitting pool of the record's scope with a
+// free slot, preferring the fullest so empty pools can be collected.
+func (d *Lifecycle) selectSharedPool(ctx context.Context, record *journalRecord, source *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	pools := &unstructured.UnstructuredList{}
+	pools.SetAPIVersion(workerPoolAPIVersion())
+	pools.SetKind("WorkerPoolList")
+	if err := d.client.List(ctx, pools, client.InNamespace(record.Placement.Namespace), client.HasLabels{sharedPoolLabel}); err != nil {
+		return nil, err
+	}
+	now := sharedNow()
+	var best *unstructured.Unstructured
+	bestEntries := -1
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		ledger, err := readSharedLedger(pool)
+		if err != nil || ledger.Scope != record.SharedWorker.Scope || !sharedAdmits(pool, ledger, now) || len(pool.GetOwnerReferences()) != 0 {
+			continue
+		}
+		label := pool.GetLabels()[sharedPoolLabel]
+		expected := maps.Clone(operatorPoolLabels(record))
+		maps.Copy(expected, sharedLabels(label))
+		if label == "" || !maps.Equal(pool.GetLabels(), expected) {
+			continue
+		}
+		spec, err := buildSharedPoolSpec(source, ledger.Scope, label)
+		if err != nil {
+			return nil, err
+		}
+		if actual, ok := poolSpecDigest(pool); !ok || actual != digest(spec) {
+			continue
+		}
+		if len(ledger.Entries) > bestEntries {
+			best, bestEntries = pool, len(ledger.Entries)
+		}
+	}
+	return best, nil
+}
+
+// ensureSharedRuntimePool selects or creates the record's shared pool and
+// claims its slot. The journal records claimIssued or createIssued before the
+// write and the pool UID only after this record's entry is observed. Before
+// the template exists, any doubt moves the record to another pool.
+//
+//nolint:gocyclo // Selection, creation, claim and fallback stay in journal order.
+func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	shared := record.SharedWorker
+	if shared.Released {
+		return sdk.ErrStaleIdentity
+	}
+	marker := claimMarker(cm, record)
+	if shared.UID != "" {
+		// A bound pool may already be retiring while its Actor is still
+		// observed for drain; prepareSharedWorker refuses it before any boot.
+		_, err := d.verifySharedRuntimePool(ctx, cm, record, true)
+		return err
+	}
+	movable := !record.Template.CreateIssued && !shared.CreateIssued
+	source := poolObject()
+	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, source); err != nil {
+		return err
+	}
+	if source.GetUID() != record.Placement.UID || source.GetDeletionTimestamp() != nil {
+		return sdk.ErrStaleIdentity
+	}
+	if movable && shared.Create != nil && !shared.ClaimIssued {
+		candidate, err := d.selectSharedPool(ctx, record, source)
+		if err != nil {
+			return err
+		}
+		if candidate != nil {
+			label := candidate.GetLabels()[sharedPoolLabel]
+			specDigest, _ := poolSpecDigest(candidate)
+			*shared = sharedPlacement{Scope: shared.Scope, Pool: candidate.GetName(), Label: label, SpecDigest: specDigest}
+			if err := bindSharedPool(record, operatorPoolLabels(record)); err != nil {
+				return err
+			}
+			if err := d.save(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+	}
+	abandon := func(reason string) error {
+		if !movable {
+			return fmt.Errorf("shared worker slot is unavailable after native creation (%s): %w", reason, sdk.ErrStaleIdentity)
+		}
+		if err := d.bindNewSharedPool(record, source, operatorPoolLabels(record)); err != nil {
+			return err
+		}
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker slot not claimed; creating a new shared worker", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
+		return d.save(ctx, cm, record)
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	if apierrors.IsNotFound(err) {
+		if shared.Create == nil {
+			return abandon("the shared worker disappeared")
+		}
+		if !shared.CreateIssued {
+			shared.CreateIssued = true
+			if err := d.save(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		created := poolObject()
+		created.SetNamespace(record.Placement.Namespace)
+		created.SetName(shared.Pool)
+		created.SetLabels(maps.Clone(record.RuntimePoolLabels))
+		var spec map[string]any
+		if err := json.Unmarshal(shared.Create, &spec); err != nil {
+			return err
+		}
+		created.Object["spec"] = spec
+		ledger := &sharedLedger{Version: sharedLedgerVersion, Scope: shared.Scope, BornAt: metav1.NewTime(sharedNow().UTC().Truncate(time.Second)), State: sharedAdmitting, Entries: []sharedLedgerEntry{{Journal: marker, Actor: actorKey(record)}}}
+		if err := setSharedLedger(created, ledger); err != nil {
+			return err
+		}
+		err = d.client.Create(ctx, created)
+		if apierrors.IsAlreadyExists(err) {
+			created = poolObject()
+			err = d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: shared.Pool}, created)
+		}
+		if err != nil {
+			return err
+		}
+		pool = created
+	} else if err != nil {
+		return err
+	}
+	if pool.GetDeletionTimestamp() != nil {
+		return abandon("the shared worker is deleting")
+	}
+	ledger, err := sharedPoolMatches(pool, record)
+	if err != nil {
+		return abandon("the shared worker no longer matches: " + err.Error())
+	}
+	if ledgerEntry(ledger, marker) == nil {
+		if shared.Create != nil {
+			return abandon("the created shared worker does not hold this allocation")
+		}
+		if !sharedAdmits(pool, ledger, sharedNow()) {
+			return abandon("the shared worker no longer admits Actors")
+		}
+		if slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.Actor == actorKey(record) }) {
+			return abandon("the shared worker already lists this Actor")
+		}
+		if !shared.ClaimIssued {
+			shared.ClaimIssued = true
+			if err := d.save(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		ledger.Entries = append(ledger.Entries, sharedLedgerEntry{Journal: marker, Actor: actorKey(record)})
+		ledger.EmptySince = nil
+		if err := setSharedLedger(pool, ledger); err != nil {
+			return err
+		}
+		// The read resourceVersion is the precondition: a claim never
+		// overfills a pool or lands on one that stopped admitting.
+		if err := d.client.Update(ctx, pool); err != nil {
+			return err
+		}
+	}
+	shared.UID = string(pool.GetUID())
+	record.RuntimePool.UID = shared.UID
+	stamp(&record.Timing.WorkerPoolCreatedAt)
+	return d.save(ctx, cm, record)
+}
+
+// verifySharedRuntimePool re-reads the bound pool and its ledger. Observation
+// and retirement may continue while a pool this provider is retiring
+// terminates; startup never does.
+func (d *Lifecycle) verifySharedRuntimePool(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, allowRetiring bool) (*sharedLedger, error) {
+	shared := record.SharedWorker
+	if shared.UID == "" || shared.Released || record.RuntimePool.UID != shared.UID {
+		return nil, sdk.ErrStaleIdentity
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	if err != nil {
+		return nil, err
+	}
+	if string(pool.GetUID()) != shared.UID {
+		return nil, sdk.ErrStaleIdentity
+	}
+	ledger, err := sharedPoolMatches(pool, record)
+	if err != nil {
+		return nil, err
+	}
+	retiring := pool.GetDeletionTimestamp() != nil || ledger.State == sharedRetiring || ledger.State == sharedQuarantined
+	if retiring && !allowRetiring {
+		return nil, fmt.Errorf("shared worker is retiring: %w", sdk.ErrStaleIdentity)
+	}
+	if ledgerEntry(ledger, claimMarker(cm, record)) == nil {
+		return nil, fmt.Errorf("shared worker ledger no longer holds this allocation: %w", sdk.ErrStaleIdentity)
+	}
+	if record.Worker != nil && ledger.Worker != nil && (ledger.Worker.Name != record.Worker.Name || ledger.Worker.UID != record.Worker.UID || ledger.Worker.PodUID != record.Worker.PodUID || ledger.Worker.Epoch != record.Worker.Epoch) {
+		return nil, fmt.Errorf("shared worker was replaced: %w", sdk.ErrStaleIdentity)
+	}
+	return ledger, nil
+}
+
+// verifySharedRuntimePoolReadOnly is verifySharedRuntimePool for read-only
+// observation, which has no journal ConfigMap in hand.
+func (d *Lifecycle) verifySharedRuntimePoolReadOnly(ctx context.Context, record *journalRecord) error {
+	cm := &corev1.ConfigMap{}
+	if err := d.client.Get(ctx, journalKey(record.Request.Key), cm); err != nil {
+		return err
+	}
+	_, err := d.verifySharedRuntimePool(ctx, cm, record, true)
+	return err
+}
+
+// updateSharedLedger applies mutate to the pool's current ledger with the
+// read resourceVersion as precondition. A missing or replaced pool is
+// reported by found=false.
+func (d *Lifecycle) updateSharedLedger(ctx context.Context, namespace, name, uid string, mutate func(*sharedLedger) (bool, error)) (bool, error) {
+	pool := poolObject()
+	if err := d.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pool); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if string(pool.GetUID()) != uid {
+		return false, nil
+	}
+	ledger, err := readSharedLedger(pool)
+	if err != nil {
+		return true, fmt.Errorf("%w: %w", errSharedLedgerInvalid, err)
+	}
+	changed, err := mutate(ledger)
+	if err != nil || !changed {
+		return true, err
+	}
+	if err := setSharedLedger(pool, ledger); err != nil {
+		return true, err
+	}
+	return true, d.client.Update(ctx, pool)
+}
+
+// sharedAssignmentsInLedger lists the worker's assignments, then re-reads the
+// ledger, so an entry written before a concurrent Resume is always seen. It
+// fails closed on any assigned Actor that is not a ledger entry with the same
+// UID, and reports whether this record's Actor is assigned.
+func (d *Lifecycle) sharedAssignmentsInLedger(ctx context.Context, record *journalRecord, workerName string) (assigned bool, count int, err error) {
+	var assignments []*pb.ActorAssignment
+	page := ""
+	seen := map[string]bool{}
+	for {
+		response, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: &pb.ObjectRef{Name: workerName}, Options: &pb.ListOptions{PageSize: 1000, PageToken: page}})
+		if err != nil {
+			return false, 0, err
+		}
+		assignments = append(assignments, response.GetActorAssignments()...)
+		page = response.GetNextPageToken()
+		if page == "" {
+			break
+		}
+		if seen[page] || len(seen) >= 100 {
+			return false, 0, fmt.Errorf("native assignment pagination repeated a token or exceeded its bound")
+		}
+		seen[page] = true
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	if err != nil {
+		return false, 0, err
+	}
+	if string(pool.GetUID()) != record.SharedWorker.UID {
+		return false, 0, sdk.ErrStaleIdentity
+	}
+	ledger, err := readSharedLedger(pool)
+	if err != nil {
+		return false, 0, err
+	}
+	for _, assignment := range assignments {
+		ref := assignment.GetActor().GetAtespace() + "/" + assignment.GetActor().GetName()
+		if !slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool {
+			return entry.ActorUID != "" && entry.ActorUID == assignment.GetActorUid() && entry.Actor == ref
+		}) {
+			return false, 0, fmt.Errorf("native shared worker hosts an Actor outside its ledger; admission is closed")
+		}
+		if ref == actorKey(record) || assignment.GetActorUid() == record.Actor.UID {
+			if record.Actor.UID == "" || assignment.GetActorUid() != record.Actor.UID || ref != actorKey(record) {
+				return false, 0, sdk.ErrStaleIdentity
+			}
+			assigned = true
+		}
+	}
+	return assigned, len(assignments), nil
+}
+
+// prepareSharedWorker replaces the private "ACTIVE and empty" pre-Resume
+// check: the pool's only worker is ACTIVE, gVisor, sized for the scope, at a
+// settled registered epoch, the ledger's fenced worker, below its slot count,
+// and hosts only ledger Actors.
+//
+//nolint:gocyclo // Every pre-Resume fence is checked in order.
+func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
+		return false, err
+	}
+	shared := record.SharedWorker
+	ledger, err := d.verifySharedRuntimePool(ctx, cm, record, false)
+	if err != nil {
+		return false, err
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	if err != nil {
+		return false, err
+	}
+	if ledger.State != sharedAdmitting && ledger.State != sharedDraining || !sharedNow().Before(sharedRetireAt(pool, ledger)) {
+		return false, fmt.Errorf("shared worker is past its lifetime or retiring: %w", sdk.ErrStaleIdentity)
+	}
+	selected, err := d.privatePoolWorker(ctx, record)
+	if err != nil || selected == nil {
+		return false, err
+	}
+	status := selected.GetStatus()
+	if status.GetState() == pb.WorkerState_WORKER_STATE_UNAVAILABLE || len(status.GetSandboxClasses()) == 0 || status.GetRegisteredEpoch() <= 0 {
+		return false, nil
+	}
+	if selected.GetMetadata().GetUid() == "" || status.GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
+		return false, fmt.Errorf("shared native worker must be active")
+	}
+	if status.GetObservedEpoch() != status.GetRegisteredEpoch() {
+		// The control plane has not yet released Actors of an earlier
+		// process; wait until the registered epoch is observed.
+		return false, nil
+	}
+	if err := verifySingleActorWorker(record, selected); err != nil {
+		return false, err
+	}
+	for key, value := range record.TemplateSpec.GetWorkerSelector().GetMatchLabels() {
+		if selected.GetLabels()[key] != value {
+			return false, sdk.ErrStaleIdentity
+		}
+	}
+	identity := &sharedWorkerIdentity{Name: selected.GetMetadata().GetName(), UID: selected.GetMetadata().GetUid(), PodUID: selected.GetWorkerPodUid(), Epoch: status.GetRegisteredEpoch()}
+	if ledger.Worker != nil && *ledger.Worker != *identity {
+		return false, fmt.Errorf("shared worker was replaced: %w", sdk.ErrStaleIdentity)
+	}
+	entry := ledgerEntry(ledger, claimMarker(cm, record))
+	if record.Actor.UID == "" || entry.ActorUID != "" && entry.ActorUID != record.Actor.UID {
+		return false, sdk.ErrStaleIdentity
+	}
+	if ledger.Worker == nil || entry.ActorUID == "" {
+		// The Actor UID is in the ledger before Resume, so its assignment can
+		// never precede its entry.
+		marker := claimMarker(cm, record)
+		found, err := d.updateSharedLedger(ctx, record.Placement.Namespace, shared.Pool, shared.UID, func(current *sharedLedger) (bool, error) {
+			if current.Scope != shared.Scope {
+				return false, sdk.ErrStaleIdentity
+			}
+			if current.Worker == nil {
+				current.Worker = identity
+			} else if *current.Worker != *identity {
+				return false, fmt.Errorf("shared worker was replaced: %w", sdk.ErrStaleIdentity)
+			}
+			own := ledgerEntry(current, marker)
+			if own == nil || own.ActorUID != "" && own.ActorUID != record.Actor.UID {
+				return false, sdk.ErrStaleIdentity
+			}
+			own.ActorUID = record.Actor.UID
+			return true, nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, sdk.ErrStaleIdentity
+		}
+		return false, nil
+	}
+	assigned, count, err := d.sharedAssignmentsInLedger(ctx, record, selected.GetMetadata().GetName())
+	if err != nil {
+		return false, err
+	}
+	if assigned {
+		return false, fmt.Errorf("shared worker reports this Actor before its boot: %w", sdk.ErrStaleIdentity)
+	}
+	if count >= int(shared.Scope.MaxActors) {
+		return false, fmt.Errorf("shared native worker has no free slot")
+	}
+	pod := &corev1.Pod{}
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: selected.WorkerNamespace, Name: selected.WorkerPod}, pod); err != nil {
+		return false, err
+	}
+	fence := &workerFence{Name: selected.Metadata.Name, UID: selected.Metadata.Uid, Namespace: selected.WorkerNamespace, Pool: selected.WorkerPool, Pod: selected.WorkerPod, PodUID: selected.WorkerPodUid, AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID, Epoch: status.GetRegisteredEpoch()}
+	if string(pod.UID) != fence.PodUID || pod.DeletionTimestamp != nil || pod.Labels[workerPoolLabel] != fence.Pool || pod.Labels[sharedPoolLabel] != shared.Label {
+		return false, sdk.ErrStaleIdentity
+	}
+	if record.Worker != nil && *record.Worker != *fence {
+		return false, sdk.ErrStaleIdentity
+	}
+	if record.Worker == nil {
+		record.Worker = fence
+		stamp(&record.Timing.WorkerActiveAt)
+		if err := d.save(ctx, cm, record); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// sharedWorkerIdentityMatches checks a native Worker against the fence.
+func sharedWorkerIdentityMatches(worker *pb.Worker, f *workerFence) bool {
+	return worker.GetMetadata().GetName() == f.Name && worker.GetMetadata().GetUid() == f.UID && worker.GetWorkerPodUid() == f.PodUID &&
+		worker.GetWorkerNamespace() == f.Namespace && worker.GetWorkerPool() == f.Pool && worker.GetWorkerPod() == f.Pod
+}
+
+// sharedStrongReason reports why retirement must take the strong path, or ""
+// when the interim evidence may still apply. Upstream read errors are doubt.
+//
+//nolint:gocyclo // Every reason for the strong path is listed in one place.
+func (d *Lifecycle) sharedStrongReason(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (string, error) {
+	shared := record.SharedWorker
+	if shared.Strong != "" {
+		return shared.Strong, nil
+	}
+	if record.Failure != "" {
+		return "the instance failed", nil
+	}
+	workspace := &api.ExecutionWorkspace{}
+	if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "the workspace disappeared", nil
+		}
+		return "", err
+	}
+	if workspace.UID != record.Request.Key.WorkspaceUID {
+		return "the workspace was replaced", nil
+	}
+	if workspaceSuspect(workspace) {
+		return "the workspace is tainted, quarantined or failed", nil
+	}
+	pool, err := d.getSharedPool(ctx, record)
+	switch {
+	case apierrors.IsNotFound(err):
+		return "the shared worker pool disappeared", nil
+	case err != nil:
+		return "", err
+	case string(pool.GetUID()) != shared.UID:
+		return "the shared worker pool was replaced", nil
+	case pool.GetDeletionTimestamp() != nil:
+		return "the shared worker pool is deleting", nil
+	}
+	ledger, err := sharedPoolMatches(pool, record)
+	if err != nil {
+		return "the shared worker ledger is in doubt", nil
+	}
+	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
+		return "the shared worker is " + strings.ToLower(ledger.State), nil
+	}
+	if ledgerEntry(ledger, claimMarker(cm, record)) == nil {
+		return "the shared worker ledger no longer holds this allocation", nil
+	}
+	if !sharedNow().Before(sharedRetireAt(pool, ledger)) {
+		return "the shared worker reached its maximum lifetime", nil
+	}
+	if record.Worker == nil {
+		return "the boot has no fenced worker", nil
+	}
+	if ledger.Worker != nil && (ledger.Worker.UID != record.Worker.UID || ledger.Worker.PodUID != record.Worker.PodUID || ledger.Worker.Epoch != record.Worker.Epoch) {
+		return "the shared worker was replaced", nil
+	}
+	for _, fence := range record.RetirementWorkers {
+		if fence.PodUID != record.Worker.PodUID {
+			return "the Actor ran on a replacement worker", nil
+		}
+	}
+	pod := &corev1.Pod{}
+	if err := d.client.Get(ctx, types.NamespacedName{Namespace: record.Worker.Namespace, Name: record.Worker.Pod}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "the shared worker Pod is gone", nil
+		}
+		return "", err
+	}
+	if string(pod.UID) != record.Worker.PodUID {
+		return "the shared worker Pod was replaced", nil
+	}
+	if pod.DeletionTimestamp != nil {
+		return "the shared worker Pod is terminating", nil
+	}
+	return "", nil
+}
+
+// markSharedStrong persists the strong path for this record.
+func (d *Lifecycle) markSharedStrong(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	if record.SharedWorker.Strong != "" {
+		return nil
+	}
+	record.SharedWorker.Strong = reason
+	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement takes the strong path", "workspaceNamespace", record.Request.Key.Namespace, "workspaceName", record.Request.Key.Name, "sequence", record.Request.Sequence, "reason", reason)
+	return d.save(ctx, cm, record)
+}
+
+// retireSharedPool closes a pool's ledger and deletes the pool with UID
+// precondition and foreground propagation. Each hosted allocation then proves
+// exact worker Pod UID absence. Deleting the worker Pod is how co-hosted
+// Actors are suspended: Orka core drains each for data-only suspension inside
+// the worker's eviction window.
+func (d *Lifecycle) retireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
+	if pool.GetDeletionTimestamp() != nil {
+		return nil
+	}
+	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
+		ledger.State, ledger.Reason = state, reason
+		if err := setSharedLedger(pool, ledger); err != nil {
+			return err
+		}
+		if err := d.client.Update(ctx, pool); err != nil {
+			return err
+		}
+		namespace := ledger.Scope.Namespace
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "workspaceNamespace", namespace, "state", state, "reason", reason)
+	}
+	uid := pool.GetUID()
+	if err := d.client.Delete(ctx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// revokeSharedEgress installs and verifies deny-all egress, removing every
+// credential-injection effect, before the Actor is suspended.
+func (d *Lifecycle) revokeSharedEgress(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if record.SharedWorker.EgressRevoked {
+		return nil
+	}
+	if err := d.applyEgressPolicy(ctx, cm, record, nil, errSharedEgressRevoked); err != nil && !errors.Is(err, errEgressDeniedAll) {
+		return err
+	}
+	if err := d.verifyEgressDenyAll(ctx, record); err != nil {
+		return err
+	}
+	record.SharedWorker.EgressRevoked = true
+	return d.save(ctx, cm, record)
+}
+
+func (d *Lifecycle) verifyEgressDenyAll(ctx context.Context, record *journalRecord) error {
+	empty, err := egressRulesDigest(nil)
+	if err != nil {
+		return err
+	}
+	existing, err := d.control.GetActorEgressPolicy(ctx, &pb.GetActorEgressPolicyRequest{Actor: actorRef(record), Name: egressPolicyName})
+	if err != nil {
+		return err
+	}
+	applied, err := egressRulesDigest(existing.GetRules())
+	if err != nil {
+		return err
+	}
+	if !record.EgressDenyAll || record.EgressPolicy.UID == "" || existing.GetMetadata().GetUid() != record.EgressPolicy.UID || applied != empty || record.EgressPolicy.Digest != empty {
+		return fmt.Errorf("native Actor egress is not deny-all")
+	}
+	return nil
+}
+
+// prepareSharedSuspend runs before SuspendActor on a shared worker. It checks
+// the fenced worker and ledger (doubt marks the strong path, but data capture
+// still proceeds), revokes egress, and records the suspend fence.
+func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) error {
+	shared := record.SharedWorker
+	if reason, err := d.sharedStrongReason(ctx, cm, record); err != nil {
+		return err
+	} else if reason != "" {
+		if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
+			return err
+		}
+	} else if err := d.verifyRetiringSharedWorker(ctx, record); err != nil {
+		if err := d.markSharedStrong(ctx, cm, record, "the shared worker could not be verified before suspension: "+err.Error()); err != nil {
+			return err
+		}
+	}
+	if err := d.revokeSharedEgress(ctx, cm, record); err != nil {
+		return err
+	}
+	if shared.Suspend == nil || !shared.Suspend.Issued {
+		shared.Suspend = &sharedSuspendFence{Issued: true, PriorVersion: actor.GetMetadata().GetVersion(), PriorGeneration: actor.GetStatus().GetLastAssignedGeneration(), PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
+	}
+	return nil
+}
+
+// sharedSuspendFenceOf returns the issued shared suspend fence, if any.
+func sharedSuspendFenceOf(record *journalRecord) *sharedSuspendFence {
+	if record.SharedWorker == nil || record.SharedWorker.Suspend == nil || !record.SharedWorker.Suspend.Issued {
+		return nil
+	}
+	return record.SharedWorker.Suspend
+}
+
+// verifyRetiringSharedWorker checks the live fenced worker and that every
+// assignment on it is a ledger Actor.
+func (d *Lifecycle) verifyRetiringSharedWorker(ctx context.Context, record *journalRecord) error {
+	f := record.Worker
+	if f == nil {
+		return fmt.Errorf("native worker fence is missing")
+	}
+	worker, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
+	if err != nil {
+		return err
+	}
+	if !sharedWorkerIdentityMatches(worker, f) || worker.GetStatus().GetRegisteredEpoch() != f.Epoch {
+		return sdk.ErrStaleIdentity
+	}
+	if err := verifySingleActorWorkerShape(record, worker, true); err != nil {
+		return err
+	}
+	_, _, err = d.sharedAssignmentsInLedger(ctx, record, f.Name)
+	return err
+}
+
+// proveSharedTermination evaluates the interim evidence for a SUSPENDED
+// Actor. It returns a proof, a doubt (strong path), or neither when only the
+// worker version moved and the proof should be retried.
+//
+//nolint:gocyclo // The interim evidence is a fixed sequence of exact checks.
+func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (*sharedTerminationProof, string) {
+	shared := record.SharedWorker
+	fence := shared.Suspend
+	f := record.Worker
+	// (1) The Actor is SUSPENDED at a later version with the expected
+	// completed data-only snapshot, and holds no worker assignment.
+	snapshot := latestSnapshot(actor)
+	if fence == nil || !fence.Issued || fence.SnapshotDigest == "" || actor.GetMetadata().GetUid() != record.Actor.UID || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED ||
+		actor.GetStatus().GetWorkerAssignment() != nil || actor.GetMetadata().GetVersion() <= fence.PriorVersion ||
+		snapshotDigest(snapshot) != fence.SnapshotDigest || verifyDataSnapshot(snapshot, pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR) != nil || snapshot.GetGeneration() <= fence.PriorGeneration {
+		return nil, "the suspended Actor does not match the issued suspend"
+	}
+	// (2) Its assignment is absent from the same fenced worker, at the same
+	// settled epoch and an unchanged worker version.
+	before, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
+	if err != nil {
+		return nil, "the fenced worker could not be read: " + status.Code(err).String()
+	}
+	if !sharedWorkerIdentityMatches(before, f) || before.GetStatus().GetRegisteredEpoch() != f.Epoch || before.GetStatus().GetObservedEpoch() != f.Epoch {
+		return nil, "the fenced worker's identity or epoch changed"
+	}
+	assigned, _, err := d.sharedAssignmentsInLedger(ctx, record, f.Name)
+	if err != nil {
+		return nil, "the fenced worker's assignments are in doubt: " + err.Error()
+	}
+	if assigned {
+		return nil, "the fenced worker still lists the suspended Actor"
+	}
+	after, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
+	if err != nil {
+		return nil, "the fenced worker could not be re-read: " + status.Code(err).String()
+	}
+	if !sharedWorkerIdentityMatches(after, f) || after.GetStatus().GetRegisteredEpoch() != f.Epoch || after.GetStatus().GetObservedEpoch() != f.Epoch {
+		return nil, "the fenced worker's identity or epoch changed during the proof"
+	}
+	if after.GetMetadata().GetVersion() != before.GetMetadata().GetVersion() {
+		if shared.ProofAttempts+1 >= sharedMaxProofAttempts {
+			return nil, "the fenced worker kept changing during the proof"
+		}
+		shared.ProofAttempts++
+		if err := d.save(ctx, cm, record); err != nil {
+			return nil, "the proof attempt could not be recorded"
+		}
+		return nil, ""
+	}
+	// (3) Egress is still deny-all: no credential-injection effect remains.
+	if err := d.verifyEgressDenyAll(ctx, record); err != nil {
+		return nil, "the revoked egress could not be verified"
+	}
+	current, err := d.actor(ctx, record)
+	if err != nil || current == nil || current.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() || current.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED || current.GetStatus().GetWorkerAssignment() != nil {
+		return nil, "the suspended Actor changed during the proof"
+	}
+	return &sharedTerminationProof{WorkerUID: f.UID, Epoch: f.Epoch, WorkerVersion: after.GetMetadata().GetVersion(), ActorVersion: actor.GetMetadata().GetVersion(), At: *milestone()}, ""
+}
+
+// stopShared retires a record on a shared worker. A never-booted Actor only
+// releases its slot. Otherwise the interim evidence applies unless there is
+// doubt, which takes the strong path; neighbours are never touched outside
+// that explicit path.
+//
+//nolint:gocyclo // Retirement steps follow the journal in order.
+func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) error {
+	shared := record.SharedWorker
+	if shared.UID == "" && !shared.Released {
+		if record.BootRequested {
+			return fmt.Errorf("native boot has no bound shared worker")
+		}
+		if err := d.resolveRetiringSharedClaim(ctx, cm, record); err != nil {
+			return err
+		}
+	}
+	if record.BootRequested && !record.WorkloadAbsent {
+		if actor != nil && actor.GetStatus().GetWorkerAssignment() != nil && (record.Worker == nil || !sharedAssignmentMatches(actor.GetStatus().GetWorkerAssignment(), record.Worker)) {
+			if err := d.captureSharedReplacement(ctx, cm, record, actor); err != nil {
+				return err
+			}
+		}
+		// A journaled interim proof is sufficient on its own; later doubt about
+		// the pool does not reopen it.
+		reason := ""
+		if shared.Proof == nil {
+			var err error
+			if reason, err = d.sharedStrongReason(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		if reason == "" && shared.Proof == nil {
+			proven, doubt, err := d.advanceSharedInterim(ctx, cm, record, actor)
+			if err != nil || (!proven && doubt == "") {
+				return err
+			}
+			reason = doubt
+		}
+		if reason != "" {
+			if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
+				return err
+			}
+			gone, err := d.strongSharedAbsence(ctx, record)
+			if err != nil || !gone {
+				return err
+			}
+		}
+		record.WorkloadAbsent = true
+		stamp(&record.Timing.WorkerAbsentAt)
+		if err := d.save(ctx, cm, record); err != nil {
+			return err
+		}
+	}
+	if actor != nil {
+		if !record.DeleteIssued {
+			record.DeleteIssued = true
+			stamp(&record.Timing.ActorDeleteIssuedAt)
+			if err := d.save(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		_, err := d.control.DeleteActor(ctx, &pb.DeleteActorRequest{Actor: actorRef(record), Options: &pb.DeleteOptions{Uid: actor.GetMetadata().GetUid()}})
+		if err != nil && status.Code(err) != codes.NotFound {
+			return err
+		}
+		return nil
+	}
+	if err := d.releaseSharedSlot(ctx, cm, record); err != nil {
+		return err
+	}
+	return d.finishStop(ctx, cm, record)
+}
+
+// advanceSharedInterim moves the interim path forward by one step. It
+// returns proven when the proof is journaled, a doubt for the strong path, or
+// neither while waiting.
+func (d *Lifecycle) advanceSharedInterim(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (bool, string, error) {
+	shared := record.SharedWorker
+	if actor == nil {
+		return false, "the Actor disappeared before its termination was proven", nil
+	}
+	switch actor.GetStatus().GetState() {
+	case pb.ActorState_ACTOR_STATE_RUNNING:
+		if shared.Suspend != nil && shared.Suspend.Issued {
+			return false, "the Actor kept running after its suspend was issued", nil
+		}
+		// A Stop issues the same synchronous VOLUMES suspend, only as
+		// termination evidence; no Tag is kept.
+		if err := d.prepareSharedSuspend(ctx, cm, record, actor); err != nil {
+			return false, "", err
+		}
+		if shared.Strong != "" {
+			return false, shared.Strong, nil
+		}
+		stamp(&record.Timing.SuspendIssuedAt)
+		if err := d.save(ctx, cm, record); err != nil {
+			return false, "", err
+		}
+		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
+		return false, "", err
+	case pb.ActorState_ACTOR_STATE_SUSPENDING:
+		return false, "", nil
+	case pb.ActorState_ACTOR_STATE_SUSPENDED:
+	default:
+		return false, "the Actor is " + actor.GetStatus().GetState().String(), nil
+	}
+	if shared.Suspend == nil || !shared.Suspend.Issued || !shared.EgressRevoked {
+		return false, "the Actor was suspended outside the recorded retirement", nil
+	}
+	if shared.Suspend.SnapshotDigest == "" {
+		snapshot := latestSnapshot(actor)
+		if verifyDataSnapshot(snapshot, pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR) != nil || snapshot.GetActorTemplateUid() != record.Template.UID || snapshot.GetGeneration() <= shared.Suspend.PriorGeneration || snapshotDigest(snapshot) == shared.Suspend.PriorSnapshotDigest {
+			return false, "the suspension exposed no new completed data-only snapshot", nil
+		}
+		shared.Suspend.SnapshotDigest = snapshotDigest(snapshot)
+		shared.Suspend.ObservedVersion = actor.GetMetadata().GetVersion()
+		stamp(&record.Timing.SuspendedObservedAt)
+		if err := d.save(ctx, cm, record); err != nil {
+			return false, "", err
+		}
+	}
+	proof, doubt := d.proveSharedTermination(ctx, cm, record, actor)
+	if proof == nil {
+		return false, doubt, nil
+	}
+	shared.Proof = proof
+	if err := d.save(ctx, cm, record); err != nil {
+		return false, "", err
+	}
+	return true, "", nil
+}
+
+func sharedAssignmentMatches(assignment *pb.WorkerAssignment, f *workerFence) bool {
+	return assignment.GetWorker().GetName() == f.Name && assignment.GetWorkerNamespace() == f.Namespace && assignment.GetWorkerPool() == f.Pool && assignment.GetWorkerPod() == f.Pod && assignment.GetWorkerPodUid() == f.PodUID
+}
+
+// captureSharedReplacement records a different worker the Actor is assigned
+// to in the same pool. That is doubt, so retirement takes the strong path and
+// waits for that Pod's absence too.
+func (d *Lifecycle) captureSharedReplacement(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) error {
+	assignment := actor.GetStatus().GetWorkerAssignment()
+	if assignment.GetWorkerNamespace() != record.Placement.Namespace || assignment.GetWorkerPool() != record.RuntimePool.Name || assignment.GetWorkerPodUid() == "" || assignment.GetWorkerPod() == "" {
+		return sdk.ErrStaleIdentity
+	}
+	for i := range record.RetirementWorkers {
+		if sharedAssignmentMatches(assignment, &record.RetirementWorkers[i]) {
+			return nil
+		}
+	}
+	if len(record.RetirementWorkers) == 16 {
+		return fmt.Errorf("native replacement retirement evidence exceeded bound")
+	}
+	record.RetirementWorkers = append(record.RetirementWorkers, workerFence{Name: assignment.GetWorker().GetName(), Namespace: assignment.GetWorkerNamespace(), Pool: assignment.GetWorkerPool(), Pod: assignment.GetWorkerPod(), PodUID: assignment.GetWorkerPodUid(), AllocationID: record.Observation.Identity.AllocationID, InstanceID: record.Observation.Identity.InstanceID})
+	if record.SharedWorker.Strong == "" {
+		record.SharedWorker.Strong = "the Actor was assigned to a replacement worker"
+	}
+	return d.save(ctx, cm, record)
+}
+
+// strongSharedAbsence retires the record's pool and reports true once the
+// pool is gone and every fenced worker Pod UID is absent.
+func (d *Lifecycle) strongSharedAbsence(ctx context.Context, record *journalRecord) (bool, error) {
+	shared := record.SharedWorker
+	pool, err := d.getSharedPool(ctx, record)
+	poolGone := apierrors.IsNotFound(err)
+	if err != nil && !poolGone {
+		return false, err
+	}
+	if !poolGone {
+		if string(pool.GetUID()) != shared.UID {
+			poolGone = true
+		} else if err := d.retireSharedPool(ctx, pool, sharedRetiring, shared.Strong); err != nil {
+			return false, err
+		}
+	}
+	fences := append([]workerFence{}, record.RetirementWorkers...)
+	if record.Worker != nil {
+		fences = append(fences, *record.Worker)
+	}
+	allAbsent := true
+	for i := range fences {
+		f := &fences[i]
+		absent, err := d.workerFenceAbsent(ctx, f)
+		if err != nil {
+			return false, err
+		}
+		if absent {
+			continue
+		}
+		allAbsent = false
+		pod := &corev1.Pod{}
+		if err := d.client.Get(ctx, types.NamespacedName{Namespace: f.Namespace, Name: f.Pod}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		if string(pod.UID) != f.PodUID || pod.Labels[workerPoolLabel] != f.Pool || pod.Labels[sharedPoolLabel] != shared.Label {
+			return false, sdk.ErrStaleIdentity
+		}
+		if pod.DeletionTimestamp == nil && poolGone {
+			if err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
+				return false, err
+			}
+		}
+	}
+	return poolGone && allAbsent, nil
+}
+
+// resolveRetiringSharedClaim binds an issued but unbound claim or creation
+// only through this record's own ledger entry; otherwise the record releases
+// it and holds nothing to retire.
+func (d *Lifecycle) resolveRetiringSharedClaim(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	shared := record.SharedWorker
+	if shared.ClaimIssued || shared.CreateIssued {
+		pool, err := d.getSharedPool(ctx, record)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if err == nil {
+			if ledger, matchErr := sharedPoolMatches(pool, record); matchErr == nil && ledgerEntry(ledger, claimMarker(cm, record)) != nil {
+				shared.UID = string(pool.GetUID())
+				record.RuntimePool.UID = shared.UID
+				return d.save(ctx, cm, record)
+			}
+		}
+	}
+	shared.Released = true
+	return d.save(ctx, cm, record)
+}
+
+// releaseSharedSlot removes this record's ledger entry after its Actor is
+// gone. A missing, replaced or deleting pool holds nothing to release.
+func (d *Lifecycle) releaseSharedSlot(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	shared := record.SharedWorker
+	if shared.Released {
+		return nil
+	}
+	if shared.UID != "" {
+		marker := claimMarker(cm, record)
+		_, err := d.updateSharedLedger(ctx, record.Placement.Namespace, shared.Pool, shared.UID, func(ledger *sharedLedger) (bool, error) {
+			before := len(ledger.Entries)
+			ledger.Entries = slices.DeleteFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.Journal == marker })
+			return len(ledger.Entries) != before, nil
+		})
+		// An unreadable ledger admits nobody, so the Actor's already-deleted
+		// slot needs no release there; API errors and conflicts are retried.
+		if err != nil && !errors.Is(err, errSharedLedgerInvalid) {
+			return err
+		}
+	}
+	shared.Released = true
+	return d.save(ctx, cm, record)
+}
+
+// finishStop reports Stopped, with retained data for a suspension.
+func (d *Lifecycle) finishStop(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	first := record.Observation.State != sdk.AllocationStopped && record.Timing.StoppedAt == nil
+	record.Observation.State = sdk.AllocationStopped
+	record.Observation.Startup = nil
+	if first {
+		stamp(&record.Timing.StoppedAt)
+	}
+	if record.Operation == "suspend" {
+		if record.Checkpoint == nil {
+			return fmt.Errorf("native suspension has no verified Data Tag")
+		}
+		if err := d.verifyCheckpoint(ctx, record.Checkpoint); err != nil {
+			return err
+		}
+		data, err := json.Marshal(record.Checkpoint)
+		if err != nil {
+			return err
+		}
+		record.Observation.RetainedData = &sdk.RetainedDataReference{ID: record.Checkpoint.Tag.Name, SourceInstance: record.Observation.Identity, ProofSHA256: digest(data)}
+	}
+	if err := d.save(ctx, cm, record); err != nil {
+		return err
+	}
+	if first {
+		logRuntimeStopped(ctx, record)
+	}
+	return nil
+}
+
+// terminationProof names the evidence a stopped record used, for timing.
+func terminationProof(record *journalRecord) string {
+	shared := record.SharedWorker
+	switch {
+	case shared == nil || !record.BootRequested:
+		return ""
+	case shared.Strong != "":
+		return "strong"
+	case shared.Proof != nil:
+		return "interim"
+	default:
+		return ""
+	}
+}

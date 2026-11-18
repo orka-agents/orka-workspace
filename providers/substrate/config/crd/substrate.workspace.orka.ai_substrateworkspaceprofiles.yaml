@@ -49,6 +49,44 @@ spec:
             description: SubstrateWorkspaceProfileSpec contains only Substrate infrastructure
               inputs.
             properties:
+              placement:
+                description: |-
+                  Placement opts in to shared workers. Omission keeps one Actor per
+                  private worker, and the profile hash is unchanged.
+                properties:
+                  sharedWorkers:
+                    description: |-
+                      SharedWorkersPolicy opts a profile in to shared native workers under the
+                      interim termination evidence of provider ADR 0008 and Orka ADR 0056. Up to
+                      maxActorsPerWorker data-only Actors of one namespace, profile and Actor size
+                      share one gVisor worker, which is recycled after maxWorkerLifetime. Taking
+                      this field changes the profile hash: sharing changes the security model, so
+                      it can only be adopted by creating a new profile.
+                    properties:
+                      maxActorsPerWorker:
+                        description: |-
+                          MaxActorsPerWorker is the number of Actors one shared worker is sized
+                          for and admits.
+                        format: int32
+                        maximum: 16
+                        minimum: 2
+                        type: integer
+                      maxWorkerLifetime:
+                        description: |-
+                          MaxWorkerLifetime bounds how long a shared worker lives. It stops
+                          admitting Actors before then and is deleted, with exact worker Pod
+                          absence proof for every Actor it still hosts, when it is reached.
+                          Defaults to 24h, which is also the maximum.
+                        type: string
+                    required:
+                    - maxActorsPerWorker
+                    type: object
+                    x-kubernetes-validations:
+                    - message: maxWorkerLifetime must be at least 1h and at most 24h
+                      rule: '!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime)
+                        >= duration(''1h'') && duration(self.maxWorkerLifetime) <=
+                        duration(''24h''))'
+                type: object
               retention:
                 description: |-
                   RetentionPolicy limits suspended occupancy per class and namespace. A class
@@ -115,6 +153,9 @@ spec:
             - message: retention.suspendAfterDetach requires suspend.mode DataOnly
               rule: '!has(self.retention) || !has(self.retention.suspendAfterDetach)
                 || (has(self.suspend) && self.suspend.mode == ''DataOnly'')'
+            - message: placement.sharedWorkers requires suspend.mode DataOnly
+              rule: '!has(self.placement) || !has(self.placement.sharedWorkers) ||
+                (has(self.suspend) && self.suspend.mode == ''DataOnly'')'
         required:
         - spec
         type: object

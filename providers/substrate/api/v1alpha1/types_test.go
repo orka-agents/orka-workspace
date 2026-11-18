@@ -301,3 +301,43 @@ func TestGeneratedSuspendAfterDetachSchema(t *testing.T) {
 		t.Fatalf("existing profile spec changed on round trip: %v", roundTrip["spec"])
 	}
 }
+
+func TestGeneratedSharedWorkersSchema(t *testing.T) {
+	schema := loadSchema(t, "substrateworkspaceprofiles")
+	shared := func(policy map[string]any) map[string]any {
+		return map[string]any{"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "suspend": map[string]any{"mode": "DataOnly"}, "placement": map[string]any{"sharedWorkers": policy}}}
+	}
+	for _, policy := range []map[string]any{
+		{"maxActorsPerWorker": int64(2)},
+		{"maxActorsPerWorker": int64(16), "maxWorkerLifetime": "24h"},
+		{"maxActorsPerWorker": int64(4), "maxWorkerLifetime": "1h"},
+	} {
+		object := shared(policy)
+		if errs := schema.validate(t, object, nil); len(errs) != 0 {
+			t.Fatalf("%v rejected: %v", policy, errs)
+		}
+		pruned := runtime.DeepCopyJSON(object)
+		structuralpruning.Prune(pruned, schema.structural, true)
+		if !reflect.DeepEqual(pruned, object) {
+			t.Fatalf("%v pruned: %v", policy, pruned)
+		}
+	}
+	for name, object := range map[string]map[string]any{
+		"one actor":           shared(map[string]any{"maxActorsPerWorker": int64(1)}),
+		"seventeen actors":    shared(map[string]any{"maxActorsPerWorker": int64(17)}),
+		"missing actors":      shared(map[string]any{"maxWorkerLifetime": "2h"}),
+		"short lifetime":      shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "59m"}),
+		"long lifetime":       shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "24h0m1s"}),
+		"without data-only":   {"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "placement": map[string]any{"sharedWorkers": map[string]any{"maxActorsPerWorker": int64(2)}}}},
+		"unparsable lifetime": shared(map[string]any{"maxActorsPerWorker": int64(2), "maxWorkerLifetime": "soon"}),
+	} {
+		if len(schema.validate(t, object, nil)) == 0 {
+			t.Fatalf("%s accepted by generated schema", name)
+		}
+	}
+	// Adopting sharing changes the frozen spec, which is immutable.
+	plain := map[string]any{"spec": map[string]any{"templateRef": map[string]any{"name": "template"}, "suspend": map[string]any{"mode": "DataOnly"}}}
+	if len(schema.validate(t, shared(map[string]any{"maxActorsPerWorker": int64(2)}), plain)) == 0 {
+		t.Fatal("an existing profile adopted shared workers in place")
+	}
+}

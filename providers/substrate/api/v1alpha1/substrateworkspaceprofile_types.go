@@ -66,9 +66,58 @@ type RetentionPolicy struct {
 // MaxSuspendAfterDetach bounds the warm window a profile may request.
 const MaxSuspendAfterDetach = time.Hour
 
+// SharedWorkersPolicy opts a profile in to shared native workers under the
+// interim termination evidence of provider ADR 0008 and Orka ADR 0056. Up to
+// maxActorsPerWorker data-only Actors of one namespace, profile and Actor size
+// share one gVisor worker, which is recycled after maxWorkerLifetime. Taking
+// this field changes the profile hash: sharing changes the security model, so
+// it can only be adopted by creating a new profile.
+// +kubebuilder:validation:XValidation:rule="!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime) >= duration('1h') && duration(self.maxWorkerLifetime) <= duration('24h'))",message="maxWorkerLifetime must be at least 1h and at most 24h"
+type SharedWorkersPolicy struct {
+	// MaxActorsPerWorker is the number of Actors one shared worker is sized
+	// for and admits.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=16
+	MaxActorsPerWorker int32 `json:"maxActorsPerWorker"`
+
+	// MaxWorkerLifetime bounds how long a shared worker lives. It stops
+	// admitting Actors before then and is deleted, with exact worker Pod
+	// absence proof for every Actor it still hosts, when it is reached.
+	// Defaults to 24h, which is also the maximum.
+	// +optional
+	MaxWorkerLifetime *metav1.Duration `json:"maxWorkerLifetime,omitempty"`
+}
+
+// SubstratePlacementPolicy chooses how Actors are placed on native workers.
+// Omission keeps one Actor per private worker.
+type SubstratePlacementPolicy struct {
+	// +optional
+	SharedWorkers *SharedWorkersPolicy `json:"sharedWorkers,omitempty"`
+}
+
+const (
+	// MinSharedActorsPerWorker and MaxSharedActorsPerWorker bound
+	// sharedWorkers.maxActorsPerWorker.
+	MinSharedActorsPerWorker = 2
+	MaxSharedActorsPerWorker = 16
+	// MinSharedWorkerLifetime and MaxSharedWorkerLifetime bound
+	// sharedWorkers.maxWorkerLifetime; the maximum is also the default.
+	MinSharedWorkerLifetime = time.Hour
+	MaxSharedWorkerLifetime = 24 * time.Hour
+)
+
+// WorkerLifetime returns the effective maximum worker lifetime.
+func (p *SharedWorkersPolicy) WorkerLifetime() time.Duration {
+	if p == nil || p.MaxWorkerLifetime == nil {
+		return MaxSharedWorkerLifetime
+	}
+	return p.MaxWorkerLifetime.Duration
+}
+
 // SubstrateWorkspaceProfileSpec contains only Substrate infrastructure inputs.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="SubstrateWorkspaceProfile spec is immutable; create a new profile"
 // +kubebuilder:validation:XValidation:rule="!has(self.retention) || !has(self.retention.suspendAfterDetach) || (has(self.suspend) && self.suspend.mode == 'DataOnly')",message="retention.suspendAfterDetach requires suspend.mode DataOnly"
+// +kubebuilder:validation:XValidation:rule="!has(self.placement) || !has(self.placement.sharedWorkers) || (has(self.suspend) && self.suspend.mode == 'DataOnly')",message="placement.sharedWorkers requires suspend.mode DataOnly"
 type SubstrateWorkspaceProfileSpec struct {
 	TemplateRef SubstrateTemplateReference `json:"templateRef"`
 
@@ -79,6 +128,11 @@ type SubstrateWorkspaceProfileSpec struct {
 
 	// +optional
 	Retention *RetentionPolicy `json:"retention,omitempty"`
+
+	// Placement opts in to shared workers. Omission keeps one Actor per
+	// private worker, and the profile hash is unchanged.
+	// +optional
+	Placement *SubstratePlacementPolicy `json:"placement,omitempty"`
 }
 
 // +kubebuilder:object:root=true

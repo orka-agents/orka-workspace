@@ -39,7 +39,8 @@ type lifecycleTiming struct {
 	// lost; the timing log then uses CreatedAt.
 	TagCompletedAt *metav1.MicroTime `json:"tagCompletedAt,omitempty"`
 	// WorkerAbsentAt is when the exact worker Pods and private pool were
-	// first proven absent.
+	// first proven absent, or, on a shared worker, when the interim or
+	// strong termination evidence was first journaled.
 	WorkerAbsentAt      *metav1.MicroTime `json:"workerAbsentAt,omitempty"`
 	ActorDeleteIssuedAt *metav1.MicroTime `json:"actorDeleteIssuedAt,omitempty"`
 	StoppedAt           *metav1.MicroTime `json:"stoppedAt,omitempty"`
@@ -99,7 +100,13 @@ func allocationPath(record *journalRecord) string {
 
 // workerSource is spare when the private WorkerPool was a claimed spare, so
 // workerPoolMs and workerActiveMs measure the claim instead of worker birth.
+//
+// A shared worker reports shared: workerPoolMs then measures the slot claim
+// (or the shared pool's creation) and workerActiveMs the wait for its worker.
 func workerSource(record *journalRecord) string {
+	if shared := record.SharedWorker; shared != nil && shared.UID != "" {
+		return "shared"
+	}
 	if spare := record.SpareWorker; spare != nil && !spare.Released && record.RuntimePool.UID != "" {
 		return "spare"
 	}
@@ -124,6 +131,12 @@ func readyTimingValues(record *journalRecord) []any {
 func stoppedTimingValues(record *journalRecord) []any {
 	t := &record.Timing
 	values := append(timingSubject(record), "operation", record.Operation)
+	if record.SharedWorker != nil {
+		values = append(values, "workerSource", "shared")
+		if proof := terminationProof(record); proof != "" {
+			values = append(values, "terminationProof", proof)
+		}
+	}
 	values = phase(values, "suspendMs", t.SuspendIssuedAt, t.SuspendedObservedAt)
 	tagCompleted := t.TagCompletedAt
 	// A recovered checkpoint, or one captured before this journal recorded
