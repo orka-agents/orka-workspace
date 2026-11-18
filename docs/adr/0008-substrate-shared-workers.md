@@ -192,7 +192,12 @@ These take the strong path:
   - the evidence-only suspend issued by a Stop is rejected or times out. The strong reason is persisted, and the pool's retirement started, before that pass returns.
 
   Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued. Once the worker Pod is proven absent, that instance is reported lost and retires through Stop, keeping its last checkpoint.
-- **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop also reads each hosted entry's journal and deletes any pool whose journal holds the marker or a recorded instance failure. It also deletes any pool whose ledger was saved as `Retiring` or `Quarantined`. A crash between saving either intent and deleting the pool therefore cannot leave the pool running, even when the native sweep runs out of time.
+- **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
+  - a hosted entry's journal holds the marker or a recorded instance failure;
+  - a hosted workspace is operator-tainted, quarantined or `Failed`;
+  - its ledger was saved as `Retiring` or `Quarantined`.
+
+  A crash between saving any of these intents and deleting the pool therefore cannot leave the pool running, even when the native sweep runs out of time or the native API is down. Every strong trigger (the marker, a failure, a pool's retirement) is persisted, and the pool's deletion started, under a fresh context bounded to 30 s and detached from the request's own deadline, so a native call that outlived the request cannot prevent it.
 - **The Actor or worker is already lost:** the Actor crashed, the worker Pod is terminating or gone, or the pool is deleting, closed for retirement, or no longer holds the entry.
 - **A suspect workspace:**
   - a workspace on the pool becomes operator-tainted, quarantined, or `Failed`, or its instance records a failure in its journal, even before the workspace reports `Failed`. The leader then strongly retires the whole pool, not just closes its admission, and admission never places an Actor on it.
