@@ -47,12 +47,15 @@ shared workers:
   (`cmd/atecontroller/internal/controllers/workerpool_apply.go`), of which the worker
   spends at most 30 minutes draining its Actors (`cmd/ateworker-gvisor/main.go`,
   `workloadGracePeriod`).
-- The egress gateway caches each Actor's policy for 10 s
-  (`cmd/atenet/internal/router/egress/policycache.go`). The worker's DNS relay caches
-  it for 5 s, and keeps a stale policy when a refresh fails
-  (`internal/atunnel/egresspolicy.go`). A checkpoint deactivates the Actor's tunnel
-  synchronously, draining its active streams, before it captures anything, and fails
-  if it cannot (`internal/atunnel/tunnel.go`, `Deactivate`).
+- The egress gateway caches each Actor's policy for `--egress-policy-cache-ttl`,
+  default 10 s (`cmd/atenet/internal/router/cmd.go`, `egress/policycache.go`). Cache
+  expiry governs only new requests. It does not end streams already admitted.
+- The worker's DNS relay caches the policy for 5 s, and keeps a stale policy when a
+  refresh fails (`internal/atunnel/egresspolicy.go`).
+- A checkpoint first calls `Tunnel.Deactivate` (`internal/atunnel/tunnel.go`) and fails
+  if it cannot. That call stops ingress and TCP egress and drains their active streams.
+  It does not stop the DNS relay, which ends only in the later, best-effort teardown
+  (`unhostActor`, then `SandboxSession.Close`).
 - `MarkWorkerUnavailable` changes a Worker's state without changing its identity or
   epochs (`cmd/ateapi/internal/controlapi/worker.go`).
 - Workers report `--max-actors` (default 1000) as their Actor count, which no
@@ -148,7 +151,9 @@ Ready observation keeps the same ledger check.
 The normal retirement path on a shared worker takes these steps:
 
 1. **Revoke egress, and let it settle.** The Actor's `default` EgressPolicy is replaced by deny-all and read back. Its credential-injection effects go with it.
-   - `SuspendActor` is issued only after deny-all has been stored for `sharedEgressSettle` (15 s). That covers the gateway's 10 s policy cache, the DNS relay's 5 s cache, and a margin. Upstream exposes no enforcement acknowledgement to wait for instead.
+   - `SuspendActor` is issued only after deny-all has been stored for longer than the larger of the gateway's policy cache and the DNS relay's 5 s cache, plus a 5 s margin: 15 s with the default gateway TTL.
+   - The gateway's TTL is the provider flag `--substrate-egress-policy-cache-ttl` (default 10 s, the upstream default). Operators of a sharing install must set it to the gateway's own `--egress-policy-cache-ttl`.
+   - The provider cannot verify that value. Reading the gateway's Deployment would need access to Substrate's system namespace, outside its least-privilege RBAC. Upstream exposes no enforcement acknowledgement either.
    - The checkpoint itself then deactivates the tunnel synchronously and drains its streams.
    - A Stop issues the same synchronous `VOLUMES` suspend, purely as termination evidence, and keeps no Tag.
 2. **The Actor is suspended.** The Actor is `SUSPENDED`, under its recorded UID, with no worker assignment, at a version above the one read just before suspend. It holds a new, completed, Actor-owned `VOLUMES` snapshot whose digest matches the one recorded.
@@ -177,14 +182,16 @@ These take the strong path:
   - the worker's identity, epoch or `ACTIVE` state changes;
   - a foreign assignment or template appears;
   - any upstream error occurs.
-- **Uncertainty in the suspend path, never replayed:**
-  - the Actor cannot be read;
-  - it leaves `RUNNING` before the suspend is issued;
-  - egress revocation fails;
-  - the shared worker cannot be verified;
-  - a suspend was issued, possibly without taking effect, and the Actor is still `RUNNING` or in any state other than `SUSPENDING` or `SUSPENDED`.
+- **Uncertainty in the suspend path, never replayed.** Once the suspension intent is persisted, every error on a shared worker selects the strong path, apart from a journal write conflict, which is retried. That includes:
+  - the Actor cannot be read, or is not `RUNNING` when its suspension begins or before the suspend is issued;
+  - egress revocation fails, or the shared worker cannot be verified;
+  - the template cannot be verified;
+  - a suspend was issued, possibly without taking effect, and the Actor is still `RUNNING` or in any state other than `SUSPENDING` or `SUSPENDED`;
+  - the snapshot evidence is invalid;
+  - any Tag-capture step fails.
 
   Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued. Once the worker Pod is proven absent, that instance is reported lost and retires through Stop, keeping its last checkpoint.
+- **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop also reads each hosted entry's journal and deletes any pool whose journal holds the marker. A crash between saving the marker and deleting the pool therefore cannot leave the pool running.
 - **The Actor or worker is already lost:** the Actor crashed, the worker Pod is terminating or gone, or the pool is deleting, closed for retirement, or no longer holds the entry.
 - **A suspect workspace:**
   - a workspace on the pool becomes operator-tainted, quarantined, or `Failed`, or its instance records a failure. The leader then strongly retires the whole pool, not just closes its admission.
@@ -199,14 +206,18 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Strong retirement starts** at `maxWorkerLifetime − 3600 s − 5 min`. That leaves the worker Pod's whole termination grace, which contains the worker's 30-minute drain and Orka core's 30-minute eviction window, plus a margin.
 - **Admission closes** one hour before that, which is why the minimum lifetime is 3h.
 - **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof.
-- **Kubernetes alone.** Lifetime enforcement runs first in every sweep and makes no native call, so an unavailable control plane or slow native discovery cannot postpone it.
+- **Its own loop, Kubernetes alone.** Lifetime enforcement and escalation run in their own leader loop every 10 s. That loop makes no native call and is never queued behind the native sweep, so an unavailable control plane or slow native discovery cannot postpone it. The native sweep itself has a one-minute aggregate deadline per pass.
+- **Robust evidence.** Each pool's hard deadline is also written once, at creation, in the `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches. The effective deadline is the earlier of that annotation and the ledger's birth plus lifetime.
+  - Unreadable or inconsistent lifetime evidence is doubt: a corrupt ledger, or a missing, malformed or mismatched deadline. The pool is then strongly retired at once.
+  - Its escalation is bounded by the recorded deadline, or by creation plus the minimum lifetime, so the bound is never lengthened.
 - **Other reasons to close admission early.** Admission also closes when the operator pool's image or shape changes, the profile disappears, or the template inventory cannot be verified.
 - **Limits.** The bound assumes a responsive kubelet. The Pod's absence on a partitioned node cannot be proven, and its instances then never report termination.
 
 ### Warm capacity
 
 - **No private spares.** For opted-in profiles, free slots in admitting shared pools are the warm capacity, and ADR 0007 private spares are not created.
-- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it, only with a verified template inventory.
+- **What the annotation counts.** The `substrate.workspace.orka.ai/spare-workers` annotation counts free admitting slots to keep. The leader creates empty shared pools to reach it.
+- **Inventory first.** Every pool creation, by an allocation or for warm capacity, requires a successful, complete template inventory showing no foreign template that could reach it. A failed inventory creates nothing.
 - **Collection.** The leader deletes an empty pool once it has been empty for 5 minutes and is not needed for warm slots, or once its admission has closed. Deletion first proves that no Actor is assigned, and carries UID and resourceVersion preconditions.
 - **Orphans.** A ledger entry whose exact journal record no longer holds it, and whose Actor is not assigned, is removed. A missing journal is not proof.
 
@@ -234,7 +245,11 @@ The ready and stopped timing logs report `workerSource: shared`. The stopped log
 - **Residual risk: a leaked sandbox.** If the best-effort teardown failed, that sandbox's memory may persist on the node until the worker Pod is gone, at most `maxWorkerLifetime` with a responsive kubelet.
   - That memory includes workspace data and the instance's credentials. Core makes those credentials unusable asynchronously, as described above.
   - The sandbox has no tunnel and deny-all egress.
-- **Residual risk: stale egress.** A DNS relay that cannot refresh keeps its last policy until the checkpoint deactivates the tunnel. That is bounded by the synchronous deactivation, not by the settle window.
+- **Residual risk: stale egress and DNS.**
+  - A gateway TTL set higher than the provider's declared value makes the settle window too short.
+  - Streams admitted before revocation continue until the checkpoint deactivates the tunnel.
+  - The DNS relay is not stopped by that deactivation. It answers by its last fetched policy until teardown. After the settle window that policy is deny-all, unless its refresh failed, in which case it keeps the stale allowlist.
+  - For a leaked sandbox whose teardown failed, that DNS relay session may persist until the worker Pod is gone.
 - **Residual risk: foreign tenants.** Isolation from other tenants depends on the operator's dedicated-install assertion. Continuous template and assignment checks detect a violation only after it happens, and then strongly retire the pool.
 - **Residual risk: worker compromise.** A compromised worker exposes every co-hosted Actor of the same namespace and profile, including their egress mTLS keys and any leaked memory.
 - **Lower capacity than reported.** A leaked sandbox can also consume capacity the worker reports as free until it is recycled.
