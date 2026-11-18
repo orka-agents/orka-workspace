@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -59,17 +60,11 @@ func main() {
 }
 func run(leader bool, leaderNamespace string, config provider.Config) error {
 	// Without acknowledged native control, run only the provider reconciler so
-	// it withdraws any stale advertisement instead of crash-looping.
-	var native pb.ControlClient
-	if err := config.Validate(); err != nil {
-		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
-	} else {
-		conn, err := provider.Dial(config)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		native = pb.NewControlClient(conn)
+	// it withdraws any stale advertisement, and the Kubernetes-only shared
+	// worker bounds loop, instead of crash-looping.
+	native, unavailable, closer := nativeControl(config)
+	if closer != nil {
+		defer closer.Close()
 	}
 	scheme := runtime.NewScheme()
 	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
@@ -85,7 +80,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	if err != nil {
 		return err
 	}
-	for _, setup := range controllerSetups(c, config, native) {
+	for _, setup := range controllerSetups(c, config, native, unavailable) {
 		if err := setup(mgr); err != nil {
 			return err
 		}
@@ -99,11 +94,29 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
+// nativeControl dials native control. An invalid configuration, or a valid
+// one whose dial fails (for example unreadable TLS material), degrades the
+// same way: it is logged, no native client is returned, and the reason is
+// reported so the provider status withdraws its advertisement.
+func nativeControl(config provider.Config) (pb.ControlClient, string, io.Closer) {
+	if err := config.Validate(); err != nil {
+		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
+		return nil, "", nil
+	}
+	conn, err := provider.Dial(config)
+	if err != nil {
+		ctrl.Log.Error(err, "native control could not be reached; withdrawing the provider advertisement and running only Kubernetes-only shared worker bounds")
+		return nil, "native control could not be reached: " + err.Error(), nil
+	}
+	return pb.NewControlClient(conn), "", conn
+}
+
 // controllerSetups registers lifecycle controllers only with native control.
 // The Kubernetes-only shared worker bounds loop always runs, so existing
-// shared pools stay bounded while native configuration is broken.
-func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient) []func(ctrl.Manager) error {
-	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
+// shared pools stay bounded while native configuration or connection is
+// broken.
+func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, nativeUnavailable string) []func(ctrl.Manager) error {
+	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config, NativeUnavailable: nativeUnavailable}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
 		return setups
 	}

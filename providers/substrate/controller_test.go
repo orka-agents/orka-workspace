@@ -64,6 +64,18 @@ func TestProviderAdvertisesNativeProcessOnlyWithPinnedReadyConfiguration(t *test
 		t.Fatal("provider with an unsupported credential provider stayed advertised")
 	}
 	r.Config.EgressCredentialProvider = ""
+	// A valid configuration whose native dial failed advertises nothing.
+	r.NativeUnavailable = "native control could not be reached"
+	if _, err := r.Reconcile(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(t.Context(), req.NamespacedName, provider); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.Status.SupportedFeatures) != 0 || provider.Status.Adapter != nil {
+		t.Fatal("provider advertised native capabilities after its dial failed")
+	}
+	r.NativeUnavailable = ""
 	// Without router-based Actor routing, the native-process capability must
 	// not be advertised.
 	routerCA := r.Config.RouterCAFile

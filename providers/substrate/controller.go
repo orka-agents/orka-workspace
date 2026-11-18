@@ -21,6 +21,10 @@ const providerHeartbeatPeriod = 20 * time.Second
 type ProviderReconciler struct {
 	client.Client
 	Config Config
+	// NativeUnavailable, when set, is why native control could not be
+	// reached even though Config validates (for example unreadable TLS
+	// material). Nothing is advertised while it is set.
+	NativeUnavailable string
 }
 
 func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -32,7 +36,7 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 	configured := false
-	transportReady := r.Config.Validate() == nil
+	transportReady := r.Config.Validate() == nil && r.NativeUnavailable == ""
 	configUID := ""
 	ref := provider.Spec.ParametersRef
 	if ref.Group == profilev1alpha1.GroupVersion.Group && ref.Kind == "SubstrateProviderConfig" && ref.Name != "" {
