@@ -1988,3 +1988,30 @@ func TestSharedWarmCreationIgnoresATemplateForAnEmptyPoolLabel(t *testing.T) {
 		t.Fatal("a template that can never reach a shared pool blocked warm provisioning")
 	}
 }
+
+func TestSharedClosingPoolNeverUncountedFromTheWarmReserve(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "2"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	// The hosting pool's admission window has ended: it never counted toward
+	// the reserve, so closing it must not take its free slot away again.
+	setNow(t, sharedAdmissionEnds(pool, ledger).Add(time.Minute))
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, closed := poolLedger(t, c, record.SharedWorker.Pool); closed.State != sharedDraining {
+		t.Fatalf("the expired pool is %s, want Draining", closed.State)
+	}
+	// Two free slots are wanted and one new 2-slot pool provides them.
+	if pools := sharedPools(t, c); len(pools) != 2 {
+		t.Fatalf("the sweep left %d shared pools, want the draining pool and one new warm pool", len(pools))
+	}
+}

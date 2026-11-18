@@ -174,7 +174,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		if err != nil {
 			continue
 		}
-		if shape := shapes[ledger.Scope.ProfileUID]; shape != nil && ledger.Scope == shape.scope && pool.GetNamespace() == shape.source.GetNamespace() && sharedAdmits(pool, ledger, now) {
+		if sharedCountsAsFree(pool, ledger, shapes[ledger.Scope.ProfileUID], now) {
 			free[ledger.Scope.ProfileUID] += int(ledger.Scope.MaxActors) - len(ledger.Entries)
 		}
 	}
@@ -329,6 +329,9 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	}
 	closing := ""
 	shape := shapes[ledger.Scope.ProfileUID]
+	// Only a pool the sweep counted toward the warm reserve gives its free
+	// slots back when it closes or is collected.
+	counted := sharedCountsAsFree(pool, ledger, shape, now)
 	switch {
 	case !now.Before(sharedAdmissionEnds(pool, ledger)):
 		closing = "the shared worker's admission window ended"
@@ -352,8 +355,9 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	changed := false
 	if closing != "" && ledger.State == sharedAdmitting {
 		ledger.State, ledger.Reason, changed = sharedDraining, closing, true
-		if shape != nil && ledger.Scope == shape.scope {
+		if counted {
 			free[ledger.Scope.ProfileUID] -= int(ledger.Scope.MaxActors) - len(ledger.Entries)
+			counted = false
 		}
 	}
 	if len(orphans) > 0 {
@@ -372,14 +376,14 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		emptySince := metav1.NewTime(now.UTC().Truncate(time.Second))
 		ledger.EmptySince, changed = &emptySince, true
 	case len(ledger.Entries) == 0 && now.Sub(ledger.EmptySince.Time) >= sharedIdleGrace:
-		warmNeeded := shape != nil && ledger.Scope == shape.scope && free[ledger.Scope.ProfileUID]-int(ledger.Scope.MaxActors) < shape.warm
+		warmNeeded := counted && free[ledger.Scope.ProfileUID]-int(ledger.Scope.MaxActors) < shape.warm
 		if !warmNeeded {
 			if changed {
 				if err := r.writeLedger(ctx, pool, ledger); err != nil {
 					return err
 				}
 			}
-			if shape != nil && ledger.Scope == shape.scope && sharedAdmits(pool, ledger, now) {
+			if counted {
 				free[ledger.Scope.ProfileUID] -= int(ledger.Scope.MaxActors)
 			}
 			return deleteIdlePool(ctx, d, workers, pool)
@@ -584,4 +588,11 @@ func sharedScopeCurrent(shape *sharedProfileShape, scope sharedScope) bool {
 	}
 	digest, err := runtimePoolRestoreDigest(spec, false)
 	return err == nil && digest == scope.Shape
+}
+
+// sharedCountsAsFree reports whether a pool's free slots count toward its
+// profile's warm reserve: an admitting pool of the profile's current
+// template-sized scope, in the operator pool's namespace.
+func sharedCountsAsFree(pool *unstructured.Unstructured, ledger *sharedLedger, shape *sharedProfileShape, now time.Time) bool {
+	return shape != nil && ledger.Scope == shape.scope && pool.GetNamespace() == shape.source.GetNamespace() && sharedAdmits(pool, ledger, now)
 }
