@@ -60,6 +60,9 @@ const (
 	sharedPoolPrefix         = "ate-shared-"
 	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
 	sharedIdleGrace = 5 * time.Minute
+	// sharedClaimAttempts bounds slot claims that lose a ledger write race
+	// within one pass.
+	sharedClaimAttempts = 5
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
 	// changing worker version; then the strong path applies.
 	sharedMaxProofAttempts = 5
@@ -689,6 +692,16 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	}
 	movable := !record.Template.CreateIssued && !shared.CreateIssued
 	if movable {
+		// Workspaces reconcile in parallel. Choosing between joining a pool
+		// and creating one is serialized per scope in this process, so a
+		// burst of cold starts fills one pool instead of each creating its
+		// own. Correctness never depends on it: every claim is still a
+		// resourceVersion-preconditioned ledger write.
+		unlock, err := sharedScopeLocks.lock(ctx, shared.Scope)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		// The workspace may have become tainted, quarantined or failed since
 		// its allocation was prepared; before any template exists it simply
 		// takes the private single-Actor path.
@@ -777,14 +790,17 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	} else if err != nil {
 		return err
 	}
-	if pool.GetDeletionTimestamp() != nil {
-		return abandon("the shared worker is deleting")
-	}
-	ledger, err := sharedPoolMatches(pool, record)
-	if err != nil {
-		return abandon("the shared worker no longer matches: " + err.Error())
-	}
-	if ledgerEntry(ledger, marker) == nil {
+	for attempt := 1; ; attempt++ {
+		if pool.GetDeletionTimestamp() != nil {
+			return abandon("the shared worker is deleting")
+		}
+		ledger, err := sharedPoolMatches(pool, record)
+		if err != nil {
+			return abandon("the shared worker no longer matches: " + err.Error())
+		}
+		if ledgerEntry(ledger, marker) != nil {
+			break
+		}
 		if shared.Create != nil {
 			return abandon("the created shared worker does not hold this allocation")
 		}
@@ -815,7 +831,20 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		}
 		// The read resourceVersion is the precondition: a claim never
 		// overfills a pool or lands on one that stopped admitting.
-		if err := d.client.Update(ctx, pool); err != nil {
+		err = d.client.Update(ctx, pool)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(err) || attempt == sharedClaimAttempts {
+			return err
+		}
+		// A neighbour's ledger write won. Re-read the pool and decide again,
+		// from every check above, while this scope is still held.
+		pool = poolObject()
+		if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: shared.Pool}, pool); err != nil {
+			if apierrors.IsNotFound(err) {
+				return abandon("the shared worker disappeared")
+			}
 			return err
 		}
 	}
@@ -823,6 +852,54 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	record.RuntimePool.UID = shared.UID
 	stamp(&record.Timing.WorkerPoolCreatedAt)
 	return d.save(ctx, cm, record)
+}
+
+// sharedScopeLocks serializes shared pool selection and creation per scope.
+var sharedScopeLocks = &scopeLocks{}
+
+// scopeLocks is a set of context-aware mutexes keyed by shared scope. An
+// entry exists only while some caller holds or waits for it.
+type scopeLocks struct {
+	mu      sync.Mutex
+	entries map[sharedScope]*scopeLock
+}
+
+type scopeLock struct {
+	held chan struct{}
+	refs int
+}
+
+// lock waits for scope's mutex or ctx, and returns its release.
+func (l *scopeLocks) lock(ctx context.Context, scope sharedScope) (func(), error) {
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = map[sharedScope]*scopeLock{}
+	}
+	entry := l.entries[scope]
+	if entry == nil {
+		entry = &scopeLock{held: make(chan struct{}, 1)}
+		l.entries[scope] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+	select {
+	case entry.held <- struct{}{}:
+		return func() {
+			<-entry.held
+			l.release(scope, entry)
+		}, nil
+	case <-ctx.Done():
+		l.release(scope, entry)
+		return nil, ctx.Err()
+	}
+}
+
+func (l *scopeLocks) release(scope sharedScope, entry *scopeLock) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if entry.refs--; entry.refs == 0 {
+		delete(l.entries, scope)
+	}
 }
 
 // verifySharedRuntimePool re-reads the bound pool and its ledger. Observation
@@ -1126,7 +1203,8 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		if !found {
 			return false, sdk.ErrStaleIdentity
 		}
-		return false, nil
+		// The write is stored, so the remaining checks run in this pass. They
+		// re-read the ledger and assignments themselves.
 	}
 	assigned, count, err := d.sharedAssignmentsInLedger(ctx, record, selected.GetMetadata().GetName())
 	if err != nil {
