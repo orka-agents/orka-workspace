@@ -16,3 +16,5 @@ These records preserve the baseline decisions. See [implementation status](../im
 [ADR 0006](0006-agent-substrate-v1.md) records the Agent Substrate v1.0.0 contract: host-name egress allowlists, router-targeted startup evidence, single-Actor worker sizing, and retire-first handling of v0.1.0 state.
 
 [ADR 0007](0007-substrate-spare-workers.md) records opt-in spare private Substrate workers that allocations claim with an optimistic-lock write, keeping one Actor per proven-empty worker.
+
+[ADR 0008](0008-substrate-shared-workers.md) records opt-in shared Substrate workers for one namespace and profile, with interim per-Actor termination evidence, egress revocation before suspension, a bounded worker lifetime, and the strong Pod-absence fallback. It supersedes ADR 0006's single-Actor sizing and Pod-absence proof, and ADR 0007's spares, only for profiles that set `spec.placement.sharedWorkers`.
