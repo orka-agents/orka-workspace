@@ -206,6 +206,82 @@ Task does not test checkpoint persistence; the Data fixture above proves that
 path. Failures retain their accepted Task and evidence for inspection and are
 not replayed; normal controllers may retire allocation resources.
 
+### Session latency and the warm-detach window
+
+After a passed proof, and before its cleanup, the same Core, provider and
+proof identity can measure session-reused, `DataOnly`, Suspend-on-detach
+latency and Orka ADR 0055's warm-detach window:
+
+```sh
+LATENCY_REPEATS=3 LATENCY_WINDOW=2m LATENCY_SCENARIOS=detach,warm \
+  bash scripts/external-substrate-core-e2e.sh latency
+```
+
+The Job (`native-core-latency-<UTC timestamp>`, label
+`orka.workspace.e2e/latency=native-core`) creates two profile/class pairs in
+the run namespace through the public APIs: `lat-detach` without a window and
+`lat-warm` with `retention.suspendAfterDetach` set to `LATENCY_WINDOW`. Both
+allow only Session reuse and Suspend, with a 30m idle timeout and a 1h
+lifetime. For each repetition it runs, one at a time:
+
+- `detach`: a cold turn 1, the suspension on detach, and turn 2 resumed from
+  the Tag; then that turn's suspension.
+- `warm`: a cold turn 1 and, once it settled warm, turn 2 inside the window,
+  which must reuse the same workload sequence and revision, provider instance,
+  Actor UID, worker Pod, runtime instance, supervisor boot and pool credential
+  Secret versions, with a new RuntimeSession and attachment epoch and no new
+  Tag. The RuntimePool must keep its replicas and the Actor its worker while
+  turn 2's own window runs; retention must then suspend with a new Tag, and
+  turn 3 resumes from it. The last window also expires before the next
+  repetition.
+
+Every Task is timed by the client from just before Create (first observation
+of each execution state and phase, prompt acceptance, `Succeeded`, and the
+workspace settlement receipt). Results go to
+`bin/external-substrate-core-latency-<UTC timestamp>/`: `latency.log`, the
+timing lines only of Core (`ACP turn timings`, `ACP workspace runtime
+started/stopped`), the provider (`Substrate runtime ready/stopped`) and the
+live-followed worker Pods (`ACP runtime session created`), and the joined
+`report.json` and `summary.md` (median, range and count per phase), including
+each worker Pod's creation, container start and boot milestones relative to
+Task creation. Secret
+data, attachment token hashes and bootstrap nonces are never read into them.
+The deterministic agent sleeps 2s per prompt, which `promptStream` includes.
+Two more scenarios cover the native provider's worker placement:
+
+- `spare` (provider ADR 0007): a no-window profile with
+  `substrate.workspace.orka.ai/spare-workers: LATENCY_SPARE_WORKERS` (default 1).
+  Each turn must run on a spare listed before it: same WorkerPool and Pod UIDs,
+  Pod born before the Task and never restarted, claim marker present, and the
+  native Worker carrying the claimed pool's labels; the spares must then be
+  replenished.
+- `shared` (provider ADR 0008, needs the proof run with
+  `SUBSTRATE_DEDICATED_INSTALL=1`, which starts the provider with
+  `--substrate-dedicated-install`): a windowed profile with
+  `placement.sharedWorkers` (`LATENCY_SHARED_ACTORS`, default 4, and
+  `LATENCY_SHARED_LIFETIME`, default 3h) and `LATENCY_SHARED_SPARES` warm free
+  slots (default 2). `LATENCY_SHARED_SESSIONS` (default 2) Sessions take a
+  concurrent first turn and must share one worker Pod listed in its ledger.
+  While Session A's window expires and its Actor is suspended per Actor,
+  Session B takes a warm turn on the same, never restarted, worker Pod; A's
+  egress must read back deny-all before its suspension is observed, A must
+  leave the ledger with a new Tag, and A then resumes onto a shared slot.
+- `scope`: a second shared profile in the same namespace must never place its
+  Actor on the first profile's workers.
+
+The measurement client is built from the checkout, so a harness change needs
+no new proof run. A failed measurement keeps its objects for inspection;
+cleanup below retires them with the run and refuses while a measurement Job
+still runs.
+
+Session member Tasks keep their frozen authority until Session cleanup records
+their runtime cleanup receipts, so cleanup first deletes every referenced
+Session through Core's public API (`DELETE /api/v1/sessions/<name>`) from a Job
+whose dedicated ServiceAccount in the run namespace may only read Tasks and
+delete Sessions. Core authenticates it by TokenReview, which the released chart
+grants and the proof's Core role omits; the proof renders, and cleanup ensures
+and removes, a `tokenreviews` `create` grant for Core's ServiceAccount.
+
 The run namespace is fixed, so a finished run (passed or failed) must be
 retired before the next one:
 
