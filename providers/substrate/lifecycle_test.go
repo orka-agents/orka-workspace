@@ -7,6 +7,7 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,6 +131,9 @@ type nativeFixture struct {
 	// churnWorker bumps a Worker's version on every read, as concurrent
 	// placements on a shared worker do.
 	churnWorker string
+	// registering births new Workers still registering (UNAVAILABLE), and
+	// unsettledEpoch births them before their registered epoch is observed.
+	registering, unsettledEpoch bool
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -591,6 +595,12 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 			return nil, err
 		}
 		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor", DefaultRuntime: &pb.WorkerSandboxRuntime{Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
+		if f.registering {
+			f.workers[name].Status.State = pb.WorkerState_WORKER_STATE_UNAVAILABLE
+		}
+		if f.unsettledEpoch {
+			f.workers[name].Status.ObservedEpoch = 0
+		}
 	}
 	out := &pb.ListWorkersResponse{}
 	for name, worker := range f.workers {
@@ -788,11 +798,10 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 	request.Revision, _ = sdk.WorkloadRevision(request)
 	workspace.Spec.Workload = &request
 	pool := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "ate.dev/v1", "kind": "WorkerPool", "metadata": map[string]any{"namespace": "native-workers", "name": "native-workers", "uid": "worker-pool-uid", "labels": map[string]any{"selected": "native"}}, "spec": map[string]any{"replicas": int64(3), "workerImage": "fixture.invalid/native-worker:pin", "sandboxClasses": []any{map[string]any{"name": "gvisor"}}}, "status": map[string]any{"sandboxClasses": []any{resolvedSandboxClassStatus(fixtureSandboxConfig)}}}}
-	uid := 0
+	var uid atomic.Int64
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(provider, workspace, parameter, pool).WithStatusSubresource(workspace, provider, &api.ExecutionWorkspaceCheckpoint{}).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 		if obj.GetUID() == "" {
-			uid++
-			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid)))
+			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid.Add(1))))
 		}
 		// The API server sets creationTimestamp, which the fake does not;
 		// shared pool lifetimes are bounded by it.
