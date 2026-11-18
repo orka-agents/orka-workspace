@@ -872,9 +872,21 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 	if err != nil {
 		return false, err
 	}
+	// One pool snapshot drives the ledger checks, the suspicion check and
+	// any retirement, whose write is preconditioned on its resourceVersion:
+	// a concurrent ledger change conflicts and is re-evaluated, never retired.
 	pool, err := d.getSharedPool(ctx, record)
 	if err != nil {
 		return false, err
+	}
+	if string(pool.GetUID()) != shared.UID {
+		return false, sdk.ErrStaleIdentity
+	}
+	if ledger, err = sharedPoolMatches(pool, record); err != nil {
+		return false, err
+	}
+	if ledgerEntry(ledger, claimMarker(cm, record)) == nil {
+		return false, fmt.Errorf("shared worker ledger no longer holds this allocation: %w", sdk.ErrStaleIdentity)
 	}
 	if ledger.State != sharedAdmitting && ledger.State != sharedDraining || !sharedNow().Before(sharedRetireAt(pool, ledger)) {
 		return false, fmt.Errorf("shared worker is past its lifetime or retiring: %w", sdk.ErrStaleIdentity)
@@ -1673,7 +1685,18 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 			// journal does not hold it, under that Actor's name and UID, the
 			// entry hides whose markers apply: doubt. A claim without an Actor
 			// UID can be an abandoned orphan and is neutral.
-			if entry.ActorUID != "" {
+			if entry.ActorUID == "" {
+				continue
+			}
+			// A release removes the entry before its journal records
+			// Released, so a concurrent release can make an older snapshot's
+			// entry look disowned. Doubt holds only if the entry is still in a
+			// pool snapshot read after the journal.
+			persists, err := d.sharedEntryPersists(ctx, pool, entry)
+			if err != nil {
+				return false, err
+			}
+			if persists {
 				return true, nil
 			}
 			continue
@@ -1844,4 +1867,26 @@ func sharedEntryHeld(record *journalRecord, pool *unstructured.Unstructured, ent
 	return shared != nil && !shared.Released && shared.Pool == pool.GetName() &&
 		(shared.UID == "" || shared.UID == string(pool.GetUID())) && record.Placement.Namespace == pool.GetNamespace() &&
 		actorKey(record) == entry.Actor && (entry.ActorUID == "" || entry.ActorUID == record.Actor.UID)
+}
+
+// sharedEntryPersists reports whether a fresh read of the same pool still
+// holds exactly this entry. It confirms a disowned-entry suspicion read from
+// an older snapshot, so a concurrent slot release is never mistaken for doubt.
+func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.Unstructured, entry sharedLedgerEntry) (bool, error) {
+	current := poolObject()
+	if err := d.client.Get(ctx, client.ObjectKeyFromObject(pool), current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if current.GetUID() != pool.GetUID() {
+		return false, nil
+	}
+	ledger, err := readSharedLedger(current)
+	if err != nil {
+		// An unreadable ledger is doubt in its own right.
+		return true, nil
+	}
+	return slices.Contains(ledger.Entries, entry), nil
 }

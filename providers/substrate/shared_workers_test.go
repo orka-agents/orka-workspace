@@ -2015,3 +2015,56 @@ func TestSharedClosingPoolNeverUncountedFromTheWarmReserve(t *testing.T) {
 		t.Fatalf("the sweep left %d shared pools, want the draining pool and one new warm pool", len(pools))
 	}
 }
+
+func TestSharedConcurrentSlotReleaseIsNotDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	cmA := &corev1.ConfigMap{}
+	if err := c.Get(t.Context(), journalKey(first.Key), cmA); err != nil {
+		t.Fatal(err)
+	}
+	// A releases its slot exactly while another allocation's admission reads
+	// A's journal: the release removes the ledger entry, then marks the
+	// journal Released, as releaseSharedSlot does, after the reader's pool
+	// snapshot was taken.
+	released := false
+	racing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == cmA.Name && !released {
+			released = true
+			d := sharedDriver(c, native)
+			cm, record, err := d.read(ctx, first.Key)
+			if err != nil {
+				return err
+			}
+			// A release follows its Actor's deletion.
+			key := refKey(actorRef(record))
+			native.releaseWorker(native.actors[key])
+			delete(native.actors, key)
+			if err := d.releaseSharedSlot(ctx, cm, record); err != nil {
+				return err
+			}
+		}
+		return w.Get(ctx, key, obj, opts...)
+	}})
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	var recordB *journalRecord
+	for range 16 {
+		observed, err := sharedDriver(racing, native).EnsureAllocation(t.Context(), second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			_, recordB, _ = sharedDriver(c, native).read(t.Context(), second.Key)
+			break
+		}
+	}
+	if !released {
+		t.Fatal("fixture did not overlap admission with the slot release")
+	}
+	if recordB == nil || recordB.SharedWorker.Pool != recordA.SharedWorker.Pool {
+		t.Fatal("the admitting allocation did not join the healthy pool")
+	}
+	if _, ledger := poolLedger(t, c, recordA.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("a concurrent slot release retired a healthy pool: %s %s", ledger.State, ledger.Reason)
+	}
+}

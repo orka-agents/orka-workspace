@@ -468,9 +468,14 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 		}
 		if !sharedEntryHeld(record, pool, entry) {
 			// An assigned or booted entry its exact journal disowns hides
-			// whose markers apply: doubt, never silently kept or collected.
+			// whose markers apply: doubt, never silently kept or collected,
+			// once a fresh pool read confirms it is not a concurrent release.
 			if assigned[entry.Actor] || entry.ActorUID != "" {
-				suspect = true
+				persists, err := d.sharedEntryPersists(ctx, pool, entry)
+				if err != nil {
+					return false, nil, err
+				}
+				suspect = suspect || persists
 			} else {
 				orphans = append(orphans, entry.Journal)
 			}
