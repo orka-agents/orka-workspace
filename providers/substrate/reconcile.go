@@ -12,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -245,16 +246,60 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		setLifecycleMilestoneConditions(current, observed, missing, operationErr, failure)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
+	key := client.ObjectKeyFromObject(workspace)
 	if err != nil {
+		r.polls.reset(key)
 		return ctrl.Result{}, err
 	}
 	if operationErr != nil {
+		r.polls.reset(key)
 		return ctrl.Result{}, operationErr
 	}
 	if pending {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+		return ctrl.Result{RequeueAfter: r.polls.next(key)}, nil
 	}
+	r.polls.reset(key)
 	return ctrl.Result{RequeueAfter: providerHeartbeatPeriod}, nil
+}
+
+// A pending workspace is polled: provider status writes do not change its
+// generation, so they trigger no event. Most waits (a worker registering, a
+// label reaching its Worker, an Actor leaving a transitional state) end well
+// under a second, so polling starts short and backs off to one second. Every
+// pass re-reads and re-verifies everything it acts on, so the interval only
+// sets how soon the next step is attempted.
+const (
+	pendingPollInitial = 200 * time.Millisecond
+	pendingPollMax     = time.Second
+)
+
+// pendingPolls holds, per workspace, the next poll interval of an unbroken
+// run of pending passes. The workqueue never reconciles one workspace twice at
+// once, but reconciles of different workspaces share this map, so it is
+// guarded. A run ends, and its entry is dropped, on any non-pending result.
+type pendingPolls struct {
+	mu        sync.Mutex
+	intervals map[types.NamespacedName]time.Duration
+}
+
+func (p *pendingPolls) next(key types.NamespacedName) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.intervals == nil {
+		p.intervals = map[types.NamespacedName]time.Duration{}
+	}
+	interval, found := p.intervals[key]
+	if !found {
+		interval = pendingPollInitial
+	}
+	p.intervals[key] = min(2*interval, pendingPollMax)
+	return interval
+}
+
+func (p *pendingPolls) reset(key types.NamespacedName) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.intervals, key)
 }
 
 // failedRetirementAuthorized reports an exact Stop or Suspend authorization
