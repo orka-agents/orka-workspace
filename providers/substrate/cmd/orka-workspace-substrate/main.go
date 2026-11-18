@@ -38,6 +38,7 @@ func main() {
 	flag.StringVar(&config.RouterServerName, "native-router-server-name", "", "router TLS server name; defaults to the endpoint host")
 	flag.DurationVar(&config.BootTimeout, "native-boot-timeout", 6*time.Minute, "fail a native allocation that has no process evidence after this long")
 	flag.BoolVar(&config.DedicatedInstall, "substrate-dedicated-install", false, "assert that only this Orka creates Actors and ActorTemplates on the Agent Substrate install; required before any profile may share workers (ADR 0008)")
+	flag.DurationVar(&config.EgressPolicyCacheTTL, "substrate-egress-policy-cache-ttl", 10*time.Second, "must equal the Agent Substrate egress gateway's --egress-policy-cache-ttl; shared workers wait longer than it after revoking egress before suspending an Actor")
 	flag.StringVar(&config.EgressCredentialProvider, "egress-credential-provider", "", "credential provider class the Substrate egress gateway was installed with (only k8s.io); empty disables egress credential injection")
 	flag.Func("egress-credential-namespace", "namespace, besides each workload's own, whose Secrets egress credential rules may name; repeatable (Orka core needs its runtime namespace)", func(value string) error {
 		config.EgressCredentialNamespaces = append(config.EgressCredentialNamespaces, strings.TrimSpace(value))

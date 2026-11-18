@@ -366,9 +366,15 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 			actor, err := d.actor(ctx, record)
 			if err != nil {
+				if record.SharedWorker != nil {
+					return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read when its suspension began"))
+				}
 				return err
 			}
 			if actor == nil || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+				if record.SharedWorker != nil {
+					return errors.Join(fmt.Errorf("native checkpoint requires the admitted running Actor"), d.sharedDoubt(ctx, cm, record, "the Actor was not running when its suspension began"))
+				}
 				return fmt.Errorf("native checkpoint requires the admitted running Actor")
 			}
 			name, err := randomName("orka-data-")
@@ -387,12 +393,26 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
+			if shared := record.SharedWorker; shared != nil && shared.Strong != "" {
+				// A persisted strong path drives the pool's deletion and the
+				// absence proof to completion whatever the checkpoint does,
+				// including after a crash right after Strong was saved.
+				if _, err := d.strongSharedAbsence(ctx, record); err != nil {
+					return err
+				}
+			}
 			err := d.capture(ctx, cm, record)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				// The capture source is gone, so this capture can never finish.
 				// The failed instance retires through the exact Stop path.
 				observed, err = d.fail(ctx, cm, record, lost.reason)
 				return err
+			}
+			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) {
+				// After the suspension intent is persisted, every error on a
+				// shared worker is doubt: the strong path never waits on the
+				// checkpoint, and the suspend is never replayed.
+				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
 			}
 			if err != nil {
 				return err

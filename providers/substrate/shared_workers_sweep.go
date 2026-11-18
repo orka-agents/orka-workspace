@@ -48,11 +48,17 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	var errs []error
 	for i := range pools.Items {
 		pool := &pools.Items[i]
-		retireAt, escalateAt := sharedBoundsOf(pool)
+		retireAt, escalateAt, evidence := sharedBoundsOf(pool)
 		if pool.GetDeletionTimestamp() == nil {
 			switch {
 			case !r.Config.DedicatedInstall:
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
+			case !evidence:
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
+			case d.sharedStrongMarked(ctx, pool):
+				// A journal persisted the strong path, possibly crashing before
+				// it deleted the pool; finish that deletion here.
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation's journal selected the strong path"))
 			case !now.Before(retireAt):
 				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
 			}
@@ -65,14 +71,21 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 }
 
 // sharedBoundsOf returns when a pool's strong retirement starts and when its
-// worker Pods are escalated. An unreadable ledger is bounded from the pool's
-// creation by the maximum lifetime.
-func sharedBoundsOf(pool *unstructured.Unstructured) (time.Time, time.Time) {
-	if ledger, err := readSharedLedger(pool); err == nil {
-		return sharedRetireAt(pool, ledger), sharedEscalateAt(pool, ledger)
+// worker Pods are escalated. Unreadable or inconsistent lifetime evidence is
+// doubt: retirement starts at once, and escalation is bounded by the
+// recorded deadline or, failing that, the pool's creation plus the minimum
+// lifetime. It never lengthens the bound.
+func sharedBoundsOf(pool *unstructured.Unstructured) (time.Time, time.Time, bool) {
+	ledger, err := readSharedLedger(pool)
+	recorded, recordedOK := sharedRecordedDeadline(pool)
+	if err == nil && recordedOK && recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
+		return sharedRetireAt(pool, ledger), sharedEscalateAt(pool, ledger), true
 	}
-	deadline := pool.GetCreationTimestamp().Add(profile.MaxSharedWorkerLifetime)
-	return deadline.Add(-workerPodTerminationGrace - sharedRetireMargin), deadline.Add(-sharedRetireMargin)
+	deadline := pool.GetCreationTimestamp().Add(profile.MinSharedWorkerLifetime)
+	if recordedOK {
+		deadline = minTime(deadline, recorded)
+	}
+	return time.Time{}, deadline.Add(-sharedRetireMargin), false
 }
 
 // escalateSharedWorkerPods re-deletes the pool's worker Pods with a
@@ -145,11 +158,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		return nil
 	}
 	now := sharedNow()
-	var templates []*pb.ActorTemplate
-	templatesErr := error(nil)
-	if len(pools.Items) > 0 {
-		templates, templatesErr = d.listAllActorTemplates(ctx)
-	}
+	// Maintenance and every pool creation need a complete, successful template
+	// inventory; a failed inventory creates nothing.
+	templates, templatesErr := d.listAllActorTemplates(ctx)
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -240,9 +251,11 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 		return err
 	}
 	pool.Object["spec"] = object
-	if err := setSharedLedger(pool, &sharedLedger{Version: sharedLedgerVersion, Scope: shape.scope, BornAt: metav1.NewTime(sharedNow().UTC().Truncate(time.Second)), State: sharedAdmitting, Entries: []sharedLedgerEntry{}}); err != nil {
+	ledger := &sharedLedger{Version: sharedLedgerVersion, Scope: shape.scope, BornAt: metav1.NewTime(sharedNow().UTC().Truncate(time.Second)), State: sharedAdmitting, Entries: []sharedLedgerEntry{}}
+	if err := setSharedLedger(pool, ledger); err != nil {
 		return err
 	}
+	setSharedDeadline(pool, ledger)
 	if err := d.client.Create(ctx, pool); err != nil {
 		return err
 	}
@@ -257,12 +270,8 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	}
 	ledger, err := readSharedLedger(pool)
 	if err != nil {
-		// An unreadable ledger admits nobody. Its pool is removed only when no
-		// Actor is assigned; otherwise its Actors retire through the strong path.
-		if idleErr := deleteIdlePool(ctx, d, workers, pool); idleErr != nil {
-			return fmt.Errorf("shared worker ledger is invalid and its pool is not idle: %w", err)
-		}
-		return nil
+		// Unreadable lifetime evidence is doubt: retire strongly at once.
+		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker ledger is unreadable")
 	}
 	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
 		return d.retireSharedPool(ctx, pool, ledger.State, ledger.Reason)
@@ -496,4 +505,23 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 		}
 	}
 	return record, true, nil
+}
+
+// sharedStrongMarked reports whether any hosted allocation's exact journal
+// record selected the strong path. It reads only Kubernetes.
+func (d *Lifecycle) sharedStrongMarked(ctx context.Context, pool *unstructured.Unstructured) bool {
+	ledger, err := readSharedLedger(pool)
+	if err != nil {
+		return false
+	}
+	for _, entry := range ledger.Entries {
+		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+		if err != nil || !found || record == nil || record.SharedWorker == nil {
+			continue
+		}
+		if record.SharedWorker.Pool == pool.GetName() && record.SharedWorker.UID == string(pool.GetUID()) && record.SharedWorker.Strong != "" {
+			return true
+		}
+	}
+	return false
 }

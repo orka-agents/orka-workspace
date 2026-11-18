@@ -304,9 +304,12 @@ pool or opted-in profile exists.
     scope, birth, admission state, fenced worker, and each hosted journal and
     Actor UID. Every write is a resourceVersion-preconditioned Update.
 - **Retirement.** Retiring one Actor touches only that Actor:
-  1. Deny-all egress is applied, verified, and left to settle for 15 s (the
-     gateway's 10 s cache, plus margin) before `SuspendActor`. A Stop also
-     suspends, as evidence only.
+  1. Deny-all egress is applied, verified, and left to settle before
+     `SuspendActor`. The window is longer than the larger of the gateway's
+     policy cache and the DNS relay's 5 s cache, plus 5 s: 15 s by default.
+     Set `--substrate-egress-policy-cache-ttl` to the egress gateway's own
+     `--egress-policy-cache-ttl`, since the provider cannot read it. A Stop
+     also suspends, as evidence only.
   2. The Actor must be `SUSPENDED` at a later version with the expected new
      `VOLUMES` snapshot.
   3. The fenced worker must still be `ACTIVE`, with the same UID, Pod UID,
@@ -319,7 +322,9 @@ pool or opted-in profile exists.
   - an assignment that is still present;
   - an epoch, identity or state change;
   - an upstream error;
-  - an unresolved suspend, which is never replayed;
+  - any error after the suspension intent is persisted (a write conflict is
+    retried). An unresolved suspend is never replayed, and a persisted strong
+    marker always drives the pool's deletion to completion;
   - a failed egress revocation;
   - a terminating worker;
   - a tainted, quarantined, or failed workspace on the pool.
@@ -328,16 +333,24 @@ pool or opted-in profile exists.
   - admission closes an hour before that;
   - a Pod still present 5 minutes before the bound is re-deleted with a
     one-second grace;
-  - this enforcement runs first in each leader sweep, using Kubernetes alone.
+  - this enforcement runs in its own leader loop every 10 s, using Kubernetes
+    alone, never behind the native sweep, which has a one-minute deadline;
+  - unreadable or inconsistent lifetime evidence (the ledger, or the
+    creation-time `substrate.workspace.orka.ai/shared-deadline` annotation)
+    retires the pool at once.
 - **Leader sweep.** A leader-only pass, every 10 seconds:
   - quarantines a pool that hosts an Actor outside its ledger;
   - removes entries that their exact journal disowns;
   - deletes empty pools after 5 minutes.
 - **Warm capacity.** For these profiles the `spare-workers` annotation counts
-  free shared slots to keep warm, and private spares are not created.
+  free shared slots to keep warm, and private spares are not created. A pool
+  is created only after a complete template inventory shows no foreign
+  template that could reach it.
 - **Residual risk.** This evidence is weaker than Pod absence:
-  - a leaked sandbox keeps its memory, with no tunnel and no egress, until the
-    worker Pod is gone;
+  - a leaked sandbox keeps its memory, with no tunnel and no TCP egress, until
+    the worker Pod is gone. Its DNS relay session is stopped only by the
+    best-effort teardown, and may answer with a stale allowlist if its last
+    refresh failed;
   - a foreign template created between checks is caught only by the next
     check;
   - a compromised worker exposes its co-hosted Actors.

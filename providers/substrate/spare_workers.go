@@ -420,13 +420,31 @@ type SpareWorkerReplenisher struct {
 	Control pb.ControlClient
 	Config  Config
 
+	// SweepDeadline bounds one sweep's native work; zero selects
+	// defaultSweepDeadline. Shared worker bounds run in their own loop and
+	// are never behind it.
+	SweepDeadline time.Duration
+
 	mu         sync.Mutex
 	lastOrphan time.Time
 	invalid    map[types.UID]string
 }
 
-// SetupWithManager runs the replenisher on the elected leader.
+// defaultSweepDeadline bounds a sweep whose native calls stall.
+const defaultSweepDeadline = time.Minute
+
+// sharedBoundsPeriod is how often shared worker lifetime bounds are enforced.
+const sharedBoundsPeriod = 10 * time.Second
+
+// SetupWithManager runs the replenisher, and separately the shared worker
+// bounds loop, on the elected leader.
 func (r *SpareWorkerReplenisher) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		r.RunSharedBounds(ctx, sharedBoundsPeriod)
+		return nil
+	})); err != nil {
+		return err
+	}
 	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		ticker := time.NewTicker(spareResyncPeriod)
 		defer ticker.Stop()
@@ -449,11 +467,40 @@ type spareShape struct {
 	digest      string
 }
 
-// Sweep runs one replenishment and garbage-collection pass.
+// RunSharedBounds enforces shared worker lifetime bounds every period, using
+// Kubernetes alone, independently of the native sweep, until ctx ends.
+func (r *SpareWorkerReplenisher) RunSharedBounds(ctx context.Context, period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for {
+		if err := r.EnforceSharedBounds(ctx); err != nil && ctx.Err() == nil {
+			ctrl.LoggerFrom(ctx).Error(err, "Substrate shared worker bounds enforcement failed")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// EnforceSharedBounds runs one Kubernetes-only shared worker bounds pass.
+func (r *SpareWorkerReplenisher) EnforceSharedBounds(ctx context.Context) error {
+	return r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config))
+}
+
+// Sweep runs one replenishment and garbage-collection pass. Its native work
+// is bounded by SweepDeadline.
 func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	d := New(r.Client, r.Control, r.Config)
 	// Shared worker lifetime bounds come first and need only Kubernetes.
-	boundsErr := r.enforceSharedBounds(ctx, d)
+	boundsErr := r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config))
+	deadline := r.SweepDeadline
+	if deadline <= 0 {
+		deadline = defaultSweepDeadline
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
 	profiles := &profile.SubstrateWorkspaceProfileList{}
 	if err := r.List(ctx, profiles); err != nil {
 		return errors.Join(boundsErr, err)

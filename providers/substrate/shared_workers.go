@@ -44,8 +44,12 @@ const (
 	sharedPoolLabel = "substrate.workspace.orka.ai/shared-pool"
 	// sharedLedgerAnnotation is the pool's resourceVersion-protected ledger.
 	sharedLedgerAnnotation = "substrate.workspace.orka.ai/shared-ledger"
-	sharedLedgerVersion    = "substrate.workspace.shared-ledger.v1"
-	sharedPoolPrefix       = "ate-shared-"
+	// sharedDeadlineAnnotation is the pool's hard lifetime deadline (RFC 3339),
+	// written once at creation and never by a ledger update, so a corrupted or
+	// rewritten ledger can never extend the bound.
+	sharedDeadlineAnnotation = "substrate.workspace.orka.ai/shared-deadline"
+	sharedLedgerVersion      = "substrate.workspace.shared-ledger.v1"
+	sharedPoolPrefix         = "ate-shared-"
 	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
 	sharedIdleGrace = 5 * time.Minute
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
@@ -70,13 +74,13 @@ const (
 	// sharedAdmissionLead closes admission this long before strong retirement
 	// begins, so a newly admitted Actor has time to run.
 	sharedAdmissionLead = time.Hour
-	// sharedEgressSettle is how long deny-all egress must be stored before
-	// SuspendActor: the egress gateway caches a fetched policy for
-	// DefaultPolicyCacheTTL (10s, cmd/atenet/internal/router/egress/
-	// policycache.go) and the worker's DNS relay for egressPolicyTTL (5s,
-	// internal/atunnel/egresspolicy.go), plus a margin. Upstream reports no
-	// enforcement acknowledgement to wait for instead.
-	sharedEgressSettle = 15 * time.Second
+	// dnsRelayPolicyTTL is the worker DNS relay's fixed policy cache
+	// (internal/atunnel/egresspolicy.go, egressPolicyTTL).
+	dnsRelayPolicyTTL = 5 * time.Second
+	// sharedEgressSettleMargin is added to the longest policy cache.
+	sharedEgressSettleMargin = 5 * time.Second
+	// sharedEgressSettle is the settle window with the default gateway TTL.
+	sharedEgressSettle = upstreamEgressPolicyCacheTTL + sharedEgressSettleMargin
 	// sharedEscalationGrace is the grace of the escalating re-delete. One
 	// second, not zero: a zero grace removes the Pod object without the
 	// kubelet confirming its containers stopped, which would forge the
@@ -384,9 +388,42 @@ func sharedBorn(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time
 	return born
 }
 
-// sharedDeadline is the hard bound: the worker Pod is gone by then.
+// sharedDeadline is the hard bound: the worker Pod is gone by then. It is the
+// earliest of the ledger's birth plus lifetime and the creation-time deadline
+// annotation; a missing or unreadable annotation bounds the pool by its
+// creation plus the minimum lifetime, so it never lengthens the bound.
 func sharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) time.Time {
-	return sharedBorn(pool, ledger).Add(ledger.Scope.Lifetime.Duration)
+	deadline := sharedBorn(pool, ledger).Add(ledger.Scope.Lifetime.Duration)
+	if recorded, ok := sharedRecordedDeadline(pool); !ok {
+		deadline = minTime(deadline, pool.GetCreationTimestamp().Add(profile.MinSharedWorkerLifetime))
+	} else {
+		deadline = minTime(deadline, recorded)
+	}
+	return deadline
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// sharedRecordedDeadline reads the creation-time deadline annotation.
+func sharedRecordedDeadline(pool *unstructured.Unstructured) (time.Time, bool) {
+	raw := pool.GetAnnotations()[sharedDeadlineAnnotation]
+	deadline, err := time.Parse(time.RFC3339, raw)
+	return deadline, err == nil && raw != ""
+}
+
+// setSharedDeadline writes a new pool's deadline annotation.
+func setSharedDeadline(pool *unstructured.Unstructured, ledger *sharedLedger) {
+	annotations := maps.Clone(pool.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(ledger.Scope.Lifetime.Duration).UTC().Format(time.RFC3339)
+	pool.SetAnnotations(annotations)
 }
 
 // sharedRetireAt is when strong retirement begins: early enough for the
@@ -434,6 +471,9 @@ func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (
 	}
 	if ledger.Scope != shared.Scope {
 		return nil, fmt.Errorf("shared worker ledger scope differs from this allocation: %w", sdk.ErrStaleIdentity)
+	}
+	if recorded, ok := sharedRecordedDeadline(pool); !ok || !recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
+		return nil, fmt.Errorf("shared worker lifetime evidence is missing or inconsistent: %w", sdk.ErrStaleIdentity)
 	}
 	return ledger, nil
 }
@@ -578,6 +618,7 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		if err := setSharedLedger(created, ledger); err != nil {
 			return err
 		}
+		setSharedDeadline(created, ledger)
 		err = d.client.Create(ctx, created)
 		if apierrors.IsAlreadyExists(err) {
 			created = poolObject()
@@ -1130,7 +1171,7 @@ func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigM
 			return false, err
 		}
 	}
-	if shared.Strong == "" && sharedNow().Before(shared.EgressRevokedAt.Add(sharedEgressSettle)) {
+	if shared.Strong == "" && sharedNow().Before(shared.EgressRevokedAt.Add(d.config.egressSettle())) {
 		return false, nil
 	}
 	if shared.Suspend == nil || !shared.Suspend.Issued {
@@ -1690,4 +1731,15 @@ func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, recor
 		return err
 	}
 	return d.initiateSharedStrongRetirement(ctx, record)
+}
+
+// egressSettle is how long deny-all egress must be stored before
+// SuspendActor: longer than both the egress gateway's declared policy cache
+// (--substrate-egress-policy-cache-ttl, which must equal the gateway's
+// --egress-policy-cache-ttl) and the worker DNS relay's 5s cache. Upstream
+// reports no enforcement acknowledgement to wait for instead. Cache expiry
+// only governs new requests; already-admitted streams end when the checkpoint
+// deactivates the tunnel.
+func (c Config) egressSettle() time.Duration {
+	return max(c.gatewayPolicyCacheTTL(), dnsRelayPolicyTTL) + sharedEgressSettleMargin
 }

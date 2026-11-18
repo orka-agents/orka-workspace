@@ -59,6 +59,26 @@ type Config struct {
 	// provider keeps verifying that no foreign template could reach a shared
 	// worker.
 	DedicatedInstall bool
+	// EgressPolicyCacheTTL must equal the Agent Substrate egress gateway's
+	// --egress-policy-cache-ttl. Shared workers wait longer than it after
+	// revoking egress before suspension. Zero or unset assumes the upstream
+	// default (10s), which is also conservative for a disabled cache.
+	EgressPolicyCacheTTL time.Duration
+}
+
+// upstreamEgressPolicyCacheTTL is the gateway default
+// (cmd/atenet/internal/router/egress/policycache.go, DefaultPolicyCacheTTL).
+const upstreamEgressPolicyCacheTTL = 10 * time.Second
+
+// maxEgressPolicyCacheTTL bounds the declared gateway cache TTL.
+const maxEgressPolicyCacheTTL = 10 * time.Minute
+
+// gatewayPolicyCacheTTL is the effective declared gateway cache TTL.
+func (c Config) gatewayPolicyCacheTTL() time.Duration {
+	if c.EgressPolicyCacheTTL <= 0 {
+		return upstreamEgressPolicyCacheTTL
+	}
+	return c.EgressPolicyCacheTTL
 }
 
 // KubernetesSecretsCredentialProvider is the upstream credential provider
@@ -102,6 +122,9 @@ func (c Config) Validate() error {
 	}
 	if c.BootTimeout < 0 {
 		return fmt.Errorf("native boot timeout must not be negative")
+	}
+	if c.EgressPolicyCacheTTL < 0 || c.EgressPolicyCacheTTL > maxEgressPolicyCacheTTL {
+		return fmt.Errorf("egress policy cache TTL must be from 0 to %s", maxEgressPolicyCacheTTL)
 	}
 	return c.ValidateEgressCredentials()
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"maps"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,19 +45,21 @@ func sharedReplenisher(c client.Client, native *nativeFixture) *SpareWorkerReple
 	return &SpareWorkerReplenisher{Client: c, Control: native, Config: sharedConfig()}
 }
 
-// testNow is the shared-worker clock in tests; tick advances it past the
-// egress settle window that precedes each suspension.
-var testNow time.Time
+// testClock is the shared-worker clock in tests, in Unix nanoseconds; tick
+// advances it past the egress settle window that precedes each suspension.
+var testClock atomic.Int64
+
+func testNow() time.Time { return time.Unix(0, testClock.Load()) }
 
 func useTestClock(t *testing.T) {
 	t.Helper()
 	previous := sharedNow
-	testNow = time.Now()
-	sharedNow = func() time.Time { return testNow }
+	testClock.Store(time.Now().UnixNano())
+	sharedNow = testNow
 	t.Cleanup(func() { sharedNow = previous })
 }
 
-func tick() { testNow = testNow.Add(sharedEgressSettle + time.Second) }
+func tick() { testClock.Add(int64(sharedEgressSettle + time.Second)) }
 
 // createSharedProfile creates an opted-in profile and returns its binding.
 func createSharedProfile(t *testing.T, c client.Client, namespace, name string, uid types.UID, maxActors int32) *api.ImmutableObjectBinding {
@@ -200,7 +204,7 @@ func poolLedger(t *testing.T, c client.Client, name string) (*unstructured.Unstr
 
 func setNow(t *testing.T, at time.Time) {
 	t.Helper()
-	testNow = at
+	testClock.Store(at.UnixNano())
 }
 
 func podExists(t *testing.T, c client.Client, namespace, name string, uid string) bool {
@@ -596,8 +600,9 @@ func TestSharedTaintOrQuarantineRetiresThroughTheStrongPath(t *testing.T) {
 func TestSharedRetirementRecoversFromTheJournalWithoutReplay(t *testing.T) {
 	for _, operation := range []string{"updateEgress", "suspend", "tag", "deleteActor"} {
 		t.Run(operation, func(t *testing.T) {
-			// A failed egress revocation is doubt, so it takes the strong path.
-			strong := operation == "updateEgress"
+			// After the suspension intent, any lost response before the proof
+			// is doubt, so it takes the strong path without replay.
+			strong := operation != "deleteActor"
 			c, native, first, binding := sharedFixture(t, 2)
 			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
 			a, _ := sharedReady(t, c, native, first)
@@ -625,7 +630,7 @@ func TestSharedRetirementRecoversFromTheJournalWithoutReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if lost == strong || stopped.RetainedData == nil || native.suspends != 1 || native.deletes != 1 || (record.SharedWorker.Proof == nil) != strong || (record.SharedWorker.Strong != "") != strong {
+			if (operation == "updateEgress") == lost || stopped.RetainedData == nil || native.suspends != 1 || native.deletes != 1 || (record.SharedWorker.Proof == nil) != strong || (record.SharedWorker.Strong != "") != strong {
 				t.Fatalf("recovery replayed a mutation or lost the proof: lost=%v suspends=%d deletes=%d %#v", lost, native.suspends, native.deletes, record.SharedWorker)
 			}
 			if strong {
@@ -1072,7 +1077,7 @@ func TestSharedEgressSettlesBeforeSuspend(t *testing.T) {
 	var suspendedAt time.Time
 	native.beforeSuspend = func(actor *pb.Actor) {
 		if actor.Metadata.Name == recordA.Actor.Name {
-			suspendedAt = testNow
+			suspendedAt = testNow()
 		}
 	}
 	for range 3 {
@@ -1151,5 +1156,235 @@ func TestSharedClaimMovesToAPrivateWorkerWhenTheWorkspaceBecomesSuspect(t *testi
 	_, record := sharedReady(t, c, native, first)
 	if record.SharedWorker != nil || record.RuntimePoolLabels[workerInstanceLabel] == "" || len(sharedPools(t, c)) != 0 {
 		t.Fatalf("a workspace tainted before its claim did not move to a private worker: %#v", record.SharedWorker)
+	}
+}
+
+func TestSharedBoundsRunIndependentlyOfAStalledNativeSweep(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	native.block = true
+	// A native sweep that stalls on every call is bounded by its deadline.
+	stalled := sharedReplenisher(c, native)
+	stalled.SweepDeadline = 50 * time.Millisecond
+	started := time.Now()
+	_ = stalled.Sweep(t.Context())
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("a stalled native sweep ran %s past its deadline", elapsed)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+		t.Fatal("a pool inside its lifetime was retired")
+	}
+	// A long native sweep is blocked; the bounds loop still retires the pool
+	// once its strong retirement time arrives.
+	ctx, cancel := context.WithCancel(t.Context())
+	var running sync.WaitGroup
+	defer func() {
+		cancel()
+		running.Wait()
+	}()
+	blocked := sharedReplenisher(c, native)
+	blocked.SweepDeadline = time.Hour
+	running.Add(2)
+	go func() {
+		defer running.Done()
+		_ = blocked.Sweep(ctx)
+	}()
+	go func() {
+		defer running.Done()
+		(&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).RunSharedBounds(ctx, 10*time.Millisecond)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	setNow(t, sharedRetireAt(pool, ledger))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the bounds loop was blocked behind a stalled native sweep")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSharedPostIntentSuspendFailuresTakeTheStrongPathWithoutReplay(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func(*nativeFixture)
+	}{
+		{"template read fails", func(native *nativeFixture) { native.failGetTemplate = 3 }},
+		{"invalid snapshot evidence", func(native *nativeFixture) {
+			native.suspendFidelity = pb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
+		}},
+		{"tag create fails", func(native *nativeFixture) { native.failCreateTag = 1 }},
+		{"tag read fails", func(native *nativeFixture) { native.failGetTag = 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 2)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			// First pass persists the suspension intent and revokes egress.
+			if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name != "invalid snapshot evidence" && tc.name != "template read fails" {
+				// Let the suspend take effect before the Tag-capture failure.
+				native.afterSuspend = func(*pb.Actor) { tc.inject(native) }
+			} else {
+				tc.inject(native)
+			}
+			for range 8 {
+				tick()
+				_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+			}
+			_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.SharedWorker.Strong == "" {
+				t.Fatalf("a post-intent failure did not select the strong path: %#v", record.SharedWorker)
+			}
+			if native.suspendCalls > 1 {
+				t.Fatalf("SuspendActor was replayed: %d calls", native.suspendCalls)
+			}
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+				t.Fatal("the strong path did not delete the pool and prove its Pod absent")
+			}
+		})
+	}
+}
+
+func TestSharedPersistedStrongMarkerFinishesDeletionAfterACrash(t *testing.T) {
+	for _, driverPath := range []string{"bounds", "retirement"} {
+		t.Run(driverPath, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			a, recordA := sharedReady(t, c, native, first)
+			// The suspend took effect; then the provider persisted Strong and
+			// crashed before deleting the pool. Tag capture keeps failing.
+			if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			cm, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record.SharedWorker.Strong = "crashed after persisting the strong path"
+			if err := sharedDriver(c, native).save(t.Context(), cm, record); err != nil {
+				t.Fatal(err)
+			}
+			native.failCreateTag = 100
+			if driverPath == "bounds" {
+				if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				for range 4 {
+					tick()
+					_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+				}
+			}
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("a persisted strong marker did not drive the pool's deletion")
+			}
+			if native.suspendCalls > 1 {
+				t.Fatalf("SuspendActor was replayed: %d calls", native.suspendCalls)
+			}
+		})
+	}
+}
+
+func TestSharedUnreadableLifetimeEvidenceRetiresAtOnce(t *testing.T) {
+	for _, corrupt := range []string{"ledger", "deadline", "extended"} {
+		t.Run(corrupt, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+			annotations := maps.Clone(pool.GetAnnotations())
+			switch corrupt {
+			case "ledger":
+				annotations[sharedLedgerAnnotation] = "{"
+			case "deadline":
+				delete(annotations, sharedDeadlineAnnotation)
+			case "extended":
+				// A rewritten ledger cannot extend the creation-time deadline.
+				ledger.BornAt = metav1.NewTime(ledger.BornAt.Add(12 * time.Hour))
+				if err := setSharedLedger(pool, ledger); err != nil {
+					t.Fatal(err)
+				}
+				maps.Copy(annotations, pool.GetAnnotations())
+			}
+			pool.SetAnnotations(annotations)
+			if err := c.Update(t.Context(), pool); err != nil {
+				t.Fatal(err)
+			}
+			if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatal("unreadable or inconsistent lifetime evidence did not retire the pool at once")
+			}
+		})
+	}
+}
+
+func TestSharedWarmCreationRequiresACleanTemplateInventory(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	native.templates["foreign/open"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "foreign", Name: "open"}}
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if len(sharedPools(t, c)) != 0 {
+		t.Fatal("a warm shared pool was created beside a foreign empty-selector template")
+	}
+	delete(native.templates, "foreign/open")
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a clean inventory did not allow the warm pool")
+	}
+}
+
+func TestSharedEgressSettleFollowsTheDeclaredGatewayTTL(t *testing.T) {
+	if got := (Config{}).egressSettle(); got != sharedEgressSettle {
+		t.Fatalf("default settle = %s, want %s", got, sharedEgressSettle)
+	}
+	if got := (Config{EgressPolicyCacheTTL: time.Minute}).egressSettle(); got != time.Minute+sharedEgressSettleMargin {
+		t.Fatalf("settle for a 1m gateway cache = %s", got)
+	}
+	if got := (Config{EgressPolicyCacheTTL: time.Second}).egressSettle(); got != dnsRelayPolicyTTL+sharedEgressSettleMargin {
+		t.Fatalf("settle below the DNS relay cache = %s", got)
+	}
+	c, native, first, _ := sharedFixture(t, 2)
+	a, _ := sharedReady(t, c, native, first)
+	config := sharedConfig()
+	config.EgressPolicyCacheTTL = time.Minute
+	d := New(c, native, config)
+	d.challengeClient = native
+	for range 4 {
+		tick()
+		if _, err := d.SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if native.suspendCalls != 0 {
+		t.Fatal("SuspendActor was issued before a 1m gateway cache expired")
+	}
+	for range 4 {
+		testClock.Add(int64(time.Minute))
+		if _, err := d.SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if native.suspendCalls != 1 {
+		t.Fatalf("SuspendActor calls after the settle window = %d", native.suspendCalls)
 	}
 }
