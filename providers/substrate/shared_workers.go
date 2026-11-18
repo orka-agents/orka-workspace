@@ -1381,12 +1381,12 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 			reason = doubt
 		}
 		if reason != "" {
-			if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
-				return err
-			}
+			// Deletion is driven even if the marker cannot be saved; the
+			// persistence error is still returned.
+			persistErr := d.markSharedStrong(ctx, cm, record, reason)
 			gone, err := d.strongSharedAbsence(ctx, record)
-			if err != nil || !gone {
-				return err
+			if persistErr != nil || err != nil || !gone {
+				return errors.Join(persistErr, err)
 			}
 		}
 		record.WorkloadAbsent = true
@@ -1914,10 +1914,11 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
 	ctx, cancel := strongCleanupContext(ctx)
 	defer cancel()
-	if err := d.markSharedStrong(ctx, cm, record, reason); err != nil {
-		return err
-	}
-	return d.initiateSharedStrongRetirement(ctx, record)
+	// The deletion is attempted whether or not the marker is durable: a
+	// rejected journal write must never gate it. A deleting pool or an absent
+	// Pod is itself strong evidence on every later pass.
+	persistErr := d.markSharedStrong(ctx, cm, record, reason)
+	return errors.Join(persistErr, d.initiateSharedStrongRetirement(ctx, record))
 }
 
 // egressSettle is how long deny-all egress must be stored before
@@ -1980,38 +1981,51 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 // failed ledger write (including a conflict) can block the UID-preconditioned
 // Delete.
 func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
-	if pool.GetDeletionTimestamp() != nil {
-		return nil
-	}
-	if len(reason) > sharedLedgerReasonMax {
-		reason = reason[:sharedLedgerReasonMax]
-	}
-	// The UID-preconditioned Delete is mandatory and comes first, on its own
-	// fresh bounded context: neither the result nor the duration of the
-	// ledger write can affect it. A deletionTimestamp already stops admission
-	// and every startup verification.
-	deleteCtx, cancelDelete := strongCleanupContext(ctx)
-	uid := pool.GetUID()
-	err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground))
-	cancelDelete()
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err := d.deleteSharedPool(ctx, pool); err != nil {
 		return err
 	}
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
-	// The state and reason are recorded afterwards, best effort, with a
-	// short timeout of their own.
-	if ledger, err := readSharedLedger(pool); err == nil && ledger.State != state && ledger.State != sharedQuarantined {
-		ledger.State, ledger.Reason = state, reason
-		recorded := pool.DeepCopy()
-		if err := setSharedLedger(recorded, ledger); err == nil {
-			writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
-			if err := d.client.Update(writeCtx, recorded); err != nil && !apierrors.IsNotFound(err) {
-				ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement state not recorded; the pool is already deleting", "reason", err.Error())
-			}
-			cancelWrite()
-		}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	defer cancel()
+	d.recordSharedRetirement(writeCtx, pool, state, reason)
+	return nil
+}
+
+// deleteSharedPool is the mandatory step of every strong retirement: the
+// UID-preconditioned foreground Delete, on its own fresh bounded context. A
+// deletionTimestamp already stops admission and every startup verification.
+func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Unstructured) error {
+	if pool.GetDeletionTimestamp() != nil {
+		return nil
+	}
+	deleteCtx, cancel := strongCleanupContext(ctx)
+	defer cancel()
+	uid := pool.GetUID()
+	if err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
+		return err
 	}
 	return nil
+}
+
+// recordSharedRetirement is best-effort bookkeeping after a pool's Delete:
+// the retirement state and reason, written under the caller's bounded ctx.
+// It never gates deletion or escalation.
+func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructured.Unstructured, state, reason string) {
+	if len(reason) > sharedLedgerReasonMax {
+		reason = reason[:sharedLedgerReasonMax]
+	}
+	ledger, err := readSharedLedger(pool)
+	if err != nil || ledger.State == state || ledger.State == sharedQuarantined {
+		return
+	}
+	ledger.State, ledger.Reason = state, reason
+	recorded := pool.DeepCopy()
+	if err := setSharedLedger(recorded, ledger); err != nil {
+		return
+	}
+	if err := d.client.Update(ctx, recorded); err != nil && !apierrors.IsNotFound(err) {
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement state not recorded; the pool is already deleting", "reason", err.Error())
+	}
 }
 
 // sharedLedgerWriteTimeout bounds the best-effort retirement state write that

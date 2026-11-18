@@ -2413,3 +2413,101 @@ func TestSharedBlockedLedgerWriteCannotDelayTheDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedRejectedStrongMarkerStillDeletesThePool(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The Actor read fails during Stop, and the journal write that would
+	// persist Strong is rejected with a non-conflict error.
+	native.failGetActor = 1
+	rejecting := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if cm, ok := obj.(*corev1.ConfigMap); ok && strings.Contains(cm.Data[journalDataKey], `"strong":`) {
+			return apierrors.NewForbidden(corev1.Resource("configmaps"), cm.Name, errors.New("journal write rejected"))
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	tick()
+	if _, err := sharedDriver(rejecting, native).StopInstance(t.Context(), first.Key, a.Identity); err == nil {
+		t.Fatal("expected the persistence error to be returned")
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a rejected strong-marker write gated the pool's deletion")
+	}
+	// A later reconcile never takes the interim path: the deleting pool and
+	// the absent Pod are themselves strong evidence.
+	_, stopped := sharedRetired(t, c, native, first, a.Identity, false)
+	if stopped.SharedWorker.Strong == "" || stopped.SharedWorker.Proof != nil || native.suspendCalls != 0 {
+		t.Fatalf("a later Stop forgot the doubt: %#v suspends=%d", stopped.SharedWorker, native.suspendCalls)
+	}
+}
+
+func TestSharedBoundsPassDoesMandatoryWorkBeforeBookkeeping(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	// Many pools, all due at once.
+	var pools []string
+	_, record := sharedReady(t, c, native, first)
+	pools = append(pools, record.SharedWorker.Pool)
+	for i := range 11 {
+		item := sharedWorkspace(t, c, first, "tenant", fmt.Sprintf("w%02d", i), types.UID(fmt.Sprintf("w%02d-uid", i)), binding)
+		// A fresh pool per workspace: fill the previous one first.
+		_, r := sharedReady(t, c, native, item)
+		if !slices.Contains(pools, r.SharedWorker.Pool) {
+			pools = append(pools, r.SharedWorker.Pool)
+		}
+	}
+	if len(pools) < 5 {
+		t.Fatalf("fixture created only %d pools", len(pools))
+	}
+	// Every pool's worker Pod lingers and every pool stays observable while
+	// deleting, and every ledger write blocks until its context ends.
+	for _, name := range pools {
+		pool, _ := poolLedger(t, c, name)
+		pool.SetFinalizers([]string{"test.invalid/hold"})
+		if err := c.Update(t.Context(), pool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool, ledger := poolLedger(t, c, pools[0])
+	setNow(t, sharedEscalateAt(pool, ledger).Add(time.Minute))
+	var deleted, escalated atomic.Int64
+	blocking := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			switch o := obj.(type) {
+			case *unstructured.Unstructured:
+				if o.GetKind() == "WorkerPool" {
+					deleted.Add(1)
+				}
+			case *corev1.Pod:
+				escalated.Add(1)
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	}))
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(done)
+		_ = (&SpareWorkerReplenisher{Client: blocking, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	}()
+	// Every Delete and escalation lands within one pass, long before the
+	// blocked bookkeeping finishes.
+	deadline := time.Now().Add(10 * time.Second)
+	for deleted.Load() < int64(len(pools)) || escalated.Load() < int64(len(pools)) {
+		if time.Now().After(deadline) {
+			t.Fatalf("after %s only %d/%d deletes and %d/%d escalations happened", time.Since(started), deleted.Load(), len(pools), escalated.Load(), len(pools))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+	case <-time.After(sharedBookkeepingBudget + 10*time.Second):
+		t.Fatal("bookkeeping exceeded its total budget")
+	}
+}

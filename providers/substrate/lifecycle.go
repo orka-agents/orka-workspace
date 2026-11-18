@@ -500,8 +500,16 @@ func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		defer cancel()
 		record.Failure = reason
 		record.Observation = pendingObservation(record)
-		if err := d.save(ctx, cm, record); err != nil {
-			return sdk.AllocationObservation{}, err
+		persistErr := d.save(ctx, cm, record)
+		if shared := record.SharedWorker; shared != nil && record.BootRequested && shared.UID != "" {
+			// A booted shared instance's failure takes the strong path; its
+			// pool deletion never waits on the failure being durable.
+			if err := d.initiateSharedStrongRetirement(ctx, record); err != nil {
+				persistErr = errors.Join(persistErr, err)
+			}
+		}
+		if persistErr != nil {
+			return sdk.AllocationObservation{}, persistErr
 		}
 	}
 	return record.Observation, nil

@@ -44,7 +44,6 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	if err != nil {
 		return err
 	}
-	now := sharedNow()
 	var errs []error
 	if provenanceErr != nil {
 		// Unavailable provenance is doubt: the mutable annotations cannot be
@@ -52,39 +51,69 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
 	}
+	// Mandatory work first: every due Delete and escalation, with the clock
+	// re-read per pool. Bookkeeping (retirement state and reason) is queued
+	// and runs afterwards within its own total budget, so it can never delay
+	// a Delete or an escalation.
+	type bookkeeping struct {
+		pool          *unstructured.Unstructured
+		state, reason string
+	}
+	var pending []bookkeeping
+	retire := func(pool *unstructured.Unstructured, state, reason string) {
+		if err := d.deleteSharedPool(ctx, pool); err != nil {
+			errs = append(errs, err)
+			return
+		}
+		pending = append(pending, bookkeeping{pool: pool, state: state, reason: reason})
+	}
 	for i := range pools {
 		pool := &pools[i]
 		recorded := provenance[pool.GetUID()]
 		retireAt, escalateAt, evidence := sharedBoundsOf(pool, recorded, provenanceErr == nil)
+		now := sharedNow()
 		if pool.GetDeletionTimestamp() == nil {
 			switch {
 			case !sharedLabelsIntact(pool):
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker carries shared evidence without its provider-owned label"))
+				retire(pool, sharedRetiring, "the shared worker carries shared evidence without its provider-owned label")
 			case !r.Config.DedicatedInstall:
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, errSharedWorkersNotDedicated.Error()))
+				retire(pool, sharedRetiring, errSharedWorkersNotDedicated.Error())
 			case !evidence:
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent"))
+				retire(pool, sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent")
 			case recorded.strong:
 				// A journal that recorded this pool's UID holds an unreleased
 				// strong marker or failure, whatever the mutable entry list
 				// now says.
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed"))
+				retire(pool, sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed")
 			case sharedRetirementPersisted(pool):
 				// A retirement state saved before a crash, or before a native
 				// sweep ran out of time, is unconditional deletion intent.
 				state, reason := sharedPersistedRetirement(pool)
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, state, reason))
+				retire(pool, state, reason)
 			case d.sharedStrongMarked(ctx, pool):
 				// A hosted journal persisted the strong path or a failure
 				// (possibly crashing before it deleted the pool), or a hosted
 				// workspace became suspect; act on it with no native read.
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect"))
+				retire(pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
 			case !now.Before(retireAt):
-				errs = append(errs, d.hardRetireSharedPool(ctx, pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime"))
+				retire(pool, sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
 			}
 		}
-		if !now.Before(escalateAt) {
+		if !sharedNow().Before(escalateAt) {
 			errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
+		}
+	}
+	if len(pending) > 0 {
+		budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedBookkeepingBudget)
+		defer cancel()
+		for _, item := range pending {
+			if budget.Err() != nil {
+				break
+			}
+			ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", item.state, "reason", item.reason)
+			writeCtx, cancelWrite := context.WithTimeout(budget, sharedLedgerWriteTimeout)
+			d.recordSharedRetirement(writeCtx, item.pool, item.state, item.reason)
+			cancelWrite()
 		}
 	}
 	return errors.Join(errs...)
@@ -160,6 +189,10 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 	}
 	return out, nil
 }
+
+// sharedBookkeepingBudget bounds the total time one bounds pass spends on
+// best-effort retirement bookkeeping, after all mandatory work.
+const sharedBookkeepingBudget = 30 * time.Second
 
 // sharedBoundsOf returns when a pool's strong retirement starts and when its
 // worker Pods are escalated, and whether its lifetime evidence is consistent.
