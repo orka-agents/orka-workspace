@@ -345,11 +345,14 @@ pool or opted-in profile exists.
 - **Leader sweep.** A leader-only pass, every 10 seconds:
   - quarantines a pool that hosts an Actor outside its ledger;
   - removes entries that their exact journal disowns;
-  - deletes empty pools after 5 minutes.
+  - deletes empty pools after 5 minutes, unless they are warm capacity.
 - **Warm capacity.** For these profiles the `spare-workers` annotation counts
   free shared slots to keep warm, and private spares are not created. A pool
   is created only after a complete template inventory shows no foreign
-  template that could reach it.
+  template that could reach it. An emptied pool that the count still needs
+  keeps admitting until its admission window closes, so a resume or cold start
+  normally lands on its running worker. Without the annotation an emptied pool
+  is kept for only 5 minutes.
 - **Residual risk.** This evidence is weaker than Pod absence:
   - a leaked sandbox keeps its memory, with no tunnel and no TCP egress, until
     the worker Pod is gone. Its DNS relay session is stopped only by the
@@ -445,6 +448,18 @@ ownership anchor. Journals remain until core finalizes the workspace.
 An issued suspension is never replayed because of a transport error. Known native
 `SUSPENDING` progress stays pending; a still-running or failed Actor reports an
 unresolved outcome until exact snapshot evidence or authorized retirement settles it.
+
+`--max-concurrent-reconciles` (default 8, from 1 to 32) sets how many
+ExecutionWorkspaces are reconciled in parallel; one workspace is never
+reconciled twice at once. Parallel reconciles share only thread-safe clients and
+resourceVersion-preconditioned writes: spare claims, shared ledgers, and the
+suspended-occupancy ledger. Allocations of one shared scope still choose between
+joining and creating a pool one at a time, so a burst of cold starts fills a pool
+before it creates another. A pending workspace is polled after 200 ms, then
+400 ms and 800 ms, then every second, because the provider's own status writes
+do not trigger a reconcile. Each pass re-verifies everything it acts on, and
+continues in the same pass after a write whose result it can verify, such as a
+restored Actor's bootstrap template rotation or a shared ledger's Actor UID.
 
 Infrastructure readiness reports the native Actor identity, exact worker Pod,
 request sequence, the public sealed-bootstrap challenge hash, the router
