@@ -310,6 +310,17 @@ bounded expiry, and the admitted mount and environment for
 session continues in the same retained directory. A workspace without a Session
 keeps that layout, so a checkpoint restore into a Delete-on-detach Task works;
 the bounded expiry covers any data it suspends.
+`retention.suspendAfterDetach` is the optional warm window from Orka ADR 0055,
+"Keep a detached Substrate workspace warm before suspending it". Orka keeps a
+detached, session-reused workspace Ready, with its Actor and supervisor running
+and its attachment revoked, for that duration before the frozen Suspend applies;
+a continuation inside the window reattaches without a cold resume. Unset, which
+is the default, suspends immediately on detach and leaves existing profile hashes
+unchanged. The CRD and the provider accept only a positive Go duration of at
+most `1h`, and only with `suspend.mode: DataOnly`. Orka core resolves the class
+and also requires Session reuse and an allowed Suspend, plus a window shorter
+than the class `idleTimeout` and `maxLifetime` when they are set. The provider
+hashes the profile as stored, so `5m` and `5m0s` are different profile contents.
 A suspended count cap additionally requires maxLifetime and uses a persistent
 ConfigMap reservation before capture. The provider verifies the exact
 single-Actor worker hosts only this Actor, requests a `SYNCHRONOUS` suspension

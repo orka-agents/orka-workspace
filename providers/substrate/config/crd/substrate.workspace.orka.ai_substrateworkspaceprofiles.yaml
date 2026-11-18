@@ -59,7 +59,21 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  suspendAfterDetach:
+                    description: |-
+                      SuspendAfterDetach is the warm window defined by Orka ADR 0055. Orka
+                      keeps a detached session-reused workspace Ready, with its Actor and
+                      supervisor running but its attachment revoked, for this long before the
+                      frozen Suspend applies. Unset suspends immediately on detach. It requires
+                      suspend.mode DataOnly and must be positive and at most 1h; Orka core
+                      additionally requires it to be shorter than the class idleTimeout and
+                      maxLifetime. There is no default, so existing profiles keep their hash.
+                    type: string
                 type: object
+                x-kubernetes-validations:
+                - message: suspendAfterDetach must be positive and at most 1h
+                  rule: '!has(self.suspendAfterDetach) || (duration(self.suspendAfterDetach)
+                    > duration(''0s'') && duration(self.suspendAfterDetach) <= duration(''1h''))'
               suspend:
                 description: |-
                   Suspend enables verified data-only cold continuation. Omission leaves
@@ -98,6 +112,9 @@ spec:
             x-kubernetes-validations:
             - message: SubstrateWorkspaceProfile spec is immutable; create a new profile
               rule: self == oldSelf
+            - message: retention.suspendAfterDetach requires suspend.mode DataOnly
+              rule: '!has(self.retention) || !has(self.retention.suspendAfterDetach)
+                || (has(self.suspend) && self.suspend.mode == ''DataOnly'')'
         required:
         - spec
         type: object

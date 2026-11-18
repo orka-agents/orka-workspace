@@ -11,6 +11,7 @@ MIT License - see LICENSE file for details.
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -20,6 +21,11 @@ func (in *RetentionPolicy) DeepCopyInto(out *RetentionPolicy) {
 	if in.MaxSuspendedWorkspaces != nil {
 		in, out := &in.MaxSuspendedWorkspaces, &out.MaxSuspendedWorkspaces
 		*out = new(int32)
+		**out = **in
+	}
+	if in.SuspendAfterDetach != nil {
+		in, out := &in.SuspendAfterDetach, &out.SuspendAfterDetach
+		*out = new(v1.Duration)
 		**out = **in
 	}
 }
