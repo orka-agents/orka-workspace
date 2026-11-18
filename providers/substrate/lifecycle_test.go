@@ -75,6 +75,14 @@ type nativeFixture struct {
 	lingering map[string]*pb.ActorAssignment
 	// failGetWorker fails the next GetWorker calls.
 	failGetWorker int
+	// failSuspendBeforeEffect rejects the next SuspendActor before it takes
+	// effect; suspendCalls counts every SuspendActor request.
+	failSuspendBeforeEffect bool
+	suspendCalls            int
+	// failGetActor fails the next GetActor calls.
+	failGetActor int
+	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
+	failEgressUpdate int
 	// staleOnce reports these assignments in only the next listing of their
 	// worker, as a listing taken just before a retirement released them.
 	staleOnce map[string]*pb.ActorAssignment
@@ -163,7 +171,21 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	delete(f.templates, key)
 	return cloneTemplate(v), f.effect("deleteTemplate")
 }
+func (f *nativeFixture) ListActorTemplates(_ context.Context, _ *pb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
+	out := &pb.ListActorTemplatesResponse{}
+	for _, template := range f.templates {
+		out.ActorTemplates = append(out.ActorTemplates, cloneTemplate(template))
+	}
+	return out, nil
+}
 func (f *nativeFixture) GetActor(_ context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+	if f.failGetActor > 0 {
+		f.failGetActor--
+		return nil, status.Error(codes.Unavailable, "actor read unavailable")
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -297,6 +319,11 @@ func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	v.Status.WorkerAssignment = nil
 }
 func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+	f.suspendCalls++
+	if f.failSuspendBeforeEffect {
+		f.failSuspendBeforeEffect = false
+		return nil, status.Error(codes.Unavailable, "suspend not applied")
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -372,6 +399,10 @@ func (f *nativeFixture) CreateActorEgressPolicy(_ context.Context, req *pb.Creat
 	return proto.Clone(v).(*pb.EgressPolicy), f.effect("egress")
 }
 func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.UpdateActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	if f.failEgressUpdate > 0 {
+		f.failEgressUpdate--
+		return nil, status.Error(codes.Unavailable, "egress update unavailable")
+	}
 	key := refKey(req.Actor)
 	v := f.egress[key]
 	if v == nil {

@@ -267,54 +267,80 @@ spec:
   placement:
     sharedWorkers:
       maxActorsPerWorker: 4   # 2 to 16
-      maxWorkerLifetime: 12h  # 1h to 24h, default 24h
+      maxWorkerLifetime: 12h  # 3h to 24h, default 24h
 ```
 
 The field is part of the immutable, hashed spec, so opting in means creating
-a new profile. Without it, nothing above changes.
+a new profile. Without it the allocation path is unchanged. The leader sweep
+adds one Kubernetes list of shared pools per pass, and no native call while no
+pool or opted-in profile exists.
 
+- **Dedicated installs only.** Start the provider with
+  `--substrate-dedicated-install` to assert that only this Orka creates Actors
+  and ActorTemplates on the Agent Substrate install. Without it:
+  - an opted-in profile's allocations are refused, and the error reaches the
+    workspace's `Provisioned` condition;
+  - existing shared pools are strongly retired.
+- **Continuous verification.** Even with the flag, the provider lists every
+  ActorTemplate before each claim, before each Resume, and on every sweep. It
+  quarantines and strongly retires any shared pool that a template outside the
+  pool's Atespace could reach, with an empty selector or one the pool's labels
+  satisfy. Your own templates outside Orka's Atespaces must therefore select
+  their workers.
 - **What shares.** Only allocations whose egress injects the provider-proxy
   credential at the gateway share, so no long-lived provider token enters a
   shared sandbox. Never shared:
   - restores from a public checkpoint;
   - operator-tainted, quarantined, or `Failed` workspaces.
+
+  The workspace is re-checked when the slot is claimed (a suspect workspace
+  moves to a private worker) and immediately before Resume (fails closed).
 - **Pools.** A shared pool is a single-replica WorkerPool named
   `ate-shared-<random>`:
-  - its labels are the operator pool's plus a random
-    `substrate.workspace.orka.ai/shared-pool` value the derived template
-    selects;
+  - its only label is a random `substrate.workspace.orka.ai/shared-pool`
+    value the derived template selects, never the operator pool's labels;
   - it is sized `cpu=N·C, memory=N·M+64Mi`, and has no owner;
   - its `substrate.workspace.orka.ai/shared-ledger` annotation records the
     scope, birth, admission state, fenced worker, and each hosted journal and
     Actor UID. Every write is a resourceVersion-preconditioned Update.
 - **Retirement.** Retiring one Actor touches only that Actor:
-  1. Deny-all egress is applied and verified before `SuspendActor`. A Stop also
+  1. Deny-all egress is applied, verified, and left to settle for 15 s (the
+     gateway's 10 s cache, plus margin) before `SuspendActor`. A Stop also
      suspends, as evidence only.
   2. The Actor must be `SUSPENDED` at a later version with the expected new
      `VOLUMES` snapshot.
-  3. The fenced worker (same UID, Pod UID, registered and observed epoch, and
-     an unchanged version on re-read) must no longer list it, and must list no
-     Actor outside the ledger.
+  3. The fenced worker must still be `ACTIVE`, with the same UID, Pod UID,
+     registered and observed epoch, and an unchanged version on re-read. It
+     must no longer list the Actor, and must list no Actor outside the ledger.
   4. Then the Actor is deleted and its slot released.
 - **Doubt.** Any doubt retires the whole pool and proves exact worker Pod UID
   absence for every hosted Actor, and Orka core suspends the neighbours through
   worker eviction. Doubt includes:
   - an assignment that is still present;
-  - an epoch or identity change;
+  - an epoch, identity or state change;
   - an upstream error;
+  - an unresolved suspend, which is never replayed;
+  - a failed egress revocation;
   - a terminating worker;
-  - a tainted, quarantined, or failed workspace.
+  - a tainted, quarantined, or failed workspace on the pool.
+- **Lifetime.** `maxWorkerLifetime` is a hard bound on the worker Pod:
+  - strong retirement starts the Pod's 3600 s grace plus 5 minutes before it;
+  - admission closes an hour before that;
+  - a Pod still present 5 minutes before the bound is re-deleted with a
+    one-second grace;
+  - this enforcement runs first in each leader sweep, using Kubernetes alone.
 - **Leader sweep.** A leader-only pass, every 10 seconds:
-  - closes admission an hour before `maxWorkerLifetime` (half of it when
-    shorter than two hours), and retires the pool at `maxWorkerLifetime`;
   - quarantines a pool that hosts an Actor outside its ledger;
   - removes entries that their exact journal disowns;
   - deletes empty pools after 5 minutes.
 - **Warm capacity.** For these profiles the `spare-workers` annotation counts
   free shared slots to keep warm, and private spares are not created.
-- **Residual risk.** This evidence is weaker than Pod absence. A leaked sandbox
-  keeps its memory, with no tunnel, no egress and revoked credentials, until
-  the worker is recycled. A compromised worker exposes its co-hosted Actors.
+- **Residual risk.** This evidence is weaker than Pod absence:
+  - a leaked sandbox keeps its memory, with no tunnel and no egress, until the
+    worker Pod is gone;
+  - a foreign template created between checks is caught only by the next
+    check;
+  - a compromised worker exposes its co-hosted Actors.
 
 ## Workload translation
 

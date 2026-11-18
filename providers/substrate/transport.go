@@ -53,6 +53,12 @@ type Config struct {
 	// provider-proxy token in its private runtime namespace, which must be
 	// listed here for core to inject it.
 	EgressCredentialNamespaces []string
+	// DedicatedInstall is the operator's assertion that only this Orka
+	// creates Actors and ActorTemplates on the Agent Substrate install. Shared
+	// workers (ADR 0008) are refused without it, and even with it the
+	// provider keeps verifying that no foreign template could reach a shared
+	// worker.
+	DedicatedInstall bool
 }
 
 // KubernetesSecretsCredentialProvider is the upstream credential provider

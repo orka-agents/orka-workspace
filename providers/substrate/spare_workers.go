@@ -452,9 +452,11 @@ type spareShape struct {
 // Sweep runs one replenishment and garbage-collection pass.
 func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	d := New(r.Client, r.Control, r.Config)
+	// Shared worker lifetime bounds come first and need only Kubernetes.
+	boundsErr := r.enforceSharedBounds(ctx, d)
 	profiles := &profile.SubstrateWorkspaceProfileList{}
 	if err := r.List(ctx, profiles); err != nil {
-		return err
+		return errors.Join(boundsErr, err)
 	}
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion(workerPoolAPIVersion())
@@ -483,7 +485,7 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 			}
 		}
 	}
-	errs = append(errs, r.sweepShared(ctx, d, profiles.Items, workers))
+	errs = append(errs, boundsErr, r.sweepShared(ctx, d, profiles.Items, workers))
 	r.mu.Lock()
 	due := time.Since(r.lastOrphan) >= spareOrphanPeriod
 	if due {

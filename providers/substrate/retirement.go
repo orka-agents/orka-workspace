@@ -144,6 +144,9 @@ func (d *Lifecycle) captureRetirementWorker(ctx context.Context, cm *corev1.Conf
 func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	actor, err := d.actor(ctx, record)
 	if err != nil {
+		if record.SharedWorker != nil && record.BootRequested && !record.WorkloadAbsent {
+			return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read during retirement"))
+		}
 		return err
 	}
 	if actor == nil && record.Actor.UID == "" && record.Actor.CreateIssued {
@@ -412,6 +415,11 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	operation := record.Pending
 	actor, err := d.actor(ctx, record)
 	if err != nil {
+		if record.SharedWorker != nil {
+			// On a shared worker an unreadable Actor is doubt: retire the
+			// whole worker rather than wait on evidence that may never come.
+			return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read during suspension"))
+		}
 		return err
 	}
 	if actor == nil && record.Actor.UID != "" {
@@ -429,13 +437,17 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	}
 	if !operation.SuspendIssued {
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+			if record.SharedWorker != nil {
+				return errors.Join(fmt.Errorf("native Actor stopped before checkpoint intent was issued"), d.sharedDoubt(ctx, cm, record, "the Actor left RUNNING before its suspension was issued"))
+			}
 			return fmt.Errorf("native Actor stopped before checkpoint intent was issued")
 		}
 		if record.SharedWorker != nil {
-			// Egress is revoked before the suspend; doubt about the shared
-			// worker only selects the strong termination proof, so the data
-			// capture still proceeds.
-			if err := d.prepareSharedSuspend(ctx, cm, record, actor); err != nil {
+			// Egress is revoked, and settles, before the suspend; doubt about
+			// the shared worker only selects the strong termination proof, so
+			// the data capture still proceeds.
+			ready, err := d.prepareSharedSuspend(ctx, cm, record, actor)
+			if err != nil || !ready {
 				return err
 			}
 		} else if err := d.verifyRetiringWorker(ctx, record); err != nil {
@@ -456,6 +468,19 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		return nil
 	}
 	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
+		if record.SharedWorker != nil {
+			// The suspend may never have taken effect. It is never replayed:
+			// the whole shared worker is retired, and once its exact Pod is
+			// absent this instance is lost and retires through Stop.
+			if err := d.sharedDoubt(ctx, cm, record, fmt.Sprintf("the suspension outcome is unresolved for Actor state %s after request issuance", state)); err != nil {
+				return err
+			}
+			gone, err := d.strongSharedAbsence(ctx, record)
+			if err != nil || !gone {
+				return err
+			}
+			return lostInstance(record, nativeActorStopped)
+		}
 		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
 	}
 	snapshot := latestSnapshot(actor)

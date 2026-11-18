@@ -73,18 +73,19 @@ spec:
                         type: integer
                       maxWorkerLifetime:
                         description: |-
-                          MaxWorkerLifetime bounds how long a shared worker lives. It stops
-                          admitting Actors before then and is deleted, with exact worker Pod
-                          absence proof for every Actor it still hosts, when it is reached.
-                          Defaults to 24h, which is also the maximum.
+                          MaxWorkerLifetime is a hard bound on how long a shared worker Pod,
+                          and any sandbox memory it holds, exists. Its strong retirement starts
+                          early enough for the worker Pod's full termination grace to elapse
+                          before the bound, and admission closes an hour before that. From 3h to
+                          24h; defaults to 24h.
                         type: string
                     required:
                     - maxActorsPerWorker
                     type: object
                     x-kubernetes-validations:
-                    - message: maxWorkerLifetime must be at least 1h and at most 24h
+                    - message: maxWorkerLifetime must be at least 3h and at most 24h
                       rule: '!has(self.maxWorkerLifetime) || (duration(self.maxWorkerLifetime)
-                        >= duration(''1h'') && duration(self.maxWorkerLifetime) <=
+                        >= duration(''3h'') && duration(self.maxWorkerLifetime) <=
                         duration(''24h''))'
                 type: object
               retention:

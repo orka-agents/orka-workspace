@@ -583,7 +583,15 @@ func compatibleRestore(previous, next *pb.ActorTemplate) bool {
 		}
 		return out
 	}
-	return proto.Equal(normalize(previous), normalize(next))
+	before, after := normalize(previous), normalize(next)
+	// A shared template selects only its pool's provider-owned label, so its
+	// stripped selector is empty. Its operator pool is still the one the
+	// callers pin by exact Placement identity, so selectors are not compared
+	// when either side was shared.
+	if len(before.GetWorkerSelector().GetMatchLabels()) == 0 || len(after.GetWorkerSelector().GetMatchLabels()) == 0 {
+		before.WorkerSelector, after.WorkerSelector = nil, nil
+	}
+	return proto.Equal(before, after)
 }
 
 func anchorOwner(record *journalRecord) metav1.OwnerReference {

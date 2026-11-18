@@ -327,7 +327,13 @@ func inheritWorkerImageProvenance(previous []workerImageTransition, transition *
 
 // operatorPoolLabels returns the operator's own WorkerPool labels, without
 // the provider's per-allocation ownership and confinement labels.
+//
+// A shared pool carries only provider-owned labels, so a shared record keeps
+// the operator pool's labels as provenance for resume and checkpoints.
 func operatorPoolLabels(record *journalRecord) map[string]string {
+	if record.SharedWorker != nil {
+		return maps.Clone(record.SharedWorker.OperatorLabels)
+	}
 	out := maps.Clone(record.RuntimePoolLabels)
 	for key := range labels(record) {
 		delete(out, key)
