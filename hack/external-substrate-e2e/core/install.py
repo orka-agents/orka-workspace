@@ -139,6 +139,10 @@ objects.append({"apiVersion": "v1", "kind": "Service", "metadata": {"name": coll
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
+# Core's API authenticates callers by TokenReview, which Orka's Helm and
+# kustomize installs grant outside the generated role (metrics-auth-role).
+# core/cleanup.sh archives the proof Session through that API.
+role["rules"].append({"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]})
 objects.append(role)
 
 
