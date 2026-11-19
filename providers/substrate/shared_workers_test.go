@@ -69,7 +69,9 @@ func useTestClock(t *testing.T) {
 	sharedProvenanceHealth.reset()
 	sharedRecordsLabelled.Store(false)
 	sharedTemplateInventoryHealth.reset()
+	sharedNativeTemplateHealth.reset()
 	t.Cleanup(func() {
+		sharedNativeTemplateHealth.reset()
 		sharedNow = previous
 		sharedProvenanceHealth.reset()
 		sharedRecordsLabelled.Store(false)
@@ -4696,5 +4698,64 @@ func TestSharedForeignTemplateOutsideTheAtespaceIsQuarantinedWithoutTheInventory
 	_ = sharedReplenisher(failingCatalogLists(c), native).Sweep(t.Context())
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
 		t.Fatal("a foreign template outside the Atespace was not quarantined while the inventory was unavailable")
+	}
+}
+
+func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		break_  func(*nativeFixture)
+		retired bool
+	}{
+		{name: "template listing fails while the control plane places", break_: func(f *nativeFixture) { f.failTemplateList = true }, retired: true},
+		{name: "template listing stalls past the sweep deadline", break_: func(f *nativeFixture) { f.blockTemplateList = true }, retired: true},
+		{name: "the whole control plane is down", break_: func(f *nativeFixture) { f.nativeDown = true }, retired: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			tc.break_(native)
+			sweep := sharedReplenisher(c, native)
+			sweep.SweepDeadline = 300 * time.Millisecond
+			// Admission closes at once (under its request's own deadline).
+			admitCtx, cancelAdmit := context.WithTimeout(t.Context(), 300*time.Millisecond)
+			err := sharedDriver(c, native).refuseForeignTemplates(admitCtx, record.Atespace, sharedLabels(record.SharedWorker.Label), nil)
+			cancelAdmit()
+			if err == nil {
+				t.Fatal("admission stayed open without a native template inventory")
+			}
+			start := sharedNow()
+			_ = sweep.Sweep(t.Context())
+			if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
+				t.Fatal("a native template inventory outage retired the pool before its bound")
+			}
+			setNow(t, start.Add(sharedProvenanceOutageBound))
+			_ = sweep.Sweep(t.Context())
+			_, found := getPool(t, c, record.SharedWorker.Pool)
+			if tc.retired && found {
+				t.Fatal("a native template inventory outage past its bound did not retire the pool")
+			}
+			if !tc.retired && !found {
+				t.Fatal("a whole control-plane outage, which places nothing, retired the pool and stranded its Actors")
+			}
+		})
+	}
+}
+
+func TestSharedOutsideAtespaceTemplateIsForeignBeforeAnyReread(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// A foreign template in another Atespace reaches the pool, and the
+	// record does not know the pool's own same-Atespace template, so a
+	// reread would be needed for it; the reread fails.
+	native.templates["other/foreign"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "other", Name: "foreign", Uid: "foreign-uid", Version: 1}}
+	recordedTemplates.replace(nil, recordedTemplates.begin())
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	err := sharedDriver(failingCatalogLists(c), native).refuseForeignTemplates(t.Context(), record.Atespace, sharedLabels(record.SharedWorker.Label), pool)
+	if !errors.Is(err, errForeignTemplate) {
+		t.Fatalf("the outside-Atespace foreign template waited on a failing reread: %v", err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("the pool reached by a foreign template was not retired at once")
 	}
 }

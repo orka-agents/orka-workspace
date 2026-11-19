@@ -1864,10 +1864,17 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 	// UID is still unknown is a miss. A miss rereads Kubernetes before a
 	// template is accepted or declared foreign.
 	ours := recordedTemplates.snapshot()
-	if !recordedTemplateMiss(templates, atespace, poolLabels, ours) {
-		// Every same-Atespace template that reaches the pool is recorded
-		// with its exact UID, so only one outside the Atespace can be foreign.
-		return templatesReach(templates, atespace, poolLabels, ours), nil
+	// What can be classified without a reread is, before any fallible read:
+	// a reaching template outside the Atespace is foreign whatever the record
+	// says, and its pool's strong retirement starts at once. Only a
+	// same-Atespace template the record does not know by its exact UID waits
+	// on the reread.
+	foreign, unclassified := classifyWithoutInventory(templates, atespace, poolLabels, ours)
+	if foreign {
+		return true, nil
+	}
+	if !unclassified {
+		return false, nil
 	}
 	began := recordedTemplates.begin()
 	all, shared, err := d.providerTemplates(ctx)
@@ -2055,8 +2062,18 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[stri
 }
 
 // listAllActorTemplates lists ActorTemplates in every Atespace.
-func (d *Lifecycle) listAllActorTemplates(ctx context.Context) ([]*pb.ActorTemplate, error) {
-	var out []*pb.ActorTemplate
+//
+// Its outcome, stamped by its start, is tracked by
+// sharedNativeTemplateHealth, which only a complete inventory refreshes.
+func (d *Lifecycle) listAllActorTemplates(ctx context.Context) (out []*pb.ActorTemplate, err error) {
+	started := sharedNow()
+	defer func() {
+		if err != nil {
+			sharedNativeTemplateHealth.failed(started)
+		} else {
+			sharedNativeTemplateHealth.succeeded(started)
+		}
+	}()
 	page := ""
 	seen := map[string]bool{}
 	for {

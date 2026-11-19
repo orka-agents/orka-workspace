@@ -584,6 +584,28 @@ var sharedProvenanceHealth = &provenanceHealth{}
 // outage of this inventory that never ends.
 var sharedTemplateInventoryHealth = &provenanceHealth{}
 
+// sharedNativeTemplateHealth tracks the native ActorTemplate inventory
+// (listAllActorTemplates) with the same rule and bound. Only a complete,
+// successful inventory refreshes it.
+var sharedNativeTemplateHealth = &provenanceHealth{}
+
+// sharedNativeProbeTimeout bounds the reachability probe that gates
+// retirement for a native template inventory outage.
+const sharedNativeProbeTimeout = 10 * time.Second
+
+// nativePlacementReachable reports whether the native control plane answers
+// a cheap worker read, on its own short context detached from the sweep's
+// deadline. A template inventory outage can let a foreign Actor be placed only
+// while the control plane still places; when it answers nothing, nothing is
+// placed, and strongly retiring every shared pool would only strand its
+// Actors' data, which cannot be suspended without it.
+func (d *Lifecycle) nativePlacementReachable(ctx context.Context) bool {
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedNativeProbeTimeout)
+	defer cancel()
+	_, err := d.control.ListWorkers(probeCtx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1}})
+	return err == nil
+}
+
 // classifyWithoutInventory classifies the templates reaching a pool while the
 // recorded-template inventory is unavailable. One outside the pool's Atespace
 // is foreign. One inside it is unclassified unless the in-process record knows
@@ -1054,6 +1076,12 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// told apart: its pool closes at once and is retired once the outage
 	// outlasts its bound. Nothing new is created meanwhile.
 	inventoryErr := oursErr
+	// A native ActorTemplate inventory that has stayed unavailable past the
+	// outage bound, while the control plane still answers, leaves foreign
+	// selectors unchecked: every shared pool is then strongly retired. The
+	// probe runs on its own context, so the sweep's deadline cannot postpone
+	// it.
+	nativeOutage := templatesErr != nil && sharedNativeTemplateHealth.outlasted(sharedNow()) && d.nativePlacementReachable(ctx)
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -1066,6 +1094,10 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		}
 	}
 	for i := range pools.Items {
+		if pool := &pools.Items[i]; nativeOutage && pool.GetDeletionTimestamp() == nil {
+			errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"))
+			continue
+		}
 		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr))
 	}
 	if err := errors.Join(templatesErr, inventoryErr); err != nil {

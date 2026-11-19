@@ -85,6 +85,9 @@ type nativeFixture struct {
 	// finalizePending marks the Actor whose finalize failed; a re-entered
 	// SuspendActor then finalizes the snapshot already taken.
 	finalizePending string
+	// failTemplateList fails, and blockTemplateList stalls, every
+	// ListActorTemplates call while other native calls work.
+	failTemplateList, blockTemplateList bool
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -193,9 +196,12 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	return cloneTemplate(v), f.effect("deleteTemplate")
 }
 func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
-	if f.block {
+	if f.block || f.blockTemplateList {
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if f.failTemplateList {
+		return nil, status.Error(codes.Unavailable, "template listing unavailable")
 	}
 	if f.nativeDown {
 		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
@@ -501,6 +507,10 @@ func nativeWorkerCapacity(pool unstructured.Unstructured) (*pb.WorkerResources, 
 	return &pb.WorkerResources{CpuMillicores: cpu.MilliValue(), MemoryBytes: memory.Value() - 64<<20, Actors: 1000}, nil
 }
 func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersRequest, _ ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
+	if err := ctx.Err(); err != nil {
+		// Like a real call, an ended context fails.
+		return nil, status.FromContextError(err).Err()
+	}
 	if f.block {
 		<-ctx.Done()
 		return nil, ctx.Err()
