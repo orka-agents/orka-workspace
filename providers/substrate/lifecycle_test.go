@@ -88,6 +88,13 @@ type nativeFixture struct {
 	// failTemplateList fails, and blockTemplateList stalls, every
 	// ListActorTemplates call while other native calls work.
 	failTemplateList, blockTemplateList bool
+	// credentialsRejected rejects the provider's own credentials on
+	// ListActorTemplates and ListWorkers, as an expired token or a revoked
+	// viewer permission would, while other clients may still place.
+	credentialsRejected bool
+	// assignmentsRejected rejects, and assignmentsUnavailable fails, only
+	// ListWorkerActorAssignments.
+	assignmentsRejected, assignmentsUnavailable bool
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -202,6 +209,9 @@ func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorT
 	}
 	if f.failTemplateList {
 		return nil, status.Error(codes.Unavailable, "template listing unavailable")
+	}
+	if f.credentialsRejected {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected")
 	}
 	if f.nativeDown {
 		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
@@ -511,6 +521,9 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		// Like a real call, an ended context fails.
 		return nil, status.FromContextError(err).Err()
 	}
+	if f.credentialsRejected {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected")
+	}
 	if f.block {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -559,8 +572,11 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 	return out, nil
 }
 func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
-	if f.nativeDown {
+	if f.nativeDown || f.assignmentsUnavailable {
 		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
+	if f.assignmentsRejected {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for assignments")
 	}
 	if f.failAfter == "assignments" {
 		f.failAfter = ""

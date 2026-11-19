@@ -3,11 +3,13 @@ package substrate
 import (
 	"context"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
+	"strconv"
 	"time"
 
 	workspacev1alpha1 "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profilev1alpha1 "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	workspaceprovider "github.com/orka-agents/orka-workspace/sdk"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -73,7 +75,50 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Status().Patch(ctx, provider, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.reportNativeCredentials(ctx, provider)
 	return ctrl.Result{RequeueAfter: providerHeartbeatPeriod}, nil
+}
+
+// nativeCredentialsEventReason is the Warning Event reason that surfaces the
+// native control plane rejecting the provider's own credentials.
+const nativeCredentialsEventReason = "NativeCredentialsRejected"
+
+// reportNativeCredentials surfaces, on every heartbeat, a rejection of the
+// provider's own native credentials as a Warning Event on the provider. The
+// core/v1 Event is created, or its last timestamp and message patched, under
+// the events create and patch verbs the provider already holds. It is best
+// effort and never fails the heartbeat.
+func (r *ProviderReconciler) reportNativeCredentials(ctx context.Context, provider *workspacev1alpha1.ExecutionWorkspaceProvider) {
+	reason := NativeCredentialsRejected()
+	if reason == "" {
+		return
+	}
+	now := metav1.Now()
+	message := "Substrate " + reason + "; shared workers whose ActorTemplates cannot be checked are strongly retired once this outlasts its bound"
+	namespace := provider.Namespace
+	if namespace == "" {
+		namespace = metav1.NamespaceDefault
+	}
+	event := &corev1.Event{
+		ObjectMeta:          metav1.ObjectMeta{Namespace: namespace, Name: provider.Name + ".native-credentials-rejected"},
+		InvolvedObject:      corev1.ObjectReference{APIVersion: workspacev1alpha1.GroupVersion.String(), Kind: "ExecutionWorkspaceProvider", Name: provider.Name, Namespace: provider.Namespace, UID: provider.UID},
+		Reason:              nativeCredentialsEventReason,
+		Message:             message,
+		Type:                corev1.EventTypeWarning,
+		Source:              corev1.EventSource{Component: ControllerName},
+		ReportingController: ControllerName,
+		FirstTimestamp:      now,
+		LastTimestamp:       now,
+		Count:               1,
+	}
+	err := r.Create(ctx, event)
+	if apierrors.IsAlreadyExists(err) {
+		patch := client.RawPatch(types.MergePatchType, []byte(`{"lastTimestamp":"`+now.UTC().Format(time.RFC3339)+`","message":`+strconv.Quote(message)+`}`))
+		err = r.Patch(ctx, &corev1.Event{ObjectMeta: event.ObjectMeta}, patch)
+	}
+	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "Substrate provider native credential rejection could not be reported as an Event", "reason", reason)
+	}
 }
 
 func (r *ProviderReconciler) SetupWithManager(mgr ctrl.Manager) error {

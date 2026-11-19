@@ -11,12 +11,15 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -593,17 +596,97 @@ var sharedNativeTemplateHealth = &provenanceHealth{}
 // retirement for a native template inventory outage.
 const sharedNativeProbeTimeout = 10 * time.Second
 
-// nativePlacementReachable reports whether the native control plane answers
-// a cheap worker read, on its own short context detached from the sweep's
+// nativeControlDown reports whether the native control plane is down, from a
+// cheap worker read on its own short context detached from the sweep's
 // deadline. A template inventory outage can let a foreign Actor be placed only
-// while the control plane still places; when it answers nothing, nothing is
-// placed, and strongly retiring every shared pool would only strand its
-// Actors' data, which cannot be suspended without it.
-func (d *Lifecycle) nativePlacementReachable(ctx context.Context) bool {
+// while the control plane still places; when it is down, nothing is placed,
+// and strongly retiring every shared pool would only strand its Actors' data,
+// which cannot be suspended without it.
+//
+// Only a transport or availability failure counts as down. Any other
+// failure, notably the provider's own credentials being rejected
+// (Unauthenticated or PermissionDenied), does not: other clients may still
+// place Actors, so retirement is not suppressed.
+func (d *Lifecycle) nativeControlDown(ctx context.Context) bool {
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedNativeProbeTimeout)
 	defer cancel()
 	_, err := d.control.ListWorkers(probeCtx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1}})
-	return err == nil
+	noteNativeCredentials(ctx, err)
+	return err != nil && nativeUnavailable(err)
+}
+
+// nativeUnavailable reports a transport or availability failure: gRPC
+// Unavailable, DeadlineExceeded or Canceled, a context timeout or
+// cancellation, or a refused or reset connection.
+func nativeUnavailable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
+}
+
+// nativeCredentialsRejected reports the control plane rejecting the
+// provider's own credentials.
+func nativeCredentialsRejected(err error) bool {
+	switch status.Code(err) {
+	case codes.Unauthenticated, codes.PermissionDenied:
+		return true
+	}
+	return false
+}
+
+// sharedNativeCredentials holds, in process, why the native control plane
+// last rejected the provider's own credentials ("" once a native read
+// succeeds again). The provider reconciler surfaces it on the provider.
+var sharedNativeCredentials atomic.Pointer[string]
+
+// noteNativeCredentials records the outcome of a native read for
+// credential reporting: a rejection is logged and kept until a later read
+// succeeds; other failures leave the record unchanged.
+func noteNativeCredentials(ctx context.Context, err error) {
+	switch {
+	case err == nil:
+		sharedNativeCredentials.Store(nil)
+	case nativeCredentialsRejected(err):
+		reason := "provider native credentials rejected: " + status.Code(err).String()
+		sharedNativeCredentials.Store(&reason)
+		ctrl.LoggerFrom(ctx).Error(err, "Substrate provider native credentials rejected; shared workers whose templates cannot be checked are retired once this outlasts its bound", "code", status.Code(err).String())
+	}
+}
+
+// sharedNativeAssignmentHealth tracks the sweep's native worker and
+// assignment reads by the same outage rule. It is separate from the
+// template inventory's, so a template List that keeps succeeding cannot clear
+// a rejection that only affects assignments.
+var sharedNativeAssignmentHealth = &provenanceHealth{}
+
+// assignmentReadFailed handles a failed native worker or assignment read in
+// a pool's maintenance. A rejection of the provider's own credentials that
+// has lasted past the outage bound fails closed: the pool's assignments
+// cannot be checked while other clients may still place, so it is strongly
+// retired. Any other failure is returned for the next pass.
+func (d *Lifecycle) assignmentReadFailed(ctx context.Context, pool *unstructured.Unstructured, hostedErr, err error) error {
+	noteNativeCredentials(ctx, err)
+	if nativeCredentialsRejected(err) {
+		sharedNativeAssignmentHealth.failed(sharedNow())
+		if sharedNativeAssignmentHealth.outlasted(sharedNow()) {
+			return errors.Join(err, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's assignments cannot be checked: "+NativeCredentialsRejected()+", past its bound"))
+		}
+	}
+	return errors.Join(hostedErr, err)
+}
+
+// NativeCredentialsRejected returns why the native control plane rejects the
+// provider's own credentials, or "" when it does not.
+func NativeCredentialsRejected() string {
+	if reason := sharedNativeCredentials.Load(); reason != nil {
+		return *reason
+	}
+	return ""
 }
 
 // classifyWithoutInventory classifies the templates reaching a pool while the
@@ -1081,7 +1164,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// selectors unchecked: every shared pool is then strongly retired. The
 	// probe runs on its own context, so the sweep's deadline cannot postpone
 	// it.
-	nativeOutage := templatesErr != nil && sharedNativeTemplateHealth.outlasted(sharedNow()) && d.nativePlacementReachable(ctx)
+	nativeOutage := templatesErr != nil && sharedNativeTemplateHealth.outlasted(sharedNow()) && !d.nativeControlDown(ctx)
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -1095,7 +1178,11 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	}
 	for i := range pools.Items {
 		if pool := &pools.Items[i]; nativeOutage && pool.GetDeletionTimestamp() == nil {
-			errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"))
+			reason := "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"
+			if rejected := NativeCredentialsRejected(); rejected != "" {
+				reason = "the native ActorTemplate inventory stayed unavailable past its bound: " + rejected
+			}
+			errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
 			continue
 		}
 		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr))
@@ -1233,7 +1320,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	}
 	poolWorkers, err := workers.pool(ctx, pool)
 	if err != nil {
-		return errors.Join(hostedErr, err)
+		return d.assignmentReadFailed(ctx, pool, hostedErr, err)
 	}
 	if len(poolWorkers) > 1 {
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker pool has more than one worker")
@@ -1251,12 +1338,13 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		}
 		listed, err := d.listWorkerAssignments(ctx, worker.GetMetadata().GetName())
 		if err != nil {
-			return errors.Join(hostedErr, err)
+			return d.assignmentReadFailed(ctx, pool, hostedErr, err)
 		}
+		sharedNativeAssignmentHealth.succeeded(sharedNow())
 		assignments[worker.GetMetadata().GetName()] = listed
 		foreign, err := sharedForeignAssignment(ctx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
 		if err != nil {
-			return errors.Join(hostedErr, err)
+			return d.assignmentReadFailed(ctx, pool, hostedErr, err)
 		}
 		if foreign {
 			current := poolObject()
@@ -1288,7 +1376,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	}
 	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers, assignments)
 	if err != nil {
-		return err
+		return d.assignmentReadFailed(ctx, pool, nil, err)
 	}
 	if hostedSuspect {
 		// Neighbours are suspended through Orka core's eviction drain of the

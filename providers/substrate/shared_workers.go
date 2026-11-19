@@ -2068,6 +2068,7 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[stri
 func (d *Lifecycle) listAllActorTemplates(ctx context.Context) (out []*pb.ActorTemplate, err error) {
 	started := sharedNow()
 	defer func() {
+		noteNativeCredentials(ctx, err)
 		if err != nil {
 			sharedNativeTemplateHealth.failed(started)
 		} else {

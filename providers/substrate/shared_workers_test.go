@@ -70,8 +70,12 @@ func useTestClock(t *testing.T) {
 	sharedRecordsLabelled.Store(false)
 	sharedTemplateInventoryHealth.reset()
 	sharedNativeTemplateHealth.reset()
+	sharedNativeCredentials.Store(nil)
+	sharedNativeAssignmentHealth.reset()
 	t.Cleanup(func() {
+		sharedNativeAssignmentHealth.reset()
 		sharedNativeTemplateHealth.reset()
+		sharedNativeCredentials.Store(nil)
 		sharedNow = previous
 		sharedProvenanceHealth.reset()
 		sharedRecordsLabelled.Store(false)
@@ -4710,6 +4714,7 @@ func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
 		{name: "template listing fails while the control plane places", break_: func(f *nativeFixture) { f.failTemplateList = true }, retired: true},
 		{name: "template listing stalls past the sweep deadline", break_: func(f *nativeFixture) { f.blockTemplateList = true }, retired: true},
 		{name: "the whole control plane is down", break_: func(f *nativeFixture) { f.nativeDown = true }, retired: false},
+		{name: "the provider's own credentials are rejected", break_: func(f *nativeFixture) { f.credentialsRejected = true }, retired: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 2)
@@ -4757,5 +4762,72 @@ func TestSharedOutsideAtespaceTemplateIsForeignBeforeAnyReread(t *testing.T) {
 	}
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
 		t.Fatal("the pool reached by a foreign template was not retired at once")
+	}
+}
+
+func TestSharedRejectedNativeCredentialsAreSurfacedOnTheProvider(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	sharedReady(t, c, native, first)
+	native.credentialsRejected = true
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if rejected := NativeCredentialsRejected(); !strings.Contains(rejected, "credentials rejected") || !strings.Contains(rejected, "PermissionDenied") {
+		t.Fatalf("a credential rejection was not recorded: %q", rejected)
+	}
+	provider := &api.ExecutionWorkspaceProvider{}
+	if err := c.Get(t.Context(), types.NamespacedName{Name: "substrate"}, provider); err != nil {
+		t.Fatal(err)
+	}
+	r := &ProviderReconciler{Client: c}
+	for range 2 {
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := &corev1.EventList{}
+	if err := c.List(t.Context(), events); err != nil {
+		t.Fatal(err)
+	}
+	found := slices.ContainsFunc(events.Items, func(event corev1.Event) bool {
+		return event.Reason == nativeCredentialsEventReason && event.Type == corev1.EventTypeWarning && event.InvolvedObject.UID == provider.UID && strings.Contains(event.Message, "native credentials rejected")
+	})
+	if !found {
+		t.Fatalf("the provider did not surface the rejected native credentials: %+v", events.Items)
+	}
+	// A successful native read clears it.
+	native.credentialsRejected = false
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if rejected := NativeCredentialsRejected(); rejected != "" {
+		t.Fatalf("a successful native read kept the rejection: %q", rejected)
+	}
+}
+
+func TestSharedRejectedAssignmentReadsFailClosedPastTheBound(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		break_  func(*nativeFixture)
+		retired bool
+	}{
+		{name: "assignment reads rejected for the provider's credentials", break_: func(f *nativeFixture) { f.assignmentsRejected = true }, retired: true},
+		{name: "assignment reads unavailable", break_: func(f *nativeFixture) { f.assignmentsUnavailable = true }, retired: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			tc.break_(native)
+			start := sharedNow()
+			_ = sharedReplenisher(c, native).Sweep(t.Context())
+			if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
+				t.Fatal("a failed assignment read retired the pool before the bound")
+			}
+			setNow(t, start.Add(sharedProvenanceOutageBound))
+			_ = sharedReplenisher(c, native).Sweep(t.Context())
+			_, found := getPool(t, c, record.SharedWorker.Pool)
+			if tc.retired && found {
+				t.Fatal("a credential rejection of the assignment checks past its bound did not fail closed")
+			}
+			if !tc.retired && !found {
+				t.Fatal("an unavailable assignment read retired the pool")
+			}
+		})
 	}
 }
