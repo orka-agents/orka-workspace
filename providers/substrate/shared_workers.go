@@ -1846,21 +1846,23 @@ func (c *recordedTemplateCache) begin() uint64 {
 }
 
 // replace installs a full inventory read from Kubernetes by a refresh that
-// began at stamp began, dropping every entry it no longer contains (for
-// example a deleted journal's), except entries added after it began, which
-// are newer than anything it read. It returns the merged record.
+// began at stamp began, and returns the merged record. Every entry keeps the
+// stamp of the information it holds: a save stamps its entry with a new
+// counter value, and a refresh stamps what it read with began. A refresh
+// overrides or drops (for example a deleted journal's entry) only entries
+// stamped at or before began, so an entry saved after it began survives it,
+// however overlapping refreshes interleave or finish.
 func (c *recordedTemplateCache) replace(entries map[string]string, began uint64) map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	merged := maps.Clone(entries)
-	if merged == nil {
-		merged = map[string]string{}
-	}
+	merged := map[string]string{}
 	stamps := map[string]uint64{}
+	for key, uid := range entries {
+		merged[key], stamps[key] = uid, began
+	}
 	for key, stamp := range c.stamps {
 		if stamp > began {
-			merged[key] = c.entries[key]
-			stamps[key] = stamp
+			merged[key], stamps[key] = c.entries[key], stamp
 		}
 	}
 	c.entries, c.stamps = merged, stamps

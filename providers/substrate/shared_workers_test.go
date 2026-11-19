@@ -3355,3 +3355,29 @@ func TestSharedUnusedWarmPoolIsBoundedByItsProfile(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedOverlappingTemplateRefreshesKeepASavedUID(t *testing.T) {
+	cache := &recordedTemplateCache{}
+	known := nativeReference{Name: "derived", UID: "known-uid"}
+	key := "native/" + known.Name
+	// Refresh A begins and reads the journal before the UID was written.
+	a := cache.begin()
+	// The save records the UID.
+	cache.add("native", known)
+	// Refresh B begins after the save, reads the UID, and finishes first.
+	b := cache.begin()
+	if merged := cache.replace(map[string]string{key: known.UID}, b); merged[key] != known.UID {
+		t.Fatalf("refresh B lost the saved UID: %q", merged[key])
+	}
+	// The older refresh A finishes last with its stale unknown UID.
+	if merged := cache.replace(map[string]string{key: ""}, a); merged[key] != known.UID {
+		t.Fatalf("an older refresh restored an unknown UID over a saved one: %q", merged[key])
+	}
+	if uid := cache.snapshot()[key]; uid != known.UID {
+		t.Fatalf("cached UID = %q, want the saved one", uid)
+	}
+	// A refresh that began after everything still drops a deleted entry.
+	if merged := cache.replace(map[string]string{}, cache.begin()); len(merged) != 0 {
+		t.Fatalf("a later complete refresh kept a deleted journal's entry: %v", merged)
+	}
+}
