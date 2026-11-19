@@ -1398,7 +1398,9 @@ func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructur
 	err = d.client.Get(getCtx, client.ObjectKeyFromObject(pool), current)
 	cancelGet()
 	if err != nil && !apierrors.IsNotFound(err) {
-		return err
+		// A failed read never drops a decided deletion: it falls through to
+		// deleting only the Pods fenced on this pool, by UID.
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker pool could not be re-read; deleting only its fenced worker Pods", "reason", err.Error())
 	}
 	held := err == nil && current.GetUID() == pool.GetUID()
 	if !held {
@@ -1954,14 +1956,11 @@ func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifec
 			return nil, d.verificationFailed(ctx, pool, true, errors.Join(hostedErr, err))
 		}
 		if foreign {
-			current := poolObject()
-			if err := d.client.Get(nativeCtx, client.ObjectKeyFromObject(pool), current); err != nil {
-				return nil, client.IgnoreNotFound(err)
-			}
-			if current.GetUID() != pool.GetUID() {
-				return nil, nil
-			}
-			return nil, d.retireSharedPool(ctx, current, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
+			// Confirmed on two listings: no later read can drop it. The
+			// retirement runs on its own cleanup context, and its Delete is
+			// preconditioned on this pool's UID, so a replaced pool is never
+			// touched.
+			return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
 		}
 	}
 	if hostedErr != nil {

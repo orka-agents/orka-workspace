@@ -5382,3 +5382,29 @@ func TestSharedDecidedRetirementsNeverDelayAQuarantine(t *testing.T) {
 		t.Fatalf("decided retirements delayed a required quarantine: %v", at.Sub(started))
 	}
 }
+
+func TestSharedConfirmedForeignAssignmentIsNeverDroppedByAFailedReread(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.foreignWorkers = map[string]bool{record.Worker.Name: true}
+	// The pool Get that confirms the foreign assignment against a fresh
+	// ledger succeeds; every later pool Get fails.
+	var poolGets atomic.Int64
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" && poolGets.Add(1) > 1 {
+				return apierrors.NewInternalError(errors.New("pool read refused"))
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	})
+	recording, deletes := recordingDeletes(t, failing)
+	_ = sharedReplenisher(recording, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a failed pool reread dropped a confirmed foreign-assignment quarantine")
+	}
+	assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, int64(workerPodTerminationGrace/time.Second))
+	if poolGets.Load() < 2 {
+		t.Fatal("the later pool reads were not exercised")
+	}
+}
