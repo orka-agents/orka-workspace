@@ -1294,18 +1294,22 @@ func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigM
 			reason = "egress could not be revoked before suspension: " + err.Error()
 		}
 	}
+	// The doubt's retirement error (for example a pool Delete that keeps
+	// failing after the worker Pod's own delete was issued) never stops the
+	// data-keeping suspend: the worker may already be draining, so the
+	// suspend is issued and captured while it terminates, and the error is
+	// returned with it. A ready result may therefore carry an error.
+	var retireErr error
 	if reason != "" {
-		if err := d.sharedDoubt(ctx, cm, record, reason); err != nil {
-			return false, err
-		}
+		retireErr = d.sharedDoubt(ctx, cm, record, reason)
 	}
 	if shared.Strong == "" && sharedNow().Before(shared.EgressRevokedAt.Add(d.config.egressSettle())) {
-		return false, nil
+		return false, retireErr
 	}
 	if shared.Suspend == nil || !shared.Suspend.Issued {
 		shared.Suspend = &sharedSuspendFence{Issued: true, PriorVersion: actor.GetMetadata().GetVersion(), PriorGeneration: actor.GetStatus().GetLastAssignedGeneration(), PriorSnapshotDigest: snapshotDigest(latestSnapshot(actor))}
 	}
-	return true, nil
+	return true, retireErr
 }
 
 // sharedSuspendFenceOf returns the issued shared suspend fence, if any.
@@ -1995,6 +1999,16 @@ func (c *recordedTemplateCache) add(atespace string, ref nativeReference) {
 // with a shared placement, and catalog templates in an Atespace that has a
 // shared placement. A private template never reaches a shared pool.
 func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[string]string, err error) {
+	// The read is tracked, stamped by its start, by the same outage rule as
+	// the journal inventory, so an unclassifiable template is bounded.
+	started := sharedNow()
+	defer func() {
+		if err != nil {
+			sharedTemplateInventoryHealth.failed(started)
+		} else {
+			sharedTemplateInventoryHealth.succeeded(started)
+		}
+	}()
 	all, shared = map[string]string{}, map[string]string{}
 	add := func(out map[string]string, atespace string, ref nativeReference) {
 		if atespace == "" || ref.Name == "" {

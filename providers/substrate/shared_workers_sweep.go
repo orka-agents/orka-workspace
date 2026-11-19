@@ -577,6 +577,34 @@ type provenanceHealth struct {
 
 var sharedProvenanceHealth = &provenanceHealth{}
 
+// sharedTemplateInventoryHealth tracks the provider's recorded-template
+// inventory reads (every journal, archive and checkpoint catalog) with the
+// same rule and bound. It is a separate instance because the bounds loop's
+// labelled journal List succeeds independently, and would otherwise clear an
+// outage of this inventory that never ends.
+var sharedTemplateInventoryHealth = &provenanceHealth{}
+
+// classifyWithoutInventory classifies the templates reaching a pool while the
+// recorded-template inventory is unavailable. One outside the pool's Atespace
+// is foreign. One inside it is unclassified unless the in-process record knows
+// it by its exact UID.
+func classifyWithoutInventory(templates []*pb.ActorTemplate, atespace string, poolLabels, cached map[string]string) (foreign, unclassified bool) {
+	for _, template := range templates {
+		if !selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels) {
+			continue
+		}
+		meta := template.GetMetadata()
+		if meta.GetAtespace() != atespace {
+			foreign = true
+			continue
+		}
+		if uid, recorded := cached[meta.GetAtespace()+"/"+meta.GetName()]; !recorded || uid == "" || uid != meta.GetUid() {
+			unclassified = true
+		}
+	}
+	return foreign, unclassified
+}
+
 func (h *provenanceHealth) succeeded(started time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1021,11 +1049,11 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		// checks against it merged with anything recorded since.
 		ours = recordedTemplates.refresh(all, shared, began)
 	}
-	if templatesErr == nil && oursErr != nil {
-		// Without the provider's own template record, no same-Atespace
-		// template can be told apart; nothing is verified or created.
-		templatesErr = oursErr
-	}
+	// Without the provider's own template record (inventoryErr), a
+	// same-Atespace template the in-process record does not know cannot be
+	// told apart: its pool closes at once and is retired once the outage
+	// outlasts its bound. Nothing new is created meanwhile.
+	inventoryErr := oursErr
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -1038,11 +1066,11 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		}
 	}
 	for i := range pools.Items {
-		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr))
+		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr))
 	}
-	if templatesErr != nil {
+	if err := errors.Join(templatesErr, inventoryErr); err != nil {
 		// Without a verified template inventory nothing new is created.
-		return errors.Join(append(errs, templatesErr)...)
+		return errors.Join(append(errs, err)...)
 	}
 	for uid, shape := range shapes {
 		for free[uid] < shape.warm {
@@ -1130,7 +1158,7 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 }
 
 //nolint:gocyclo // Every pool-wide rule is evaluated in one pass, in priority order.
-func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr error) error {
+func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) error {
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
@@ -1150,8 +1178,19 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	// unrelated read failure can never suppress it: the pass's template
 	// inventory is in hand, so a foreign template reaching the pool comes
 	// first.
-	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
+	unclassified := false
+	if templatesErr == nil && inventoryErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
 		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+	}
+	if templatesErr == nil && inventoryErr != nil {
+		var foreign bool
+		foreign, unclassified = classifyWithoutInventory(templates, ledger.Scope.Atespace, pool.GetLabels(), recordedTemplates.snapshot())
+		if foreign {
+			return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+		}
+		if unclassified && sharedTemplateInventoryHealth.outlasted(sharedNow()) {
+			return d.retireSharedPool(ctx, pool, sharedRetiring, "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound")
+		}
 	}
 	// Kubernetes-only suspicion comes before any native read in this pass. A
 	// failed check is held back, not returned, so the worker checks below
@@ -1224,7 +1263,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		// terminating worker; the suspect Actor retires through the strong path.
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted workspace is tainted, quarantined or failed")
 	}
-	if closing == "" && templatesErr != nil {
+	if closing == "" && (templatesErr != nil || unclassified) {
 		closing = "the install's ActorTemplates could not be verified"
 	}
 	changed := false

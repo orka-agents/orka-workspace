@@ -68,7 +68,13 @@ func useTestClock(t *testing.T) {
 	sharedNow = testNow
 	sharedProvenanceHealth.reset()
 	sharedRecordsLabelled.Store(false)
-	t.Cleanup(func() { sharedNow = previous; sharedProvenanceHealth.reset(); sharedRecordsLabelled.Store(false) })
+	sharedTemplateInventoryHealth.reset()
+	t.Cleanup(func() {
+		sharedNow = previous
+		sharedProvenanceHealth.reset()
+		sharedRecordsLabelled.Store(false)
+		sharedTemplateInventoryHealth.reset()
+	})
 }
 
 func tick() { testClock.Add(int64(sharedEgressSettle + time.Second)) }
@@ -4569,5 +4575,126 @@ func TestSharedStalledRelabelNeverHoldsUpEnforcement(t *testing.T) {
 	}
 	if sharedRecordsLabelled.Load() {
 		t.Fatal("an incomplete backfill switched discovery to labelled records")
+	}
+}
+
+func TestSharedFailingPoolDeleteBeforeTheSuspendStillKeepsTheData(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// Pod deletes succeed (the Pod terminates); every WorkerPool delete fails.
+	var podDeletes atomic.Int64
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			switch o := obj.(type) {
+			case *unstructured.Unstructured:
+				if o.GetKind() == "WorkerPool" {
+					return apierrors.NewInternalError(errors.New("pool delete refused"))
+				}
+			case *corev1.Pod:
+				podDeletes.Add(1)
+				return nil
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+	// Doubt before the suspend: egress revocation fails.
+	native.failEgressUpdate = 1
+	for range 24 {
+		tick()
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Checkpoint != nil {
+			break
+		}
+		_, _ = sharedDriver(failing, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || podDeletes.Load() == 0 {
+		t.Fatal("the pre-suspend doubt did not take the strong path and delete the worker Pod")
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("the fixture's pool delete did not fail")
+	}
+	if native.suspendCalls == 0 {
+		t.Fatal("a failing pool delete before the suspend kept the data-keeping suspend from being issued")
+	}
+	if record.Checkpoint == nil || native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil {
+		t.Fatal("a failing pool delete before the suspend lost the Actor's Tag")
+	}
+}
+
+// failingCatalogLists fails every checkpoint-catalog List, so the provider's
+// recorded-template inventory is unavailable while journal Lists still work.
+func failingCatalogLists(c client.Client) client.Client {
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				options := &client.ListOptions{}
+				options.ApplyOptions(opts)
+				if options.LabelSelector != nil && strings.Contains(options.LabelSelector.String(), catalogLabel) {
+					return apierrors.NewServiceUnavailable("checkpoint catalogs unavailable")
+				}
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+}
+
+func TestSharedUnclassifiableTemplateClosesAdmissionThenRetiresPastTheOutageBound(t *testing.T) {
+	c, native, record, poolLabels := sharedTemplateFixture(t)
+	// The derived template now carries an unrecorded UID, and the in-process
+	// record cannot vouch for it.
+	recordedTemplates.replace(nil, recordedTemplates.begin())
+	failing := failingCatalogLists(c)
+	// Admission closes at once.
+	if foreign, err := sharedDriver(failing, native).foreignTemplateMatches(t.Context(), record.Atespace, poolLabels); err == nil && !foreign {
+		t.Fatal("admission accepted an unclassifiable template while the inventory was unavailable")
+	}
+	start := sharedNow()
+	_ = sharedReplenisher(failing, native).Sweep(t.Context())
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("an unclassifiable template retired the pool before the outage bound")
+	}
+	if _, ledger := poolLedger(t, c, record.SharedWorker.Pool); ledger.State != sharedDraining {
+		t.Fatalf("the pool kept admitting with an unclassifiable template: %s", ledger.State)
+	}
+	// Still unavailable past the bound: strongly retired.
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = sharedReplenisher(failing, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("an unclassifiable template outlasting the inventory outage bound did not retire the pool")
+	}
+}
+
+func TestSharedRecordedTemplateStaysFineWhileTheInventoryIsUnavailable(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	failing := failingCatalogLists(c)
+	start := sharedNow()
+	for _, at := range []time.Duration{0, sharedProvenanceOutageBound} {
+		setNow(t, start.Add(at))
+		_ = sharedReplenisher(failing, native).Sweep(t.Context())
+	}
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("an inventory outage retired a pool whose templates the in-process record knows")
+	}
+	if _, ledger := poolLedger(t, c, record.SharedWorker.Pool); ledger.State != sharedAdmitting {
+		t.Fatalf("an inventory outage closed a pool whose templates are known: %s", ledger.State)
+	}
+}
+
+func TestSharedForeignTemplateOutsideTheAtespaceIsQuarantinedWithoutTheInventory(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// A template in another Atespace with an empty selector reaches the pool.
+	native.templates["other/foreign"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "other", Name: "foreign", Uid: "foreign-uid", Version: 1}}
+	_ = sharedReplenisher(failingCatalogLists(c), native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a foreign template outside the Atespace was not quarantined while the inventory was unavailable")
 	}
 }

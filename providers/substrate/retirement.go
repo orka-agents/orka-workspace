@@ -480,26 +480,29 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 			}
 			return fmt.Errorf("native Actor stopped before checkpoint intent was issued")
 		}
+		var retireErr error
 		if record.SharedWorker != nil {
 			// Egress is revoked, and settles, before the suspend; doubt about
 			// the shared worker only selects the strong termination proof, so
-			// the data capture still proceeds.
+			// the data capture still proceeds, even when the strong path's
+			// retirement fails (its error is returned after the suspend).
 			ready, err := d.prepareSharedSuspend(ctx, cm, record, actor)
-			if err != nil || !ready {
+			if !ready {
 				return err
 			}
+			retireErr = err
 		} else if err := d.verifyRetiringWorker(ctx, record); err != nil {
 			return err
 		}
 		operation.SuspendIssued = true
 		stamp(&record.Timing.SuspendIssuedAt)
 		if err := d.save(ctx, cm, record); err != nil {
-			return err
+			return errors.Join(err, retireErr)
 		}
 		// Synchronous durability returns only after the snapshot is uploaded,
 		// so CreateTag copies it without changing the Actor.
 		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
-		return err
+		return errors.Join(err, retireErr)
 	}
 	state := actor.GetStatus().GetState()
 	if state == pb.ActorState_ACTOR_STATE_SUSPENDING {
