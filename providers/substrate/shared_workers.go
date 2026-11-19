@@ -1648,7 +1648,11 @@ func (d *Lifecycle) strongSharedAbsence(ctx context.Context, record *journalReco
 			return false, sdk.ErrStaleIdentity
 		}
 		if pod.DeletionTimestamp == nil && poolGone {
-			if err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
+			// The pool's own deadline is gone with it; the Pod was created
+			// after its pool, so its creation plus the frozen lifetime is the
+			// nearest bound still readable. The grace never exceeds it.
+			escalateAt := pod.CreationTimestamp.Add(shared.Scope.Lifetime.Duration - sharedRetireMargin)
+			if err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}, client.GracePeriodSeconds(sharedWorkerGrace(escalateAt, sharedNow()))); err != nil && !apierrors.IsNotFound(err) {
 				return false, err
 			}
 		}
@@ -2208,12 +2212,17 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 // failed ledger write (including a conflict) can block the UID-preconditioned
 // Delete.
 func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
-	if err := d.deleteSharedPool(ctx, pool); err != nil {
+	issued, err := d.deleteSharedPool(ctx, pool, time.Time{})
+	if err != nil {
 		// The decision must survive a failed Delete: persist the intent and
 		// the state on its own context, so admission refuses the pool and
 		// the next pass retries the Delete.
 		d.persistSharedRetireDecision(ctx, pool, state, reason, err)
 		return err
+	}
+	if !issued {
+		// Already deleting: logged once, when this provider issued it.
+		return nil
 	}
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
@@ -2222,20 +2231,47 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 	return nil
 }
 
-// deleteSharedPool is the mandatory step of every strong retirement: the
-// UID-preconditioned foreground Delete, on its own fresh bounded context. A
-// deletionTimestamp already stops admission and every startup verification.
-func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Unstructured) error {
+// deleteSharedPool is the mandatory step of every strong retirement, on its
+// own fresh bounded context, and reports whether it issued the pool's Delete
+// (false when the pool was already deleting). A deletionTimestamp already
+// stops admission and every startup verification.
+//
+// The pool's worker Pods are deleted first, directly, each with a UID
+// precondition and a grace that ends by the hard bound's escalation time
+// (escalateAt; zero means the pool's own annotations' bound): never longer
+// than the time left, at most the Pod's 3600 s. Only then is the pool
+// deleted. A kubelet that has started a long stop does not shorten it when a
+// later delete lowers the grace, so the first delete must already carry the
+// right one; the API server never lengthens an in-progress grace, so the
+// Deployment's later cascade cannot either.
+func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Unstructured, escalateAt time.Time) (bool, error) {
 	if pool.GetDeletionTimestamp() != nil {
-		return nil
+		return false, nil
 	}
 	deleteCtx, cancel := strongCleanupContext(ctx)
 	defer cancel()
-	uid := pool.GetUID()
-	if err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil && !apierrors.IsNotFound(err) {
-		return err
+	if escalateAt.IsZero() {
+		escalateAt = sharedLatestEscalateAt(pool)
 	}
-	return nil
+	if err := d.deleteSharedWorkerPods(deleteCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring"); err != nil {
+		return false, err
+	}
+	uid := pool.GetUID()
+	if err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// sharedWorkerGrace is the deletion grace, in seconds, that ends a worker
+// Pod's termination by escalateAt: the time left, at least the one-second
+// escalation grace and at most the Pod's own 3600 s.
+func sharedWorkerGrace(escalateAt, now time.Time) int64 {
+	left := int64(escalateAt.Sub(now) / time.Second)
+	return min(max(left, sharedEscalationGrace), int64(workerPodTerminationGrace/time.Second))
 }
 
 // recordSharedRetirement is best-effort bookkeeping after a pool's Delete:

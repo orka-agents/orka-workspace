@@ -86,6 +86,9 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	type retirement struct {
 		pool          *unstructured.Unstructured
 		state, reason string
+		// escalateAt is the pass's hard-bound escalation time for the pool,
+		// which caps its worker Pods' deletion grace.
+		escalateAt time.Time
 	}
 	var retirements []retirement
 	var escalations []*unstructured.Unstructured
@@ -101,7 +104,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			continue
 		}
 		retire := func(state, reason string) {
-			retirements = append(retirements, retirement{pool: pool, state: state, reason: reason})
+			retirements = append(retirements, retirement{pool: pool, state: state, reason: reason, escalateAt: escalateAt})
 		}
 		switch {
 		case outage:
@@ -149,7 +152,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		go func() {
 			defer group.Done()
 			for item := range work {
-				err := d.deleteSharedPool(ctx, item.pool)
+				_, err := d.deleteSharedPool(ctx, item.pool, item.escalateAt)
 				if err != nil {
 					// The decision survives a failed Delete: admission
 					// refuses the pool and the next pass retries.
@@ -546,7 +549,7 @@ func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructur
 		go func() {
 			defer group.Done()
 			for pool := range work {
-				if err := d.escalateSharedWorkerPods(ctx, pool, provenance[pool.GetUID()].podUIDs); err != nil {
+				if err := d.deleteSharedWorkerPods(ctx, pool, provenance[pool.GetUID()].podUIDs, sharedEscalationGrace, "the worker Pod outlived its strong retirement"); err != nil {
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
@@ -765,8 +768,10 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 	return time.Time{}, deadline.Add(-sharedRetireMargin), false
 }
 
-// escalateSharedWorkerPods re-deletes the pool's worker Pods with a
-// one-second grace once the hard bound nears. By then the worker has had its
+// deleteSharedWorkerPods deletes the pool's worker Pods with grace, skipping
+// any whose deletion already carries a grace no longer than that. Escalation
+// re-deletes them with a one-second grace once the hard bound nears. By then
+// the worker has had its
 // full drain and Orka core's eviction window has ended, so every neighbour was
 // suspended or failed without replay. A one-second grace keeps the absence
 // proof kubelet-confirmed, which a zero grace would not.
@@ -782,7 +787,10 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 // listed Pod is this pool's or older. If the pool is gone or replaced, only
 // Pods whose UID the pool's ledger or a journal fenced on this pool are
 // deleted. Each delete is preconditioned on the listed Pod's UID.
-func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured, recorded map[string]bool) error {
+//
+// Retirement uses the same deletion, first, with the grace the time left
+// allows (deleteSharedPool).
+func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured, recorded map[string]bool, grace int64, reason string) error {
 	pods := &corev1.PodList{}
 	listCtx, cancelList := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
 	err := d.client.List(listCtx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()})
@@ -816,11 +824,14 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 		if !held && !recorded[string(pod.UID)] {
 			continue
 		}
-		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds <= sharedEscalationGrace {
+		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds <= grace {
 			continue
 		}
-		grace := sharedEscalationGrace
-		ctrl.LoggerFrom(ctx).Info("Substrate shared worker Pod escalated before its hard lifetime bound", "reason", "the worker Pod outlived its strong retirement")
+		if grace == sharedEscalationGrace {
+			ctrl.LoggerFrom(ctx).Info("Substrate shared worker Pod escalated before its hard lifetime bound", "reason", reason)
+		} else {
+			ctrl.LoggerFrom(ctx).Info("Substrate shared worker Pod deleted with a grace bounded by its hard lifetime bound", "graceSeconds", grace, "reason", reason)
+		}
 		deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
 		err := d.client.Delete(deleteCtx, pod, client.Preconditions{UID: &pod.UID}, client.GracePeriodSeconds(grace))
 		cancel()
