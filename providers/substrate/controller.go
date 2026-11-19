@@ -181,7 +181,7 @@ func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *ExecutionWorkspaceReconciler) maxConcurrentReconciles() int {
-	if r.MaxConcurrentReconciles <= 0 {
+	if r.MaxConcurrentReconciles == 0 {
 		return DefaultMaxConcurrentReconciles
 	}
 	return r.MaxConcurrentReconciles

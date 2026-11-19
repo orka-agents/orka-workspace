@@ -472,6 +472,11 @@ func TestMaxConcurrentReconcilesIsBounded(t *testing.T) {
 	if got := (&ExecutionWorkspaceReconciler{}).maxConcurrentReconciles(); got != DefaultMaxConcurrentReconciles {
 		t.Fatalf("unset concurrency = %d", got)
 	}
+	// Only an unset value takes the default: a directly configured negative
+	// value stays out of range so SetupWithManager rejects it.
+	if err := ValidateMaxConcurrentReconciles((&ExecutionWorkspaceReconciler{MaxConcurrentReconciles: -1}).maxConcurrentReconciles()); err == nil {
+		t.Fatal("a negative MaxConcurrentReconciles was defaulted instead of rejected")
+	}
 }
 
 // TestSharedWarmReserveServesAResumeInOnePass keeps an emptied pool as the
