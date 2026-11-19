@@ -4196,3 +4196,164 @@ func TestSharedTemplateRefreshCachesOnlySharedRelevantTemplates(t *testing.T) {
 		t.Fatalf("a private allocation's template is cached as shared-relevant: all=%v shared=%v", privateAll, privateShared)
 	}
 }
+
+// deleteRecord is one Delete the provider issued.
+type deleteRecord struct {
+	kind  string
+	uid   string
+	grace *int64
+}
+
+// recordingDeletes records every WorkerPool and Pod Delete, in order, with
+// its grace and UID precondition (the fake client ignores both).
+func recordingDeletes(t *testing.T, c client.Client) (client.Client, func() []deleteRecord) {
+	t.Helper()
+	var mu sync.Mutex
+	var records []deleteRecord
+	wrapped := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			options := &client.DeleteOptions{}
+			options.ApplyOptions(opts)
+			kind := ""
+			switch o := obj.(type) {
+			case *corev1.Pod:
+				kind = "Pod"
+			case *unstructured.Unstructured:
+				kind = o.GetKind()
+			}
+			if kind == "Pod" || kind == "WorkerPool" {
+				if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != obj.GetUID() {
+					t.Errorf("a %s Delete carried no UID precondition", kind)
+				}
+				mu.Lock()
+				records = append(records, deleteRecord{kind: kind, uid: string(obj.GetUID()), grace: options.GracePeriodSeconds})
+				mu.Unlock()
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+	return wrapped, func() []deleteRecord {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(records)
+	}
+}
+
+// assertWorkerPodFirst checks the worker Pod was deleted directly, before
+// its pool, with the expected grace.
+func assertWorkerPodFirst(t *testing.T, records []deleteRecord, podUID string, grace int64) {
+	t.Helper()
+	pod, pool := -1, -1
+	for i, record := range records {
+		switch {
+		case record.kind == "Pod" && record.uid == podUID && pod < 0:
+			pod = i
+			if record.grace == nil || *record.grace != grace {
+				got := "none"
+				if record.grace != nil {
+					got = strconv.FormatInt(*record.grace, 10)
+				}
+				t.Fatalf("the worker Pod's first delete carried grace %s, want %d", got, grace)
+			}
+		case record.kind == "WorkerPool" && pool < 0:
+			pool = i
+		}
+	}
+	if pod < 0 || pool < 0 || pod > pool {
+		t.Fatalf("the worker Pod was not deleted directly before its pool: %+v", records)
+	}
+}
+
+func TestSharedRetirementDeletesTheWorkerPodFirstWithABoundedGrace(t *testing.T) {
+	full := int64(workerPodTerminationGrace / time.Second)
+	t.Run("lifetime at its retirement time", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		setNow(t, sharedRetireAt(pool, ledger))
+		recording, deletes := recordingDeletes(t, c)
+		_ = (&SpareWorkerReplenisher{Client: recording, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, full)
+	})
+	t.Run("lifetime retired late", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		// The provider was down past the retirement time: 20 minutes remain.
+		setNow(t, sharedEscalateAt(pool, ledger).Add(-20*time.Minute))
+		recording, deletes := recordingDeletes(t, c)
+		_ = (&SpareWorkerReplenisher{Client: recording, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, int64((20*time.Minute)/time.Second))
+	})
+	t.Run("outage past its bound", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+		created := pool.GetCreationTimestamp().Time
+		failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				return apierrors.NewServiceUnavailable("journal inventory unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		}})
+		recording, deletes := recordingDeletes(t, failing)
+		bounds := &SpareWorkerReplenisher{Client: recording, Config: sharedConfig()}
+		// The outage starts 10 minutes before creation plus the 3h minimum's
+		// escalation time and outlasts its bound.
+		start := created.Add(profile.MinSharedWorkerLifetime - sharedRetireMargin - 10*time.Minute)
+		setNow(t, start)
+		_ = bounds.EnforceSharedBounds(t.Context())
+		setNow(t, start.Add(sharedProvenanceOutageBound))
+		_ = bounds.EnforceSharedBounds(t.Context())
+		assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, int64((10*time.Minute-sharedProvenanceOutageBound)/time.Second))
+	})
+	t.Run("strong path", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		a, record := sharedReady(t, c, native, first)
+		native.failSuspendBeforeEffect = true
+		recording, deletes := recordingDeletes(t, c)
+		for range 4 {
+			tick()
+			if _, err := sharedDriver(recording, native).StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if native.suspendCalls == 1 {
+				break
+			}
+		}
+		assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, full)
+	})
+	t.Run("quarantine", func(t *testing.T) {
+		c, native, record, _ := sharedTemplateFixture(t)
+		recording, deletes := recordingDeletes(t, c)
+		_ = sharedReplenisher(recording, native).Sweep(t.Context())
+		assertWorkerPodFirst(t, deletes(), record.Worker.PodUID, full)
+	})
+}
+
+func TestSharedRetiredIsLoggedOncePerTransition(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// The pool is kept deleting (as a foreground cascade would) so later
+	// passes see it in that state.
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	pool.SetFinalizers([]string{"foregroundDeletion"})
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	logs := &bytes.Buffer{}
+	ctx := ctrl.LoggerInto(t.Context(), zap.New(zap.WriteTo(logs), zap.UseDevMode(false)))
+	d := sharedDriver(c, native)
+	for range 5 {
+		current, found := getPool(t, c, record.SharedWorker.Pool)
+		if !found {
+			t.Fatal("the pool vanished")
+		}
+		if err := d.hardRetireSharedPool(ctx, current, sharedRetiring, "repeated"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if count := strings.Count(logs.String(), "Substrate shared worker retired"); count != 1 {
+		t.Fatalf("the retirement was logged %d times, want once", count)
+	}
+}
