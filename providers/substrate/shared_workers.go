@@ -599,6 +599,9 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	if !d.config.DedicatedInstall {
 		return errSharedWorkersNotDedicated
 	}
+	if err := d.requireSharedProvenance(ctx); err != nil {
+		return err
+	}
 	movable := !record.Template.CreateIssued && !shared.CreateIssued
 	if movable {
 		// The workspace may have become tainted, quarantined or failed since
@@ -965,6 +968,9 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		return false, fmt.Errorf("the shared worker hosts a tainted, quarantined or failed workspace: %w", sdk.ErrStaleIdentity)
 	}
 	if err := d.refuseForeignTemplates(ctx, shared.Scope.Atespace, record.RuntimePoolLabels, pool); err != nil {
+		return false, err
+	}
+	if err := d.requireSharedProvenance(ctx); err != nil {
 		return false, err
 	}
 	selected, err := d.privatePoolWorker(ctx, record)
@@ -1468,7 +1474,13 @@ func (d *Lifecycle) advanceSharedInterim(ctx context.Context, cm *corev1.ConfigM
 		}
 		return false, "", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDING:
-		return false, "", nil
+		// A synchronous evidence suspend that succeeded returns SUSPENDED, and
+		// one that failed is already doubt, so a SUSPENDING Actor seen on a
+		// later pass (for example after a crash between the RPC and its
+		// result) is unresolved: a failed upstream workflow can leave it
+		// SUSPENDING for good. A Stop needs no data, so it never waits for or
+		// continues that suspension; it takes the strong path.
+		return false, "the evidence-only suspend left the Actor SUSPENDING, unresolved", nil
 	case pb.ActorState_ACTOR_STATE_SUSPENDED:
 	default:
 		return false, "the Actor is " + actor.GetStatus().GetState().String(), nil

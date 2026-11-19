@@ -878,7 +878,13 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 		last = operation.ContinuedAt
 	}
 	now := sharedNow()
-	if operation.Continuations >= maxSuspendContinuations || last != nil && now.Sub(last.Time) < suspendContinuationInterval {
+	if operation.Continuations >= maxSuspendContinuations {
+		// Every continuation ended without a result (for example a crash
+		// each time): the suspension is doubt, so the strong path takes over
+		// rather than wait for the lifetime bound.
+		return fmt.Errorf("the suspension stayed SUSPENDING after %d continuations", operation.Continuations)
+	}
+	if last != nil && now.Sub(last.Time) < suspendContinuationInterval {
 		return nil
 	}
 	operation.Continuations++

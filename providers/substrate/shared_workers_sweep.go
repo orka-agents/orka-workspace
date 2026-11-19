@@ -52,6 +52,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
 	}
+	// A short outage only closes admission. One that outlasts its bound
+	// is doubt about every pool, including a strong marker a tampered entry
+	// might hide, so every pool is then strongly retired.
+	outage := provenanceErr != nil && sharedProvenanceHealth.outlasted(sharedNow())
 	// Phase 0 decides, reading only Kubernetes and re-reading the clock per
 	// pool. Phase 1 issues every due escalation first, each Pod delete on its
 	// own short context. Phase 2 issues the pool Deletes concurrently, capped,
@@ -80,6 +84,8 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			retirements = append(retirements, retirement{pool: pool, state: state, reason: reason})
 		}
 		switch {
+		case outage:
+			retire(sharedRetiring, "the shared worker's journal provenance stayed unavailable past its bound")
 		case !sharedLabelsIntact(pool):
 			retire(sharedRetiring, "the shared worker carries shared evidence without its provider-owned label")
 		case !r.Config.DedicatedInstall:
@@ -108,7 +114,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			retire(sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
 		}
 	}
-	errs = append(errs, d.escalateSharedPools(ctx, escalations))
+	errs = append(errs, d.escalateSharedPools(ctx, escalations, provenance))
 	var mu sync.Mutex
 	var deleted []retirement
 	work := make(chan retirement)
@@ -196,6 +202,8 @@ type sharedProvenance struct {
 	scopes   []sharedScope
 	// strong is an unreleased recorded Strong marker or instance failure.
 	strong bool
+	// podUIDs are the worker Pod UIDs journals fenced on this pool.
+	podUIDs map[string]bool
 }
 
 // sharedJournalProvenance reads every journal and archived record (Kubernetes
@@ -203,8 +211,10 @@ type sharedProvenance struct {
 func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]sharedProvenance, error) {
 	journals := &corev1.ConfigMapList{}
 	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		sharedProvenanceHealth.failed(sharedNow())
 		return nil, err
 	}
+	defer sharedProvenanceHealth.succeeded(sharedNow())
 	out := map[types.UID]sharedProvenance{}
 	for i := range journals.Items {
 		record, ok := decodeClaimRecord(&journals.Items[i])
@@ -219,12 +229,94 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 		}
 		entry.found = true
 		entry.scopes = append(entry.scopes, scope)
+		fences := append([]workerFence{}, record.RetirementWorkers...)
+		if record.Worker != nil {
+			fences = append(fences, *record.Worker)
+		}
+		for _, fence := range fences {
+			if fence.PodUID != "" {
+				if entry.podUIDs == nil {
+					entry.podUIDs = map[string]bool{}
+				}
+				entry.podUIDs[fence.PodUID] = true
+			}
+		}
 		if !record.SharedWorker.Released && (record.SharedWorker.Strong != "" || record.Failure != "") {
 			entry.strong = true
 		}
 		out[uid] = entry
 	}
 	return out, nil
+}
+
+// sharedProvenanceFreshness is how recent a successful journal inventory read
+// must be for a shared pool to admit a claim or a Resume. The bounds loop
+// reads it every 10 s; admission reads it itself when it is older.
+const sharedProvenanceFreshness = 30 * time.Second
+
+// sharedProvenanceOutageBound is how long the journal inventory may stay
+// unavailable before every shared pool is strongly retired as doubt.
+const sharedProvenanceOutageBound = 60 * time.Second
+
+// provenanceHealth tracks, in process, the leader's journal inventory reads:
+// when one last succeeded, and since when they have been failing. A new
+// leader starts with neither, so it admits nothing until its own read
+// succeeds, and its outage bound starts from its own first failure.
+type provenanceHealth struct {
+	mu           sync.Mutex
+	verifiedAt   time.Time
+	failingSince time.Time
+}
+
+var sharedProvenanceHealth = &provenanceHealth{}
+
+func (h *provenanceHealth) succeeded(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.verifiedAt, h.failingSince = now, time.Time{}
+}
+
+func (h *provenanceHealth) failed(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.failingSince.IsZero() {
+		h.failingSince = now
+	}
+}
+
+// fresh reports a recent successful read with no failure since.
+func (h *provenanceHealth) fresh(now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failingSince.IsZero() && !h.verifiedAt.IsZero() && now.Sub(h.verifiedAt) < sharedProvenanceFreshness
+}
+
+// outlasted reports reads failing for at least the outage bound.
+func (h *provenanceHealth) outlasted(now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.failingSince.IsZero() && now.Sub(h.failingSince) >= sharedProvenanceOutageBound
+}
+
+func (h *provenanceHealth) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.verifiedAt, h.failingSince = time.Time{}, time.Time{}
+}
+
+// requireSharedProvenance closes admission (a new claim, a new pool, or a
+// Resume onto a shared pool) unless the journal inventory was read
+// successfully within the freshness window. Without it the pool's lifetime
+// rests on its mutable annotations alone, so admission fails closed; the pool
+// is not retired for that until the outage bound passes.
+func (d *Lifecycle) requireSharedProvenance(ctx context.Context) error {
+	if sharedProvenanceHealth.fresh(sharedNow()) {
+		return nil
+	}
+	if _, err := d.sharedJournalProvenance(ctx); err != nil {
+		return fmt.Errorf("shared worker provenance is unavailable, so shared admission is closed: %w", err)
+	}
+	return nil
 }
 
 // sharedDeleteConcurrency caps concurrent pool Deletes in one bounds pass.
@@ -235,15 +327,16 @@ const sharedDeleteConcurrency = 8
 const sharedEscalationTimeout = 10 * time.Second
 
 // sharedEscalationConcurrency caps concurrent per-pool escalations. With one
-// worker Pod per pool, a pool takes at most two calls (2 x 10s), so within
-// the 5-minute margin 16 workers cover 16 x 300s / 20s = 240 due pools even
-// when every call stalls to its timeout.
+// worker Pod per pool, a pool takes at most three calls (its Pod List, a
+// pool read and one Pod delete, 3 x 10s), so within the 5-minute margin 16
+// workers cover 16 x 300s / 30s = 160 due pools even when every call stalls
+// to its timeout.
 const sharedEscalationConcurrency = 16
 
 // escalateSharedPools escalates the worker Pods of every due pool
 // concurrently, capped, each call on its own short context, so stalled Pod
 // DELETEs cannot push later escalations past the lifetime margin.
-func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructured.Unstructured) error {
+func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructured.Unstructured, provenance map[types.UID]sharedProvenance) error {
 	var mu sync.Mutex
 	var errs []error
 	work := make(chan *unstructured.Unstructured)
@@ -253,7 +346,7 @@ func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructur
 		go func() {
 			defer group.Done()
 			for pool := range work {
-				if err := d.escalateSharedWorkerPods(ctx, pool); err != nil {
+				if err := d.escalateSharedWorkerPods(ctx, pool, provenance[pool.GetUID()].podUIDs); err != nil {
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
@@ -293,7 +386,7 @@ func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) er
 			due = append(due, pool)
 		}
 	}
-	errs = append(errs, d.escalateSharedPools(ctx, due))
+	errs = append(errs, d.escalateSharedPools(ctx, due, provenance))
 	return errors.Join(errs...)
 }
 
@@ -366,7 +459,16 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 //
 // It does not wait for the pool's deletion to have started: a deletion that
 // failed must not postpone the bound.
-func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured) error {
+//
+// Every Pod it deletes is tied to this pool's UID, never to its name alone,
+// so a pool replaced under the same name never loses its Pods. The Pods are
+// listed by the pool-name label, then the pool is read again: the pass's
+// List saw this UID before the Pod List and the read sees it after, and a
+// UID is never reused, so the name held this pool throughout and every
+// listed Pod is this pool's or older. If the pool is gone or replaced, only
+// Pods whose UID the pool's ledger or a journal fenced on this pool are
+// deleted. Each delete is preconditioned on the listed Pod's UID.
+func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured, recorded map[string]bool) error {
 	pods := &corev1.PodList{}
 	listCtx, cancelList := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
 	err := d.client.List(listCtx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()})
@@ -374,9 +476,32 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 	if err != nil {
 		return err
 	}
+	if len(pods.Items) == 0 {
+		return nil
+	}
+	current := poolObject()
+	getCtx, cancelGet := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
+	err = d.client.Get(getCtx, client.ObjectKeyFromObject(pool), current)
+	cancelGet()
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	held := err == nil && current.GetUID() == pool.GetUID()
+	if !held {
+		if ledger, err := readSharedLedger(pool); err == nil && ledger.Worker != nil && ledger.Worker.PodUID != "" {
+			recorded = maps.Clone(recorded)
+			if recorded == nil {
+				recorded = map[string]bool{}
+			}
+			recorded[ledger.Worker.PodUID] = true
+		}
+	}
 	var errs []error
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if !held && !recorded[string(pod.UID)] {
+			continue
+		}
 		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds <= sharedEscalationGrace {
 			continue
 		}

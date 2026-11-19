@@ -64,7 +64,8 @@ func useTestClock(t *testing.T) {
 	previous := sharedNow
 	testClock.Store(time.Now().UnixNano())
 	sharedNow = testNow
-	t.Cleanup(func() { sharedNow = previous })
+	sharedProvenanceHealth.reset()
+	t.Cleanup(func() { sharedNow = previous; sharedProvenanceHealth.reset() })
 }
 
 func tick() { testClock.Add(int64(sharedEgressSettle + time.Second)) }
@@ -2901,4 +2902,242 @@ func shippedRBACClient(t *testing.T, c client.Client) client.Client {
 			return w.Delete(ctx, obj, opts...)
 		},
 	})
+}
+
+func TestSharedStopRecoveringAnUnresolvedSuspendingActorTakesTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The evidence suspend takes effect upstream but its workflow fails in
+	// FinalizeSuspended, leaving the Actor SUSPENDING, and the provider crashes
+	// before it handles the result: nothing after the RPC is saved.
+	native.failFinalizeOnce = true
+	crashing := &suspensionReviewControl{nativeFixture: native, submit: func(request *pb.SuspendActorRequest) (*pb.SuspendActorResponse, error) {
+		_, _ = native.SuspendActor(t.Context(), request)
+		panic("provider crashed after the evidence suspend")
+	}}
+	for range 4 {
+		tick()
+		crashed := func() (crashed bool) {
+			defer func() { crashed = recover() != nil }()
+			d := sharedDriver(c, native)
+			d.control = crashing
+			if _, err := d.StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			return false
+		}()
+		if crashed {
+			break
+		}
+	}
+	if crashing.calls != 1 || native.actors[refKey(actorRef(recordA))].Status.State != pb.ActorState_ACTOR_STATE_SUSPENDING {
+		t.Fatalf("the crash was not modelled: calls=%d", crashing.calls)
+	}
+	// Recovery: one Stop pass on a healthy worker and a matching ledger.
+	tick()
+	d := sharedDriver(c, native)
+	d.control = crashing
+	if _, err := d.StopInstance(t.Context(), first.Key, a.Identity); err != nil {
+		t.Fatal(err)
+	}
+	_, record, err := d.read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.SharedWorker.Proof != nil {
+		t.Fatalf("an unresolved SUSPENDING Actor left the Stop waiting: %#v", record.SharedWorker)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the pool's retirement did not start on recovery")
+	}
+	if crashing.calls != 1 {
+		t.Fatalf("the evidence suspend was reissued or continued: calls=%d", crashing.calls)
+	}
+}
+
+func TestSharedUnavailableProvenanceClosesAdmissionThenRetiresPastItsBound(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, record := sharedReady(t, c, native, first)
+	var listing atomic.Bool
+	listing.Store(true)
+	// The journal inventory List fails while every pool's annotations stay
+	// consistent.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok && !listing.Load() {
+				return apierrors.NewServiceUnavailable("journal inventory unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	bounds := &SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}
+	listing.Store(false)
+	if err := bounds.EnforceSharedBounds(t.Context()); err == nil {
+		t.Fatal("expected the unavailable provenance to be reported")
+	}
+	if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || sharedRetirementPersisted(pool) {
+		t.Fatal("one failed inventory List retired a healthy shared pool")
+	}
+	// Admission is closed at once: no new claim onto the pool...
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	if _, err := sharedDriver(failing, native).EnsureAllocation(t.Context(), second); err == nil || !strings.Contains(err.Error(), "provenance is unavailable") {
+		t.Fatalf("a claim was admitted without provenance: %v", err)
+	}
+	if _, ledger := poolLedger(t, c, record.SharedWorker.Pool); len(ledger.Entries) != 1 {
+		t.Fatal("a claim landed on the pool without provenance")
+	}
+	// ...and no Resume onto it.
+	cm, current, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sharedDriver(failing, native).prepareSharedWorker(t.Context(), cm, current); err == nil || !strings.Contains(err.Error(), "provenance is unavailable") {
+		t.Fatalf("a Resume onto the pool was admitted without provenance: %v", err)
+	}
+	// Still unavailable past the bound: every pool is strongly retired.
+	setNow(t, sharedNow().Add(sharedProvenanceOutageBound))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("provenance unavailable past its bound did not retire the pool")
+	}
+}
+
+func TestSharedProvenanceRecoveryWithinItsBoundRetiresNothing(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, record := sharedReady(t, c, native, first)
+	var listing atomic.Bool
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok && !listing.Load() {
+				return apierrors.NewServiceUnavailable("journal inventory unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	bounds := &SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}
+	_ = bounds.EnforceSharedBounds(t.Context())
+	setNow(t, sharedNow().Add(sharedProvenanceOutageBound-time.Second))
+	listing.Store(true)
+	if err := bounds.EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// A later failure restarts the bound from its own first failure.
+	listing.Store(false)
+	setNow(t, sharedNow().Add(2*time.Second))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+		t.Fatal("an outage that recovered within its bound retired the pool")
+	}
+	listing.Store(true)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	if _, recordB := sharedReady(t, c, native, second); recordB.SharedWorker.Pool != record.SharedWorker.Pool {
+		t.Fatal("admission did not reopen once provenance was read again")
+	}
+}
+
+func TestSharedEscalationNeverDeletesAReplacementPoolsPods(t *testing.T) {
+	for _, recordedBy := range []string{"journal", "ledger"} {
+		t.Run(recordedBy, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			retired, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+			if ledger.Worker == nil || ledger.Worker.PodUID != record.Worker.PodUID {
+				t.Fatal("the fixture's ledger does not record the fenced worker Pod")
+			}
+			if recordedBy == "ledger" {
+				// Without journals, the ledger's fenced worker Pod alone
+				// ties the old Pod to the retired pool.
+				cms := &corev1.ConfigMapList{}
+				if err := c.List(t.Context(), cms, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+					t.Fatal(err)
+				}
+				for i := range cms.Items {
+					if err := c.Delete(t.Context(), &cms.Items[i]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			setNow(t, sharedEscalateAt(retired, ledger).Add(time.Minute))
+			replacementPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: record.Worker.Namespace, Name: "replacement-worker", UID: "replacement-worker-uid", Labels: map[string]string{workerPoolLabel: retired.GetName()}}}
+			var replaced bool
+			// The pool is replaced under the same name after the pass listed
+			// it and before its Pods are listed; the old fenced Pod lingers.
+			racing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*corev1.PodList); ok && !replaced {
+						replaced = true
+						live := poolObject()
+						if err := w.Get(ctx, client.ObjectKeyFromObject(retired), live); err != nil {
+							return err
+						}
+						if err := w.Delete(ctx, live); err != nil {
+							return err
+						}
+						replacement := live.DeepCopy()
+						replacement.SetResourceVersion("")
+						replacement.SetUID("replacement-pool-uid")
+						replacement.SetCreationTimestamp(metav1.NewTime(sharedNow()))
+						if err := w.Create(ctx, replacement); err != nil {
+							return err
+						}
+						if err := w.Create(ctx, replacementPod.DeepCopy()); err != nil {
+							return err
+						}
+					}
+					return w.List(ctx, list, opts...)
+				},
+			})
+			_ = (&SpareWorkerReplenisher{Client: racing, Config: sharedConfig()}).EnforceSharedEscalation(t.Context())
+			if !replaced {
+				t.Fatal("the replacement race was not exercised")
+			}
+			if !podExists(t, c, replacementPod.Namespace, replacementPod.Name, string(replacementPod.UID)) {
+				t.Fatal("escalation deleted a replacement pool's worker Pod")
+			}
+			if podExists(t, c, record.Worker.Namespace, record.Worker.Pod, record.Worker.PodUID) {
+				t.Fatal("escalation skipped the retired pool's recorded worker Pod")
+			}
+		})
+	}
+}
+
+func TestSharedSuspensionWhoseContinuationsNeverReturnTakesTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The original suspend leaves the Actor SUSPENDING, and the provider
+	// crashes on it and on every continuation before handling a result.
+	native.failFinalizeOnce = true
+	crashing := &suspensionReviewControl{nativeFixture: native, submit: func(request *pb.SuspendActorRequest) (*pb.SuspendActorResponse, error) {
+		if native.actors[refKey(request.Actor)].Status.State == pb.ActorState_ACTOR_STATE_RUNNING {
+			_, _ = native.SuspendActor(t.Context(), request)
+		}
+		panic("provider crashed during SuspendActor")
+	}}
+	pass := func() (crashed bool) {
+		defer func() { crashed = recover() != nil }()
+		tick()
+		d := sharedDriver(c, native)
+		d.control = crashing
+		_, _ = d.SuspendInstance(t.Context(), first.Key, a.Identity)
+		return false
+	}
+	for range 4*maxSuspendContinuations + 8 {
+		pass()
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.SharedWorker.Strong != "" {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" {
+		t.Fatalf("a suspension whose continuations never return waited instead of taking the strong path: calls=%d", crashing.calls)
+	}
+	if crashing.calls != 1+maxSuspendContinuations {
+		t.Fatalf("SuspendActor calls = %d, want the original and %d continuations", crashing.calls, maxSuspendContinuations)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("the strong deletion did not start")
+	}
 }
