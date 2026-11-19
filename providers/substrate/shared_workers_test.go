@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	sigsyaml "sigs.k8s.io/yaml"
 )
 
 func sharedConfig() Config {
@@ -2631,19 +2635,14 @@ func TestSharedFailedDeleteKeepsTheRetirementDecision(t *testing.T) {
 	_, record := sharedReady(t, c, native, first)
 	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
 	setNow(t, sharedRetireAt(pool, ledger))
-	// The mandatory Delete fails, and so does the ledger write.
-	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+	// The mandatory Delete fails, and the client holds only the shipped
+	// RBAC verbs on WorkerPools.
+	failing := interceptor.NewClient(shippedRBACClient(t, c).(client.WithWatch), interceptor.Funcs{
 		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
 				return apierrors.NewInternalError(errors.New("pool delete refused"))
 			}
 			return w.Delete(ctx, obj, opts...)
-		},
-		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
-				return apierrors.NewInternalError(errors.New("ledger write refused"))
-			}
-			return w.Update(ctx, obj, opts...)
 		},
 	})
 	if err := (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err == nil {
@@ -2651,7 +2650,10 @@ func TestSharedFailedDeleteKeepsTheRetirementDecision(t *testing.T) {
 	}
 	current, found := getPool(t, c, record.SharedWorker.Pool)
 	if !found || !sharedRetireIntended(current) {
-		t.Fatal("a failed Delete left no persisted retirement decision")
+		t.Fatal("a failed Delete left no persisted retirement decision with the shipped RBAC verbs")
+	}
+	if state, _ := sharedPersistedRetirement(current); !sharedRetirementPersisted(current) || state != sharedRetiring {
+		t.Fatal("a failed Delete did not record the retirement state with its intent")
 	}
 	// A new claim arrives and is refused that pool.
 	setNow(t, ledger.BornAt.Time.Add(time.Minute))
@@ -2756,68 +2758,147 @@ func TestSharedEscalationsAreIssuedConcurrentlyWhenPodDeletesStall(t *testing.T)
 }
 
 func TestSharedRetireIntentNeverMarksAReplacementPool(t *testing.T) {
-	for _, deleteFails := range []bool{false, true} {
-		t.Run(fmt.Sprintf("deleteFails=%t", deleteFails), func(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// deleteErr is the Delete's result against the replacement.
+		deleteErr error
+		// replaceAfterRead replaces the pool between the intent's read and
+		// its Update.
+		replaceAfterRead bool
+	}{
+		{name: "uid precondition refused", deleteErr: apierrors.NewConflict(schema.GroupResource{Group: "ate.dev", Resource: "workerpools"}, "pool", errors.New("Precondition failed: UID in precondition"))},
+		{name: "delete failed otherwise", deleteErr: apierrors.NewInternalError(errors.New("pool delete refused"))},
+		{name: "replaced after the read", deleteErr: apierrors.NewInternalError(errors.New("pool delete refused")), replaceAfterRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 3)
 			_, record := sharedReady(t, c, native, first)
-			stale, _ := poolLedger(t, c, record.SharedWorker.Pool)
-			// The decided pool is replaced under the same name.
-			if err := c.Delete(t.Context(), stale.DeepCopy()); err != nil {
-				t.Fatal(err)
+			decided, _ := poolLedger(t, c, record.SharedWorker.Pool)
+			replace := func(ctx context.Context, w client.WithWatch) {
+				live := poolObject()
+				if err := w.Get(ctx, client.ObjectKeyFromObject(decided), live); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Delete(ctx, live); err != nil {
+					t.Fatal(err)
+				}
+				replacement := live.DeepCopy()
+				replacement.SetResourceVersion("")
+				replacement.SetUID(types.UID("replacement-" + string(live.GetUID())))
+				if err := w.Create(ctx, replacement); err != nil {
+					t.Fatal(err)
+				}
 			}
-			replacement := stale.DeepCopy()
-			replacement.SetResourceVersion("")
-			replacement.SetUID("replacement-uid")
-			if err := c.Create(t.Context(), replacement); err != nil {
-				t.Fatal(err)
+			if !tc.replaceAfterRead {
+				replace(t.Context(), c.(client.WithWatch))
 			}
-			current, _ := getPool(t, c, record.SharedWorker.Pool)
-			stale.SetUID("decided-uid")
-			// The API server refuses the Delete by its UID precondition;
-			// the fake client does not enforce preconditions.
-			guarded := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			var replaced bool
+			guarded := interceptor.NewClient(shippedRBACClient(t, c).(client.WithWatch), interceptor.Funcs{
+				// The API server refuses the Delete by its UID precondition;
+				// the fake client does not enforce preconditions.
 				Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-					return apierrors.NewConflict(schema.GroupResource{Group: "ate.dev", Resource: "workerpools"}, obj.GetName(), errors.New("Precondition failed: UID in precondition"))
+					return tc.deleteErr
+				},
+				Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					err := w.Get(ctx, key, obj, opts...)
+					if tc.replaceAfterRead && !replaced && err == nil && obj.GetUID() == decided.GetUID() {
+						replaced = true
+						replace(ctx, w)
+					}
+					return err
 				},
 			})
-			if deleteFails {
-				// A Delete failing for another reason must still not
-				// transfer the intent to the replacement.
-				guarded = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
-					Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-						return apierrors.NewInternalError(errors.New("pool delete refused"))
-					},
-					Patch: func(ctx context.Context, w client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-						// The API server refuses a patch that changes metadata.uid.
-						data, err := patch.Data(obj)
-						if err != nil {
-							return err
-						}
-						var body struct {
-							Metadata struct {
-								UID string `json:"uid"`
-							} `json:"metadata"`
-						}
-						if err := json.Unmarshal(data, &body); err != nil {
-							return err
-						}
-						live := poolObject()
-						if err := w.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
-							return err
-						}
-						if body.Metadata.UID != "" && body.Metadata.UID != string(live.GetUID()) {
-							return apierrors.NewBadRequest("metadata.uid: field is immutable")
-						}
-						return w.Patch(ctx, obj, patch, opts...)
-					},
-				})
-			}
-			d := driver(guarded, native)
-			_ = d.hardRetireSharedPool(t.Context(), stale, sharedRetiring, "stale decision")
+			_ = driver(guarded, native).hardRetireSharedPool(t.Context(), decided, sharedRetiring, "stale decision")
 			after, found := getPool(t, c, record.SharedWorker.Pool)
-			if !found || after.GetUID() != current.GetUID() || sharedRetireIntended(after) {
-				t.Fatal("a stale retirement decision marked or deleted the replacement pool")
+			if !found || after.GetUID() == decided.GetUID() || sharedRetireIntended(after) || sharedRetirementPersisted(after) {
+				t.Fatal("a stale retirement decision marked the replacement pool")
+			}
+			if tc.replaceAfterRead && !replaced {
+				t.Fatal("the race was not exercised")
 			}
 		})
 	}
+}
+
+// shippedRBACClient refuses every WorkerPool request whose verb the shipped
+// config/rbac.yaml does not grant on ate.dev workerpools.
+func shippedRBACClient(t *testing.T, c client.Client) client.Client {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("config", "rbac.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	granted := map[string]bool{}
+	for _, document := range strings.Split(string(data), "\n---\n") {
+		var role rbacv1.ClusterRole
+		if err := sigsyaml.Unmarshal([]byte(document), &role); err != nil {
+			t.Fatal(err)
+		}
+		if role.Kind != "ClusterRole" && role.Kind != "Role" {
+			continue
+		}
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.APIGroups, "ate.dev") && slices.Contains(rule.Resources, "workerpools") && len(rule.ResourceNames) == 0 {
+				for _, verb := range rule.Verbs {
+					granted[verb] = true
+				}
+			}
+		}
+	}
+	if len(granted) == 0 {
+		t.Fatal("the shipped RBAC grants nothing on workerpools")
+	}
+	pool := func(obj runtime.Object) bool {
+		switch typed := obj.(type) {
+		case *unstructured.Unstructured:
+			return typed.GetKind() == "WorkerPool"
+		case *unstructured.UnstructuredList:
+			return typed.GetKind() == "WorkerPoolList"
+		}
+		return false
+	}
+	check := func(verb string, obj runtime.Object) error {
+		if pool(obj) && !granted[verb] {
+			return apierrors.NewForbidden(schema.GroupResource{Group: "ate.dev", Resource: "workerpools"}, "", fmt.Errorf("verb %q is not granted", verb))
+		}
+		return nil
+	}
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := check("get", obj); err != nil {
+				return err
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if err := check("list", list); err != nil {
+				return err
+			}
+			return w.List(ctx, list, opts...)
+		},
+		Create: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if err := check("create", obj); err != nil {
+				return err
+			}
+			return w.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := check("update", obj); err != nil {
+				return err
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, w client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if err := check("patch", obj); err != nil {
+				return err
+			}
+			return w.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if err := check("delete", obj); err != nil {
+				return err
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
 }

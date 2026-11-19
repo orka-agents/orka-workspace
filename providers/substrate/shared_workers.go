@@ -2053,13 +2053,10 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 // Delete.
 func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
 	if err := d.deleteSharedPool(ctx, pool); err != nil {
-		// The decision must survive a failed Delete: mark the intent and
-		// record the state, each on its own context, so admission refuses
-		// the pool and the next pass retries the Delete.
-		d.markSharedRetireIntent(ctx, pool, reason, err)
-		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
-		d.recordSharedRetirement(writeCtx, pool, state, reason)
-		cancel()
+		// The decision must survive a failed Delete: persist the intent and
+		// the state on its own context, so admission refuses the pool and
+		// the next pass retries the Delete.
+		d.persistSharedRetireDecision(ctx, pool, state, reason, err)
 		return err
 	}
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
@@ -2116,31 +2113,66 @@ func sharedRetireIntended(pool *unstructured.Unstructured) bool {
 	return intended
 }
 
-// markSharedRetireIntent records, best effort and on its own short context,
-// that the pool's strong retirement was decided after its Delete failed with
-// deleteErr. It uses a merge patch of one annotation, independent of the
-// ledger's size and of its resourceVersion, but bound to the decided pool's
-// UID: the patch carries that UID, which the API server refuses to change, so
-// a replacement pool under the same name is never marked. A Delete refused by
-// its UID precondition (Conflict) means the decided pool is already gone or
-// replaced, and nothing is marked.
-func (d *Lifecycle) markSharedRetireIntent(ctx context.Context, pool *unstructured.Unstructured, reason string, deleteErr error) {
-	if sharedRetireIntended(pool) || pool.GetUID() == "" || apierrors.IsConflict(deleteErr) {
+// persistSharedRetireDecision records, best effort and on its own short
+// context, that the pool's strong retirement was decided after its Delete
+// failed with deleteErr: the retirement-intent annotation, and the ledger's
+// retirement state when it can be written, in one Update.
+//
+// The write is bound to the decided pool's UID. It reads the pool, does
+// nothing if the live object has another UID (a replacement under the same
+// name), and updates with the read's resourceVersion as its precondition, so
+// it never lands on a pool replaced after the read. A Delete refused by its
+// UID precondition (Conflict) means the decided pool is already gone or
+// replaced, and nothing is written. It needs only get and update, the verbs
+// the provider already holds on WorkerPools.
+func (d *Lifecycle) persistSharedRetireDecision(ctx context.Context, pool *unstructured.Unstructured, state, reason string, deleteErr error) {
+	uid := pool.GetUID()
+	if uid == "" || apierrors.IsConflict(deleteErr) {
 		return
 	}
 	if len(reason) > sharedLedgerReasonMax {
 		reason = reason[:sharedLedgerReasonMax]
 	}
-	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": pool.GetUID(), "annotations": map[string]string{sharedRetireIntentAnnotation: reason}}})
-	if err != nil {
-		return
-	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
 	defer cancel()
-	target := poolObject()
-	target.SetNamespace(pool.GetNamespace())
-	target.SetName(pool.GetName())
-	if err := d.client.Patch(writeCtx, target, client.RawPatch(types.MergePatchType, patch)); err != nil && !apierrors.IsNotFound(err) {
-		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement intent not recorded", "reason", err.Error())
+	var err error
+	for range sharedRetireDecisionAttempts {
+		current := poolObject()
+		if err = d.client.Get(writeCtx, client.ObjectKeyFromObject(pool), current); err != nil {
+			break
+		}
+		if current.GetUID() != uid || current.GetDeletionTimestamp() != nil {
+			return
+		}
+		changed := false
+		if !sharedRetireIntended(current) {
+			annotations := current.GetAnnotations()
+			if annotations == nil {
+				annotations = map[string]string{}
+			}
+			annotations[sharedRetireIntentAnnotation] = reason
+			current.SetAnnotations(annotations)
+			changed = true
+		}
+		if ledger, readErr := readSharedLedger(current); readErr == nil && ledger.State != state && ledger.State != sharedQuarantined {
+			ledger.State, ledger.Reason = state, reason
+			// An oversized ledger keeps its state; the intent alone suffices.
+			if setSharedLedger(current, ledger) == nil {
+				changed = true
+			}
+		}
+		if !changed {
+			return
+		}
+		if err = d.client.Update(writeCtx, current); !apierrors.IsConflict(err) {
+			break
+		}
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement decision not recorded", "reason", err.Error())
 	}
 }
+
+// sharedRetireDecisionAttempts bounds the conflict retries of a retirement
+// decision's write.
+const sharedRetireDecisionAttempts = 3

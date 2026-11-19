@@ -122,13 +122,15 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				if err != nil {
 					// The decision survives a failed Delete: admission
 					// refuses the pool and the next pass retries.
-					d.markSharedRetireIntent(ctx, item.pool, item.reason, err)
+					// It also records the state, so bookkeeping skips it.
+					d.persistSharedRetireDecision(ctx, item.pool, item.state, item.reason, err)
 				}
 				mu.Lock()
 				if err != nil {
 					errs = append(errs, err)
+				} else {
+					deleted = append(deleted, item)
 				}
-				deleted = append(deleted, item)
 				mu.Unlock()
 			}
 		}()
