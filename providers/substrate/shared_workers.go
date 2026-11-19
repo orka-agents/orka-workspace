@@ -1785,7 +1785,7 @@ func (d *Lifecycle) abandonSharedToPrivate(ctx context.Context, cm *corev1.Confi
 // sweep (before any native read) and the bounds loop all use it.
 func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger) (bool, error) {
 	for _, entry := range ledger.Entries {
-		record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+		record, found, err := d.sharedEntryRecordConfirmed(ctx, pool, entry)
 		if errors.Is(err, errSharedJournalUndecodable) {
 			// Its Strong and Failure markers and its workspace cannot be
 			// checked, so it blocks admission and retires the pool.

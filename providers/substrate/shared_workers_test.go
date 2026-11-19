@@ -3030,6 +3030,9 @@ func TestSharedProvenanceRecoveryWithinItsBoundRetiresNothing(t *testing.T) {
 		t.Fatal("an outage that recovered within its bound retired the pool")
 	}
 	listing.Store(true)
+	// The recovering read starts after the last failure; a read that starts
+	// at the same instant cannot be ordered after it, and does not count.
+	setNow(t, sharedNow().Add(time.Second))
 	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
 	if _, recordB := sharedReady(t, c, native, second); recordB.SharedWorker.Pool != record.SharedWorker.Pool {
 		t.Fatal("admission did not reopen once provenance was read again")
@@ -3747,5 +3750,114 @@ func TestSharedOutageRetirementFiresOnTimeWhenTheJournalReadUsesTheBudget(t *tes
 	_ = bounds.EnforceSharedBounds(t.Context())
 	if _, found := getPool(t, c, pool.GetName()); found {
 		t.Fatal("a journal read that used the whole discovery budget kept the outage retirement from firing")
+	}
+}
+
+func TestSharedAdmissionRequiresTheReadItselfToEstablishFreshness(t *testing.T) {
+	t.Run("older success after a newer failure", func(t *testing.T) {
+		c, native, _, _ := sharedFixture(t, 2)
+		release := make(chan struct{})
+		entered := make(chan struct{})
+		var calls atomic.Int64
+		interleaved := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*corev1.ConfigMapList); !ok {
+					return w.List(ctx, list, opts...)
+				}
+				switch calls.Add(1) {
+				case 1:
+					// Admission's own read is slow, and succeeds.
+					close(entered)
+					<-release
+				case 2:
+					// The bounds loop's newer read fails meanwhile.
+					return apierrors.NewServiceUnavailable("journal inventory unavailable")
+				}
+				return w.List(ctx, list, opts...)
+			},
+		})
+		d := sharedDriver(interleaved, native)
+		start := sharedNow()
+		admitted := make(chan error, 1)
+		go func() { admitted <- d.requireSharedProvenance(t.Context()) }()
+		<-entered
+		setNow(t, start.Add(time.Second))
+		if _, err := d.sharedJournalProvenance(t.Context()); err == nil {
+			t.Fatal("the newer read did not fail")
+		}
+		close(release)
+		if err := <-admitted; err == nil {
+			t.Fatal("an admission read that started before a newer failure admitted")
+		}
+	})
+	t.Run("slow read", func(t *testing.T) {
+		c, native, _, _ := sharedFixture(t, 2)
+		start := sharedNow()
+		// The read takes longer than the freshness window.
+		slow := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*corev1.ConfigMapList); ok {
+					setNow(t, start.Add(sharedProvenanceFreshness+time.Second))
+				}
+				return w.List(ctx, list, opts...)
+			},
+		})
+		if err := sharedDriver(slow, native).requireSharedProvenance(t.Context()); err == nil {
+			t.Fatal("a read already stale when it finished admitted")
+		}
+	})
+}
+
+func TestSharedStaleJournalSnapshotNeverRetiresAHealthyPool(t *testing.T) {
+	for _, loop := range []string{"bounds", "sweep"} {
+		t.Run(loop, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 3)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			_, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			journal := journalKey(recordA.Request.Key)
+			// The pass's inventory List was taken just before A saved its
+			// Actor UID: it lists A's journal without it, while the pool,
+			// listed afterwards, already holds A's booted entry.
+			stale := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if err := w.List(ctx, list, opts...); err != nil {
+						return err
+					}
+					cms, ok := list.(*corev1.ConfigMapList)
+					if !ok {
+						return nil
+					}
+					for i := range cms.Items {
+						if client.ObjectKeyFromObject(&cms.Items[i]) != journal {
+							continue
+						}
+						record, ok := decodeClaimRecord(&cms.Items[i])
+						if !ok {
+							t.Fatal("the fixture journal does not decode")
+						}
+						record.Actor.UID = ""
+						data, err := json.Marshal(record)
+						if err != nil {
+							t.Fatal(err)
+						}
+						cms.Items[i].Data[journalDataKey] = string(data)
+					}
+					return nil
+				},
+			})
+			if loop == "bounds" {
+				_ = (&SpareWorkerReplenisher{Client: stale, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+			} else {
+				_ = sharedReplenisher(stale, native).Sweep(t.Context())
+			}
+			pool, found := getPool(t, c, recordA.SharedWorker.Pool)
+			if !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || sharedRetirementPersisted(pool) {
+				t.Fatal("a journal snapshot older than the pool List retired a healthy pool")
+			}
+			if _, ledger := poolLedger(t, c, recordA.SharedWorker.Pool); len(ledger.Entries) != 2 {
+				t.Fatalf("a stale snapshot collected a valid entry: %d entries", len(ledger.Entries))
+			}
+		})
 	}
 }

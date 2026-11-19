@@ -503,6 +503,12 @@ func (d *Lifecycle) requireSharedProvenance(ctx context.Context) error {
 	if _, err := d.sharedJournalProvenance(ctx); err != nil {
 		return fmt.Errorf("shared worker provenance is unavailable, so shared admission is closed: %w", err)
 	}
+	// A successful read admits only if it established fresh health: a read
+	// that started before a newer failure does not count, and one that took
+	// longer than the freshness window is already stale.
+	if !sharedProvenanceHealth.fresh(sharedNow()) {
+		return errors.New("shared worker provenance is not freshly verified, so shared admission is closed")
+	}
 	return nil
 }
 
@@ -1160,7 +1166,7 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 	suspect := false
 	var orphans []string
 	for _, entry := range ledger.Entries {
-		record, journalFound, err := d.sharedEntryRecord(ctx, entry.Journal)
+		record, journalFound, err := d.sharedEntryRecordConfirmed(ctx, pool, entry)
 		if errors.Is(err, errSharedJournalUndecodable) {
 			// Never collected, and doubt: its markers cannot be read.
 			suspect = true
@@ -1214,6 +1220,23 @@ func sharedPersistedRetirement(pool *unstructured.Unstructured) (string, string)
 func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
 	state, _ := sharedPersistedRetirement(pool)
 	return state != ""
+}
+
+// sharedEntryRecordConfirmed reads an entry's exact journal record from the
+// pass's snapshot and, unless that shows the entry held, confirms it with a
+// live read of that one journal before anything is decided. The snapshot is
+// taken before the pools are listed, so an allocation that saved its Actor
+// UID or moved to a new sequence in between would otherwise look like it
+// disowns a valid entry, and a healthy pool would be strongly retired or its
+// entry collected. Only a mismatch costs a live read, so they stay rare.
+func (d *Lifecycle) sharedEntryRecordConfirmed(ctx context.Context, pool *unstructured.Unstructured, entry sharedLedgerEntry) (*journalRecord, bool, error) {
+	record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
+	if d.sharedPass == nil || err == nil && found && record != nil && sharedEntryHeld(record, pool, entry) {
+		return record, found, err
+	}
+	live := *d
+	live.sharedPass = nil
+	return live.sharedEntryRecord(ctx, entry.Journal)
 }
 
 // sharedAssignmentPage is one native assignment page.
