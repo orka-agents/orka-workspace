@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -2751,5 +2752,72 @@ func TestSharedEscalationsAreIssuedConcurrentlyWhenPodDeletesStall(t *testing.T)
 	}
 	if elapsed := time.Since(started); elapsed > 2*sharedEscalationTimeout+5*time.Second {
 		t.Fatalf("stalled escalations took %s; they were not issued concurrently", elapsed)
+	}
+}
+
+func TestSharedRetireIntentNeverMarksAReplacementPool(t *testing.T) {
+	for _, deleteFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deleteFails=%t", deleteFails), func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 3)
+			_, record := sharedReady(t, c, native, first)
+			stale, _ := poolLedger(t, c, record.SharedWorker.Pool)
+			// The decided pool is replaced under the same name.
+			if err := c.Delete(t.Context(), stale.DeepCopy()); err != nil {
+				t.Fatal(err)
+			}
+			replacement := stale.DeepCopy()
+			replacement.SetResourceVersion("")
+			replacement.SetUID("replacement-uid")
+			if err := c.Create(t.Context(), replacement); err != nil {
+				t.Fatal(err)
+			}
+			current, _ := getPool(t, c, record.SharedWorker.Pool)
+			stale.SetUID("decided-uid")
+			// The API server refuses the Delete by its UID precondition;
+			// the fake client does not enforce preconditions.
+			guarded := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					return apierrors.NewConflict(schema.GroupResource{Group: "ate.dev", Resource: "workerpools"}, obj.GetName(), errors.New("Precondition failed: UID in precondition"))
+				},
+			})
+			if deleteFails {
+				// A Delete failing for another reason must still not
+				// transfer the intent to the replacement.
+				guarded = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+					Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						return apierrors.NewInternalError(errors.New("pool delete refused"))
+					},
+					Patch: func(ctx context.Context, w client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						// The API server refuses a patch that changes metadata.uid.
+						data, err := patch.Data(obj)
+						if err != nil {
+							return err
+						}
+						var body struct {
+							Metadata struct {
+								UID string `json:"uid"`
+							} `json:"metadata"`
+						}
+						if err := json.Unmarshal(data, &body); err != nil {
+							return err
+						}
+						live := poolObject()
+						if err := w.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
+							return err
+						}
+						if body.Metadata.UID != "" && body.Metadata.UID != string(live.GetUID()) {
+							return apierrors.NewBadRequest("metadata.uid: field is immutable")
+						}
+						return w.Patch(ctx, obj, patch, opts...)
+					},
+				})
+			}
+			d := driver(guarded, native)
+			_ = d.hardRetireSharedPool(t.Context(), stale, sharedRetiring, "stale decision")
+			after, found := getPool(t, c, record.SharedWorker.Pool)
+			if !found || after.GetUID() != current.GetUID() || sharedRetireIntended(after) {
+				t.Fatal("a stale retirement decision marked or deleted the replacement pool")
+			}
+		})
 	}
 }

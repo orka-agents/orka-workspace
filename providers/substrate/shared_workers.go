@@ -2056,7 +2056,7 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 		// The decision must survive a failed Delete: mark the intent and
 		// record the state, each on its own context, so admission refuses
 		// the pool and the next pass retries the Delete.
-		d.markSharedRetireIntent(ctx, pool, reason)
+		d.markSharedRetireIntent(ctx, pool, reason, err)
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
 		d.recordSharedRetirement(writeCtx, pool, state, reason)
 		cancel()
@@ -2117,16 +2117,21 @@ func sharedRetireIntended(pool *unstructured.Unstructured) bool {
 }
 
 // markSharedRetireIntent records, best effort and on its own short context,
-// that the pool's strong retirement was decided. It uses a merge patch of one
-// annotation, independent of the ledger's size and of its resourceVersion.
-func (d *Lifecycle) markSharedRetireIntent(ctx context.Context, pool *unstructured.Unstructured, reason string) {
-	if sharedRetireIntended(pool) {
+// that the pool's strong retirement was decided after its Delete failed with
+// deleteErr. It uses a merge patch of one annotation, independent of the
+// ledger's size and of its resourceVersion, but bound to the decided pool's
+// UID: the patch carries that UID, which the API server refuses to change, so
+// a replacement pool under the same name is never marked. A Delete refused by
+// its UID precondition (Conflict) means the decided pool is already gone or
+// replaced, and nothing is marked.
+func (d *Lifecycle) markSharedRetireIntent(ctx context.Context, pool *unstructured.Unstructured, reason string, deleteErr error) {
+	if sharedRetireIntended(pool) || pool.GetUID() == "" || apierrors.IsConflict(deleteErr) {
 		return
 	}
 	if len(reason) > sharedLedgerReasonMax {
 		reason = reason[:sharedLedgerReasonMax]
 	}
-	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]string{sharedRetireIntentAnnotation: reason}}})
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": pool.GetUID(), "annotations": map[string]string{sharedRetireIntentAnnotation: reason}}})
 	if err != nil {
 		return
 	}
