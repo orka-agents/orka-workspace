@@ -5189,3 +5189,76 @@ func TestSharedAssignmentCheckThatAlwaysTimesOutRetiresAtTheBound(t *testing.T) 
 		t.Fatal("an assignment check that always times out did not retire the pool at the bound")
 	}
 }
+
+func TestSharedKnownQuarantineIsNotDelayedByOtherPoolsStalledChecks(t *testing.T) {
+	previous := sharedIsolationCheckTimeout
+	sharedIsolationCheckTimeout = 2 * time.Second
+	t.Cleanup(func() { sharedIsolationCheckTimeout = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	names := manySharedPools(t, c, native, first, binding, 40)
+	slices.Sort(names)
+	journals := &corev1.ConfigMapList{}
+	if err := c.List(t.Context(), journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		t.Fatal(err)
+	}
+	var target *journalRecord
+	for i := range journals.Items {
+		if record, ok := decodeClaimRecord(&journals.Items[i]); ok && record.SharedWorker != nil && record.SharedWorker.Pool == names[len(names)-1] && record.Template.Name != "" {
+			target = record
+		}
+	}
+	if target == nil {
+		t.Fatal("no record holds the last pool")
+	}
+	// The last pool by name is reached by a foreign template; every pool's
+	// assignment Lists hang.
+	native.templates[refKey(&pb.ObjectRef{Atespace: target.Atespace, Name: target.Template.Name})].Metadata.Uid = "foreign-template-uid"
+	native.blockAssignments = true
+	var mu sync.Mutex
+	var podDeleted time.Time
+	recording := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if pod, ok := obj.(*corev1.Pod); ok && string(pod.UID) == target.Worker.PodUID {
+				mu.Lock()
+				podDeleted = time.Now()
+				mu.Unlock()
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+	started := time.Now()
+	_ = sharedReplenisher(recording, native).Sweep(t.Context())
+	mu.Lock()
+	defer mu.Unlock()
+	if podDeleted.IsZero() || podDeleted.Sub(started) > 3*time.Second {
+		t.Fatalf("other pools' stalled checks delayed a known quarantine: %v", podDeleted.Sub(started))
+	}
+	// The pass itself is bounded by the per-pool budget times the rounds of
+	// concurrent checks, not by the number of pools.
+	if elapsed := time.Since(started); elapsed > 4*sharedIsolationCheckTimeout+10*time.Second {
+		t.Fatalf("40 stalled pools made the pass take %s", elapsed)
+	}
+}
+
+func TestSharedMaintenanceBudgetStartsAfterIsolation(t *testing.T) {
+	previousCheck, previousMaintain := sharedIsolationCheckTimeout, sharedMaintenanceTimeout
+	sharedIsolationCheckTimeout, sharedMaintenanceTimeout = 2*time.Second, time.Second
+	t.Cleanup(func() { sharedIsolationCheckTimeout, sharedMaintenanceTimeout = previousCheck, previousMaintain })
+	c, native, first, _ := sharedFixture(t, 2)
+	sharedReady(t, c, native, first)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "3"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	// The isolation scan outlasts the whole maintenance budget.
+	native.blockAssignments = true
+	before := len(sharedPools(t, c))
+	_ = sharedReplenisher(contextAwareClient(c.(client.WithWatch)), native).Sweep(t.Context())
+	if after := len(sharedPools(t, c)); after <= before {
+		t.Fatal("a long isolation scan left warm replenishment with an expired budget")
+	}
+}

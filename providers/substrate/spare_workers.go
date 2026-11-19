@@ -727,17 +727,27 @@ func (d *Lifecycle) createSpare(ctx context.Context, item *profile.SubstrateWork
 // spareWorkerCache lists native Workers at most once per namespace per sweep.
 type spareWorkerCache struct {
 	d           *Lifecycle
+	mu          sync.Mutex
+	namespaces  keyedMutex
 	byNamespace map[string]map[string][]*pb.Worker
 }
 
+// pool returns a pool's native workers from a per-namespace listing, made
+// once per pass. It is safe for concurrent per-pool checks, which list each
+// namespace once.
 func (c *spareWorkerCache) pool(ctx context.Context, pool *unstructured.Unstructured) ([]*pb.Worker, error) {
+	defer c.namespaces.lock(pool.GetNamespace())()
+	c.mu.Lock()
 	workers, found := c.byNamespace[pool.GetNamespace()]
+	c.mu.Unlock()
 	if !found {
 		var err error
 		if workers, err = c.d.namespaceWorkers(ctx, pool.GetNamespace()); err != nil {
 			return nil, err
 		}
+		c.mu.Lock()
 		c.byNamespace[pool.GetNamespace()] = workers
+		c.mu.Unlock()
 	}
 	return workers[pool.GetName()], nil
 }

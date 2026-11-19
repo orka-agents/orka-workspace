@@ -1467,13 +1467,17 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		}
 	}
 	// Non-isolation work (profile discovery, closing, collection, ledger
-	// writes and warm creation) has its own budget and runs after every
-	// isolation check, so a slow profile lookup can never fail one.
-	maintainCtx, cancelMaintain := freshBudget(ctx, sharedMaintenanceTimeout)
-	defer cancelMaintain()
+	// writes and warm creation) has its own budget, started after every
+	// isolation check, so a slow profile lookup can never fail one and a long
+	// isolation scan never leaves it an expired context.
 	var shapes map[string]*sharedProfileShape
 	if len(pools.Items) == 0 {
-		if shapes = r.sharedProfileShapes(maintainCtx, d, profiles); len(shapes) == 0 {
+		// No pool to isolate: only discovery decides whether anything is
+		// shared, on a budget of its own.
+		discoverCtx, cancelDiscover := freshBudget(ctx, sharedMaintenanceTimeout)
+		shapes = r.sharedProfileShapes(discoverCtx, d, profiles)
+		cancelDiscover()
+		if len(shapes) == 0 {
 			// Nothing shared remains, so the in-process template record is
 			// pruned; a later shared check rereads it from Kubernetes.
 			recordedTemplates.replace(nil, recordedTemplates.begin())
@@ -1507,7 +1511,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// outage bound leaves foreign selectors unchecked: shared pools are then
 	// strongly retired (nativeTemplateOutage).
 	outage := &nativeTemplateOutage{d: d, failing: templatesErr != nil}
-	var verified []*sharedIsolation
+	// Every known strong trigger first, for every pool, before any pool's
+	// fallible checks.
+	var candidates []*sharedCandidate
 	for i := range pools.Items {
 		pool := &pools.Items[i]
 		if pool.GetDeletionTimestamp() == nil {
@@ -1516,12 +1522,41 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 				continue
 			}
 		}
-		isolated, err := r.isolateSharedPool(ctx, d, workers, pool, now, templates, ours, templatesErr, inventoryErr)
+		candidate, err := r.sharedKnownTriggers(ctx, d, pool, now, templates, ours, templatesErr, inventoryErr)
 		errs = append(errs, err)
+		if candidate != nil {
+			candidates = append(candidates, candidate)
+		}
+	}
+	// Then each pool's fallible checks, concurrently and capped, each on
+	// budgets of its own.
+	results := make([]*sharedIsolation, len(candidates))
+	checkErrs := make([]error, len(candidates))
+	work := make(chan int)
+	var group sync.WaitGroup
+	for range min(sharedCheckConcurrency, len(candidates)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := range work {
+				results[i], checkErrs[i] = r.isolateSharedPool(ctx, d, workers, candidates[i])
+			}
+		}()
+	}
+	for i := range candidates {
+		work <- i
+	}
+	close(work)
+	group.Wait()
+	errs = append(errs, checkErrs...)
+	var verified []*sharedIsolation
+	for _, isolated := range results {
 		if isolated != nil {
 			verified = append(verified, isolated)
 		}
 	}
+	maintainCtx, cancelMaintain := freshBudget(ctx, sharedMaintenanceTimeout)
+	defer cancelMaintain()
 	if shapes == nil {
 		shapes = r.sharedProfileShapes(maintainCtx, d, profiles)
 	}
@@ -1719,13 +1754,27 @@ func passBudget(ctx context.Context, budget time.Duration) time.Duration {
 	return budget
 }
 
-// isolateSharedPool runs a pool's isolation checks: its persisted state, the
-// pass's template inventory, hosted suspicion, its workers and assignments,
-// and its ledger's hosted records. A strong trigger retires the pool. A check
+// isolateSharedPool runs a candidate pool's fallible isolation checks:
+// hosted suspicion, its workers and assignments, and its ledger's hosted
+// records. A strong trigger retires the pool. A check
 // that fails or does not finish within its own budget makes the pool
 // unverified (verificationFailed); only a pool whose checks all completed is
 // returned for maintenance.
-func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) (*sharedIsolation, error) {
+// sharedCandidate is a pool whose known strong triggers did not retire it,
+// awaiting its fallible isolation checks.
+type sharedCandidate struct {
+	pool         *unstructured.Unstructured
+	ledger       *sharedLedger
+	unclassified bool
+}
+
+// sharedKnownTriggers evaluates, without any read, the strong triggers the
+// pass already knows for a pool: its persisted state, its lifetime and the
+// pass's template inventory. It runs for every pool before any pool's
+// fallible checks, so stalled reads on other pools can never postpone a
+// known quarantine. It returns the pool as a candidate for its fallible
+// checks, or nil when it was retired or needs none.
+func (r *SpareWorkerReplenisher) sharedKnownTriggers(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) (*sharedCandidate, error) {
 	if pool.GetDeletionTimestamp() != nil {
 		return nil, nil
 	}
@@ -1741,10 +1790,6 @@ func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifec
 		// enforceSharedBounds already retired it, without native reads.
 		return nil, nil
 	}
-	// A strong trigger already known acts before any fallible read, so an
-	// unrelated read failure can never suppress it: the pass's template
-	// inventory is in hand, so a foreign template reaching the pool comes
-	// first.
 	unclassified := false
 	if templatesErr == nil && inventoryErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
 		return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
@@ -1759,6 +1804,15 @@ func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifec
 			return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound")
 		}
 	}
+	return &sharedCandidate{pool: pool, ledger: ledger, unclassified: unclassified}, nil
+}
+
+// sharedCheckConcurrency caps the pools whose fallible isolation checks run
+// at once, so stalled reads do not add up across pools.
+const sharedCheckConcurrency = 8
+
+func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, candidate *sharedCandidate) (*sharedIsolation, error) {
+	pool, ledger, unclassified := candidate.pool, candidate.ledger, candidate.unclassified
 	// Kubernetes-only suspicion comes before any native read, on its own
 	// budget. A failed check is held back, not returned, so the worker checks
 	// below still run, each on a fresh budget of its own.
@@ -2150,6 +2204,30 @@ type sharedPassReads struct {
 	marks []outageMark
 	// probed and down cache the pass's native control-plane probe.
 	probed, down bool
+	// namespaces serializes each namespace's first List across concurrent
+	// per-pool checks, so a namespace is still listed once per pass.
+	namespaces keyedMutex
+}
+
+// keyedMutex is one mutex per key.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.locks == nil {
+		k.locks = map[string]*sync.Mutex{}
+	}
+	m, ok := k.locks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		k.locks[key] = m
+	}
+	k.mu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 func newSharedPassReads() *sharedPassReads {
@@ -2223,9 +2301,15 @@ func (d *Lifecycle) sharedWorkspace(ctx context.Context, key types.NamespacedNam
 	if p == nil {
 		return d.client.Get(ctx, key, workspace)
 	}
+	unlock := p.namespaces.lock(key.Namespace)
 	p.mu.Lock()
 	listed, failed := p.listed[key.Namespace], p.failed[key.Namespace]
 	p.mu.Unlock()
+	if listed || failed {
+		unlock()
+	} else {
+		defer unlock()
+	}
 	if failed {
 		return d.client.Get(ctx, key, workspace)
 	}
