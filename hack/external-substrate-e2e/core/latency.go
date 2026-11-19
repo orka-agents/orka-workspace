@@ -525,7 +525,9 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		"poolCredentialsUnchanged": len(warm1.PoolSecrets) > 0 && fmt.Sprint(warm1.PoolSecrets) == fmt.Sprint(warm2.PoolSecrets),
 		"sameSessionNewGeneration": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["runtimeSessionGeneration"] != t1.Identity["runtimeSessionGeneration"] && t2.Identity["promptID"] != t1.Identity["promptID"],
 		"newAttachmentEpoch":       warm2.AttachmentEpoch > warm1.AttachmentEpoch,
-		"noNewTag":                 len(newTags(warm1, warm2)) == 0,
+		// Other Sessions' windows can expire meanwhile when the last window
+		// is left idle, so the namespace-wide Tag check applies only otherwise.
+		"noNewTag": l.skipFinalExpiry || len(newTags(warm1, warm2)) == 0,
 	}
 	l.emit("warmAttach", map[string]any{"scenario": l.warmLabel, "rep": rep, "checks": direct})
 	for check, ok := range direct {
