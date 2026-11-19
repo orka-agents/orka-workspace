@@ -110,6 +110,8 @@ type ExecutionWorkspaceReconciler struct {
 	MaxConcurrentReconciles int
 
 	polls pendingPolls
+	// challengeClient replaces the router challenge reader in tests.
+	challengeClient challengeGetter
 }
 
 func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -127,7 +129,7 @@ func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.R
 		r.polls.reset(req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
-	return r.reconcileLifecycle(ctx, workspace)
+	return r.reconcileRead(ctx, workspace, provider)
 }
 
 func (r *ExecutionWorkspaceReconciler) maxConcurrentReconciles() int {
