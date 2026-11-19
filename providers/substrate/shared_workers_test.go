@@ -5262,3 +5262,24 @@ func TestSharedMaintenanceBudgetStartsAfterIsolation(t *testing.T) {
 		t.Fatal("a long isolation scan left warm replenishment with an expired budget")
 	}
 }
+
+func TestSharedFreshBudgetsEndOnCancellationAfterTheSweepDeadline(t *testing.T) {
+	root, cancelRoot := context.WithCancel(t.Context())
+	defer cancelRoot()
+	sweepCtx, cancelSweep := context.WithTimeout(withSweepBudget(root, time.Hour), 10*time.Millisecond)
+	defer cancelSweep()
+	<-sweepCtx.Done()
+	// The sweep's own deadline has expired; a fresh budget still starts...
+	fresh, cancel := freshBudget(sweepCtx, time.Hour)
+	defer cancel()
+	if fresh.Err() != nil {
+		t.Fatal("a fresh budget inherited the sweep's spent deadline")
+	}
+	// ...and still ends when the original context is cancelled.
+	cancelRoot()
+	select {
+	case <-fresh.Done():
+	case <-time.After(time.Second):
+		t.Fatal("a fresh budget outlived the cancellation of the sweep's original context")
+	}
+}

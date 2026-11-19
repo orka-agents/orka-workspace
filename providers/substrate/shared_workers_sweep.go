@@ -1723,12 +1723,17 @@ func isolationContext(ctx context.Context) (context.Context, context.CancelFunc)
 }
 
 // freshBudget returns a context with a whole budget of its own: it drops any
-// deadline the caller's context already spent, but still ends when that
-// context is cancelled (for example on shutdown or lost leadership).
+// deadline the caller's context already spent, but still ends when the
+// sweep's original context is cancelled (for example on shutdown or lost
+// leadership), even after a deadline derived from it has expired.
 func freshBudget(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	root := ctx
+	if sweep, ok := ctx.Value(sweepBudgetKey{}).(sweepBudget); ok && sweep.root != nil {
+		root = sweep.root
+	}
 	fresh, cancel := context.WithTimeout(context.WithoutCancel(ctx), passBudget(ctx, budget))
-	stop := context.AfterFunc(ctx, func() {
-		if errors.Is(ctx.Err(), context.Canceled) {
+	stop := context.AfterFunc(root, func() {
+		if errors.Is(root.Err(), context.Canceled) {
 			cancel()
 		}
 	})
@@ -1739,17 +1744,25 @@ func freshBudget(ctx context.Context, budget time.Duration) (context.Context, co
 }
 
 // sweepBudgetKey carries a sweep's own deadline, which caps each of its
-// fresh budgets: every step still gets a whole budget of its own, never one
-// another step spent, but none is longer than the sweep's configured deadline.
+// fresh budgets (every step still gets a whole budget of its own, never one
+// another step spent, but none is longer than the sweep's configured
+// deadline), and the sweep's original context, whose cancellation ends them.
 type sweepBudgetKey struct{}
 
-func withSweepBudget(ctx context.Context, budget time.Duration) context.Context {
-	return context.WithValue(ctx, sweepBudgetKey{}, budget)
+type sweepBudget struct {
+	limit time.Duration
+	root  context.Context
+}
+
+// withSweepBudget records ctx, which must not yet carry the sweep's own
+// deadline, as the cancellation root.
+func withSweepBudget(ctx context.Context, limit time.Duration) context.Context {
+	return context.WithValue(ctx, sweepBudgetKey{}, sweepBudget{limit: limit, root: ctx})
 }
 
 func passBudget(ctx context.Context, budget time.Duration) time.Duration {
-	if limit, ok := ctx.Value(sweepBudgetKey{}).(time.Duration); ok && limit > 0 && limit < budget {
-		return limit
+	if sweep, ok := ctx.Value(sweepBudgetKey{}).(sweepBudget); ok && sweep.limit > 0 && sweep.limit < budget {
+		return sweep.limit
 	}
 	return budget
 }
