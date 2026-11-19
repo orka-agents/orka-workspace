@@ -48,8 +48,16 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	go func() { discovered <- d.discoverShared(ctx, true) }()
 	escalatedEarly, earlyErr := d.escalateDueByAnnotations(ctx)
 	found := <-discovered
+	// The outage state comes first, independent of the discovery budget and
+	// of the pool List: it is the journal reads' own record.
+	outage := found.provenanceErr != nil && sharedProvenanceHealth.outlasted(sharedNow())
 	if found.listErr != nil {
-		return errors.Join(earlyErr, found.listErr)
+		// Nothing can be retired by name this pass. The loop retries within
+		// its 10 s period, and a failed journal read keeps admission closed.
+		if outage {
+			ctrl.LoggerFrom(ctx).Error(found.listErr, "Substrate shared worker provenance outage outlasted its bound, but the shared pools could not be listed to retire them")
+		}
+		return errors.Join(earlyErr, found.listErr, found.provenanceErr)
 	}
 	provenance, provenanceErr, pools := found.provenance, found.provenanceErr, found.pools
 	errs := append([]error{earlyErr}, found.errs...)
@@ -61,8 +69,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	}
 	// A short outage only closes admission. One that outlasts its bound
 	// is doubt about every pool, including a strong marker a tampered entry
-	// might hide, so every pool is then strongly retired.
-	outage := provenanceErr != nil && sharedProvenanceHealth.outlasted(sharedNow())
+	// might hide, so every pool is then strongly retired (outage above).
 	// Phase 0 decides, reading only Kubernetes and re-reading the clock per
 	// pool. Phase 1 issues every due escalation first, each Pod delete on its
 	// own short context. Phase 2 issues the pool Deletes concurrently, capped,
@@ -594,12 +601,20 @@ type sharedDiscovery struct {
 // discoverShared reads the pass's provenance under its own deadline: the
 // journal inventory, the shared pools, each journal-less pool's profile and,
 // for the bounds pass (suspects), each recorded workspace.
-func (d *Lifecycle) discoverShared(ctx context.Context, suspects bool) sharedDiscovery {
-	ctx, cancel := context.WithTimeout(ctx, sharedDiscoveryTimeout)
+//
+// The pool List has its own deadline, never the provenance reads' remainder:
+// a journal List that used up the discovery deadline must still leave the
+// pools listed, so the unavailable-provenance bound and the outage policy
+// are applied to them.
+func (d *Lifecycle) discoverShared(parent context.Context, suspects bool) sharedDiscovery {
+	ctx, cancel := context.WithTimeout(parent, sharedDiscoveryTimeout)
 	defer cancel()
 	var out sharedDiscovery
 	out.provenance, out.provenanceErr = d.sharedJournalProvenance(ctx)
-	if out.pools, out.listErr = listSharedPools(ctx, d.client, out.provenance); out.listErr != nil || out.provenanceErr != nil {
+	listCtx, cancelList := context.WithTimeout(parent, sharedDiscoveryTimeout)
+	out.pools, out.listErr = listSharedPools(listCtx, d.client, out.provenance)
+	cancelList()
+	if out.listErr != nil || out.provenanceErr != nil {
 		return out
 	}
 	if err := d.sharedProfileProvenance(ctx, out.pools, out.provenance); err != nil {

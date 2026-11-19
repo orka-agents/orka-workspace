@@ -3687,3 +3687,65 @@ func TestSharedPassReadCounts(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedJournalTimeoutStillAppliesTheUnavailableBound(t *testing.T) {
+	c, _, _, pool, ledger := warmSharedPool(t, 24*time.Hour)
+	previous := sharedDiscoveryTimeout
+	sharedDiscoveryTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { sharedDiscoveryTimeout = previous })
+	// The journal List uses up the whole discovery deadline.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	found := sharedDriver(stalling, nil).withSharedPass().discoverShared(t.Context(), true)
+	if found.listErr != nil || len(found.pools) != 1 || found.provenanceErr == nil {
+		t.Fatalf("a journal timeout lost the pool inventory: listErr=%v pools=%d provenanceErr=%v", found.listErr, len(found.pools), found.provenanceErr)
+	}
+	// With provenance unavailable, a 24h pool past creation plus the 3h
+	// minimum's escalation time is escalated, not left to its annotations.
+	created := pool.GetCreationTimestamp().Time
+	setNow(t, created.Add(profile.MinSharedWorkerLifetime-sharedRetireMargin+time.Minute))
+	if !sharedNow().Before(sharedEscalateAt(pool, ledger)) {
+		t.Fatal("the fixture pool is already due by its annotations")
+	}
+	_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedEscalation(t.Context())
+	if workerPodCount(t, c, pool.GetName()) != 0 {
+		t.Fatal("a journal timeout skipped the unavailable-provenance bound")
+	}
+}
+
+func TestSharedOutageRetirementFiresOnTimeWhenTheJournalReadUsesTheBudget(t *testing.T) {
+	c, _, _, pool, _ := warmSharedPool(t, 24*time.Hour)
+	previous := sharedDiscoveryTimeout
+	sharedDiscoveryTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { sharedDiscoveryTimeout = previous })
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	bounds := &SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}
+	start := sharedNow()
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if current, found := getPool(t, c, pool.GetName()); !found || current.GetDeletionTimestamp() != nil {
+		t.Fatal("a young pool was retired before the outage bound")
+	}
+	if sharedProvenanceHealth.fresh(sharedNow()) {
+		t.Fatal("admission stayed open while the journal read timed out")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, pool.GetName()); found {
+		t.Fatal("a journal read that used the whole discovery budget kept the outage retirement from firing")
+	}
+}
