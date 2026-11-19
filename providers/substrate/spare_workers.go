@@ -455,8 +455,16 @@ func (b *SharedWorkerBounds) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	// Escalation runs in its own loop, so slow pool deletes in a bounds pass
 	// can never push a worker Pod's escalation past its deadline.
-	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedEscalation(ctx, sharedEscalationPeriod)
+		return nil
+	})); err != nil {
+		return err
+	}
+	// Labelling shared journals written before the shared label runs in its
+	// own loop too, off every enforcement path.
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedLabelBackfill(ctx, sharedLabelBackfillPeriod)
 		return nil
 	}))
 }

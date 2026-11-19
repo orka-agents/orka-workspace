@@ -276,11 +276,11 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 	unlabelled := false
 	for i := range journals.Items {
 		record, ok := decodeClaimRecord(&journals.Items[i])
-		if ok && record.SharedWorker != nil && journals.Items[i].Labels[sharedRecordLabel] != "true" && !labelledOnly {
-			// A shared record written before the label existed.
-			if !d.labelSharedRecord(ctx, &journals.Items[i]) {
-				unlabelled = true
-			}
+		if ok && record.SharedWorker != nil && journals.Items[i].Labels[sharedRecordLabel] != "true" {
+			// A shared record written before the label existed: it counts
+			// as shared here, and keeps the full scan until the separate
+			// label backfill has labelled it. Enforcement never writes it.
+			unlabelled = true
 		}
 		if !ok || record.SharedWorker == nil || record.SharedWorker.UID == "" {
 			continue
@@ -458,18 +458,94 @@ func (d *Lifecycle) prefetchSharedWorkspaces(ctx context.Context, namespaces map
 // process (including a newly elected leader) scans in full again once.
 var sharedRecordsLabelled atomic.Bool
 
-// labelSharedRecord adds the shared label to one record written before it
-// existed, preconditioned on the listed resourceVersion, and reports
-// success. A failure leaves the full scan in place for the next pass.
-func (d *Lifecycle) labelSharedRecord(ctx context.Context, cm *corev1.ConfigMap) bool {
-	labeled := cm.DeepCopy()
-	if labeled.Labels == nil {
-		labeled.Labels = map[string]string{}
+// sharedLabelBackfillTimeout bounds one label backfill pass, and
+// sharedLabelBackfillConcurrency its concurrent label writes.
+var sharedLabelBackfillTimeout = 60 * time.Second
+
+const sharedLabelBackfillConcurrency = 8
+
+// sharedLabelBackfillPeriod spaces label backfill passes.
+const sharedLabelBackfillPeriod = 30 * time.Second
+
+// EnforceSharedLabelBackfill runs one leader-only label backfill pass, off
+// the discovery and enforcement path: within its own overall bound, it lists
+// every provider record and labels each shared record written before the
+// label existed, concurrently and capped, each write preconditioned on the
+// listed resourceVersion. Discovery treats unlabelled shared records as
+// shared, with a full scan, until a scan finds none left; nothing in the
+// bounds, escalation or admission paths waits on this pass.
+func (r *SpareWorkerReplenisher) EnforceSharedLabelBackfill(ctx context.Context) error {
+	if sharedRecordsLabelled.Load() {
+		return nil
 	}
-	labeled.Labels[sharedRecordLabel] = "true"
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sharedLabelBackfillTimeout)
 	defer cancel()
-	return d.client.Update(writeCtx, labeled) == nil
+	journals := &corev1.ConfigMapList{}
+	if err := r.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		return err
+	}
+	var pending []*corev1.ConfigMap
+	for i := range journals.Items {
+		if record, ok := decodeClaimRecord(&journals.Items[i]); ok && record.SharedWorker != nil && journals.Items[i].Labels[sharedRecordLabel] != "true" {
+			pending = append(pending, &journals.Items[i])
+		}
+	}
+	var mu sync.Mutex
+	var errs []error
+	work := make(chan *corev1.ConfigMap)
+	var group sync.WaitGroup
+	for range min(sharedLabelBackfillConcurrency, len(pending)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for cm := range work {
+				labeled := cm.DeepCopy()
+				if labeled.Labels == nil {
+					labeled.Labels = map[string]string{}
+				}
+				labeled.Labels[sharedRecordLabel] = "true"
+				writeCtx, cancelWrite := context.WithTimeout(ctx, sharedLedgerWriteTimeout)
+				err := r.Update(writeCtx, labeled)
+				cancelWrite()
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+feed:
+	for _, cm := range pending {
+		select {
+		case work <- cm:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(work)
+	group.Wait()
+	if len(errs) == 0 && ctx.Err() == nil {
+		sharedRecordsLabelled.Store(true)
+	}
+	return errors.Join(append(errs, ctx.Err())...)
+}
+
+// RunSharedLabelBackfill runs EnforceSharedLabelBackfill every period until
+// the backfill is confirmed or ctx ends.
+func (r *SpareWorkerReplenisher) RunSharedLabelBackfill(ctx context.Context, period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for !sharedRecordsLabelled.Load() {
+		if err := r.EnforceSharedLabelBackfill(ctx); err != nil && ctx.Err() == nil {
+			ctrl.LoggerFrom(ctx).Info("Substrate shared journal label backfill incomplete; it is retried", "reason", err.Error())
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // sharedProvenanceFreshness is how recent a successful journal inventory read

@@ -4480,18 +4480,24 @@ func TestSharedUnlabelledLegacyRecordIsLabelledAndStillFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	sharedRecordsLabelled.Store(false)
-	d := sharedDriver(c, native)
-	for pass := range 2 {
-		provenance, err := d.sharedJournalProvenance(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !provenance[types.UID(record.SharedWorker.UID)].found {
-			t.Fatalf("pass %d lost the legacy record's provenance", pass)
-		}
+	d := sharedDriver(c, native).withSharedPass()
+	// Discovery counts it as shared, with the full scan, and never labels it.
+	provenance, err := d.sharedJournalProvenance(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !provenance[types.UID(record.SharedWorker.UID)].found || sharedRecordsLabelled.Load() {
+		t.Fatal("discovery lost the unlabelled legacy record or stopped the full scan")
+	}
+	// The separate backfill labels it; discovery then lists labelled records.
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedLabelBackfill(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if !sharedRecordsLabelled.Load() {
-		t.Fatal("the confirming scan did not switch to labelled records")
+		t.Fatal("the backfill did not confirm the labels")
+	}
+	if provenance, err := d.sharedJournalProvenance(t.Context()); err != nil || !provenance[types.UID(record.SharedWorker.UID)].found {
+		t.Fatalf("the labelled record was lost: %v", err)
 	}
 	labelled, _, err := sharedDriver(c, native).read(t.Context(), first.Key)
 	if err != nil {
@@ -4499,5 +4505,69 @@ func TestSharedUnlabelledLegacyRecordIsLabelledAndStillFound(t *testing.T) {
 	}
 	if labelled.Labels[sharedRecordLabel] != "true" {
 		t.Fatal("the legacy record was not labelled")
+	}
+}
+
+func TestSharedStalledRelabelNeverHoldsUpEnforcement(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	cm, _, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Many legacy shared records, every label write stalling.
+	const legacy = 100
+	delete(cm.Labels, sharedRecordLabel)
+	if err := c.Update(t.Context(), cm.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	for i := range legacy {
+		copied := cm.DeepCopy()
+		copied.Name = fmt.Sprintf("substrate-history-legacy-%03d", i)
+		copied.ResourceVersion, copied.UID = "", ""
+		if err := c.Create(t.Context(), copied); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var writes atomic.Int64
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Labels[sharedRecordLabel] == "true" {
+				writes.Add(1)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+	}))
+	sharedRecordsLabelled.Store(false)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	setNow(t, sharedEscalateAt(pool, ledger).Add(time.Minute))
+	r := &SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}
+	started := time.Now()
+	_ = r.EnforceSharedEscalation(t.Context())
+	_ = r.EnforceSharedBounds(t.Context())
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("discovery and enforcement took %s with stalled relabel writes", elapsed)
+	}
+	if writes.Load() != 0 {
+		t.Fatalf("enforcement issued %d relabel writes", writes.Load())
+	}
+	if podExists(t, c, record.Worker.Namespace, record.Worker.Pod, record.Worker.PodUID) {
+		t.Fatal("escalation did not issue while legacy records were unlabelled")
+	}
+	// The backfill pass itself is bounded, and stays incomplete.
+	previous := sharedLabelBackfillTimeout
+	sharedLabelBackfillTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { sharedLabelBackfillTimeout = previous })
+	started = time.Now()
+	if err := r.EnforceSharedLabelBackfill(t.Context()); err == nil {
+		t.Fatal("a stalled backfill reported success")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("the backfill pass took %s past its bound", elapsed)
+	}
+	if sharedRecordsLabelled.Load() {
+		t.Fatal("an incomplete backfill switched discovery to labelled records")
 	}
 }
