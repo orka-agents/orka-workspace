@@ -296,7 +296,9 @@ pool or opted-in profile exists.
   The workspace is re-checked when the slot is claimed (a suspect workspace
   moves to a private worker) and immediately before Resume (fails closed).
 - **Pools.** A shared pool is a single-replica WorkerPool named
-  `ate-shared-<random>`:
+  `ate-shared-<commitment>-<random>`, where the commitment hashes the pool's
+  scope (profile UID, profile hash, lifetime and shape), so the immutable name
+  binds the pool to the scope its ledger may claim:
   - its only label is a random `substrate.workspace.orka.ai/shared-pool`
     value the derived template selects, never the operator pool's labels;
   - it is sized `cpu=N·C, memory=N·M+64Mi`, and has no owner;

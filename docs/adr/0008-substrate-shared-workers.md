@@ -230,7 +230,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
 
 - **Strong retirement starts** at `maxWorkerLifetime − 3600 s − 5 min`. That leaves the worker Pod's whole termination grace, which contains the worker's 30-minute drain and Orka core's 30-minute eviction window, plus a margin.
 - **Admission closes** one hour before that, which is why the minimum lifetime is 3h.
-- **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof.
+- **Escalation.** At `maxWorkerLifetime − 5 min`, a worker Pod that still exists is re-deleted with a one-second grace. By then every neighbour was suspended or failed without replay under Core's existing eviction semantics. One second rather than zero, because a zero grace removes the Pod object without the kubelet confirming its containers stopped, which would forge the absence proof. Only the provider's own deletes are kept on the kubelet path this way; see the accepted restriction under Limits.
   - **Tied to the pool's UID.** Each Pod it deletes belongs to the retired pool's UID, never only to its name, so a pool replaced under the same name never loses its Pods. Upstream worker Pods are owned through a ReplicaSet and Deployment, so a Pod's own owner reference does not name the pool.
   - The Pods are listed by the pool-name label, and the pool is then read again. The pass's pool List saw the retired UID before the Pod List, and the read sees it after. A UID is never reused, so the name held that pool throughout, and every listed Pod is that pool's or older.
   - If the pool is gone or replaced by then, only Pods whose UID the pool's ledger or a journal fenced on that pool are deleted.
@@ -241,6 +241,9 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - the creation-time `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches;
   - the pool's server-set `metadata.creationTimestamp` plus the shortest lifetime frozen in any journal or archived record that recorded the pool's UID;
   - for a pool no journal recorded, such as an unused warm pool: that creation time plus the `maxWorkerLifetime` of the profile its ledger scope names. Profiles are immutable and hashed, so the profile in the scope's namespace with the scope's UID applies only if its hash still equals the scope's. A profile that is gone, mismatched, unreadable or no longer opted in gives the 3h minimum instead. Both loops read profiles with one List per namespace;
+    - the ledger scope counts here only if the pool's name commits to it. A new pool is named `ate-shared-<commitment>-<nonce>`, where the commitment is 16 hex characters of a domain-separated SHA-256 of the canonical scope, including the profile UID, profile hash and lifetime, and the nonce is 16 random hex characters. The name is immutable and set at creation;
+    - a scope the name does not commit to is doubt: the pool is strongly retired at once, and admission refuses it. A ledger rewritten to name a different valid 24h profile is caught this way;
+    - a pool whose name follows no commitment (one created before the scheme) commits to nothing and gets no profile bound. Without journals, it is bounded by its creation time plus the 3h minimum;
   - that creation time plus the 24h maximum, an absolute ceiling.
 
   If the journal inventory cannot be listed, provenance is unavailable, and every pool is then bounded by its creation time plus the 3h minimum, never by its annotations.
@@ -276,6 +279,12 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - Only the non-strong `Draining` transition keeps a resourceVersion-conflict recheck.
 - **Other reasons to close admission early.** Admission also closes when the operator pool's image or shape changes, the profile disappears, or the template inventory cannot be verified.
 - **Limits.** The bound assumes a responsive kubelet. The Pod's absence on a partitioned node cannot be proven, and its instances then never report termination.
+  - **Accepted operational restriction: Pod absence is kubelet-confirmed only for the provider's own deletes.** The provider deletes worker Pods only with a non-zero grace, which stays on the kubelet path. Two other paths remove the Pod object without kubelet confirmation:
+    - PodGC deletes Pods bound to a Node object that no longer exists, for example when a partitioned node's Node object is deleted while its worker keeps running;
+    - anyone may force-delete the Pod.
+
+    Exact Pod UID absence then does not prove the hosted sandboxes stopped. This is the same limit as Orka's existing private-path proof (ADRs 0031 and 0049), which also rests on exact worker Pod UID absence. Operators must not force-delete Substrate worker Pods, and must not delete the Node object of a partitioned node without first fencing that node.
+  - The provider does not detect these cases. Doing so would need each fence's node and an observed graceful deletion persisted before absence, plus Node read access, which the provider does not hold.
 
 ### Warm capacity
 
@@ -317,6 +326,7 @@ The ready and stopped timing logs report `workerSource: shared`. The stopped log
   - The DNS relay is not stopped by that deactivation. It answers by its last fetched policy until teardown. After the settle window that policy is deny-all, unless its refresh failed, in which case it keeps the stale allowlist.
   - For a leaked sandbox whose teardown failed, that DNS relay session may persist until the worker Pod is gone.
 - **Residual risk: foreign tenants.** Isolation from other tenants depends on the operator's dedicated-install assertion. Continuous template and assignment checks detect a violation only after it happens, and then strongly retire the pool.
+- **Threat model: writers in the provider's namespaces are operator-equivalent.** A principal with WorkerPool or ConfigMap write access in the provider's namespaces can already disrupt or delete workers, so it is treated as operator-equivalent. Making the lifetime bound tamper-resistant against such a writer is defence in depth. It relies only on immutable, server-set data (the pool's name, UID and creationTimestamp) and the provider's own journals, never on mutable annotations alone. A rewrite of an annotation is therefore not by itself a new hole.
 - **Residual risk: worker compromise.** A compromised worker exposes every co-hosted Actor of the same namespace and profile, including their egress mTLS keys and any leaked memory.
 - **Lower capacity than reported.** A leaked sandbox can also consume capacity the worker reports as free until it is recycled.
 - **Strong retirements disturb neighbours.** A strong retirement suspends a pool's neighbours through Core's eviction path. A neighbour that cannot drain in time fails without replay.
