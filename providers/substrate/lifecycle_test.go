@@ -79,6 +79,12 @@ type nativeFixture struct {
 	// effect; suspendCalls counts every SuspendActor request.
 	failSuspendBeforeEffect bool
 	suspendCalls            int
+	// failFinalizeOnce makes the next SuspendActor fail after its
+	// checkpoint, leaving the Actor SUSPENDING.
+	failFinalizeOnce bool
+	// finalizePending marks the Actor whose finalize failed; a re-entered
+	// SuspendActor then finalizes the snapshot already taken.
+	finalizePending string
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -351,6 +357,17 @@ func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRe
 		f.failSuspendBeforeEffect = false
 		return nil, status.Error(codes.Unavailable, "suspend not applied")
 	}
+	if v := f.actors[refKey(req.Actor)]; v != nil && f.finalizePending == refKey(req.Actor) && v.Status.State == pb.ActorState_ACTOR_STATE_SUSPENDING {
+		// A re-entered workflow finalizes the snapshot already taken.
+		f.finalizePending = ""
+		snapshot := v.Status.Snapshots[len(v.Status.Snapshots)-1]
+		snapshot.DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+		v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDED
+		v.Metadata.Version++
+		f.releaseWorker(v)
+		f.suspends++
+		return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, nil
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -379,6 +396,16 @@ func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRe
 	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}
 	if f.afterSuspend != nil {
 		f.afterSuspend(v)
+	}
+	if f.failFinalizeOnce {
+		// FinalizeSuspended failed after the checkpoint: the Actor stays
+		// SUSPENDING, its snapshot's durable copy PENDING.
+		f.failFinalizeOnce = false
+		f.finalizePending = refKey(req.Actor)
+		f.suspends--
+		v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDING
+		v.Status.Snapshots[len(v.Status.Snapshots)-1].DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+		return nil, status.Error(codes.Unavailable, "workflow failed at step FinalizeSuspended: timeout")
 	}
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }

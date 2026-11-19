@@ -12,6 +12,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -43,6 +44,11 @@ const (
 	// derived template selects it, so only allocations that claimed a slot in
 	// that pool's ledger can be placed there.
 	sharedPoolLabel = "substrate.workspace.orka.ai/shared-pool"
+	// sharedRetireIntentAnnotation records a decided strong retirement whose
+	// Delete has not succeeded yet. It is written by a merge patch, separate
+	// from the ledger, so it survives a failed ledger write; admission
+	// refuses the pool and the bounds loop retries the Delete.
+	sharedRetireIntentAnnotation = "substrate.workspace.orka.ai/shared-retire"
 	// sharedLedgerAnnotation is the pool's resourceVersion-protected ledger.
 	sharedLedgerAnnotation = "substrate.workspace.orka.ai/shared-ledger"
 	// sharedDeadlineAnnotation is the pool's hard lifetime deadline (RFC 3339),
@@ -494,7 +500,7 @@ func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) 
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
-	return pool.GetDeletionTimestamp() == nil && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+	return pool.GetDeletionTimestamp() == nil && !sharedRetireIntended(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
 }
 
 func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
@@ -750,7 +756,7 @@ func (d *Lifecycle) verifySharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	if err != nil {
 		return nil, err
 	}
-	retiring := pool.GetDeletionTimestamp() != nil || ledger.State == sharedRetiring || ledger.State == sharedQuarantined
+	retiring := pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || ledger.State == sharedRetiring || ledger.State == sharedQuarantined
 	if retiring && !allowRetiring {
 		return nil, fmt.Errorf("shared worker is retiring: %w", sdk.ErrStaleIdentity)
 	}
@@ -1093,6 +1099,8 @@ func (d *Lifecycle) sharedStrongReason(ctx context.Context, cm *corev1.ConfigMap
 		return "the shared worker pool was replaced", nil
 	case pool.GetDeletionTimestamp() != nil:
 		return "the shared worker pool is deleting", nil
+	case sharedRetireIntended(pool):
+		return "the shared worker's strong retirement was decided but its deletion has not completed", nil
 	}
 	ledger, err := sharedPoolMatches(pool, record)
 	if err != nil {
@@ -1763,11 +1771,73 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 	if err != nil {
 		return false, err
 	}
-	ours, err := d.providerTemplates(ctx)
+	// The hot path consults the in-process record of provider templates. A
+	// stale record can only miss, never wrongly vouch: entries come only
+	// from data this provider wrote, template UIDs are immutable, and every
+	// refresh replaces the whole set. A miss refreshes from Kubernetes
+	// before a template is declared foreign.
+	ours := recordedTemplates.snapshot()
+	if !templatesReach(templates, atespace, poolLabels, ours) {
+		return false, nil
+	}
+	if !recordedTemplateMiss(templates, atespace, poolLabels, ours) {
+		// Only templates outside the Atespace reach the pool: foreign.
+		return true, nil
+	}
+	fresh, err := d.providerTemplates(ctx)
 	if err != nil {
 		return false, err
 	}
-	return templatesReach(templates, atespace, poolLabels, ours), nil
+	recordedTemplates.replace(fresh)
+	return templatesReach(templates, atespace, poolLabels, fresh), nil
+}
+
+// recordedTemplateMiss reports a template inside the pool's Atespace that
+// reaches the pool and is absent from (or disagrees with) the record.
+func recordedTemplateMiss(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string, ours map[string]string) bool {
+	return slices.ContainsFunc(templates, func(template *pb.ActorTemplate) bool {
+		meta := template.GetMetadata()
+		if meta.GetAtespace() != atespace || !selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels) {
+			return false
+		}
+		uid, recorded := ours[meta.GetAtespace()+"/"+meta.GetName()]
+		return !recorded || uid != "" && uid != meta.GetUid()
+	})
+}
+
+// recordedTemplateCache is the in-process record of provider templates.
+type recordedTemplateCache struct {
+	mu      sync.Mutex
+	entries map[string]string
+}
+
+var recordedTemplates = &recordedTemplateCache{}
+
+func (c *recordedTemplateCache) snapshot() map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.entries)
+}
+
+// replace installs a full inventory read from Kubernetes, dropping every
+// entry it no longer contains (for example a deleted journal's).
+func (c *recordedTemplateCache) replace(entries map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = maps.Clone(entries)
+}
+
+// add records a template this process just wrote to a journal.
+func (c *recordedTemplateCache) add(atespace string, ref nativeReference) {
+	if atespace == "" || ref.Name == "" || ref.UID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[string]string{}
+	}
+	c.entries[atespace+"/"+ref.Name] = ref.UID
 }
 
 // providerTemplates is every derived template this provider recorded: each
@@ -1800,7 +1870,8 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (map[string]string, e
 		return nil, err
 	}
 	for i := range catalogs {
-		_, artifact, err := d.readCatalog(ctx, client.ObjectKeyFromObject(&catalogs[i]))
+		// The List already returned the full objects: no per-catalog Get.
+		artifact, err := decodeCatalog(&catalogs[i], client.ObjectKeyFromObject(&catalogs[i]))
 		if err != nil {
 			return nil, err
 		}
@@ -1982,6 +2053,13 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 // Delete.
 func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
 	if err := d.deleteSharedPool(ctx, pool); err != nil {
+		// The decision must survive a failed Delete: mark the intent and
+		// record the state, each on its own context, so admission refuses
+		// the pool and the next pass retries the Delete.
+		d.markSharedRetireIntent(ctx, pool, reason)
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+		d.recordSharedRetirement(writeCtx, pool, state, reason)
+		cancel()
 		return err
 	}
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
@@ -2031,3 +2109,33 @@ func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructur
 // sharedLedgerWriteTimeout bounds the best-effort retirement state write that
 // follows a strong retirement's Delete.
 const sharedLedgerWriteTimeout = 5 * time.Second
+
+// sharedRetireIntended reports a decided strong retirement not yet deleted.
+func sharedRetireIntended(pool *unstructured.Unstructured) bool {
+	_, intended := pool.GetAnnotations()[sharedRetireIntentAnnotation]
+	return intended
+}
+
+// markSharedRetireIntent records, best effort and on its own short context,
+// that the pool's strong retirement was decided. It uses a merge patch of one
+// annotation, independent of the ledger's size and of its resourceVersion.
+func (d *Lifecycle) markSharedRetireIntent(ctx context.Context, pool *unstructured.Unstructured, reason string) {
+	if sharedRetireIntended(pool) {
+		return
+	}
+	if len(reason) > sharedLedgerReasonMax {
+		reason = reason[:sharedLedgerReasonMax]
+	}
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]string{sharedRetireIntentAnnotation: reason}}})
+	if err != nil {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	defer cancel()
+	target := poolObject()
+	target.SetNamespace(pool.GetNamespace())
+	target.SetName(pool.GetName())
+	if err := d.client.Patch(writeCtx, target, client.RawPatch(types.MergePatchType, patch)); err != nil && !apierrors.IsNotFound(err) {
+		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement intent not recorded", "reason", err.Error())
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -494,6 +495,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	}
 	state := actor.GetStatus().GetState()
 	if state == pb.ActorState_ACTOR_STATE_SUSPENDING {
+		if record.SharedWorker != nil {
+			return d.continueSuspend(ctx, cm, record, operation)
+		}
 		return nil
 	}
 	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
@@ -843,4 +847,46 @@ func captureUnrecoverable(err error) bool {
 	}
 	var api apierrors.APIStatus
 	return !errors.As(err, &api)
+}
+
+// suspendContinuationInterval spaces re-issues of a stalled suspension, and
+// maxSuspendContinuations bounds them.
+const (
+	suspendContinuationInterval = 10 * time.Second
+	maxSuspendContinuations     = 10
+)
+
+// continueSuspend resumes the same upstream suspension when a SuspendActor
+// call failed after the Actor was marked SUSPENDING, for example a transient
+// control-plane database timeout in FinalizeSuspended. Agent Substrate's
+// SuspendActor is a re-entrant workflow (workflow_suspend.go): it skips
+// MarkSuspending for a SUSPENDING Actor, so no new snapshot generation is
+// minted; it re-sends the same snapshot to atelet, which answers a Checkpoint
+// it already committed without checkpointing again (atelet Checkpoint,
+// BeginCheckpoint committed); and FinalizeSuspended then records it. This is
+// therefore not a replay: a RUNNING Actor whose suspend outcome is unresolved
+// is never suspended again. The workflow holds the Actor lease
+// (acquireActorLease), so a continuation issued while the original call is
+// still running is refused with Aborted and has no effect. It must finish
+// before the worker Pod is gone, because the worker-delete workflow crashes a
+// SUSPENDING Actor and reclaims its node state. Only shared workers continue:
+// their strong path deletes the pool, so waiting loses the data, while a
+// private worker keeps observing without resubmitting.
+func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, operation *checkpointIntent) error {
+	last := record.Timing.SuspendIssuedAt
+	if operation.ContinuedAt != nil {
+		last = operation.ContinuedAt
+	}
+	now := sharedNow()
+	if operation.Continuations >= maxSuspendContinuations || last != nil && now.Sub(last.Time) < suspendContinuationInterval {
+		return nil
+	}
+	operation.Continuations++
+	continued := metav1.NewMicroTime(now.Truncate(time.Microsecond))
+	operation.ContinuedAt = &continued
+	if err := d.save(ctx, cm, record); err != nil {
+		return err
+	}
+	_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
+	return err
 }

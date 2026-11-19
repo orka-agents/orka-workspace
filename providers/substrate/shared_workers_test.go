@@ -2591,3 +2591,165 @@ func TestSharedEscalationIsIndependentOfSlowPoolDeletes(t *testing.T) {
 		}
 	})
 }
+
+func TestSharedFinalizeFailureKeepsTheDataThroughTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// A transient control-plane database timeout in FinalizeSuspended, after
+	// the checkpoint was taken.
+	native.failFinalizeOnce = true
+	for range 24 {
+		tick()
+		observed, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if err == nil && observed.State == sdk.AllocationStopped {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Observation.RetainedData == nil || record.Checkpoint == nil {
+		t.Fatal("a transient FinalizeSuspended failure lost the workspace data")
+	}
+	if record.SharedWorker.Strong == "" || record.Failure != "" {
+		t.Fatalf("the failure did not take the strong path, or was reported as a loss: %#v failure=%q", record.SharedWorker, record.Failure)
+	}
+	if native.suspendCalls != 2 || record.Pending != nil {
+		t.Fatalf("SuspendActor calls = %d, want the original and one re-entry of the same workflow", native.suspendCalls)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the strong deletion was skipped")
+	}
+}
+
+func TestSharedFailedDeleteKeepsTheRetirementDecision(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	setNow(t, sharedRetireAt(pool, ledger))
+	// The mandatory Delete fails, and so does the ledger write.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+				return apierrors.NewInternalError(errors.New("pool delete refused"))
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" {
+				return apierrors.NewInternalError(errors.New("ledger write refused"))
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+	})
+	if err := (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err == nil {
+		t.Fatal("expected the failed Delete to be reported")
+	}
+	current, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || !sharedRetireIntended(current) {
+		t.Fatal("a failed Delete left no persisted retirement decision")
+	}
+	// A new claim arrives and is refused that pool.
+	setNow(t, ledger.BornAt.Time.Add(time.Minute))
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	if _, joined := sharedReady(t, c, native, second); joined.SharedWorker.Pool == record.SharedWorker.Pool {
+		t.Fatal("a pool whose retirement was decided accepted a new claim")
+	}
+	// The next pass retries and deletes.
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("the next pass did not retry the failed Delete")
+	}
+}
+
+func TestSharedRecordedTemplateCheckHitsTheCacheAndRefreshesOnAMiss(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 4)
+	_, record := sharedReady(t, c, native, first)
+	var configMapLists, configMapGets atomic.Int64
+	counting := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				configMapLists.Add(1)
+			}
+			return w.List(ctx, list, opts...)
+		},
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if cm, ok := obj.(*corev1.ConfigMap); ok && strings.HasPrefix(key.Name, "substrate-checkpoint") {
+				_ = cm
+				configMapGets.Add(1)
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	})
+	// Hit: the provider's own derived template is in the in-process record,
+	// so a claim and its Resume list no ConfigMaps for the template check.
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	for range 16 {
+		observed, err := sharedDriver(counting, native).EnsureAllocation(t.Context(), second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	if configMapLists.Load() != 0 {
+		t.Fatalf("a cache hit listed ConfigMaps %d times", configMapLists.Load())
+	}
+	// Miss: an unrecorded template in the same Atespace reaching the pool
+	// refreshes from Kubernetes (two Lists, no per-catalog Gets) and then
+	// fails closed.
+	native.templates["native/intruder"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "native", Name: "intruder", Uid: "intruder-uid"}, WorkerSelector: &pb.Selector{MatchLabels: map[string]string{sharedPoolLabel: record.SharedWorker.Label}}}
+	configMapLists.Store(0)
+	configMapGets.Store(0)
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	if _, err := sharedDriver(counting, native).EnsureAllocation(t.Context(), third); !errors.Is(err, errForeignTemplate) {
+		t.Fatalf("a miss that stayed unrecorded after refresh was not foreign: %v", err)
+	}
+	if configMapLists.Load() != 2 || configMapGets.Load() != 0 {
+		t.Fatalf("a miss refreshed with %d ConfigMap lists and %d catalog gets, want 2 and 0", configMapLists.Load(), configMapGets.Load())
+	}
+}
+
+func TestSharedEscalationsAreIssuedConcurrentlyWhenPodDeletesStall(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	pools := manySharedPools(t, c, native, first, binding, 11)
+	pool, ledger := poolLedger(t, c, pools[0])
+	setNow(t, sharedEscalateAt(pool, ledger).Add(time.Minute))
+	var issued atomic.Int64
+	// Every escalating Pod DELETE stalls until its context ends.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if _, ok := obj.(*corev1.Pod); ok {
+			issued.Add(1)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return w.Delete(ctx, obj, opts...)
+	}}))
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(done)
+		_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedEscalation(t.Context())
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for issued.Load() < int64(len(pools)) {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d escalations were issued within 3s while Pod deletes stall", issued.Load(), len(pools))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+	case <-time.After(sharedRetireMargin):
+		t.Fatal("escalation exceeded the lifetime margin")
+	}
+	if elapsed := time.Since(started); elapsed > 2*sharedEscalationTimeout+5*time.Second {
+		t.Fatalf("stalled escalations took %s; they were not issued concurrently", elapsed)
+	}
+}

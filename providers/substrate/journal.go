@@ -72,6 +72,11 @@ type checkpointIntent struct {
 	SourceVersion        int64           `json:"sourceVersion,omitempty"`
 	SourceSnapshotDigest string          `json:"sourceSnapshotDigest,omitempty"`
 	Tag                  nativeReference `json:"tag"`
+	// Continuations counts re-issues of SuspendActor that resume the same
+	// upstream workflow for an Actor left SUSPENDING by a failed call, and
+	// ContinuedAt is the last one. Both are saved before each re-issue.
+	Continuations int               `json:"continuations,omitempty"`
+	ContinuedAt   *metav1.MicroTime `json:"continuedAt,omitempty"`
 }
 type checkpointRecord struct {
 	Tag        nativeReference `json:"tag"`
@@ -311,7 +316,13 @@ func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	cm.Data = map[string]string{journalDataKey: data}
-	return d.client.Update(ctx, cm)
+	if err := d.client.Update(ctx, cm); err != nil {
+		return err
+	}
+	// Templates this process recorded join the in-process provider record.
+	recordedTemplates.add(record.Atespace, record.Template)
+	recordedTemplates.add(record.Atespace, record.CreateTemplate)
+	return nil
 }
 func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	archived := cm.DeepCopy()

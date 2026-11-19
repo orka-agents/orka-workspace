@@ -91,6 +91,9 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			// strong marker or failure, whatever the mutable entry list now
 			// says.
 			retire(sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed")
+		case sharedRetireIntended(pool):
+			// A retirement decided earlier whose Delete failed.
+			retire(sharedRetiring, pool.GetAnnotations()[sharedRetireIntentAnnotation])
 		case sharedRetirementPersisted(pool):
 			// A retirement state saved before a crash, or before a native
 			// sweep ran out of time, is unconditional deletion intent.
@@ -105,9 +108,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			retire(sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
 		}
 	}
-	for _, pool := range escalations {
-		errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
-	}
+	errs = append(errs, d.escalateSharedPools(ctx, escalations))
 	var mu sync.Mutex
 	var deleted []retirement
 	work := make(chan retirement)
@@ -118,12 +119,16 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			defer group.Done()
 			for item := range work {
 				err := d.deleteSharedPool(ctx, item.pool)
+				if err != nil {
+					// The decision survives a failed Delete: admission
+					// refuses the pool and the next pass retries.
+					d.markSharedRetireIntent(ctx, item.pool, item.reason)
+				}
 				mu.Lock()
 				if err != nil {
 					errs = append(errs, err)
-				} else {
-					deleted = append(deleted, item)
 				}
+				deleted = append(deleted, item)
 				mu.Unlock()
 			}
 		}()
@@ -223,8 +228,44 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 // sharedDeleteConcurrency caps concurrent pool Deletes in one bounds pass.
 const sharedDeleteConcurrency = 8
 
-// sharedEscalationTimeout bounds each escalating Pod delete.
+// sharedEscalationTimeout bounds each escalation call: a pool's Pod list or
+// one escalating Pod delete.
 const sharedEscalationTimeout = 10 * time.Second
+
+// sharedEscalationConcurrency caps concurrent per-pool escalations. With one
+// worker Pod per pool, a pool takes at most two calls (2 x 10s), so within
+// the 5-minute margin 16 workers cover 16 x 300s / 20s = 240 due pools even
+// when every call stalls to its timeout.
+const sharedEscalationConcurrency = 16
+
+// escalateSharedPools escalates the worker Pods of every due pool
+// concurrently, capped, each call on its own short context, so stalled Pod
+// DELETEs cannot push later escalations past the lifetime margin.
+func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructured.Unstructured) error {
+	var mu sync.Mutex
+	var errs []error
+	work := make(chan *unstructured.Unstructured)
+	var group sync.WaitGroup
+	for range min(sharedEscalationConcurrency, len(pools)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for pool := range work {
+				if err := d.escalateSharedWorkerPods(ctx, pool); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, pool := range pools {
+		work <- pool
+	}
+	close(work)
+	group.Wait()
+	return errors.Join(errs...)
+}
 
 // sharedEscalationPeriod is how often the escalation-only loop runs.
 const sharedEscalationPeriod = 10 * time.Second
@@ -243,12 +284,14 @@ func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) er
 	if provenanceErr != nil {
 		errs = append(errs, provenanceErr)
 	}
+	var due []*unstructured.Unstructured
 	for i := range pools {
 		pool := &pools[i]
 		if _, escalateAt, _ := sharedBoundsOf(pool, provenance[pool.GetUID()], provenanceErr == nil); !sharedNow().Before(escalateAt) {
-			errs = append(errs, d.escalateSharedWorkerPods(ctx, pool))
+			due = append(due, pool)
 		}
 	}
+	errs = append(errs, d.escalateSharedPools(ctx, due))
 	return errors.Join(errs...)
 }
 
@@ -323,7 +366,10 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 // failed must not postpone the bound.
 func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured) error {
 	pods := &corev1.PodList{}
-	if err := d.client.List(ctx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()}); err != nil {
+	listCtx, cancelList := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
+	err := d.client.List(listCtx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()})
+	cancelList()
+	if err != nil {
 		return err
 	}
 	var errs []error
@@ -392,6 +438,10 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// inventory; a failed inventory creates nothing.
 	templates, templatesErr := d.listAllActorTemplates(ctx)
 	ours, oursErr := d.providerTemplates(ctx)
+	if oursErr == nil {
+		// Every sweep refreshes the in-process record from Kubernetes.
+		recordedTemplates.replace(ours)
+	}
 	if templatesErr == nil && oursErr != nil {
 		// Without the provider's own template record, no same-Atespace
 		// template can be told apart; nothing is verified or created.
