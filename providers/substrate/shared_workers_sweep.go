@@ -78,6 +78,11 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	// best-effort bookkeeping within its own total budget. Escalation also
 	// runs in its own short-period loop (RunSharedEscalation) that never waits
 	// on pool deletes.
+	// The decision phase's reads (hosted-journal and workspace checks)
+	// share one bounded deadline, so a stalled read can delay decisions by
+	// at most that bound, never indefinitely.
+	decideCtx, cancelDecide := context.WithTimeout(ctx, sharedDiscoveryTimeout)
+	defer cancelDecide()
 	type retirement struct {
 		pool          *unstructured.Unstructured
 		state, reason string
@@ -124,13 +129,14 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			// sweep ran out of time, is unconditional deletion intent.
 			state, reason := sharedPersistedRetirement(pool)
 			retire(state, reason)
-		case d.sharedStrongMarked(ctx, pool):
+		case !now.Before(retireAt):
+			// Checked before any hosted read, so a due pool never waits on one.
+			retire(sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
+		case d.sharedStrongMarked(decideCtx, pool):
 			// A hosted journal persisted the strong path or a failure
 			// (possibly crashing before it deleted the pool), or a hosted
 			// workspace became suspect; act on it with no native read.
 			retire(sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
-		case !now.Before(retireAt):
-			retire(sharedRetiring, "the shared worker reached the start of its strong retirement before maxWorkerLifetime")
 		}
 	}
 	errs = append(errs, d.escalateSharedPools(ctx, escalations, provenance))
@@ -651,6 +657,9 @@ func sharedPassBounds(pool *unstructured.Unstructured, provenance sharedProvenan
 	return sharedBoundsOf(pool, provenance, provenanceErr == nil)
 }
 
+// sharedPoolListTimeout bounds the escalation step's own pool List.
+var sharedPoolListTimeout = 30 * time.Second
+
 // sharedLatestEscalateAt is the latest escalation time any provenance could
 // give a pool: its annotations' bound under the 24h ceiling. Journal and
 // profile provenance can only bring it earlier, never later. It is not the
@@ -664,7 +673,9 @@ func sharedLatestEscalateAt(pool *unstructured.Unstructured) time.Time {
 // escalateDueByAnnotations escalates every pool already due by
 // sharedLatestEscalateAt, without waiting for provenance, and returns them.
 func (d *Lifecycle) escalateDueByAnnotations(ctx context.Context) (map[types.UID]bool, error) {
-	pools, err := listSharedPools(ctx, d.client, nil)
+	listCtx, cancel := context.WithTimeout(ctx, sharedPoolListTimeout)
+	pools, err := listSharedPools(listCtx, d.client, nil)
+	cancel()
 	if err != nil {
 		return nil, err
 	}

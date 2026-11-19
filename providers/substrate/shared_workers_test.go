@@ -2630,6 +2630,9 @@ func TestSharedFinalizeFailureKeepsTheDataThroughTheStrongPath(t *testing.T) {
 	if record.Observation.RetainedData == nil || record.Checkpoint == nil {
 		t.Fatal("a transient FinalizeSuspended failure lost the workspace data")
 	}
+	if native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil {
+		t.Fatal("the continued suspension's Tag was not captured")
+	}
 	if record.SharedWorker.Strong == "" || record.Failure != "" {
 		t.Fatalf("the failure did not take the strong path, or was reported as a loss: %#v failure=%q", record.SharedWorker, record.Failure)
 	}
@@ -3910,5 +3913,139 @@ func TestSharedOneFailedJournalListNeverRetiresOrEscalatesAHealthyPool(t *testin
 				t.Fatal("an outage past its bound did not retire the pool")
 			}
 		})
+	}
+}
+
+func TestSharedEnforcementReadsAreBounded(t *testing.T) {
+	previousDiscovery, previousList := sharedDiscoveryTimeout, sharedPoolListTimeout
+	sharedDiscoveryTimeout, sharedPoolListTimeout = 300*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { sharedDiscoveryTimeout, sharedPoolListTimeout = previousDiscovery, previousList })
+	t.Run("stalled hosted reads never hold up a due retirement", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+		setNow(t, sharedRetireAt(pool, ledger))
+		// Every workspace and journal read in the decision phase stalls.
+		stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				switch obj.(type) {
+				case *api.ExecutionWorkspace, *corev1.ConfigMap:
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return w.Get(ctx, key, obj, opts...)
+			},
+			List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*api.ExecutionWorkspaceList); ok {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return w.List(ctx, list, opts...)
+			},
+		}))
+		started := time.Now()
+		_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		if elapsed := time.Since(started); elapsed > 3*time.Second {
+			t.Fatalf("the bounds pass took %s with stalled hosted reads", elapsed)
+		}
+		if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+			t.Fatal("a due pool waited on stalled hosted reads")
+		}
+	})
+	t.Run("a stalled pool List ends the escalation pass", func(t *testing.T) {
+		c, _, _, _, _ := warmSharedPool(t, 24*time.Hour)
+		stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if u, ok := list.(*unstructured.UnstructuredList); ok && u.GetKind() == "WorkerPoolList" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return w.List(ctx, list, opts...)
+			},
+		}))
+		started := time.Now()
+		_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedEscalation(t.Context())
+		if elapsed := time.Since(started); elapsed > 3*time.Second {
+			t.Fatalf("the escalation pass took %s on a stalled pool List", elapsed)
+		}
+	})
+}
+
+func TestSharedContinuationLosingThePodRaceReportsTheInstanceLost(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, _ := sharedReady(t, c, native, first)
+	// A first suspension leaves a verified checkpoint, and the workspace
+	// resumes from it.
+	_, suspended := sharedRetired(t, c, native, first, a.Identity, true)
+	if suspended.Observation.RetainedData == nil {
+		t.Fatal("the first suspension retained no data")
+	}
+	retained := *suspended.Observation.RetainedData
+	next := *first.DeepCopy()
+	next.Sequence++
+	next.PreviousInstance = &a.Identity
+	next.RetainedData = &retained
+	next.Runtime.Template.Spec.Containers[0].Env[0].Value = "rotated-public-nonce"
+	next.Revision, _ = sdk.WorkloadRevision(next)
+	if err := admit(c)(t.Context(), next); err != nil {
+		t.Fatal(err)
+	}
+	b, recordB := sharedReady(t, c, native, next)
+	tags := len(native.tags)
+	calls := native.suspendCalls
+	// The second suspension's FinalizeSuspended fails, leaving it
+	// SUSPENDING; the strong path starts.
+	native.failFinalizeOnce = true
+	tick()
+	_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), next.Key, b.Identity)
+	// Upstream's worker-delete crashes the SUSPENDING Actor before any
+	// continuation is sent.
+	actor := native.actors[refKey(actorRef(recordB))]
+	if actor.Status.State != pb.ActorState_ACTOR_STATE_SUSPENDING {
+		t.Fatalf("the fixture Actor is %s, not SUSPENDING", actor.Status.State)
+	}
+	native.finalizePending = ""
+	actor.Status.State = pb.ActorState_ACTOR_STATE_CRASHED
+	actor.Metadata.Version++
+	native.releaseWorker(actor)
+	// The suspension's data can no longer be captured: the instance is
+	// reported lost, never suspended.
+	for range 8 {
+		tick()
+		if observed, _ := sharedDriver(c, native).SuspendInstance(t.Context(), next.Key, b.Identity); observed.State == sdk.AllocationStopped {
+			t.Fatal("a suspension whose data was lost reported success")
+		}
+		if _, current, err := sharedDriver(c, native).read(t.Context(), next.Key); err == nil && current.Failure != "" {
+			break
+		}
+	}
+	if _, current, err := sharedDriver(c, native).read(t.Context(), next.Key); err != nil || current.Failure == "" {
+		t.Fatalf("the lost race was not reported as a lost instance: %v", err)
+	}
+	// It retires through Stop.
+	observed, record := sharedRetired(t, c, native, next, b.Identity, false)
+	if observed.State != sdk.AllocationStopped {
+		t.Fatalf("the lost instance did not retire through Stop: %s", observed.State)
+	}
+	// The last verified checkpoint, the one it resumed from, is kept: its Tag
+	// still exists, so the workspace's earlier retained data stays restorable.
+	source := recordB.InheritedCheckpoint
+	if source == nil {
+		t.Fatal("the resumed instance recorded no restore checkpoint")
+	}
+	if native.tags[source.Atespace+"/"+source.Tag.Name] == nil {
+		t.Fatal("the lost instance's last verified checkpoint was not kept")
+	}
+	if observed.RetainedData != nil {
+		t.Fatal("the lost instance reported new retained data")
+	}
+	if len(native.tags) != tags {
+		t.Fatal("a Tag was invented for the lost suspension")
+	}
+	if native.suspendCalls != calls+1 {
+		t.Fatalf("SuspendActor calls = %d, want only the failed original", native.suspendCalls-calls)
+	}
+	if record.SharedWorker.Strong == "" || !record.WorkloadAbsent {
+		t.Fatal("the lost instance did not finish the strong path")
 	}
 }
