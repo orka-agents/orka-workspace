@@ -215,6 +215,25 @@ func workspaceOwner(key sdk.AllocationKey) metav1.OwnerReference {
 func labels(record *journalRecord) map[string]string {
 	return map[string]string{ownershipLabel: string(record.Request.Key.WorkspaceUID), providerLabel: string(record.Request.Key.ProviderUID)}
 }
+
+// sharedRecordLabel marks a journal or archived record that has recorded a
+// shared placement. It is set in the same write that first records one, is
+// copied into archives, and is never removed by the provider, so the shared
+// inventory lists only these records.
+const sharedRecordLabel = "substrate.workspace.orka.ai/shared"
+
+// journalLabelsMatch reports a journal's labels exactly as the provider
+// writes them: labels(record), optionally with sharedRecordLabel "true".
+func journalLabelsMatch(actual map[string]string, record *journalRecord) bool {
+	expected := labels(record)
+	if value, marked := actual[sharedRecordLabel]; marked {
+		if value != "true" {
+			return false
+		}
+		expected[sharedRecordLabel] = "true"
+	}
+	return maps.Equal(actual, expected)
+}
 func (d *Lifecycle) read(ctx context.Context, key sdk.AllocationKey) (*corev1.ConfigMap, *journalRecord, error) {
 	return d.readAt(ctx, key, journalKey(key))
 }
@@ -257,7 +276,7 @@ func (d *Lifecycle) readAtChecked(ctx context.Context, key sdk.AllocationKey, na
 	if err := json.Unmarshal([]byte(raw), record); err != nil {
 		return nil, nil, fmt.Errorf("native journal is unreadable")
 	}
-	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !reflect.DeepEqual(cm.Labels, labels(record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
+	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !journalLabelsMatch(cm.Labels, record) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
 		return nil, nil, sdk.ErrStaleIdentity
 	}
 	if err := validate(record); err != nil {
@@ -319,6 +338,15 @@ func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	cm.Data = map[string]string{journalDataKey: data}
+	if record.SharedWorker != nil && cm.Labels[sharedRecordLabel] != "true" {
+		// Set in the same write that first records a shared placement.
+		labeled := maps.Clone(cm.Labels)
+		if labeled == nil {
+			labeled = map[string]string{}
+		}
+		labeled[sharedRecordLabel] = "true"
+		cm.Labels = labeled
+	}
 	if err := d.client.Update(ctx, cm); err != nil {
 		return err
 	}

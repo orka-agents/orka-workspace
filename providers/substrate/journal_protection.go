@@ -178,7 +178,7 @@ func protectedJournalRecord(cm *corev1.ConfigMap) (*journalRecord, bool, error) 
 		(!historical && client.ObjectKeyFromObject(cm) != journalKey(key)) ||
 		record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence ||
 		!record.Observation.Identity.Valid() || record.Observation.Identity.RequestRevision != record.Request.Revision ||
-		!reflect.DeepEqual(cm.Labels, labels(record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{owner}) {
+		!journalLabelsMatch(cm.Labels, record) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{owner}) {
 		return nil, false, sdk.ErrStaleIdentity
 	}
 	if err := validateJournalRecord(record); err != nil {

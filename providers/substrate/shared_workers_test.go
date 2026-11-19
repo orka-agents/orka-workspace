@@ -67,7 +67,8 @@ func useTestClock(t *testing.T) {
 	testClock.Store(time.Now().UnixNano())
 	sharedNow = testNow
 	sharedProvenanceHealth.reset()
-	t.Cleanup(func() { sharedNow = previous; sharedProvenanceHealth.reset() })
+	sharedRecordsLabelled.Store(false)
+	t.Cleanup(func() { sharedNow = previous; sharedProvenanceHealth.reset(); sharedRecordsLabelled.Store(false) })
 }
 
 func tick() { testClock.Add(int64(sharedEgressSettle + time.Second)) }
@@ -4398,5 +4399,105 @@ func TestSharedFailingPoolDeleteNeverStopsTheSuspensionContinuation(t *testing.T
 	}
 	if pool, _ := getPool(t, c, recordA.SharedWorker.Pool); !sharedRetireIntended(pool) {
 		t.Fatal("the failed pool delete left no retirement intent to retry")
+	}
+}
+
+// countingJournalLists counts provider journal Lists, the items they return
+// and the journal bytes those items carry.
+func countingJournalLists(c client.Client) (client.Client, func() (int64, int64, int64)) {
+	var lists, items, bytes atomic.Int64
+	wrapped := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if err := w.List(ctx, list, opts...); err != nil {
+				return err
+			}
+			if cms, ok := list.(*corev1.ConfigMapList); ok {
+				lists.Add(1)
+				for i := range cms.Items {
+					items.Add(1)
+					bytes.Add(int64(len(cms.Items[i].Data[journalDataKey])))
+				}
+			}
+			return nil
+		},
+	})
+	return wrapped, func() (int64, int64, int64) {
+		defer lists.Store(0)
+		defer items.Store(0)
+		defer bytes.Store(0)
+		return lists.Load(), items.Load(), bytes.Load()
+	}
+}
+
+func TestSharedInventoryListsOnlyLabelledRecordsOnAPrivateInstall(t *testing.T) {
+	const journals = 20
+	c, native, request := fixture(t, true)
+	useTestClock(t)
+	ready(t, c, native, request)
+	// N private journals and archives.
+	cm, _, err := driver(c, native).read(t.Context(), request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range journals - 1 {
+		copied := cm.DeepCopy()
+		copied.Name = fmt.Sprintf("substrate-history-private-%02d", i)
+		copied.ResourceVersion, copied.UID = "", ""
+		if err := c.Create(t.Context(), copied); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counting, counts := countingJournalLists(c)
+	bounds := &SpareWorkerReplenisher{Client: counting, Config: sharedConfig()}
+	_ = bounds.EnforceSharedBounds(t.Context())
+	firstLists, firstItems, firstBytes := counts()
+	_ = bounds.EnforceSharedBounds(t.Context())
+	lists, items, bytes := counts()
+	t.Logf("private-only, N=%d journals: first pass %d List(s), %d records, %d bytes decoded; later passes %d List(s), %d records, %d bytes", journals, firstLists, firstItems, firstBytes, lists, items, bytes)
+	// The confirming scan sees every labelled provider record (the journals
+	// plus the allocation's native anchor).
+	if firstItems < journals {
+		t.Fatalf("the confirming scan saw %d records, want at least %d", firstItems, journals)
+	}
+	if lists != 1 || items != 0 || bytes != 0 {
+		t.Fatalf("a private-only install still decodes its history every pass: %d records, %d bytes", items, bytes)
+	}
+}
+
+func TestSharedUnlabelledLegacyRecordIsLabelledAndStillFound(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	cm, _, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Labels[sharedRecordLabel] != "true" {
+		t.Fatal("a shared placement's save did not label its journal")
+	}
+	// A record written before the label existed.
+	delete(cm.Labels, sharedRecordLabel)
+	if err := c.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+	sharedRecordsLabelled.Store(false)
+	d := sharedDriver(c, native)
+	for pass := range 2 {
+		provenance, err := d.sharedJournalProvenance(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !provenance[types.UID(record.SharedWorker.UID)].found {
+			t.Fatalf("pass %d lost the legacy record's provenance", pass)
+		}
+	}
+	if !sharedRecordsLabelled.Load() {
+		t.Fatal("the confirming scan did not switch to labelled records")
+	}
+	labelled, _, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labelled.Labels[sharedRecordLabel] != "true" {
+		t.Fatal("the legacy record was not labelled")
 	}
 }

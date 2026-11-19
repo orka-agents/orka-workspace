@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -20,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -252,15 +254,34 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 	// Health updates carry the time their read started, so a slow read never
 	// overrides a newer one's result.
 	started := sharedNow()
-	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+	// Once this process has confirmed every shared record carries the shared
+	// label, only labelled records are listed: a private-only install then
+	// lists and decodes none.
+	labelledOnly := sharedRecordsLabelled.Load()
+	requirements := []string{ownershipLabel, providerLabel}
+	if labelledOnly {
+		requirements = append(requirements, sharedRecordLabel+"=true")
+	}
+	selector, err := klabels.Parse(strings.Join(requirements, ","))
+	if err != nil {
+		return nil, err
+	}
+	if err := d.client.List(ctx, journals, client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		sharedProvenanceHealth.failed(started)
 		return nil, err
 	}
 	defer sharedProvenanceHealth.succeeded(started)
 	d.sharedPass.noteJournals(journals.Items)
 	out := map[types.UID]sharedProvenance{}
+	unlabelled := false
 	for i := range journals.Items {
 		record, ok := decodeClaimRecord(&journals.Items[i])
+		if ok && record.SharedWorker != nil && journals.Items[i].Labels[sharedRecordLabel] != "true" && !labelledOnly {
+			// A shared record written before the label existed.
+			if !d.labelSharedRecord(ctx, &journals.Items[i]) {
+				unlabelled = true
+			}
+		}
 		if !ok || record.SharedWorker == nil || record.SharedWorker.UID == "" {
 			continue
 		}
@@ -291,6 +312,9 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 			entry.workspaces = append(entry.workspaces, record.Request.Key)
 		}
 		out[uid] = entry
+	}
+	if !labelledOnly && !unlabelled {
+		sharedRecordsLabelled.Store(true)
 	}
 	return out, nil
 }
@@ -427,6 +451,25 @@ func (d *Lifecycle) prefetchSharedWorkspaces(ctx context.Context, namespaces map
 	close(work)
 	group.Wait()
 	return errors.Join(errs...)
+}
+
+// sharedRecordsLabelled is set, in process, once a full inventory scan has
+// labelled or confirmed the shared label on every shared record. A new
+// process (including a newly elected leader) scans in full again once.
+var sharedRecordsLabelled atomic.Bool
+
+// labelSharedRecord adds the shared label to one record written before it
+// existed, preconditioned on the listed resourceVersion, and reports
+// success. A failure leaves the full scan in place for the next pass.
+func (d *Lifecycle) labelSharedRecord(ctx context.Context, cm *corev1.ConfigMap) bool {
+	labeled := cm.DeepCopy()
+	if labeled.Labels == nil {
+		labeled.Labels = map[string]string{}
+	}
+	labeled.Labels[sharedRecordLabel] = "true"
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	defer cancel()
+	return d.client.Update(writeCtx, labeled) == nil
 }
 
 // sharedProvenanceFreshness is how recent a successful journal inventory read
