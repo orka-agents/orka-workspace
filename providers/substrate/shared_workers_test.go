@@ -3271,70 +3271,95 @@ func TestSharedCachedUnknownTemplateUIDIsRereadBeforeItMatches(t *testing.T) {
 	}
 }
 
+// warmSharedPool creates an unused warm pool of a profile with this
+// lifetime, and lists its worker so the pool has a worker Pod.
+func warmSharedPool(t *testing.T, lifetime time.Duration) (client.Client, *nativeFixture, *profile.SubstrateWorkspaceProfile, *unstructured.Unstructured, *sharedLedger) {
+	t.Helper()
+	c, native, _ := fixture(t, true)
+	useTestClock(t)
+	createSharedProfile(t, c, "tenant", "warm", "warm-profile-uid", 2, lifetime)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "warm"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	warm := sharedPools(t, c)
+	if len(warm) != 1 {
+		t.Fatalf("warm shared pools = %d, want 1", len(warm))
+	}
+	pool, ledger := poolLedger(t, c, warm[0].GetName())
+	if len(ledger.Entries) != 0 {
+		t.Fatal("the warm pool is not unused")
+	}
+	if _, bound := sharedNameBinding(pool, ledger.Scope); !bound {
+		t.Fatal("a new shared pool's name does not commit to its scope")
+	}
+	if _, err := native.ListWorkers(t.Context(), &pb.ListWorkersRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	native.nativeDown = true
+	return c, native, item, pool, ledger
+}
+
+// rewriteSharedLifetime rewrites a pool's ledger scope and deadline
+// annotation consistently.
+func rewriteSharedLifetime(t *testing.T, c client.Client, pool *unstructured.Unstructured, ledger *sharedLedger, scope sharedScope) {
+	t.Helper()
+	ledger.Scope = scope
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(scope.Lifetime.Duration).UTC().Format(time.RFC3339Nano)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func workerPodCount(t *testing.T, c client.Client, pool string) int {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := c.List(t.Context(), pods, client.MatchingLabels{workerPoolLabel: pool}); err != nil {
+		t.Fatal(err)
+	}
+	return len(pods.Items)
+}
+
 func TestSharedUnusedWarmPoolIsBoundedByItsProfile(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		profileLifetime time.Duration
+		rewrite         bool
 		deleteProfile   bool
 		// bound is the lifetime that must govern escalation.
 		bound time.Duration
 	}{
-		{name: "profile 3h", profileLifetime: 3 * time.Hour, bound: 3 * time.Hour},
+		{name: "profile 3h, rewritten to 24h", profileLifetime: 3 * time.Hour, rewrite: true, bound: 3 * time.Hour},
+		{name: "profile 6h, rewritten to 24h", profileLifetime: 6 * time.Hour, rewrite: true, bound: profile.MinSharedWorkerLifetime},
 		{name: "profile 6h", profileLifetime: 6 * time.Hour, bound: 6 * time.Hour},
-		{name: "profile gone", profileLifetime: 6 * time.Hour, deleteProfile: true, bound: profile.MinSharedWorkerLifetime},
+		{name: "profile 6h, gone", profileLifetime: 6 * time.Hour, deleteProfile: true, bound: profile.MinSharedWorkerLifetime},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, native, _ := fixture(t, true)
-			useTestClock(t)
-			createSharedProfile(t, c, "tenant", "warm", "warm-profile-uid", 2, tc.profileLifetime)
-			item := &profile.SubstrateWorkspaceProfile{}
-			if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "warm"}, item); err != nil {
-				t.Fatal(err)
-			}
-			item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
-			if err := c.Update(t.Context(), item); err != nil {
-				t.Fatal(err)
-			}
-			if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			warm := sharedPools(t, c)
-			if len(warm) != 1 {
-				t.Fatalf("warm shared pools = %d, want 1", len(warm))
-			}
-			pool, ledger := poolLedger(t, c, warm[0].GetName())
-			if len(ledger.Entries) != 0 {
-				t.Fatal("the warm pool is not unused")
-			}
-			if _, err := native.ListWorkers(t.Context(), &pb.ListWorkersRequest{}); err != nil {
-				t.Fatal(err)
-			}
+			c, _, item, pool, ledger := warmSharedPool(t, tc.profileLifetime)
 			created := pool.GetCreationTimestamp().Time
-			// Both lifetime records are rewritten, consistently, to 24h.
-			ledger.Scope.Lifetime = metav1.Duration{Duration: 24 * time.Hour}
-			if err := setSharedLedger(pool, ledger); err != nil {
-				t.Fatal(err)
-			}
-			annotations := maps.Clone(pool.GetAnnotations())
-			annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
-			pool.SetAnnotations(annotations)
-			if err := c.Update(t.Context(), pool); err != nil {
-				t.Fatal(err)
+			if tc.rewrite {
+				scope := ledger.Scope
+				scope.Lifetime = metav1.Duration{Duration: 24 * time.Hour}
+				rewriteSharedLifetime(t, c, pool, ledger, scope)
 			}
 			if tc.deleteProfile {
 				if err := c.Delete(t.Context(), item); err != nil {
 					t.Fatal(err)
 				}
 			}
-			native.nativeDown = true
-			workerPods := func() int {
-				pods := &corev1.PodList{}
-				if err := c.List(t.Context(), pods, client.MatchingLabels{workerPoolLabel: pool.GetName()}); err != nil {
-					t.Fatal(err)
-				}
-				return len(pods.Items)
-			}
-			if workerPods() == 0 {
+			if workerPodCount(t, c, pool.GetName()) == 0 {
 				t.Fatal("the warm pool has no worker Pod")
 			}
 			escalation := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
@@ -3342,17 +3367,60 @@ func TestSharedUnusedWarmPoolIsBoundedByItsProfile(t *testing.T) {
 			if err := escalation.EnforceSharedEscalation(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if workerPods() == 0 {
+			if workerPodCount(t, c, pool.GetName()) == 0 {
 				t.Fatal("the warm pool was escalated before its bound")
 			}
 			setNow(t, created.Add(tc.bound-sharedRetireMargin+time.Minute))
 			if err := escalation.EnforceSharedEscalation(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if workerPods() != 0 {
-				t.Fatalf("rewritten annotations extended an unused warm pool past its %s bound", tc.bound)
+			if workerPodCount(t, c, pool.GetName()) != 0 {
+				t.Fatalf("an unused warm pool outlived its %s bound", tc.bound)
 			}
 		})
+	}
+}
+
+func TestSharedWarmPoolRewrittenToAnotherProfileIsDoubt(t *testing.T) {
+	c, _, _, pool, ledger := warmSharedPool(t, 3*time.Hour)
+	// Another valid opted-in profile with a 24h lifetime.
+	long := createSharedProfile(t, c, "tenant", "long", "long-profile-uid", 2, 24*time.Hour)
+	scope := ledger.Scope
+	scope.ProfileUID, scope.ProfileHash, scope.Lifetime = string(long.UID), long.ProfileHash, metav1.Duration{Duration: 24 * time.Hour}
+	rewriteSharedLifetime(t, c, pool, ledger, scope)
+	// The rewritten scope passes the profile check on its own...
+	provenance := map[types.UID]sharedProvenance{}
+	current, _ := getPool(t, c, pool.GetName())
+	if err := sharedDriver(c, nil).sharedProfileProvenance(t.Context(), []unstructured.Unstructured{*current}, provenance); err != nil {
+		t.Fatal(err)
+	}
+	if provenance[current.GetUID()].profileLifetime != 0 {
+		t.Fatal("a ledger rewritten to another profile took that profile's lifetime")
+	}
+	// ...but the name does not commit to it: doubt, retired at once.
+	if _, _, evidence := sharedBoundsOf(current, provenance[current.GetUID()], true); evidence {
+		t.Fatal("a scope the pool's name does not commit to counted as evidence")
+	}
+	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, pool.GetName()); found {
+		t.Fatal("a pool rewritten to another 24h profile was not retired")
+	}
+}
+
+func TestSharedLegacyNamedPoolWithoutJournalsIsBoundedByTheMinimum(t *testing.T) {
+	c, _, _, pool, _ := warmSharedPool(t, 24*time.Hour)
+	// A pool created before names committed to their scope.
+	legacy := pool.DeepCopy()
+	legacy.SetName(sharedPoolPrefix + strings.Repeat("ab", 16))
+	legacy.SetUID("legacy-pool-uid")
+	created := legacy.GetCreationTimestamp().Time
+	provenance := map[types.UID]sharedProvenance{}
+	if err := sharedDriver(c, nil).sharedProfileProvenance(t.Context(), []unstructured.Unstructured{*legacy}, provenance); err != nil {
+		t.Fatal(err)
+	}
+	retireAt, escalateAt, evidence := sharedBoundsOf(legacy, provenance[legacy.GetUID()], true)
+	if !evidence || escalateAt.After(created.Add(profile.MinSharedWorkerLifetime-sharedRetireMargin)) || retireAt.After(created.Add(profile.MinSharedWorkerLifetime)) {
+		t.Fatalf("a legacy-named pool without journals outlived the minimum: escalateAt=%s", escalateAt.Sub(created))
 	}
 }
 

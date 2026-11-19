@@ -280,12 +280,15 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 }
 
 // sharedProfileProvenance gives every pool no journal recorded an
-// independent lifetime from the profile its ledger scope names. Profiles are
-// immutable and hashed: the profile in the scope's namespace with the scope's
-// UID is read (one List per namespace), and its maxWorkerLifetime applies
-// only if its hash still equals the scope's. A profile that is gone,
-// mismatched, unreadable or no longer opted in leaves the pool bounded by the
-// minimum lifetime, so rewriting a pool's annotations can never lengthen it.
+// independent lifetime from the profile its ledger scope names. The ledger is
+// mutable, so the scope counts only if the pool's immutable name commits to
+// it; a pool whose name commits to nothing (created before the scheme) gets
+// no profile bound. Profiles are immutable and hashed: the profile in the
+// scope's namespace with the scope's UID is read (one List per namespace),
+// and its maxWorkerLifetime applies only if its hash still equals the
+// scope's. A profile that is gone, mismatched, unreadable or no longer opted
+// in leaves the pool bounded by the minimum lifetime, so rewriting a pool's
+// annotations can never lengthen it.
 func (d *Lifecycle) sharedProfileProvenance(ctx context.Context, pools []unstructured.Unstructured, provenance map[types.UID]sharedProvenance) error {
 	wanted := map[string][]*unstructured.Unstructured{}
 	for i := range pools {
@@ -294,7 +297,9 @@ func (d *Lifecycle) sharedProfileProvenance(ctx context.Context, pools []unstruc
 			continue
 		}
 		if ledger, err := readSharedLedger(pool); err == nil {
-			wanted[ledger.Scope.Namespace] = append(wanted[ledger.Scope.Namespace], pool)
+			if _, bound := sharedNameBinding(pool, ledger.Scope); bound {
+				wanted[ledger.Scope.Namespace] = append(wanted[ledger.Scope.Namespace], pool)
+			}
 		}
 	}
 	var errs []error
@@ -568,6 +573,12 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 	recorded, recordedOK := sharedRecordedDeadline(pool)
 	consistent := err == nil && recordedOK && recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration))
 	if consistent {
+		// A name that commits to another scope is doubt.
+		if committed, bound := sharedNameBinding(pool, ledger.Scope); committed && !bound {
+			consistent = false
+		}
+	}
+	if consistent {
 		for _, scope := range provenance.scopes {
 			if scope != ledger.Scope {
 				consistent = false
@@ -773,7 +784,7 @@ func (d *Lifecycle) profileSharedShape(ctx context.Context, item *profile.Substr
 
 // createWarmSharedPool creates an empty admitting shared pool.
 func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfileShape, templates []*pb.ActorTemplate, ours map[string]string) error {
-	name, err := randomName(sharedPoolPrefix)
+	name, err := newSharedPoolName(shape.scope)
 	if err != nil {
 		return err
 	}

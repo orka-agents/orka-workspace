@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -320,9 +321,71 @@ func (d *Lifecycle) prepareSharedPlacement(record *journalRecord, source *unstru
 	return d.bindNewSharedPool(record, source)
 }
 
+// sharedScopeCommitment is the part of a shared pool's name that commits to
+// its scope: a domain-separated SHA-256 of the canonical scope, which includes
+// the profile UID, profile hash and lifetime. A pool's name is immutable and
+// set when it is created, so unlike the ledger it cannot be rewritten.
+func sharedScopeCommitment(scope sharedScope) string {
+	data, err := json.Marshal(scope)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(append([]byte("orka.ai/substrate-shared-pool-scope/v1\x00"), data...))
+	return hex.EncodeToString(sum[:sharedCommitmentBytes])
+}
+
+// sharedCommitmentBytes and sharedNonceBytes size a committed pool name:
+// ate-shared-<16 hex commitment>-<16 hex nonce>, 44 characters.
+const (
+	sharedCommitmentBytes = 8
+	sharedNonceBytes      = 8
+)
+
+// newSharedPoolName returns a fresh pool name committing to scope.
+func newSharedPoolName(scope sharedScope) (string, error) {
+	commitment := sharedScopeCommitment(scope)
+	if commitment == "" {
+		return "", fmt.Errorf("shared worker scope cannot be committed")
+	}
+	var nonce [sharedNonceBytes]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return sharedPoolPrefix + commitment + "-" + hex.EncodeToString(nonce[:]), nil
+}
+
+// sharedNameCommitment returns the scope commitment in a pool's name, and
+// false for a name that does not follow the committed scheme (a pool created
+// before it), which commits to nothing.
+func sharedNameCommitment(name string) (string, bool) {
+	rest, ok := strings.CutPrefix(name, sharedPoolPrefix)
+	if !ok {
+		return "", false
+	}
+	commitment, nonce, ok := strings.Cut(rest, "-")
+	if !ok || len(commitment) != 2*sharedCommitmentBytes || len(nonce) != 2*sharedNonceBytes {
+		return "", false
+	}
+	if _, err := hex.DecodeString(commitment); err != nil {
+		return "", false
+	}
+	if _, err := hex.DecodeString(nonce); err != nil {
+		return "", false
+	}
+	return commitment, true
+}
+
+// sharedNameBinding reports whether a pool's name commits to scope
+// (committed and bound), commits to another scope (committed, not bound:
+// doubt), or follows no commitment scheme (not committed).
+func sharedNameBinding(pool *unstructured.Unstructured, scope sharedScope) (committed, bound bool) {
+	commitment, committed := sharedNameCommitment(pool.GetName())
+	return committed, committed && commitment == sharedScopeCommitment(scope)
+}
+
 // bindNewSharedPool rebinds the record to a fresh pool of its own.
 func (d *Lifecycle) bindNewSharedPool(record *journalRecord, source *unstructured.Unstructured) error {
-	name, err := randomName(sharedPoolPrefix)
+	name, err := newSharedPoolName(record.SharedWorker.Scope)
 	if err != nil {
 		return err
 	}
@@ -526,6 +589,9 @@ func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (
 	}
 	if ledger.Scope != shared.Scope {
 		return nil, fmt.Errorf("shared worker ledger scope differs from this allocation: %w", sdk.ErrStaleIdentity)
+	}
+	if committed, bound := sharedNameBinding(pool, ledger.Scope); committed && !bound {
+		return nil, fmt.Errorf("shared worker name does not commit to its ledger scope: %w", sdk.ErrStaleIdentity)
 	}
 	if recorded, ok := sharedRecordedDeadline(pool); !ok || !recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
 		return nil, fmt.Errorf("shared worker lifetime evidence is missing or inconsistent: %w", sdk.ErrStaleIdentity)
