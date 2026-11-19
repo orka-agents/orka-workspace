@@ -2249,7 +2249,7 @@ func TestSharedOperatorPoolWithTheSharedPrefixIsNeverTouched(t *testing.T) {
 	}
 }
 
-func TestSharedUnavailableProvenanceBoundsByTheMinimumLifetime(t *testing.T) {
+func TestSharedUnavailableProvenanceBoundsByTheMinimumLifetimePastTheOutageBound(t *testing.T) {
 	c, native, first, _ := sharedFixture(t, 2)
 	_, record := sharedReady(t, c, native, first)
 	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
@@ -2272,10 +2272,19 @@ func TestSharedUnavailableProvenanceBoundsByTheMinimumLifetime(t *testing.T) {
 		}
 		return w.List(ctx, list, opts...)
 	}})
+	bounds := &SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}
 	setNow(t, created.Add(profile.MinSharedWorkerLifetime-workerPodTerminationGrace-sharedRetireMargin))
-	_ = (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	// Inside the outage window the annotations' bound applies, and
+	// admission is closed: the pool is not retired yet.
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if current, found := getPool(t, c, record.SharedWorker.Pool); !found || current.GetDeletionTimestamp() != nil {
+		t.Fatal("a failed journal List applied the minimum lifetime inside the outage window")
+	}
+	// Past the outage bound, creation plus the minimum applies.
+	setNow(t, sharedNow().Add(sharedProvenanceOutageBound))
+	_ = bounds.EnforceSharedBounds(t.Context())
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
-		t.Fatal("unavailable provenance let rewritten annotations extend the bound past creation plus the minimum lifetime")
+		t.Fatal("unavailable provenance past its bound let rewritten annotations extend the bound past creation plus the minimum lifetime")
 	}
 }
 
@@ -3710,8 +3719,9 @@ func TestSharedJournalTimeoutStillAppliesTheUnavailableBound(t *testing.T) {
 	if found.listErr != nil || len(found.pools) != 1 || found.provenanceErr == nil {
 		t.Fatalf("a journal timeout lost the pool inventory: listErr=%v pools=%d provenanceErr=%v", found.listErr, len(found.pools), found.provenanceErr)
 	}
-	// With provenance unavailable, a 24h pool past creation plus the 3h
-	// minimum's escalation time is escalated, not left to its annotations.
+	// With provenance unavailable since that first read, well past the outage
+	// bound, a 24h pool past creation plus the 3h minimum's escalation time is
+	// escalated, not left to its annotations.
 	created := pool.GetCreationTimestamp().Time
 	setNow(t, created.Add(profile.MinSharedWorkerLifetime-sharedRetireMargin+time.Minute))
 	if !sharedNow().Before(sharedEscalateAt(pool, ledger)) {
@@ -3857,6 +3867,47 @@ func TestSharedStaleJournalSnapshotNeverRetiresAHealthyPool(t *testing.T) {
 			}
 			if _, ledger := poolLedger(t, c, recordA.SharedWorker.Pool); len(ledger.Entries) != 2 {
 				t.Fatalf("a stale snapshot collected a valid entry: %d entries", len(ledger.Entries))
+			}
+		})
+	}
+}
+
+func TestSharedOneFailedJournalListNeverRetiresOrEscalatesAHealthyPool(t *testing.T) {
+	for _, age := range []time.Duration{2 * time.Hour, profile.MinSharedWorkerLifetime - sharedRetireMargin + time.Minute} {
+		t.Run(age.String(), func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 3)
+			_, record := sharedReady(t, c, native, first)
+			pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+			created := pool.GetCreationTimestamp().Time
+			setNow(t, created.Add(age))
+			var failing atomic.Bool
+			failing.Store(true)
+			flaky := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*corev1.ConfigMapList); ok && failing.Load() {
+						return apierrors.NewServiceUnavailable("journal inventory unavailable")
+					}
+					return w.List(ctx, list, opts...)
+				},
+			})
+			r := &SpareWorkerReplenisher{Client: flaky, Config: sharedConfig()}
+			_ = r.EnforceSharedBounds(t.Context())
+			_ = r.EnforceSharedEscalation(t.Context())
+			current, found := getPool(t, c, record.SharedWorker.Pool)
+			if !found || current.GetDeletionTimestamp() != nil || sharedRetireIntended(current) || sharedRetirementPersisted(current) {
+				t.Fatalf("one failed journal List retired a healthy %s-old pool", age)
+			}
+			if !podExists(t, c, record.Worker.Namespace, record.Worker.Pod, record.Worker.PodUID) {
+				t.Fatalf("one failed journal List escalated a healthy %s-old pool", age)
+			}
+			if err := sharedDriver(flaky, native).requireSharedProvenance(t.Context()); err == nil {
+				t.Fatal("admission stayed open while the journal inventory was unavailable")
+			}
+			// A sustained outage past its bound still retires the pool.
+			setNow(t, sharedNow().Add(sharedProvenanceOutageBound))
+			_ = r.EnforceSharedBounds(t.Context())
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatal("an outage past its bound did not retire the pool")
 			}
 		})
 	}

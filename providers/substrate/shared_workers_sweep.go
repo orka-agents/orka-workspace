@@ -62,9 +62,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	provenance, provenanceErr, pools := found.provenance, found.provenanceErr, found.pools
 	errs := append([]error{earlyErr}, found.errs...)
 	if provenanceErr != nil {
-		// Unavailable provenance is doubt: the mutable annotations cannot be
-		// checked, so every pool is bounded by its server-set creation time
-		// plus the minimum lifetime, never by the annotations' value.
+		// Unavailable provenance closes admission at once. Inside the outage
+		// window the annotations' 24h-capped bounds apply; past it, every
+		// pool is bounded by creation plus the minimum and strongly retired
+		// (sharedPassBounds, outage).
 		errs = append(errs, provenanceErr)
 	}
 	// A short outage only closes admission. One that outlasts its bound
@@ -86,7 +87,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 	for i := range pools {
 		pool := &pools[i]
 		recorded := provenance[pool.GetUID()]
-		retireAt, escalateAt, evidence := sharedBoundsOf(pool, recorded, provenanceErr == nil)
+		retireAt, escalateAt, evidence := sharedPassBounds(pool, recorded, provenanceErr, outage)
 		now := sharedNow()
 		if !now.Before(escalateAt) && !escalatedEarly[pool.GetUID()] {
 			escalations = append(escalations, pool)
@@ -574,6 +575,7 @@ func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) er
 	if found.provenanceErr != nil {
 		errs = append(errs, found.provenanceErr)
 	}
+	outage := found.provenanceErr != nil && sharedProvenanceHealth.outlasted(sharedNow())
 	// Provenance can only bring an escalation earlier than the bound the
 	// first step used, so this adds the escalations it made due.
 	var due []*unstructured.Unstructured
@@ -582,7 +584,7 @@ func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) er
 		if escalatedEarly[pool.GetUID()] {
 			continue
 		}
-		if _, escalateAt, _ := sharedBoundsOf(pool, found.provenance[pool.GetUID()], found.provenanceErr == nil); !sharedNow().Before(escalateAt) {
+		if _, escalateAt, _ := sharedPassBounds(pool, found.provenance[pool.GetUID()], found.provenanceErr, outage); !sharedNow().Before(escalateAt) {
 			due = append(due, pool)
 		}
 	}
@@ -633,6 +635,20 @@ func (d *Lifecycle) discoverShared(parent context.Context, suspects bool) shared
 		}
 	}
 	return out
+}
+
+// sharedPassBounds is a pass's bounds for a pool. With provenance, they are
+// sharedBoundsOf's. While the journal inventory is unavailable but the
+// outage has not outlasted its bound, they are the annotations' bounds under
+// the 24h ceiling (admission is already closed), so one transient failed List
+// never retires or escalates a healthy pool. Only an outage past its bound
+// applies the creation-plus-3h ceiling, together with the strong retirement
+// of every shared pool.
+func sharedPassBounds(pool *unstructured.Unstructured, provenance sharedProvenance, provenanceErr error, outage bool) (time.Time, time.Time, bool) {
+	if provenanceErr != nil && !outage {
+		return sharedBoundsOf(pool, sharedProvenance{found: true, lifetime: profile.MaxSharedWorkerLifetime}, true)
+	}
+	return sharedBoundsOf(pool, provenance, provenanceErr == nil)
 }
 
 // sharedLatestEscalateAt is the latest escalation time any provenance could
