@@ -332,7 +332,9 @@ pool or opted-in profile exists.
   - a tainted, quarantined, or failed workspace on the pool.
 - **Lifetime.** `maxWorkerLifetime` is a hard bound on the worker Pod:
   - strong retirement starts the Pod's 3600 s grace plus 5 minutes before it;
-  - admission closes an hour before that;
+  - admission closes an hour before that, so a pool admits for
+    `maxWorkerLifetime − 2h05m` after birth: 55 minutes at the 3h minimum,
+    21h55m at the 24h default;
   - a Pod still present 5 minutes before the bound is re-deleted with a
     one-second grace;
   - this enforcement runs in its own leader loop every 10 s, using Kubernetes
