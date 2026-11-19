@@ -3141,3 +3141,217 @@ func TestSharedSuspensionWhoseContinuationsNeverReturnTakesTheStrongPath(t *test
 		t.Fatal("the strong deletion did not start")
 	}
 }
+
+func TestSharedRemovedEntryCannotHideASuspectWorkspaceFromTheBoundsLoop(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// A's entry is removed from an otherwise valid ledger.
+	pool, ledger := poolLedger(t, c, recordA.SharedWorker.Pool)
+	ledger.Entries = slices.DeleteFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.ActorUID == recordA.Actor.UID })
+	if len(ledger.Entries) != 1 {
+		t.Fatal("the fixture did not remove exactly A's entry")
+	}
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	// Then A's workspace is tainted, with native control down.
+	workspace := &api.ExecutionWorkspace{}
+	if err := c.Get(t.Context(), clientKey(first.Key), workspace); err != nil {
+		t.Fatal(err)
+	}
+	annotations := workspace.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[operatorTaintAnnotation] = "true"
+	workspace.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	native.nativeDown = true
+	var workspaceLists atomic.Int64
+	counting := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*api.ExecutionWorkspaceList); ok {
+				workspaceLists.Add(1)
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	_ = (&SpareWorkerReplenisher{Client: counting, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("a removed ledger entry hid its suspect workspace from the bounds loop")
+	}
+	if workspaceLists.Load() != 1 {
+		t.Fatalf("the recorded workspaces were read with %d Lists, want one per namespace", workspaceLists.Load())
+	}
+}
+
+// sharedTemplateFixture returns a ready shared allocation whose derived
+// template is then replaced natively by a foreign template of the same name.
+func sharedTemplateFixture(t *testing.T) (client.Client, *nativeFixture, *journalRecord, map[string]string) {
+	t.Helper()
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	template := native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})]
+	if template == nil || template.Metadata.Uid != record.Template.UID {
+		t.Fatal("the fixture's derived template is missing")
+	}
+	template.Metadata.Uid = "foreign-template-uid"
+	return c, native, record, sharedLabels(record.SharedWorker.Label)
+}
+
+func TestSharedTemplateRefreshNeverRestoresAnUnknownUID(t *testing.T) {
+	c, native, record, poolLabels := sharedTemplateFixture(t)
+	// The journal still holds the template before its UID was written, and
+	// the process has no record yet.
+	cm, current, err := sharedDriver(c, native).read(t.Context(), record.Request.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := current.Template
+	current.Template.UID, current.CreateTemplate.UID = "", ""
+	data, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.Data[journalDataKey] = string(data)
+	if err := c.Update(t.Context(), cm); err != nil {
+		t.Fatal(err)
+	}
+	recordedTemplates.replace(nil, recordedTemplates.begin())
+	// A refresh lists that journal; before it completes, save() records the
+	// real UID.
+	var interleaved bool
+	racing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			err := w.List(ctx, list, opts...)
+			if _, ok := list.(*corev1.ConfigMapList); ok && !interleaved {
+				interleaved = true
+				recordedTemplates.add(record.Atespace, known)
+			}
+			return err
+		},
+	})
+	foreign, err := sharedDriver(racing, native).foreignTemplateMatches(t.Context(), record.Atespace, poolLabels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !interleaved {
+		t.Fatal("the refresh was not interleaved with the save")
+	}
+	if !foreign {
+		t.Fatal("a refresh restored an unknown UID, so a foreign same-name template passed")
+	}
+	if uid := recordedTemplates.snapshot()[record.Atespace+"/"+known.Name]; uid != known.UID {
+		t.Fatalf("the refresh replaced the recorded UID with %q", uid)
+	}
+}
+
+func TestSharedCachedUnknownTemplateUIDIsRereadBeforeItMatches(t *testing.T) {
+	c, native, record, poolLabels := sharedTemplateFixture(t)
+	// The cache holds the template with its UID still unknown, while the
+	// journal has since persisted the real UID.
+	entries := recordedTemplates.snapshot()
+	for key := range entries {
+		entries[key] = ""
+	}
+	recordedTemplates.replace(entries, recordedTemplates.begin())
+	foreign, err := sharedDriver(c, native).foreignTemplateMatches(t.Context(), record.Atespace, poolLabels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !foreign {
+		t.Fatal("a cached unknown UID accepted a foreign same-name template without a reread")
+	}
+}
+
+func TestSharedUnusedWarmPoolIsBoundedByItsProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		profileLifetime time.Duration
+		deleteProfile   bool
+		// bound is the lifetime that must govern escalation.
+		bound time.Duration
+	}{
+		{name: "profile 3h", profileLifetime: 3 * time.Hour, bound: 3 * time.Hour},
+		{name: "profile 6h", profileLifetime: 6 * time.Hour, bound: 6 * time.Hour},
+		{name: "profile gone", profileLifetime: 6 * time.Hour, deleteProfile: true, bound: profile.MinSharedWorkerLifetime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, _ := fixture(t, true)
+			useTestClock(t)
+			createSharedProfile(t, c, "tenant", "warm", "warm-profile-uid", 2, tc.profileLifetime)
+			item := &profile.SubstrateWorkspaceProfile{}
+			if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "warm"}, item); err != nil {
+				t.Fatal(err)
+			}
+			item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+			if err := c.Update(t.Context(), item); err != nil {
+				t.Fatal(err)
+			}
+			if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			warm := sharedPools(t, c)
+			if len(warm) != 1 {
+				t.Fatalf("warm shared pools = %d, want 1", len(warm))
+			}
+			pool, ledger := poolLedger(t, c, warm[0].GetName())
+			if len(ledger.Entries) != 0 {
+				t.Fatal("the warm pool is not unused")
+			}
+			if _, err := native.ListWorkers(t.Context(), &pb.ListWorkersRequest{}); err != nil {
+				t.Fatal(err)
+			}
+			created := pool.GetCreationTimestamp().Time
+			// Both lifetime records are rewritten, consistently, to 24h.
+			ledger.Scope.Lifetime = metav1.Duration{Duration: 24 * time.Hour}
+			if err := setSharedLedger(pool, ledger); err != nil {
+				t.Fatal(err)
+			}
+			annotations := maps.Clone(pool.GetAnnotations())
+			annotations[sharedDeadlineAnnotation] = ledger.BornAt.Add(24 * time.Hour).UTC().Format(time.RFC3339Nano)
+			pool.SetAnnotations(annotations)
+			if err := c.Update(t.Context(), pool); err != nil {
+				t.Fatal(err)
+			}
+			if tc.deleteProfile {
+				if err := c.Delete(t.Context(), item); err != nil {
+					t.Fatal(err)
+				}
+			}
+			native.nativeDown = true
+			workerPods := func() int {
+				pods := &corev1.PodList{}
+				if err := c.List(t.Context(), pods, client.MatchingLabels{workerPoolLabel: pool.GetName()}); err != nil {
+					t.Fatal(err)
+				}
+				return len(pods.Items)
+			}
+			if workerPods() == 0 {
+				t.Fatal("the warm pool has no worker Pod")
+			}
+			escalation := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
+			setNow(t, created.Add(tc.bound-sharedRetireMargin-time.Minute))
+			if err := escalation.EnforceSharedEscalation(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if workerPods() == 0 {
+				t.Fatal("the warm pool was escalated before its bound")
+			}
+			setNow(t, created.Add(tc.bound-sharedRetireMargin+time.Minute))
+			if err := escalation.EnforceSharedEscalation(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if workerPods() != 0 {
+				t.Fatalf("rewritten annotations extended an unused warm pool past its %s bound", tc.bound)
+			}
+		})
+	}
+}

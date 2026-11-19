@@ -20,6 +20,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,11 +47,22 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		return err
 	}
 	var errs []error
+	if provenanceErr == nil {
+		if err := d.sharedProfileProvenance(ctx, pools, provenance); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if provenanceErr != nil {
 		// Unavailable provenance is doubt: the mutable annotations cannot be
 		// checked, so every pool is bounded by its server-set creation time
 		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
+	}
+	if provenanceErr == nil {
+		// Each recorded workspace's suspicion, independent of the entries.
+		if err := d.sharedProvenanceSuspects(ctx, provenance); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	// A short outage only closes admission. One that outlasts its bound
 	// is doubt about every pool, including a strong marker a tampered entry
@@ -97,6 +109,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			// strong marker or failure, whatever the mutable entry list now
 			// says.
 			retire(sharedRetiring, "a journal that recorded this shared worker selected the strong path or failed")
+		case recorded.suspect:
+			// The workspace of an unreleased journal that recorded this pool's
+			// UID is suspect, even if its entry was removed from the ledger.
+			retire(sharedRetiring, "a workspace a journal recorded on this shared worker is tainted, quarantined or failed")
 		case sharedRetireIntended(pool):
 			// A retirement decided earlier whose Delete failed.
 			retire(sharedRetiring, pool.GetAnnotations()[sharedRetireIntentAnnotation])
@@ -204,6 +220,17 @@ type sharedProvenance struct {
 	strong bool
 	// podUIDs are the worker Pod UIDs journals fenced on this pool.
 	podUIDs map[string]bool
+	// workspaces are the workspaces of the unreleased journals that recorded
+	// this pool, whatever the pool's mutable entry list says.
+	workspaces []sdk.AllocationKey
+	// suspect is set when one of those workspaces is tainted, quarantined or
+	// Failed (sharedProvenanceSuspects).
+	suspect bool
+	// profileLifetime bounds a pool no journal recorded (for example an
+	// unused warm pool): the maxWorkerLifetime of the profile its ledger
+	// scope names, when that profile's UID and hash still match. Zero means
+	// unresolved, and the pool is then bounded by the minimum lifetime.
+	profileLifetime time.Duration
 }
 
 // sharedJournalProvenance reads every journal and archived record (Kubernetes
@@ -244,9 +271,107 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 		if !record.SharedWorker.Released && (record.SharedWorker.Strong != "" || record.Failure != "") {
 			entry.strong = true
 		}
+		if !record.SharedWorker.Released {
+			entry.workspaces = append(entry.workspaces, record.Request.Key)
+		}
 		out[uid] = entry
 	}
 	return out, nil
+}
+
+// sharedProfileProvenance gives every pool no journal recorded an
+// independent lifetime from the profile its ledger scope names. Profiles are
+// immutable and hashed: the profile in the scope's namespace with the scope's
+// UID is read (one List per namespace), and its maxWorkerLifetime applies
+// only if its hash still equals the scope's. A profile that is gone,
+// mismatched, unreadable or no longer opted in leaves the pool bounded by the
+// minimum lifetime, so rewriting a pool's annotations can never lengthen it.
+func (d *Lifecycle) sharedProfileProvenance(ctx context.Context, pools []unstructured.Unstructured, provenance map[types.UID]sharedProvenance) error {
+	wanted := map[string][]*unstructured.Unstructured{}
+	for i := range pools {
+		pool := &pools[i]
+		if provenance[pool.GetUID()].found {
+			continue
+		}
+		if ledger, err := readSharedLedger(pool); err == nil {
+			wanted[ledger.Scope.Namespace] = append(wanted[ledger.Scope.Namespace], pool)
+		}
+	}
+	var errs []error
+	for namespace, namespacePools := range wanted {
+		profiles := &unstructured.UnstructuredList{}
+		profiles.SetGroupVersionKind(profile.GroupVersion.WithKind("SubstrateWorkspaceProfileList"))
+		if err := d.client.List(ctx, profiles, client.InNamespace(namespace)); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		lifetimes := map[types.UID]map[string]time.Duration{}
+		for i := range profiles.Items {
+			raw := &profiles.Items[i]
+			hash, err := sdk.ParametersProfileHash(raw)
+			if err != nil {
+				continue
+			}
+			item := &profile.SubstrateWorkspaceProfile{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw.Object, item); err != nil || item.Validate() != nil || item.Spec.Placement == nil || item.Spec.Placement.SharedWorkers == nil {
+				continue
+			}
+			if lifetimes[raw.GetUID()] == nil {
+				lifetimes[raw.GetUID()] = map[string]time.Duration{}
+			}
+			lifetimes[raw.GetUID()][hash] = item.Spec.Placement.SharedWorkers.WorkerLifetime()
+		}
+		for _, pool := range namespacePools {
+			ledger, _ := readSharedLedger(pool)
+			if lifetime, found := lifetimes[types.UID(ledger.Scope.ProfileUID)][ledger.Scope.ProfileHash]; found {
+				entry := provenance[pool.GetUID()]
+				entry.profileLifetime = lifetime
+				provenance[pool.GetUID()] = entry
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sharedProvenanceSuspects marks every pool whose unreleased journals record
+// a workspace that is tainted, quarantined or Failed, under the journal's
+// exact workspace UID. It reads the workspaces with one List per namespace,
+// so the bounds pass stays cheap, and checks them whatever the pool's mutable
+// entry list says: removing an entry cannot hide a suspect workspace. A
+// namespace whose List fails is reported and leaves its pools unmarked; their
+// entries are still checked one by one.
+func (d *Lifecycle) sharedProvenanceSuspects(ctx context.Context, provenance map[types.UID]sharedProvenance) error {
+	namespaces := map[string]bool{}
+	for _, entry := range provenance {
+		for _, key := range entry.workspaces {
+			namespaces[key.Namespace] = true
+		}
+	}
+	suspects := map[types.NamespacedName]types.UID{}
+	listed := map[string]bool{}
+	var errs []error
+	for namespace := range namespaces {
+		workspaces := &api.ExecutionWorkspaceList{}
+		if err := d.client.List(ctx, workspaces, client.InNamespace(namespace)); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		listed[namespace] = true
+		for i := range workspaces.Items {
+			if workspaceSuspect(&workspaces.Items[i]) {
+				suspects[client.ObjectKeyFromObject(&workspaces.Items[i])] = workspaces.Items[i].UID
+			}
+		}
+	}
+	for uid, entry := range provenance {
+		for _, key := range entry.workspaces {
+			if workspaceUID, found := suspects[clientKey(key)]; listed[key.Namespace] && found && workspaceUID == key.WorkspaceUID {
+				entry.suspect = true
+			}
+		}
+		provenance[uid] = entry
+	}
+	return errors.Join(errs...)
 }
 
 // sharedProvenanceFreshness is how recent a successful journal inventory read
@@ -378,6 +503,8 @@ func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) er
 	var errs []error
 	if provenanceErr != nil {
 		errs = append(errs, provenanceErr)
+	} else if err := d.sharedProfileProvenance(ctx, pools, provenance); err != nil {
+		errs = append(errs, err)
 	}
 	var due []*unstructured.Unstructured
 	for i := range pools {
@@ -427,8 +554,15 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 	if !known {
 		ceiling = created.Add(profile.MinSharedWorkerLifetime)
 	}
-	if provenance.found {
+	switch {
+	case provenance.found:
 		ceiling = minTime(ceiling, created.Add(provenance.lifetime))
+	case provenance.profileLifetime > 0:
+		// No journal recorded the pool: its profile bounds it.
+		ceiling = minTime(ceiling, created.Add(provenance.profileLifetime))
+	default:
+		// Neither a journal nor a matching profile bounds it.
+		ceiling = minTime(ceiling, created.Add(profile.MinSharedWorkerLifetime))
 	}
 	ledger, err := readSharedLedger(pool)
 	recorded, recordedOK := sharedRecordedDeadline(pool)
@@ -564,10 +698,12 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// Maintenance and every pool creation need a complete, successful template
 	// inventory; a failed inventory creates nothing.
 	templates, templatesErr := d.listAllActorTemplates(ctx)
+	began := recordedTemplates.begin()
 	ours, oursErr := d.providerTemplates(ctx)
 	if oursErr == nil {
-		// Every sweep refreshes the in-process record from Kubernetes.
-		recordedTemplates.replace(ours)
+		// Every sweep refreshes the in-process record from Kubernetes, and
+		// checks against it merged with anything recorded since.
+		ours = recordedTemplates.replace(ours, began)
 	}
 	if templatesErr == nil && oursErr != nil {
 		// Without the provider's own template record, no same-Atespace

@@ -1785,27 +1785,28 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 	}
 	// The hot path consults the in-process record of provider templates. A
 	// stale record can only miss, never wrongly vouch: entries come only
-	// from data this provider wrote, template UIDs are immutable, and every
-	// refresh replaces the whole set. A miss refreshes from Kubernetes
-	// before a template is declared foreign.
+	// from data this provider wrote, template UIDs are immutable, a refresh
+	// never replaces an entry recorded after it began, and an entry whose
+	// UID is still unknown is a miss. A miss rereads Kubernetes before a
+	// template is accepted or declared foreign.
 	ours := recordedTemplates.snapshot()
-	if !templatesReach(templates, atespace, poolLabels, ours) {
-		return false, nil
-	}
 	if !recordedTemplateMiss(templates, atespace, poolLabels, ours) {
-		// Only templates outside the Atespace reach the pool: foreign.
-		return true, nil
+		// Every same-Atespace template that reaches the pool is recorded
+		// with its exact UID, so only one outside the Atespace can be foreign.
+		return templatesReach(templates, atespace, poolLabels, ours), nil
 	}
+	began := recordedTemplates.begin()
 	fresh, err := d.providerTemplates(ctx)
 	if err != nil {
 		return false, err
 	}
-	recordedTemplates.replace(fresh)
-	return templatesReach(templates, atespace, poolLabels, fresh), nil
+	// The authoritative reread, merged with anything recorded since it began.
+	return templatesReach(templates, atespace, poolLabels, recordedTemplates.replace(fresh, began)), nil
 }
 
 // recordedTemplateMiss reports a template inside the pool's Atespace that
-// reaches the pool and is absent from (or disagrees with) the record.
+// reaches the pool and is absent from, disagrees with, or has no known UID
+// in the record. An unknown-UID entry is accepted only after a reread.
 func recordedTemplateMiss(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string, ours map[string]string) bool {
 	return slices.ContainsFunc(templates, func(template *pb.ActorTemplate) bool {
 		meta := template.GetMetadata()
@@ -1813,14 +1814,19 @@ func recordedTemplateMiss(templates []*pb.ActorTemplate, atespace string, poolLa
 			return false
 		}
 		uid, recorded := ours[meta.GetAtespace()+"/"+meta.GetName()]
-		return !recorded || uid != "" && uid != meta.GetUid()
+		return !recorded || uid == "" || uid != meta.GetUid()
 	})
 }
 
 // recordedTemplateCache is the in-process record of provider templates.
+// Every add is stamped from a counter, so a refresh that began before an add
+// (and may have read that journal before its UID was written) never replaces
+// it.
 type recordedTemplateCache struct {
 	mu      sync.Mutex
 	entries map[string]string
+	stamps  map[string]uint64
+	clock   uint64
 }
 
 var recordedTemplates = &recordedTemplateCache{}
@@ -1831,12 +1837,34 @@ func (c *recordedTemplateCache) snapshot() map[string]string {
 	return maps.Clone(c.entries)
 }
 
-// replace installs a full inventory read from Kubernetes, dropping every
-// entry it no longer contains (for example a deleted journal's).
-func (c *recordedTemplateCache) replace(entries map[string]string) {
+// begin returns the stamp a refresh must pass to replace, read before the
+// refresh lists anything.
+func (c *recordedTemplateCache) begin() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = maps.Clone(entries)
+	return c.clock
+}
+
+// replace installs a full inventory read from Kubernetes by a refresh that
+// began at stamp began, dropping every entry it no longer contains (for
+// example a deleted journal's), except entries added after it began, which
+// are newer than anything it read. It returns the merged record.
+func (c *recordedTemplateCache) replace(entries map[string]string, began uint64) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	merged := maps.Clone(entries)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	stamps := map[string]uint64{}
+	for key, stamp := range c.stamps {
+		if stamp > began {
+			merged[key] = c.entries[key]
+			stamps[key] = stamp
+		}
+	}
+	c.entries, c.stamps = merged, stamps
+	return maps.Clone(merged)
 }
 
 // add records a template this process just wrote to a journal.
@@ -1849,7 +1877,13 @@ func (c *recordedTemplateCache) add(atespace string, ref nativeReference) {
 	if c.entries == nil {
 		c.entries = map[string]string{}
 	}
-	c.entries[atespace+"/"+ref.Name] = ref.UID
+	if c.stamps == nil {
+		c.stamps = map[string]uint64{}
+	}
+	c.clock++
+	key := atespace + "/" + ref.Name
+	c.entries[key] = ref.UID
+	c.stamps[key] = c.clock
 }
 
 // providerTemplates is every derived template this provider recorded: each
