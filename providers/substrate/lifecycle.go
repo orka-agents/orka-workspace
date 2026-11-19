@@ -236,7 +236,7 @@ func (d *Lifecycle) EnsureAllocation(ctx context.Context, request sdk.WorkloadRe
 				return err
 			}
 		}
-		observed, err = d.observeReady(ctx, record)
+		observed, err = d.observeReady(ctx, cm, record)
 		if err != nil {
 			var lost *nativeInstanceLostError
 			if errors.As(err, &lost) {
@@ -558,17 +558,33 @@ func (d *Lifecycle) failure(ctx context.Context, key sdk.AllocationKey, identity
 }
 
 func (d *Lifecycle) Observe(ctx context.Context, key sdk.AllocationKey) (sdk.AllocationObservation, error) {
+	_, observed, err := d.observe(ctx, key, nil)
+	return observed, err
+}
+
+// observe is Observe that also returns the journal it verified. A workspace
+// this pass already read stands in for re-reading it to check the journal
+// marker.
+func (d *Lifecycle) observe(ctx context.Context, key sdk.AllocationKey, workspace *api.ExecutionWorkspace) (*passSnapshot, sdk.AllocationObservation, error) {
 	cm, record, err := d.read(ctx, key)
 	if err != nil {
-		return sdk.AllocationObservation{}, err
+		return nil, sdk.AllocationObservation{}, err
 	}
-	if err := d.requireJournalReadOnly(ctx, cm, record); err != nil {
-		return sdk.AllocationObservation{}, err
+	if workspace == nil {
+		err = d.requireJournalReadOnly(ctx, cm, record)
+	} else {
+		err = journalMarked(workspace, cm, record)
 	}
+	if err != nil {
+		return nil, sdk.AllocationObservation{}, err
+	}
+	observed := record.Observation
 	if record.Operation == "ensure" && record.Failure == "" {
-		return d.observeReady(ctx, record)
+		if observed, err = d.observeReady(ctx, cm, record); err != nil {
+			return nil, sdk.AllocationObservation{}, err
+		}
 	}
-	return record.Observation, nil
+	return &passSnapshot{cm: cm, record: record, observed: observed}, observed, nil
 }
 
 func (d *Lifecycle) StopInstance(ctx context.Context, key sdk.AllocationKey, identity sdk.InstanceIdentity) (sdk.AllocationObservation, error) {
@@ -610,6 +626,12 @@ func (d *Lifecycle) requireJournalReadOnly(ctx context.Context, cm *corev1.Confi
 	if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
 		return err
 	}
+	return journalMarked(workspace, cm, record)
+}
+
+// journalMarked checks that the workspace is the journal's and carries its
+// exact protected marker.
+func journalMarked(workspace *api.ExecutionWorkspace, cm *corev1.ConfigMap, record *journalRecord) error {
 	if workspace.UID != record.Request.Key.WorkspaceUID || workspace.Spec.ProviderBinding.UID != record.Request.Key.ProviderUID {
 		return sdk.ErrStaleIdentity
 	}
