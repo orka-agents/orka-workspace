@@ -1340,7 +1340,6 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		if err != nil {
 			return d.assignmentReadFailed(ctx, pool, hostedErr, err)
 		}
-		sharedNativeAssignmentHealth.succeeded(sharedNow())
 		assignments[worker.GetMetadata().GetName()] = listed
 		foreign, err := sharedForeignAssignment(ctx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
 		if err != nil {
@@ -1378,6 +1377,9 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	if err != nil {
 		return d.assignmentReadFailed(ctx, pool, nil, err)
 	}
+	// Every check this tracker covers succeeded; only now is a rejection
+	// cleared, so a later check that keeps being rejected cannot reset it.
+	sharedNativeAssignmentHealth.succeeded(sharedNow())
 	if hostedSuspect {
 		// Neighbours are suspended through Orka core's eviction drain of the
 		// terminating worker; the suspect Actor retires through the strong path.

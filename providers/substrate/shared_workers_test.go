@@ -4831,3 +4831,23 @@ func TestSharedRejectedAssignmentReadsFailClosedPastTheBound(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedPartialAssignmentSuccessNeverResetsTheRejectionBound(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// An assignment the ledger does not hold forces the foreign-assignment
+	// confirmation; the first List succeeds and every confirmation is
+	// rejected for the provider's credentials.
+	native.lingering = map[string]*pb.ActorAssignment{record.Worker.Name + "|stranger": {Actor: &pb.ObjectRef{Atespace: record.Atespace, Name: "stranger"}, ActorUid: "stranger-uid"}}
+	native.rejectEverySecondAssignmentList = true
+	start := sharedNow()
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("a rejected confirmation retired the pool before the bound")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a successful first assignment List reset the rejection bound of its confirmation")
+	}
+}

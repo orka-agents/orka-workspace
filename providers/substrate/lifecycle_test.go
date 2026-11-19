@@ -95,6 +95,10 @@ type nativeFixture struct {
 	// assignmentsRejected rejects, and assignmentsUnavailable fails, only
 	// ListWorkerActorAssignments.
 	assignmentsRejected, assignmentsUnavailable bool
+	// rejectEverySecondAssignmentList rejects every second assignment List,
+	// so a first List succeeds and its confirmation is rejected.
+	rejectEverySecondAssignmentList bool
+	assignmentLists                 int
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -577,6 +581,12 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 	}
 	if f.assignmentsRejected {
 		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for assignments")
+	}
+	if f.rejectEverySecondAssignmentList {
+		f.assignmentLists++
+		if f.assignmentLists%2 == 0 {
+			return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for assignments")
+		}
 	}
 	if f.failAfter == "assignments" {
 		f.failAfter = ""
