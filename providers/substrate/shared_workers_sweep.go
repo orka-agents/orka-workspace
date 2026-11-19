@@ -1123,7 +1123,7 @@ const sharedDeleteConcurrency = 8
 
 // sharedEscalationTimeout bounds each escalation call: a pool's Pod list or
 // one escalating Pod delete.
-const sharedEscalationTimeout = 10 * time.Second
+var sharedEscalationTimeout = 10 * time.Second
 
 // sharedEscalationConcurrency caps concurrent per-pool escalations. With one
 // worker Pod per pool, a pool takes at most three calls (its Pod List, a
@@ -1968,6 +1968,12 @@ func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifec
 	if hostedErr != nil {
 		// The hosted check did not complete: the pool is unverified.
 		return nil, d.verificationFailed(ctx, pool, false, hostedErr)
+	}
+	if len(poolWorkers) == 0 && slices.ContainsFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.ActorUID != "" }) {
+		// A pool hosting booted Actors whose worker cannot be listed cannot
+		// be checked: it is unverified, never "nothing to check". A claim
+		// still booting, or an empty warm pool, stays neutral.
+		return nil, d.verificationFailed(ctx, pool, true, errors.New("the shared worker hosts booted Actors but no native worker is listed for it"))
 	}
 	ledgerCtx, cancelLedger := isolationContext(ctx)
 	hostedSuspect, orphans, err := d.sharedLedgerHosts(ledgerCtx, pool, ledger, poolWorkers, assignments)

@@ -102,6 +102,8 @@ type nativeFixture struct {
 	rejectAssignmentsFor map[string]bool
 	// blockAssignments stalls every assignment List until its context ends.
 	blockAssignments bool
+	// hiddenWorkers omits these workers from ListWorkers.
+	hiddenWorkers map[string]bool
 	assignmentLists  int
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
@@ -578,7 +580,10 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor", DefaultRuntime: &pb.WorkerSandboxRuntime{Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
 	}
 	out := &pb.ListWorkersResponse{}
-	for _, worker := range f.workers {
+	for name, worker := range f.workers {
+		if f.hiddenWorkers[name] {
+			continue
+		}
 		out.Workers = append(out.Workers, proto.Clone(worker).(*pb.Worker))
 	}
 	return out, nil

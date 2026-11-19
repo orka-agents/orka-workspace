@@ -5495,3 +5495,60 @@ func TestCaptureTreatsKubernetesTransportErrorsAsRecoverable(t *testing.T) {
 		t.Error("the provider's own evidence failure was treated as transient")
 	}
 }
+
+func TestSharedHostedPoolWithoutAListedWorkerIsUnverified(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// The pool hosts a booted Actor, but its worker is no longer listed.
+	native.hiddenWorkers = map[string]bool{record.Worker.Name: true}
+	start := sharedNow()
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || !sharedPoolUnverified(pool) {
+		t.Fatal("a hosted pool without a listed worker was skipped as having nothing to check")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a hosted pool without a listed worker was not retired at the bound")
+	}
+}
+
+func TestSharedWarmPoolWithoutAWorkerStaysNeutral(t *testing.T) {
+	c, native, _, pool, _ := warmSharedPool(t, 24*time.Hour)
+	native.nativeDown = false
+	native.hiddenWorkers = map[string]bool{pool.GetName() + "-worker": true}
+	start := sharedNow()
+	for _, at := range []time.Duration{0, sharedProvenanceOutageBound} {
+		setNow(t, start.Add(at))
+		_ = sharedReplenisher(c, native).Sweep(t.Context())
+	}
+	current, found := getPool(t, c, pool.GetName())
+	if !found || sharedPoolUnverified(current) {
+		t.Fatal("an empty warm pool without a worker was treated as unverified")
+	}
+}
+
+func TestSharedPoolDeleteHasItsOwnBudgetAfterASlowPodCleanup(t *testing.T) {
+	previousCleanup, previousEscalation := sharedCleanupTimeout, sharedEscalationTimeout
+	sharedCleanupTimeout, sharedEscalationTimeout = time.Second, time.Second
+	t.Cleanup(func() { sharedCleanupTimeout, sharedEscalationTimeout = previousCleanup, previousEscalation })
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	setNow(t, sharedRetireAt(pool, ledger))
+	// The direct Pod cleanup stalls through the whole cleanup budget.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				time.Sleep(sharedCleanupTimeout + 200*time.Millisecond)
+				return context.DeadlineExceeded
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a slow Pod cleanup left the pool's Delete an expired budget")
+	}
+}

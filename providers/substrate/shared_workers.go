@@ -2281,8 +2281,8 @@ func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Uns
 	if pool.GetDeletionTimestamp() != nil {
 		return false, nil
 	}
-	deleteCtx, cancel := strongCleanupContext(ctx)
-	defer cancel()
+	podCtx, cancelPods := strongCleanupContext(ctx)
+	defer cancelPods()
 	if escalateAt.IsZero() {
 		escalateAt = sharedLatestEscalateAt(pool)
 	}
@@ -2291,7 +2291,11 @@ func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Uns
 	// The cascade may then give the worker Pod its default grace; the
 	// escalation loop keeps re-deleting it, and later passes retry the
 	// capped Pod delete.
-	podErr := d.deleteSharedWorkerPods(deleteCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring")
+	podErr := d.deleteSharedWorkerPods(podCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring")
+	// The pool's Delete has a cleanup budget of its own, so a slow Pod
+	// cleanup can never leave it an expired context.
+	deleteCtx, cancel := strongCleanupContext(ctx)
+	defer cancel()
 	uid := pool.GetUID()
 	if err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
 		if apierrors.IsNotFound(err) {
