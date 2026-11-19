@@ -884,11 +884,12 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// inventory; a failed inventory creates nothing.
 	templates, templatesErr := d.listAllActorTemplates(ctx)
 	began := recordedTemplates.begin()
-	ours, oursErr := d.providerTemplates(ctx)
+	all, shared, oursErr := d.providerTemplates(ctx)
+	var ours map[string]string
 	if oursErr == nil {
 		// Every sweep refreshes the in-process record from Kubernetes, and
 		// checks against it merged with anything recorded since.
-		ours = recordedTemplates.replace(ours, began)
+		ours = recordedTemplates.refresh(all, shared, began)
 	}
 	if templatesErr == nil && oursErr != nil {
 		// Without the provider's own template record, no same-Atespace

@@ -1862,12 +1862,12 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 		return templatesReach(templates, atespace, poolLabels, ours), nil
 	}
 	began := recordedTemplates.begin()
-	fresh, err := d.providerTemplates(ctx)
+	all, shared, err := d.providerTemplates(ctx)
 	if err != nil {
 		return false, err
 	}
 	// The authoritative reread, merged with anything recorded since it began.
-	return templatesReach(templates, atespace, poolLabels, recordedTemplates.replace(fresh, began)), nil
+	return templatesReach(templates, atespace, poolLabels, recordedTemplates.refresh(all, shared, began)), nil
 }
 
 // recordedTemplateMiss reports a template inside the pool's Atespace that
@@ -1898,7 +1898,7 @@ type recordedTemplateCache struct {
 var recordedTemplates = &recordedTemplateCache{}
 
 // recordedTemplateCacheMax bounds the in-process template record.
-const recordedTemplateCacheMax = 4096
+var recordedTemplateCacheMax = 4096
 
 func (c *recordedTemplateCache) snapshot() map[string]string {
 	c.mu.Lock()
@@ -1914,28 +1914,47 @@ func (c *recordedTemplateCache) begin() uint64 {
 	return c.clock
 }
 
-// replace installs a full inventory read from Kubernetes by a refresh that
-// began at stamp began, and returns the merged record. Every entry keeps the
-// stamp of the information it holds: a save stamps its entry with a new
-// counter value, and a refresh stamps what it read with began. A refresh
-// overrides or drops (for example a deleted journal's entry) only entries
-// stamped at or before began, so an entry saved after it began survives it,
-// however overlapping refreshes interleave or finish.
-func (c *recordedTemplateCache) replace(entries map[string]string, began uint64) map[string]string {
+// refresh installs what a refresh that began at stamp began read from
+// Kubernetes, and returns the authoritative view for that refresh's own
+// check: the whole inventory (all), with any entry saved after the refresh
+// began taking precedence. Only the shared-relevant part (shared) is cached.
+// Every cached entry keeps the stamp of the information it holds: a save
+// stamps its entry with a new counter value, and a refresh stamps what it
+// read with began. A refresh overrides or drops (for example a deleted
+// journal's entry) only entries stamped at or before began, so an entry saved
+// after it began survives it, however overlapping refreshes interleave or
+// finish. If the cached part would exceed recordedTemplateCacheMax, nothing is
+// cached: the record is cleared, so later checks miss and reread rather than
+// hit.
+func (c *recordedTemplateCache) refresh(all, shared map[string]string, began uint64) map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	merged := map[string]string{}
+	view := maps.Clone(all)
+	if view == nil {
+		view = map[string]string{}
+	}
+	cached := map[string]string{}
 	stamps := map[string]uint64{}
-	for key, uid := range entries {
-		merged[key], stamps[key] = uid, began
+	for key, uid := range shared {
+		cached[key], stamps[key] = uid, began
 	}
 	for key, stamp := range c.stamps {
 		if stamp > began {
-			merged[key], stamps[key] = c.entries[key], stamp
+			cached[key], stamps[key] = c.entries[key], stamp
+			view[key] = c.entries[key]
 		}
 	}
-	c.entries, c.stamps = merged, stamps
-	return maps.Clone(merged)
+	if len(cached) > recordedTemplateCacheMax {
+		c.entries, c.stamps = map[string]string{}, map[string]uint64{}
+		return view
+	}
+	c.entries, c.stamps = cached, stamps
+	return view
+}
+
+// replace is refresh with an inventory that is entirely shared-relevant.
+func (c *recordedTemplateCache) replace(entries map[string]string, began uint64) map[string]string {
+	return c.refresh(entries, entries, began)
 }
 
 // add records a template this process just wrote to a journal.
@@ -1967,9 +1986,13 @@ func (c *recordedTemplateCache) add(atespace string, ref nativeReference) {
 // journal or archived record's template and create template, and each
 // checkpoint catalog's template (which may outlive its workspace). Keys are
 // <atespace>/<name>; values are the recorded UID, or "" before it is known.
-func (d *Lifecycle) providerTemplates(ctx context.Context) (map[string]string, error) {
-	out := map[string]string{}
-	add := func(atespace string, ref nativeReference) {
+//
+// shared is the part the in-process record caches: the templates of records
+// with a shared placement, and catalog templates in an Atespace that has a
+// shared placement. A private template never reaches a shared pool.
+func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[string]string, err error) {
+	all, shared = map[string]string{}, map[string]string{}
+	add := func(out map[string]string, atespace string, ref nativeReference) {
 		if atespace == "" || ref.Name == "" {
 			return
 		}
@@ -1980,28 +2003,37 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (map[string]string, e
 	}
 	journals := &corev1.ConfigMapList{}
 	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	d.sharedPass.noteJournals(journals.Items)
+	sharedAtespaces := map[string]bool{}
 	for i := range journals.Items {
 		if record, ok := decodeClaimRecord(&journals.Items[i]); ok {
-			add(record.Atespace, record.Template)
-			add(record.Atespace, record.CreateTemplate)
+			add(all, record.Atespace, record.Template)
+			add(all, record.Atespace, record.CreateTemplate)
+			if record.SharedWorker != nil {
+				add(shared, record.Atespace, record.Template)
+				add(shared, record.Atespace, record.CreateTemplate)
+				sharedAtespaces[record.Atespace] = true
+			}
 		}
 	}
 	catalogs, err := d.listCatalogs(ctx, "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for i := range catalogs {
 		// The List already returned the full objects: no per-catalog Get.
 		artifact, err := decodeCatalog(&catalogs[i], client.ObjectKeyFromObject(&catalogs[i]))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		add(artifact.Checkpoint.Atespace, artifact.Checkpoint.Template)
+		add(all, artifact.Checkpoint.Atespace, artifact.Checkpoint.Template)
+		if sharedAtespaces[artifact.Checkpoint.Atespace] {
+			add(shared, artifact.Checkpoint.Atespace, artifact.Checkpoint.Template)
+		}
 	}
-	return out, nil
+	return all, shared, nil
 }
 
 // listAllActorTemplates lists ActorTemplates in every Atespace.

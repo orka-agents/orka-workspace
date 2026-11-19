@@ -4117,3 +4117,72 @@ func TestSharedRecordedTemplateCacheIsBounded(t *testing.T) {
 		}
 	})
 }
+
+func TestSharedTemplateRefreshOverTheCapCachesNothing(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, record := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	previous := recordedTemplateCacheMax
+	recordedTemplateCacheMax = 1
+	t.Cleanup(func() { recordedTemplateCacheMax = previous })
+	var configMapLists atomic.Int64
+	counting := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				configMapLists.Add(1)
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	d := sharedDriver(counting, native)
+	poolLabels := sharedLabels(record.SharedWorker.Label)
+	// A miss forces a refresh; its two shared templates exceed the cap.
+	recordedTemplates.replace(nil, recordedTemplates.begin())
+	foreign, err := d.foreignTemplateMatches(t.Context(), record.Atespace, poolLabels)
+	if err != nil || foreign {
+		t.Fatalf("the over-cap refresh changed the decision: foreign=%v err=%v", foreign, err)
+	}
+	if lists := configMapLists.Load(); lists == 0 {
+		t.Fatal("the first check did not refresh")
+	}
+	if entries := recordedTemplates.snapshot(); len(entries) != 0 {
+		t.Fatalf("a refresh over the cap was cached: %v", entries)
+	}
+	// The next check is never a hit: it rereads.
+	configMapLists.Store(0)
+	if foreign, err := d.foreignTemplateMatches(t.Context(), record.Atespace, poolLabels); err != nil || foreign {
+		t.Fatalf("the reread changed the decision: foreign=%v err=%v", foreign, err)
+	}
+	if configMapLists.Load() == 0 {
+		t.Fatal("a refresh that skipped caching was treated as a hit")
+	}
+}
+
+func TestSharedTemplateRefreshCachesOnlySharedRelevantTemplates(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	all, shared, err := sharedDriver(c, native).providerTemplates(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := record.Atespace + "/" + record.Template.Name
+	if shared[key] != record.Template.UID || all[key] != record.Template.UID {
+		t.Fatal("the shared allocation's template is missing from the inventory")
+	}
+	// A private allocation's template is inventoried but never cached.
+	privateC, privateNative, privateRequest := fixture(t, true)
+	ready(t, privateC, privateNative, privateRequest)
+	_, privateRecord, err := driver(privateC, privateNative).read(t.Context(), privateRequest.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateAll, privateShared, err := driver(privateC, privateNative).providerTemplates(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKey := privateRecord.Atespace + "/" + privateRecord.Template.Name
+	if privateAll[privateKey] == "" || len(privateShared) != 0 {
+		t.Fatalf("a private allocation's template is cached as shared-relevant: all=%v shared=%v", privateAll, privateShared)
+	}
+}
