@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4048,4 +4049,71 @@ func TestSharedContinuationLosingThePodRaceReportsTheInstanceLost(t *testing.T) 
 	if record.SharedWorker.Strong == "" || !record.WorkloadAbsent {
 		t.Fatal("the lost instance did not finish the strong path")
 	}
+}
+
+func TestSharedKnownStrongTriggersActBeforeAFailingHostedRead(t *testing.T) {
+	for _, trigger := range []string{"foreign template", "worker restarted"} {
+		t.Run(trigger, func(t *testing.T) {
+			c, native, record, _ := sharedTemplateFixture(t)
+			if trigger == "worker restarted" {
+				// Undo the fixture's foreign template; restart the worker.
+				native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})].Metadata.Uid = record.Template.UID
+				native.workers[record.Worker.Name].Status.RegisteredEpoch++
+			}
+			// Every hosted workspace read fails.
+			failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if _, ok := obj.(*api.ExecutionWorkspace); ok {
+						return apierrors.NewServiceUnavailable("workspace reads unavailable")
+					}
+					return w.Get(ctx, key, obj, opts...)
+				},
+				List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*api.ExecutionWorkspaceList); ok {
+						return apierrors.NewServiceUnavailable("workspace reads unavailable")
+					}
+					return w.List(ctx, list, opts...)
+				},
+			})
+			_ = sharedReplenisher(failing, native).Sweep(t.Context())
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatalf("a failing hosted read suppressed the strong retirement for a %s", trigger)
+			}
+		})
+	}
+}
+
+func TestSharedRecordedTemplateCacheIsBounded(t *testing.T) {
+	t.Run("private allocations add nothing", func(t *testing.T) {
+		recordedTemplates.replace(nil, recordedTemplates.begin())
+		c, native, request := fixture(t, true)
+		ready(t, c, native, request)
+		if entries := recordedTemplates.snapshot(); len(entries) != 0 {
+			t.Fatalf("a private allocation grew the shared template record: %v", entries)
+		}
+	})
+	t.Run("a sweep with nothing shared prunes it", func(t *testing.T) {
+		c, native, _ := fixture(t, true)
+		for i := range 8 {
+			recordedTemplates.add("native", nativeReference{Name: fmt.Sprintf("stale-%d", i), UID: fmt.Sprintf("stale-%d-uid", i)})
+		}
+		if err := (&SpareWorkerReplenisher{Client: c, Control: native, Config: sharedConfig()}).Sweep(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if entries := recordedTemplates.snapshot(); len(entries) != 0 {
+			t.Fatalf("a sweep with no shared profile or pool kept %d template entries", len(entries))
+		}
+	})
+	t.Run("capped", func(t *testing.T) {
+		cache := &recordedTemplateCache{}
+		for i := range recordedTemplateCacheMax + 10 {
+			cache.add("native", nativeReference{Name: fmt.Sprintf("t-%d", i), UID: fmt.Sprintf("t-%d-uid", i)})
+		}
+		if size := len(cache.snapshot()); size > recordedTemplateCacheMax {
+			t.Fatalf("the template record holds %d entries, over its cap of %d", size, recordedTemplateCacheMax)
+		}
+		if cache.snapshot()["native/t-"+strconv.Itoa(recordedTemplateCacheMax+9)] == "" {
+			t.Fatal("the newest entry was dropped")
+		}
+	})
 }

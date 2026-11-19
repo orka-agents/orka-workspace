@@ -1897,6 +1897,9 @@ type recordedTemplateCache struct {
 
 var recordedTemplates = &recordedTemplateCache{}
 
+// recordedTemplateCacheMax bounds the in-process template record.
+const recordedTemplateCacheMax = 4096
+
 func (c *recordedTemplateCache) snapshot() map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1947,6 +1950,12 @@ func (c *recordedTemplateCache) add(atespace string, ref nativeReference) {
 	}
 	if c.stamps == nil {
 		c.stamps = map[string]uint64{}
+	}
+	if len(c.entries) >= recordedTemplateCacheMax {
+		// Bounded: a full record is dropped. Every missing or unknown entry
+		// is reread from Kubernetes before it counts, so this costs reads,
+		// never a wrong match.
+		c.entries, c.stamps = map[string]string{}, map[string]uint64{}
 	}
 	c.clock++
 	key := atespace + "/" + ref.Name

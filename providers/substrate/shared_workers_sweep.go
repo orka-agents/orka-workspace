@@ -874,6 +874,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		shapes[string(item.UID)] = shape
 	}
 	if len(pools.Items) == 0 && len(shapes) == 0 {
+		// Nothing shared remains, so the in-process template record is
+		// pruned; a later shared check rereads it from Kubernetes.
+		recordedTemplates.replace(nil, recordedTemplates.begin())
 		return nil
 	}
 	now := sharedNow()
@@ -1012,18 +1015,23 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		// enforceSharedBounds already retired it, without native reads.
 		return nil
 	}
-	// Kubernetes-only suspicion comes before any native read in this pass.
-	if suspect, err := d.sharedPoolHostsSuspect(ctx, pool, ledger); err != nil {
-		return err
-	} else if suspect {
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
-	}
+	// A strong trigger already known acts before any fallible read, so an
+	// unrelated read failure can never suppress it: the pass's template
+	// inventory is in hand, so a foreign template reaching the pool comes
+	// first.
 	if templatesErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
 		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
 	}
+	// Kubernetes-only suspicion comes before any native read in this pass. A
+	// failed check is held back, not returned, so the worker checks below
+	// still run; only the non-strong maintenance after them is skipped.
+	suspect, hostedErr := d.sharedPoolHostsSuspect(ctx, pool, ledger)
+	if hostedErr == nil && suspect {
+		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
+	}
 	poolWorkers, err := workers.pool(ctx, pool)
 	if err != nil {
-		return err
+		return errors.Join(hostedErr, err)
 	}
 	if len(poolWorkers) > 1 {
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker pool has more than one worker")
@@ -1041,12 +1049,12 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		}
 		listed, err := d.listWorkerAssignments(ctx, worker.GetMetadata().GetName())
 		if err != nil {
-			return err
+			return errors.Join(hostedErr, err)
 		}
 		assignments[worker.GetMetadata().GetName()] = listed
 		foreign, err := sharedForeignAssignment(ctx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
 		if err != nil {
-			return err
+			return errors.Join(hostedErr, err)
 		}
 		if foreign {
 			current := poolObject()
@@ -1058,6 +1066,10 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 			}
 			return d.retireSharedPool(ctx, current, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
 		}
+	}
+	if hostedErr != nil {
+		// Closing, collection and ledger writes need a complete hosted check.
+		return hostedErr
 	}
 	closing := ""
 	shape := shapes[ledger.Scope.ProfileUID]

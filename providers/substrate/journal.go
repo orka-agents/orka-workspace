@@ -323,8 +323,12 @@ func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	// Templates this process recorded join the in-process provider record.
-	recordedTemplates.add(record.Atespace, record.Template)
-	recordedTemplates.add(record.Atespace, record.CreateTemplate)
+	// Only shared placements consult that record; a private template never
+	// reaches a shared pool, whose only label is its random shared label.
+	if record.SharedWorker != nil {
+		recordedTemplates.add(record.Atespace, record.Template)
+		recordedTemplates.add(record.Atespace, record.CreateTemplate)
+	}
 	return nil
 }
 func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
