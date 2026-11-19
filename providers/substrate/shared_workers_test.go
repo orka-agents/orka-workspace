@@ -5408,3 +5408,63 @@ func TestSharedConfirmedForeignAssignmentIsNeverDroppedByAFailedReread(t *testin
 		t.Fatal("the later pool reads were not exercised")
 	}
 }
+
+func TestSharedFailedPodCleanupStillDeletesTheQuarantinedPool(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.foreignWorkers = map[string]bool{record.Worker.Name: true}
+	// Every Pod List fails, so the direct worker Pod cleanup cannot run.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return apierrors.NewInternalError(errors.New("pod list refused"))
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	recording, deletes := recordingDeletes(t, failing)
+	_ = sharedReplenisher(recording, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a failed Pod cleanup kept a quarantined pool's Delete from being issued")
+	}
+	if !slices.ContainsFunc(deletes(), func(d deleteRecord) bool { return d.kind == "WorkerPool" && d.uid == record.SharedWorker.UID }) {
+		t.Fatal("the quarantined pool's UID-preconditioned Delete was not issued")
+	}
+}
+
+func TestSharedFailedNamespaceInventoryIsListedOncePerPass(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	names := manySharedPools(t, c, native, first, binding, 20)
+	var lists, gets atomic.Int64
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*api.ExecutionWorkspaceList); ok {
+				lists.Add(1)
+				return apierrors.NewServiceUnavailable("workspaces unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		},
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*api.ExecutionWorkspace); ok {
+				gets.Add(1)
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := sharedReplenisher(failing, native)
+	profiles := &profile.SubstrateWorkspaceProfileList{}
+	if err := c.List(t.Context(), profiles); err != nil {
+		t.Fatal(err)
+	}
+	d := New(failing, native, sharedConfig())
+	_ = r.sweepShared(t.Context(), d, profiles.Items, &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}, true)
+	if lists.Load() != 1 || gets.Load() != 0 {
+		t.Fatalf("a failed namespace inventory was re-requested: %d Lists, %d Gets in one pass", lists.Load(), gets.Load())
+	}
+	for _, name := range names {
+		pool, found := getPool(t, c, name)
+		if !found || !sharedPoolUnverified(pool) {
+			t.Fatalf("pool %s was not marked unverified", name)
+		}
+	}
+}

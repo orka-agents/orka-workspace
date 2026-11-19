@@ -2028,6 +2028,7 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[stri
 	}
 	journals := &corev1.ConfigMapList{}
 	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		d.sharedPass.noteJournalsFailed(err)
 		return nil, nil, err
 	}
 	d.sharedPass.noteJournals(journals.Items)
@@ -2245,7 +2246,7 @@ func (d *Lifecycle) sharedEntryPersists(ctx context.Context, pool *unstructured.
 // Delete.
 func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured.Unstructured, state, reason string) error {
 	issued, err := d.deleteSharedPool(ctx, pool, time.Time{})
-	if err != nil {
+	if err != nil && !issued {
 		// The decision must survive a failed Delete: persist the intent and
 		// the state on its own context, so admission refuses the pool and
 		// the next pass retries the Delete.
@@ -2285,17 +2286,20 @@ func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Uns
 	if escalateAt.IsZero() {
 		escalateAt = sharedLatestEscalateAt(pool)
 	}
-	if err := d.deleteSharedWorkerPods(deleteCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring"); err != nil {
-		return false, err
-	}
+	// Isolation wins over the grace cap: if the direct Pod cleanup fails, the
+	// pool's Delete is still issued, and the Pod error is returned with it.
+	// The cascade may then give the worker Pod its default grace; the
+	// escalation loop keeps re-deleting it, and later passes retry the
+	// capped Pod delete.
+	podErr := d.deleteSharedWorkerPods(deleteCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring")
 	uid := pool.GetUID()
 	if err := d.client.Delete(deleteCtx, pool, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return false, podErr
 		}
-		return false, err
+		return false, errors.Join(podErr, err)
 	}
-	return true, nil
+	return true, podErr
 }
 
 // sharedWorkerGrace is the deletion grace, in seconds, that ends a worker

@@ -162,8 +162,8 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		go func() {
 			defer group.Done()
 			for item := range work {
-				_, err := d.deleteSharedPool(ctx, item.pool, item.escalateAt)
-				if err != nil {
+				issued, err := d.deleteSharedPool(ctx, item.pool, item.escalateAt)
+				if err != nil && !issued {
 					// The decision survives a failed Delete: admission
 					// refuses the pool and the next pass retries.
 					// It also records the state, so bookkeeping skips it.
@@ -172,7 +172,8 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 				mu.Lock()
 				if err != nil {
 					errs = append(errs, err)
-				} else {
+				}
+				if issued || err == nil {
 					deleted = append(deleted, item)
 				}
 				mu.Unlock()
@@ -274,6 +275,7 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 	}
 	if err := d.client.List(ctx, journals, client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		sharedProvenanceHealth.failed(started)
+		d.sharedPass.noteJournalsFailed(err)
 		return nil, err
 	}
 	defer sharedProvenanceHealth.succeeded(started)
@@ -441,7 +443,7 @@ func (d *Lifecycle) prefetchSharedWorkspaces(ctx context.Context, namespaces map
 			for namespace := range work {
 				workspaces := &api.ExecutionWorkspaceList{}
 				if err := d.client.List(ctx, workspaces, client.InNamespace(namespace)); err != nil {
-					d.sharedPass.noteWorkspaceListFailed(namespace)
+					d.sharedPass.noteWorkspaceListFailed(namespace, err)
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
@@ -2182,7 +2184,7 @@ func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
 // entry collected. Only a mismatch costs a live read, so they stay rare.
 func (d *Lifecycle) sharedEntryRecordConfirmed(ctx context.Context, pool *unstructured.Unstructured, entry sharedLedgerEntry) (*journalRecord, bool, error) {
 	record, found, err := d.sharedEntryRecord(ctx, entry.Journal)
-	if d.sharedPass == nil || err == nil && found && record != nil && sharedEntryHeld(record, pool, entry) {
+	if d.sharedPass == nil || err == nil && found && record != nil && sharedEntryHeld(record, pool, entry) || errors.Is(err, errPassInventoryFailed) {
 		return record, found, err
 	}
 	live := *d
@@ -2299,8 +2301,11 @@ type sharedPassReads struct {
 	journals   map[types.NamespacedName]*corev1.ConfigMap
 	workspaces map[string]map[string]*api.ExecutionWorkspace
 	// listed marks a namespace whose List succeeded, failed one whose List
-	// failed this pass (its lookups then use live Gets, never a re-List).
+	// failed this pass; failedErr and journalsErr cache those failures, so
+	// no lookup re-requests them.
 	listed, failed map[string]bool
+	failedErr      map[string]error
+	journalsErr    error
 	// marks are the pass's queued durable outage annotation changes.
 	marks []outageMark
 	// probed and down cache the pass's native control-plane probe.
@@ -2336,14 +2341,34 @@ func newSharedPassReads() *sharedPassReads {
 }
 
 // noteWorkspaceListFailed records a namespace whose List failed this pass.
-func (p *sharedPassReads) noteWorkspaceListFailed(namespace string) {
+func (p *sharedPassReads) noteWorkspaceListFailed(namespace string, err error) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.failed[namespace] = true
+	if p.failedErr == nil {
+		p.failedErr = map[string]error{}
+	}
+	p.failedErr[namespace] = fmt.Errorf("%w: the ExecutionWorkspaces of namespace %s could not be listed: %w", errPassInventoryFailed, namespace, err)
 }
+
+// noteJournalsFailed records that the pass's journal inventory List failed.
+func (p *sharedPassReads) noteJournalsFailed(err error) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.journalsErr = fmt.Errorf("%w: the journal inventory could not be listed: %w", errPassInventoryFailed, err)
+}
+
+// errPassInventoryFailed marks a lookup answered from a pass inventory List
+// that failed. The failure is cached for the rest of the pass (a negative
+// cache): no pool re-requests it, and every pool that needed it is unverified
+// at once, so its outage bound keeps running.
+var errPassInventoryFailed = errors.New("a pass inventory List failed")
 
 // withSharedPass returns a Lifecycle that shares one pass's reads.
 func (d *Lifecycle) withSharedPass() *Lifecycle {
@@ -2386,10 +2411,14 @@ func (d *Lifecycle) sharedConfigMap(ctx context.Context, key types.NamespacedNam
 	if p := d.sharedPass; p != nil {
 		p.mu.Lock()
 		cached, found := p.journals[key]
+		journalsErr := p.journalsErr
 		p.mu.Unlock()
 		if found {
 			cached.DeepCopyInto(cm)
 			return nil
+		}
+		if journalsErr != nil {
+			return journalsErr
 		}
 	}
 	return d.client.Get(ctx, key, cm)
@@ -2412,13 +2441,17 @@ func (d *Lifecycle) sharedWorkspace(ctx context.Context, key types.NamespacedNam
 		defer unlock()
 	}
 	if failed {
-		return d.client.Get(ctx, key, workspace)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.failedErr[key.Namespace]
 	}
 	if !listed {
 		workspaces := &api.ExecutionWorkspaceList{}
 		if err := d.client.List(ctx, workspaces, client.InNamespace(key.Namespace)); err != nil {
-			p.noteWorkspaceListFailed(key.Namespace)
-			return d.client.Get(ctx, key, workspace)
+			p.noteWorkspaceListFailed(key.Namespace, err)
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			return p.failedErr[key.Namespace]
 		}
 		p.noteWorkspaces(key.Namespace, workspaces.Items)
 	}
