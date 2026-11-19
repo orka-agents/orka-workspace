@@ -17,16 +17,28 @@ import (
 )
 
 func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, workspace *workspacev1alpha1.ExecutionWorkspace) (ctrl.Result, error) {
+	return r.reconcileRead(ctx, workspace, nil)
+}
+
+// reconcileRead runs one pass. A provider Reconcile just read with the
+// workspace lets the first attempt use both reads; a retry re-reads them.
+//
+//nolint:gocyclo // The pass evaluates every lifecycle intent in order.
+func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, workspace *workspacev1alpha1.ExecutionWorkspace, read *workspacev1alpha1.ExecutionWorkspaceProvider) (ctrl.Result, error) {
 	pending := false
 	var operationErr error
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		current := &workspacev1alpha1.ExecutionWorkspace{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
-			return client.IgnoreNotFound(err)
-		}
 		provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
-		if err := r.Get(ctx, types.NamespacedName{Name: current.Spec.ProviderBinding.Name}, provider); err != nil {
-			return client.IgnoreNotFound(err)
+		if read != nil {
+			current, provider, read = workspace.DeepCopy(), read, nil
+		} else {
+			if err := r.Get(ctx, client.ObjectKeyFromObject(workspace), current); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+			if err := r.Get(ctx, types.NamespacedName{Name: current.Spec.ProviderBinding.Name}, provider); err != nil {
+				return client.IgnoreNotFound(err)
+			}
 		}
 		if provider.UID != current.Spec.ProviderBinding.UID || provider.Spec.ControllerName != ControllerName {
 			return nil
@@ -49,7 +61,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			// effects applied once their configuration stops admitting. The
 			// revocation reads only this workspace's own journal fence.
 			key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
-			operationErr = New(r.Client, r.Control, r.Config).revokeWithdrawnEgressCredentials(ctx, key)
+			operationErr = r.lifecycle().revokeWithdrawnEgressCredentials(ctx, key)
 			return nil
 		}
 		// Acknowledge the attachment before Pod startup. This signal lets core
@@ -71,9 +83,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			}
 		}
 		before = current.DeepCopy()
-		driver := New(r.Client, r.Control, r.Config)
+		driver := r.lifecycle()
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation
+		// snap is this pass's verified journal and observation, while nothing
+		// has replaced either.
+		var snap *passSnapshot
 		err := workloadErr
 		if workloadErr != nil {
 			// An invalid launch intent must not leave an existing Actor's
@@ -81,7 +96,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			err = errors.Join(err, driver.revokeWithdrawnEgressCredentials(ctx, key))
 		}
 		if workloadErr == nil {
-			observed, err = driver.Observe(ctx, key)
+			snap, observed, err = driver.observe(ctx, key, current)
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				observed, err = driver.recordFailure(ctx, key, lost)
 			} else if err != nil && !errors.Is(err, workspaceprovider.ErrNotFound) {
@@ -94,6 +109,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		if (workloadErr != nil && maintenance) || deleted || quarantined || current.Spec.Retirement != nil {
 			// Cleanup uses only this workspace's durable instance fence. A
 			// malformed launch intent cannot authorize a different workspace.
+			snap = nil
 			_, record, readErr := driver.read(ctx, key)
 			err = readErr
 			if record != nil {
@@ -117,10 +133,15 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			operationErr = err
 		}
 		failure := ""
-		if err == nil {
+		if err == nil && snap != nil && snap.record.Observation.Identity == observed.Identity {
+			// The journal this pass just verified is the failure record.
+			failure = snap.record.Failure
+		} else if err == nil {
 			// An unreadable failure record must block every operation below.
+			snap = nil
 			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
+		steady := false
 		if missing && (disabled || before.Status.State == workspacev1alpha1.ExecutionWorkspaceStateFailed) {
 			// Disabled skips Ensure, and a failed instance never reaches it, so
 			// their missing-journal guard must independently distinguish no
@@ -153,6 +174,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 			case !missing && current.Spec.Retirement != nil && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
 			case !disabled && workloadErr == nil && !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
+				if steady = !missing && driver.steadyReady(ctx, snap, current, provider, *current.Spec.Workload); steady {
+					// EnsureAllocation would only repeat this pass's
+					// verification and rewrite the same journal.
+					observed = snap.observed
+					break
+				}
 				observed, operationErr = driver.EnsureAllocation(ctx, *current.Spec.Workload)
 				if operationErr == nil {
 					missing = false
@@ -162,11 +189,19 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 		if operationErr == nil && !missing && observed.Key != key {
 			operationErr = workspaceprovider.ErrStaleIdentity
 		}
-		if failure == "" && operationErr == nil && !missing {
+		if failure == "" && operationErr == nil && !missing && !steady {
 			// EnsureAllocation can record the failure during this pass.
 			failure, operationErr = driver.failure(ctx, key, observed.Identity)
 		}
-		if !missing {
+		if steady {
+			// Nothing was written since the journal was verified: revocation
+			// reads no more unless the configuration withdrew its credentials.
+			if driver.egressRevocationNeeded(snap.record) {
+				if revokeErr := driver.revokeLiveEgressCredentials(ctx, key); revokeErr != nil {
+					operationErr = errors.Join(operationErr, revokeErr)
+				}
+			}
+		} else if !missing {
 			// Failed, retiring and still-booting instances verify no egress
 			// when observed, a Disabled provider never reaches
 			// EnsureAllocation, and cleanup can fail or stall. After any
@@ -300,6 +335,13 @@ func (p *pendingPolls) reset(key types.NamespacedName) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.intervals, key)
+}
+
+// lifecycle returns this pass's driver.
+func (r *ExecutionWorkspaceReconciler) lifecycle() *Lifecycle {
+	d := New(r.Client, r.Control, r.Config)
+	d.challengeClient = r.challengeClient
+	return d
 }
 
 // failedRetirementAuthorized reports an exact Stop or Suspend authorization

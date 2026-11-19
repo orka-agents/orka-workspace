@@ -391,19 +391,30 @@ func (d *Lifecycle) admitted(ctx context.Context, request sdk.WorkloadRequest) e
 	if err := d.client.Get(ctx, types.NamespacedName{Namespace: request.Key.Namespace, Name: request.Key.Name}, workspace); err != nil {
 		return err
 	}
-	if workspace.UID != request.Key.WorkspaceUID || workspace.Spec.ProviderBinding.UID != request.Key.ProviderUID {
-		return sdk.ErrStaleIdentity
-	}
-	if workspace.DeletionTimestamp != nil || workspace.Spec.Retirement != nil || workspace.Spec.DesiredState != api.ExecutionWorkspaceDesiredReady || !workspaceCurrentlyAdmittedByCore(workspace) || workspace.Spec.Workload == nil || workspace.Spec.Workload.Revision != request.Revision || workspace.Spec.Workload.Sequence != request.Sequence {
-		return sdk.ErrWorkspaceNotAdmitted
-	}
-	if err := sdk.ValidateWorkspaceWorkload(workspace); err != nil {
+	if err := admittedWorkspace(workspace, request); err != nil {
 		return err
 	}
 	provider := &api.ExecutionWorkspaceProvider{}
 	if err := d.client.Get(ctx, types.NamespacedName{Name: workspace.Spec.ProviderBinding.Name}, provider); err != nil {
 		return err
 	}
+	return admittedProvider(provider, request)
+}
+
+// admittedWorkspace checks that the workspace currently admits exactly this
+// request.
+func admittedWorkspace(workspace *api.ExecutionWorkspace, request sdk.WorkloadRequest) error {
+	if workspace.UID != request.Key.WorkspaceUID || workspace.Spec.ProviderBinding.UID != request.Key.ProviderUID {
+		return sdk.ErrStaleIdentity
+	}
+	if workspace.DeletionTimestamp != nil || workspace.Spec.Retirement != nil || workspace.Spec.DesiredState != api.ExecutionWorkspaceDesiredReady || !workspaceCurrentlyAdmittedByCore(workspace) || workspace.Spec.Workload == nil || workspace.Spec.Workload.Revision != request.Revision || workspace.Spec.Workload.Sequence != request.Sequence {
+		return sdk.ErrWorkspaceNotAdmitted
+	}
+	return sdk.ValidateWorkspaceWorkload(workspace)
+}
+
+// admittedProvider checks that the workspace's provider is this active one.
+func admittedProvider(provider *api.ExecutionWorkspaceProvider, request sdk.WorkloadRequest) error {
 	if provider.UID != request.Key.ProviderUID || provider.Spec.ControllerName != ControllerName {
 		return sdk.ErrStaleIdentity
 	}
