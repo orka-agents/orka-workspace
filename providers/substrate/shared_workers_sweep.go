@@ -641,7 +641,7 @@ func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.U
 		return ""
 	}
 	if !o.probed {
-		o.down, o.probed = o.d.nativeControlDown(ctx), true
+		o.down, o.probed = o.d.sharedPass.nativeDown(ctx, o.d), true
 	}
 	switch {
 	case !o.down:
@@ -730,7 +730,7 @@ func (d *Lifecycle) flushOutageMarks(ctx context.Context) {
 	if len(order) == 0 {
 		return
 	}
-	budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedOutageMarkBudget)
+	budget, cancel := freshBudget(ctx, sharedOutageMarkBudget)
 	defer cancel()
 	work := make(chan []outageMark)
 	var group sync.WaitGroup
@@ -802,7 +802,7 @@ const sharedNativeProbeTimeout = 10 * time.Second
 // (Unauthenticated or PermissionDenied), does not: other clients may still
 // place Actors, so retirement is not suppressed.
 func (d *Lifecycle) nativeControlDown(ctx context.Context) bool {
-	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedNativeProbeTimeout)
+	probeCtx, cancel := freshBudget(ctx, sharedNativeProbeTimeout)
 	defer cancel()
 	_, err := d.control.ListWorkers(probeCtx, &pb.ListWorkersRequest{Options: &pb.ListOptions{PageSize: 1}})
 	noteNativeCredentials(ctx, err)
@@ -852,21 +852,22 @@ func noteNativeCredentials(ctx context.Context, err error) {
 	}
 }
 
-// sharedAssignmentRejectedAnnotation durably records, on a pool, when its
-// native worker or assignment checks were first rejected for the provider's
-// own credentials, so a restarting provider cannot reset that clock.
-const sharedAssignmentRejectedAnnotation = "substrate.workspace.orka.ai/assignments-rejected-since"
+// sharedUnverifiedAnnotation durably records, on a pool, when its isolation
+// checks (hosted workspaces, workers and assignments, ledger records) first
+// failed to complete, including on a timeout, so a restarting provider cannot
+// reset that clock.
+const sharedUnverifiedAnnotation = "substrate.workspace.orka.ai/unverified-since"
 
 // poolRejections tracks, per pool UID and in process, when each pool's
-// assignment checks were first rejected. A pool's entry is cleared only by
-// that pool's own complete, successful checks, so another pool's success,
+// isolation checks first failed to complete. A pool's entry is cleared only
+// by that pool's own complete, successful checks, so another pool's success,
 // or a pool with no worker to read, never resets it.
 type poolRejections struct {
 	mu    sync.Mutex
 	since map[types.UID]time.Time
 }
 
-var sharedAssignmentRejections = &poolRejections{}
+var sharedUnverifiedPools = &poolRejections{}
 
 func (p *poolRejections) failed(uid types.UID, now time.Time) time.Time {
 	p.mu.Lock()
@@ -887,33 +888,80 @@ func (p *poolRejections) succeeded(uid types.UID) {
 	delete(p.since, uid)
 }
 
+func (p *poolRejections) pending(uid types.UID) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.since[uid]
+	return ok
+}
+
 func (p *poolRejections) reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.since = nil
 }
 
-// assignmentReadFailed handles a failed native worker or assignment read in
-// a pool's maintenance. A rejection of the provider's own credentials that
-// has lasted past the outage bound for this pool fails closed: its
-// assignments cannot be checked while other clients may still place, so it
-// is strongly retired. Any other failure is returned for the next pass.
-func (d *Lifecycle) assignmentReadFailed(ctx context.Context, pool *unstructured.Unstructured, hostedErr, err error) error {
-	noteNativeCredentials(ctx, err)
-	if nativeCredentialsRejected(err) {
-		start := d.recordOutageSince(ctx, pool, sharedAssignmentRejectedAnnotation, sharedAssignmentRejections.failed(pool.GetUID(), sharedNow()))
-		if !sharedNow().Before(start.Add(sharedProvenanceOutageBound)) {
-			return errors.Join(err, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's assignments cannot be checked: "+NativeCredentialsRejected()+", past its bound"))
-		}
-	}
-	return errors.Join(hostedErr, err)
+// sharedPoolUnverified reports a pool whose isolation checks have not
+// completed since they last failed; admission refuses it.
+func sharedPoolUnverified(pool *unstructured.Unstructured) bool {
+	_, stamped := pool.GetAnnotations()[sharedUnverifiedAnnotation]
+	return stamped || sharedUnverifiedPools.pending(pool.GetUID())
 }
 
-// assignmentChecksSucceeded clears a pool's rejection record after all of
-// its own assignment checks succeeded.
-func (d *Lifecycle) assignmentChecksSucceeded(ctx context.Context, pool *unstructured.Unstructured) {
-	sharedAssignmentRejections.succeeded(pool.GetUID())
-	d.clearOutageMark(ctx, pool, sharedAssignmentRejectedAnnotation)
+// verificationFailed handles an isolation check that failed or did not
+// finish within its budget. The pool is unverified: admission refuses it at
+// once, and it is strongly retired once that has lasted past the outage
+// bound (60 s). Only a native check's transport or availability failure, while
+// the control plane looks down from the provider, takes the longer
+// control-plane-down grace instead; a rejection of the provider's own
+// credentials never does. The error is returned for the next pass.
+func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.Unstructured, native bool, err error) error {
+	if native {
+		noteNativeCredentials(ctx, err)
+	}
+	start := d.recordOutageSince(ctx, pool, sharedUnverifiedAnnotation, sharedUnverifiedPools.failed(pool.GetUID(), sharedNow()))
+	elapsed := sharedNow().Sub(start)
+	if elapsed < sharedProvenanceOutageBound {
+		return err
+	}
+	bound := sharedProvenanceOutageBound
+	if native && nativeUnavailable(err) && !nativeCredentialsRejected(err) && d.sharedPass.nativeDown(ctx, d) {
+		bound = sharedControlPlaneDownGrace
+	}
+	if elapsed < bound {
+		return err
+	}
+	reason := "the shared worker's isolation checks did not complete past their bound"
+	if rejected := NativeCredentialsRejected(); native && rejected != "" {
+		reason = "the shared worker's assignments cannot be checked: " + rejected + ", past its bound"
+	}
+	return errors.Join(err, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
+}
+
+// verificationSucceeded clears a pool's unverified record after all of its
+// own isolation checks completed.
+func (d *Lifecycle) verificationSucceeded(ctx context.Context, pool *unstructured.Unstructured) {
+	sharedUnverifiedPools.succeeded(pool.GetUID())
+	d.clearOutageMark(ctx, pool, sharedUnverifiedAnnotation)
+}
+
+// nativeDown probes, once per pass, whether the native control plane looks
+// down from the provider (nativeControlDown).
+func (p *sharedPassReads) nativeDown(ctx context.Context, d *Lifecycle) bool {
+	if p == nil {
+		return d.nativeControlDown(ctx)
+	}
+	p.mu.Lock()
+	probed, down := p.probed, p.down
+	p.mu.Unlock()
+	if probed {
+		return down
+	}
+	down = d.nativeControlDown(ctx)
+	p.mu.Lock()
+	p.probed, p.down = true, down
+	p.mu.Unlock()
+	return down
 }
 
 // nativeDegradation records that native control could not be set up when
@@ -1404,7 +1452,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	d = d.withSharedPass()
 	// Durable outage stamps are written after every safety action.
 	defer d.flushOutageMarks(ctx)
-	discovered, err := listSharedPools(ctx, r.Client, nil)
+	listCtx, cancelList := isolationContext(ctx)
+	discovered, err := listSharedPools(listCtx, r.Client, nil)
+	cancelList()
 	if err != nil {
 		return err
 	}
@@ -1416,8 +1466,111 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 			pools.Items = append(pools.Items, pool)
 		}
 	}
-	shapes := map[string]*sharedProfileShape{}
+	// Non-isolation work (profile discovery, closing, collection, ledger
+	// writes and warm creation) has its own budget and runs after every
+	// isolation check, so a slow profile lookup can never fail one.
+	maintainCtx, cancelMaintain := freshBudget(ctx, sharedMaintenanceTimeout)
+	defer cancelMaintain()
+	var shapes map[string]*sharedProfileShape
+	if len(pools.Items) == 0 {
+		if shapes = r.sharedProfileShapes(maintainCtx, d, profiles); len(shapes) == 0 {
+			// Nothing shared remains, so the in-process template record is
+			// pruned; a later shared check rereads it from Kubernetes.
+			recordedTemplates.replace(nil, recordedTemplates.begin())
+			return nil
+		}
+	}
+	now := sharedNow()
 	var errs []error
+	// The isolation inventories, each on a budget of its own. Maintenance and
+	// every pool creation need a complete, successful template inventory; a
+	// failed inventory creates nothing.
+	templatesCtx, cancelTemplates := freshBudget(ctx, sharedInventoryTimeout)
+	templates, templatesErr := d.listAllActorTemplates(templatesCtx)
+	cancelTemplates()
+	began := recordedTemplates.begin()
+	recordsCtx, cancelRecords := freshBudget(ctx, sharedInventoryTimeout)
+	all, shared, oursErr := d.providerTemplates(recordsCtx)
+	cancelRecords()
+	var ours map[string]string
+	if oursErr == nil {
+		// Every sweep refreshes the in-process record from Kubernetes, and
+		// checks against it merged with anything recorded since.
+		ours = recordedTemplates.refresh(all, shared, began)
+	}
+	// Without the provider's own template record (inventoryErr), a
+	// same-Atespace template the in-process record does not know cannot be
+	// told apart: its pool closes at once and is retired once the outage
+	// outlasts its bound. Nothing new is created meanwhile.
+	inventoryErr := oursErr
+	// A native ActorTemplate inventory that has stayed unavailable past the
+	// outage bound leaves foreign selectors unchecked: shared pools are then
+	// strongly retired (nativeTemplateOutage).
+	outage := &nativeTemplateOutage{d: d, failing: templatesErr != nil}
+	var verified []*sharedIsolation
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		if pool.GetDeletionTimestamp() == nil {
+			if reason := outage.retires(ctx, pool); reason != "" {
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
+				continue
+			}
+		}
+		isolated, err := r.isolateSharedPool(ctx, d, workers, pool, now, templates, ours, templatesErr, inventoryErr)
+		errs = append(errs, err)
+		if isolated != nil {
+			verified = append(verified, isolated)
+		}
+	}
+	if shapes == nil {
+		shapes = r.sharedProfileShapes(maintainCtx, d, profiles)
+	}
+	free := map[string]int{}
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		ledger, err := readSharedLedger(pool)
+		if err != nil {
+			continue
+		}
+		if sharedCountsAsFree(pool, ledger, shapes[ledger.Scope.ProfileUID], now) {
+			free[ledger.Scope.ProfileUID] += int(ledger.Scope.MaxActors) - len(ledger.Entries)
+		}
+	}
+	if profilesKnown {
+		// Without the profiles every safety check above still ran; closing,
+		// collection and ledger writes need their shapes.
+		for _, isolated := range verified {
+			errs = append(errs, r.maintainSharedPool(maintainCtx, d, workers, isolated, shapes, free, now, templatesErr))
+		}
+	}
+	if err := errors.Join(templatesErr, inventoryErr); err != nil {
+		// Without a verified template inventory nothing new is created.
+		return errors.Join(append(errs, err)...)
+	}
+	for uid, shape := range shapes {
+		for free[uid] < shape.warm {
+			if err := d.createWarmSharedPool(maintainCtx, shape, templates, ours); err != nil {
+				errs = append(errs, err)
+				break
+			}
+			free[uid] += int(shape.scope.MaxActors)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sharedInventoryTimeout is the budget of each of the pass's isolation
+// inventories (the native ActorTemplate List and the provider's records), and
+// sharedMaintenanceTimeout that of its non-isolation work.
+var (
+	sharedInventoryTimeout   = 30 * time.Second
+	sharedMaintenanceTimeout = 60 * time.Second
+)
+
+// sharedProfileShapes derives each opted-in profile's shape, for
+// maintenance and warm creation only.
+func (r *SpareWorkerReplenisher) sharedProfileShapes(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile) map[string]*sharedProfileShape {
+	shapes := map[string]*sharedProfileShape{}
 	for i := range profiles {
 		item := &profiles[i]
 		if item.Spec.Placement == nil || item.Spec.Placement.SharedWorkers == nil || item.DeletionTimestamp != nil || item.Validate() != nil {
@@ -1435,69 +1588,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		shape.warm, _ = spareWorkerCount(item.Annotations)
 		shapes[string(item.UID)] = shape
 	}
-	if len(pools.Items) == 0 && len(shapes) == 0 {
-		// Nothing shared remains, so the in-process template record is
-		// pruned; a later shared check rereads it from Kubernetes.
-		recordedTemplates.replace(nil, recordedTemplates.begin())
-		return nil
-	}
-	now := sharedNow()
-	// Maintenance and every pool creation need a complete, successful template
-	// inventory; a failed inventory creates nothing.
-	templates, templatesErr := d.listAllActorTemplates(ctx)
-	began := recordedTemplates.begin()
-	all, shared, oursErr := d.providerTemplates(ctx)
-	var ours map[string]string
-	if oursErr == nil {
-		// Every sweep refreshes the in-process record from Kubernetes, and
-		// checks against it merged with anything recorded since.
-		ours = recordedTemplates.refresh(all, shared, began)
-	}
-	// Without the provider's own template record (inventoryErr), a
-	// same-Atespace template the in-process record does not know cannot be
-	// told apart: its pool closes at once and is retired once the outage
-	// outlasts its bound. Nothing new is created meanwhile.
-	inventoryErr := oursErr
-	// A native ActorTemplate inventory that has stayed unavailable past the
-	// outage bound, while the control plane still answers, leaves foreign
-	// selectors unchecked: every shared pool is then strongly retired. The
-	// probe runs on its own context, so the sweep's deadline cannot postpone
-	// it.
-	outage := &nativeTemplateOutage{d: d, failing: templatesErr != nil}
-	free := map[string]int{}
-	for i := range pools.Items {
-		pool := &pools.Items[i]
-		ledger, err := readSharedLedger(pool)
-		if err != nil {
-			continue
-		}
-		if sharedCountsAsFree(pool, ledger, shapes[ledger.Scope.ProfileUID], now) {
-			free[ledger.Scope.ProfileUID] += int(ledger.Scope.MaxActors) - len(ledger.Entries)
-		}
-	}
-	for i := range pools.Items {
-		if pool := &pools.Items[i]; pool.GetDeletionTimestamp() == nil {
-			if reason := outage.retires(ctx, pool); reason != "" {
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
-				continue
-			}
-		}
-		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr, profilesKnown))
-	}
-	if err := errors.Join(templatesErr, inventoryErr); err != nil {
-		// Without a verified template inventory nothing new is created.
-		return errors.Join(append(errs, err)...)
-	}
-	for uid, shape := range shapes {
-		for free[uid] < shape.warm {
-			if err := d.createWarmSharedPool(ctx, shape, templates, ours); err != nil {
-				errs = append(errs, err)
-				break
-			}
-			free[uid] += int(shape.scope.MaxActors)
-		}
-	}
-	return errors.Join(errs...)
+	return shapes
 }
 
 // profileSharedShape derives the scope a template-sized allocation of this
@@ -1573,22 +1664,82 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 	return nil
 }
 
+// sharedIsolation is what a pool's completed isolation checks leave for its
+// non-isolation maintenance.
+//
 //nolint:gocyclo // Every pool-wide rule is evaluated in one pass, in priority order.
-func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error, profilesKnown bool) error {
+type sharedIsolation struct {
+	pool         *unstructured.Unstructured
+	ledger       *sharedLedger
+	workers      []*pb.Worker
+	orphans      []string
+	unclassified bool
+}
+
+// sharedIsolationCheckTimeout is each isolation check's own budget: a pool's
+// hosted-workspace check, its worker and assignment checks, and its ledger
+// check each run on a fresh context, never on a deadline another step spent.
+var sharedIsolationCheckTimeout = 15 * time.Second
+
+// isolationContext is a fresh bounded context for one isolation check,
+// detached from any deadline the pass already spent.
+func isolationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return freshBudget(ctx, sharedIsolationCheckTimeout)
+}
+
+// freshBudget returns a context with a whole budget of its own: it drops any
+// deadline the caller's context already spent, but still ends when that
+// context is cancelled (for example on shutdown or lost leadership).
+func freshBudget(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	fresh, cancel := context.WithTimeout(context.WithoutCancel(ctx), passBudget(ctx, budget))
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return fresh, func() {
+		stop()
+		cancel()
+	}
+}
+
+// sweepBudgetKey carries a sweep's own deadline, which caps each of its
+// fresh budgets: every step still gets a whole budget of its own, never one
+// another step spent, but none is longer than the sweep's configured deadline.
+type sweepBudgetKey struct{}
+
+func withSweepBudget(ctx context.Context, budget time.Duration) context.Context {
+	return context.WithValue(ctx, sweepBudgetKey{}, budget)
+}
+
+func passBudget(ctx context.Context, budget time.Duration) time.Duration {
+	if limit, ok := ctx.Value(sweepBudgetKey{}).(time.Duration); ok && limit > 0 && limit < budget {
+		return limit
+	}
+	return budget
+}
+
+// isolateSharedPool runs a pool's isolation checks: its persisted state, the
+// pass's template inventory, hosted suspicion, its workers and assignments,
+// and its ledger's hosted records. A strong trigger retires the pool. A check
+// that fails or does not finish within its own budget makes the pool
+// unverified (verificationFailed); only a pool whose checks all completed is
+// returned for maintenance.
+func (r *SpareWorkerReplenisher) isolateSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) (*sharedIsolation, error) {
 	if pool.GetDeletionTimestamp() != nil {
-		return nil
+		return nil, nil
 	}
 	ledger, err := readSharedLedger(pool)
 	if err != nil {
 		// Unreadable lifetime evidence is doubt: retire strongly at once.
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker ledger is unreadable")
+		return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker ledger is unreadable")
 	}
 	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
-		return d.retireSharedPool(ctx, pool, ledger.State, ledger.Reason)
+		return nil, d.retireSharedPool(ctx, pool, ledger.State, ledger.Reason)
 	}
 	if !now.Before(sharedRetireAt(pool, ledger)) || !r.Config.DedicatedInstall {
 		// enforceSharedBounds already retired it, without native reads.
-		return nil
+		return nil, nil
 	}
 	// A strong trigger already known acts before any fallible read, so an
 	// unrelated read failure can never suppress it: the pass's template
@@ -1596,67 +1747,96 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	// first.
 	unclassified := false
 	if templatesErr == nil && inventoryErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
-		return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+		return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
 	}
 	if templatesErr == nil && inventoryErr != nil {
 		var foreign bool
 		foreign, unclassified = classifyWithoutInventory(templates, ledger.Scope.Atespace, pool.GetLabels(), recordedTemplates.snapshot())
 		if foreign {
-			return d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+			return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
 		}
 		if unclassified && sharedTemplateInventoryHealth.outlasted(sharedNow()) {
-			return d.retireSharedPool(ctx, pool, sharedRetiring, "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound")
+			return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound")
 		}
 	}
-	// Kubernetes-only suspicion comes before any native read in this pass. A
-	// failed check is held back, not returned, so the worker checks below
-	// still run; only the non-strong maintenance after them is skipped.
-	suspect, hostedErr := d.sharedPoolHostsSuspect(ctx, pool, ledger)
+	// Kubernetes-only suspicion comes before any native read, on its own
+	// budget. A failed check is held back, not returned, so the worker checks
+	// below still run, each on a fresh budget of its own.
+	hostedCtx, cancelHosted := isolationContext(ctx)
+	suspect, hostedErr := d.sharedPoolHostsSuspect(hostedCtx, pool, ledger)
+	cancelHosted()
 	if hostedErr == nil && suspect {
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
+		return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted allocation selected the strong path or its workspace is suspect")
 	}
-	poolWorkers, err := workers.pool(ctx, pool)
+	nativeCtx, cancelNative := isolationContext(ctx)
+	defer cancelNative()
+	poolWorkers, err := workers.pool(nativeCtx, pool)
 	if err != nil {
-		return d.assignmentReadFailed(ctx, pool, hostedErr, err)
+		return nil, d.verificationFailed(ctx, pool, true, errors.Join(hostedErr, err))
 	}
 	if len(poolWorkers) > 1 {
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker pool has more than one worker")
+		return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker pool has more than one worker")
 	}
 	// Each worker's assignments are listed once and shared by both checks.
 	assignments := map[string][]*pb.ActorAssignment{}
 	for _, worker := range poolWorkers {
 		if ledger.Worker != nil && (worker.GetMetadata().GetUid() != ledger.Worker.UID || worker.GetWorkerPodUid() != ledger.Worker.PodUID) {
-			return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker was replaced")
+			return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker was replaced")
 		}
 		if ledger.Worker != nil && worker.GetStatus().GetRegisteredEpoch() != ledger.Worker.Epoch {
 			// A restarted worker process lost every sandbox; its Actors fail
 			// and retire through the strong path, which this anticipates.
-			return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker process restarted")
+			return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker process restarted")
 		}
-		listed, err := d.listWorkerAssignments(ctx, worker.GetMetadata().GetName())
+		listed, err := d.listWorkerAssignments(nativeCtx, worker.GetMetadata().GetName())
 		if err != nil {
-			return d.assignmentReadFailed(ctx, pool, hostedErr, err)
+			return nil, d.verificationFailed(ctx, pool, true, errors.Join(hostedErr, err))
 		}
 		assignments[worker.GetMetadata().GetName()] = listed
-		foreign, err := sharedForeignAssignment(ctx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
+		foreign, err := sharedForeignAssignment(nativeCtx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
 		if err != nil {
-			return d.assignmentReadFailed(ctx, pool, hostedErr, err)
+			return nil, d.verificationFailed(ctx, pool, true, errors.Join(hostedErr, err))
 		}
 		if foreign {
 			current := poolObject()
-			if err := d.client.Get(ctx, client.ObjectKeyFromObject(pool), current); err != nil {
-				return client.IgnoreNotFound(err)
+			if err := d.client.Get(nativeCtx, client.ObjectKeyFromObject(pool), current); err != nil {
+				return nil, client.IgnoreNotFound(err)
 			}
 			if current.GetUID() != pool.GetUID() {
-				return nil
+				return nil, nil
 			}
-			return d.retireSharedPool(ctx, current, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
+			return nil, d.retireSharedPool(ctx, current, sharedQuarantined, "the shared worker hosts an Actor outside its ledger")
 		}
 	}
 	if hostedErr != nil {
-		// Closing, collection and ledger writes need a complete hosted check.
-		return hostedErr
+		// The hosted check did not complete: the pool is unverified.
+		return nil, d.verificationFailed(ctx, pool, false, hostedErr)
 	}
+	ledgerCtx, cancelLedger := isolationContext(ctx)
+	hostedSuspect, orphans, err := d.sharedLedgerHosts(ledgerCtx, pool, ledger, poolWorkers, assignments)
+	cancelLedger()
+	if err != nil {
+		return nil, d.verificationFailed(ctx, pool, false, err)
+	}
+	// Every isolation check completed. A pool with a worker, or with no
+	// hosted entry to verify, is verified; only that clears its record.
+	if len(poolWorkers) > 0 || len(ledger.Entries) == 0 {
+		d.verificationSucceeded(ctx, pool)
+	}
+	if hostedSuspect {
+		// Neighbours are suspended through Orka core's eviction drain of the
+		// terminating worker; the suspect Actor retires through the strong path.
+		return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted workspace is tainted, quarantined or failed")
+	}
+	return &sharedIsolation{pool: pool, ledger: ledger, workers: poolWorkers, orphans: orphans, unclassified: unclassified}, nil
+}
+
+// maintainSharedPool is a verified pool's non-isolation maintenance, after
+// profile discovery: closing admission, collecting orphans and idle pools,
+// and ledger writes. It needs the profiles' shapes, so it is skipped when
+// they could not be listed.
+func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, isolated *sharedIsolation, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templatesErr error) error {
+	pool, ledger, orphans := isolated.pool, isolated.ledger, isolated.orphans
 	closing := ""
 	shape := shapes[ledger.Scope.ProfileUID]
 	// Only a pool the sweep counted toward the warm reserve gives its free
@@ -1670,26 +1850,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	case !sharedScopeCurrent(shape, ledger.Scope) || shape.source.GetNamespace() != pool.GetNamespace():
 		closing = "the shared worker's operator pool or profile changed"
 	}
-	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers, assignments)
-	if err != nil {
-		return d.assignmentReadFailed(ctx, pool, nil, err)
-	}
-	// Every check the pool's rejection record covers succeeded; only now is
-	// it cleared, so a later check that keeps being rejected cannot reset it.
-	if len(poolWorkers) > 0 {
-		d.assignmentChecksSucceeded(ctx, pool)
-	}
-	if hostedSuspect {
-		// Neighbours are suspended through Orka core's eviction drain of the
-		// terminating worker; the suspect Actor retires through the strong path.
-		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted workspace is tainted, quarantined or failed")
-	}
-	if !profilesKnown {
-		// Every safety check ran; closing, collection and ledger writes
-		// need the profiles' shapes.
-		return nil
-	}
-	if closing == "" && (templatesErr != nil || unclassified) {
+	if closing == "" && (templatesErr != nil || isolated.unclassified) {
 		closing = "the install's ActorTemplates could not be verified"
 	}
 	changed := false
@@ -1987,6 +2148,8 @@ type sharedPassReads struct {
 	listed, failed map[string]bool
 	// marks are the pass's queued durable outage annotation changes.
 	marks []outageMark
+	// probed and down cache the pass's native control-plane probe.
+	probed, down bool
 }
 
 func newSharedPassReads() *sharedPassReads {

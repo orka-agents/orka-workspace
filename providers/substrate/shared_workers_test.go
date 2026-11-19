@@ -71,11 +71,11 @@ func useTestClock(t *testing.T) {
 	sharedTemplateInventoryHealth.reset()
 	sharedNativeTemplateHealth.reset()
 	sharedNativeCredentials.Store(nil)
-	sharedAssignmentRejections.reset()
+	sharedUnverifiedPools.reset()
 	sharedNativeDegraded.Store(nil)
 	sharedProfileInventoryHealth.reset()
 	t.Cleanup(func() {
-		sharedAssignmentRejections.reset()
+		sharedUnverifiedPools.reset()
 		sharedNativeDegraded.Store(nil)
 		sharedProfileInventoryHealth.reset()
 		sharedNativeTemplateHealth.reset()
@@ -4868,7 +4868,9 @@ func TestSharedRejectedAssignmentReadsFailClosedPastTheBound(t *testing.T) {
 		retired bool
 	}{
 		{name: "assignment reads rejected for the provider's credentials", break_: func(f *nativeFixture) { f.assignmentsRejected = true }, retired: true},
-		{name: "assignment reads unavailable", break_: func(f *nativeFixture) { f.assignmentsUnavailable = true }, retired: false},
+		// A check that never completes is an outage of that check: with the
+		// control plane otherwise answering, it retires at the same bound.
+		{name: "assignment reads unavailable", break_: func(f *nativeFixture) { f.assignmentsUnavailable = true }, retired: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 2)
@@ -5032,7 +5034,7 @@ func TestSharedStalledOutageStampsNeverDelayAQuarantine(t *testing.T) {
 	// Every outage stamp write stalls.
 	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetAnnotations()[sharedAssignmentRejectedAnnotation] != "" {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetAnnotations()[sharedUnverifiedAnnotation] != "" {
 				<-ctx.Done()
 				return ctx.Err()
 			}
@@ -5058,5 +5060,132 @@ func TestSharedStalledOutageStampsNeverDelayAQuarantine(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the stamp writes outlasted their budget")
+	}
+}
+
+func TestSharedStalledHostedListStillRunsTheAssignmentChecks(t *testing.T) {
+	previous := sharedDiscoveryTimeout
+	sharedDiscoveryTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { sharedDiscoveryTimeout = previous })
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// The worker hosts an Actor outside the ledger, and every hosted
+	// workspace read stalls.
+	native.foreignWorkers = map[string]bool{record.Worker.Name: true}
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*api.ExecutionWorkspace); ok {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*api.ExecutionWorkspaceList); ok {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	sweep := sharedReplenisher(stalling, native)
+	sweep.SweepDeadline = 500 * time.Millisecond
+	_ = sweep.Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a stalled hosted-workspace read kept the assignment checks from catching a foreign Actor")
+	}
+}
+
+func TestSharedStalledBoundsDeletesNeverDelayTheIsolationChecks(t *testing.T) {
+	previous := sharedCleanupTimeout
+	sharedCleanupTimeout = 2 * time.Second
+	t.Cleanup(func() { sharedCleanupTimeout = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	due := manySharedPools(t, c, native, first, binding, 17)
+	pool, ledger := poolLedger(t, c, due[0])
+	setNow(t, sharedRetireAt(pool, ledger).Add(time.Minute))
+	// A young pool, reached by a foreign template.
+	young := sharedWorkspace(t, c, first, "tenant", "young", "young-uid", binding)
+	_, record := sharedReady(t, c, native, young)
+	if slices.Contains(due, record.SharedWorker.Pool) {
+		t.Fatal("the young allocation joined a due pool")
+	}
+	native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})].Metadata.Uid = "foreign-template-uid"
+	// Every WorkerPool delete stalls until its context ends; Pod deletes are
+	// recorded with their time.
+	var mu sync.Mutex
+	var youngPodDeleted time.Time
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			switch o := obj.(type) {
+			case *unstructured.Unstructured:
+				if o.GetKind() == "WorkerPool" {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+			case *corev1.Pod:
+				if string(o.GetUID()) == record.Worker.PodUID {
+					mu.Lock()
+					youngPodDeleted = time.Now()
+					mu.Unlock()
+				}
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	}))
+	started := time.Now()
+	_ = sharedReplenisher(stalling, native).Sweep(t.Context())
+	mu.Lock()
+	defer mu.Unlock()
+	if youngPodDeleted.IsZero() || youngPodDeleted.Sub(started) > 2*time.Second {
+		t.Fatalf("stalled bounds deletes delayed the foreign-template quarantine: %v", youngPodDeleted.Sub(started))
+	}
+}
+
+func TestSharedSlowProfileDiscoveryNeverRetiresAHealthyPool(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// Every profile-shape lookup stalls.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "SubstrateWorkspaceProfile" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	}))
+	sweep := sharedReplenisher(stalling, native)
+	sweep.SweepDeadline = 300 * time.Millisecond
+	start := sharedNow()
+	for _, at := range []time.Duration{0, 30 * time.Second, sharedProvenanceOutageBound, 2 * sharedProvenanceOutageBound} {
+		setNow(t, start.Add(at))
+		_ = sweep.Sweep(t.Context())
+	}
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil || sharedPoolUnverified(pool) {
+		t.Fatal("slow profile discovery retired or failed the verification of a healthy pool")
+	}
+}
+
+func TestSharedAssignmentCheckThatAlwaysTimesOutRetiresAtTheBound(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.blockAssignments = true
+	sweep := sharedReplenisher(c, native)
+	sweep.SweepDeadline = 300 * time.Millisecond
+	start := sharedNow()
+	_ = sweep.Sweep(t.Context())
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("a timed-out assignment check retired the pool before the bound")
+	}
+	if !sharedPoolUnverified(pool) {
+		t.Fatal("a timed-out assignment check left admission open")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = sweep.Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("an assignment check that always times out did not retire the pool at the bound")
 	}
 }

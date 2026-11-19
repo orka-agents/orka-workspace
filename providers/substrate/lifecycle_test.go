@@ -100,7 +100,9 @@ type nativeFixture struct {
 	rejectEverySecondAssignmentList bool
 	// rejectAssignmentsFor rejects assignment Lists for these workers only.
 	rejectAssignmentsFor map[string]bool
-	assignmentLists      int
+	// blockAssignments stalls every assignment List until its context ends.
+	blockAssignments bool
+	assignmentLists  int
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -209,6 +211,10 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	return cloneTemplate(v), f.effect("deleteTemplate")
 }
 func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	if err := ctx.Err(); err != nil {
+		// Like a real call, an ended context fails.
+		return nil, status.FromContextError(err).Err()
+	}
 	if f.block || f.blockTemplateList {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -577,7 +583,11 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 	}
 	return out, nil
 }
-func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+func (f *nativeFixture) ListWorkerActorAssignments(ctx context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+	if f.blockAssignments {
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 	if f.nativeDown || f.assignmentsUnavailable {
 		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
 	}

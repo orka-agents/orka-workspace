@@ -563,7 +563,7 @@ func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) 
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
-	return pool.GetDeletionTimestamp() == nil && !sharedRetireIntended(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+	return pool.GetDeletionTimestamp() == nil && !sharedRetireIntended(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
 }
 
 func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
@@ -2197,7 +2197,7 @@ func (c Config) egressSettle() time.Duration {
 
 // sharedCleanupTimeout bounds persisting a strong trigger and starting the
 // pool's retirement after the caller's own context has ended.
-const sharedCleanupTimeout = 30 * time.Second
+var sharedCleanupTimeout = 30 * time.Second
 
 // strongCleanupContext detaches a strong-retirement step from the caller's
 // cancellation (keeping its values) and bounds it on its own. It uses only

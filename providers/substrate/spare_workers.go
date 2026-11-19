@@ -520,14 +520,11 @@ func (r *SpareWorkerReplenisher) EnforceSharedBounds(ctx context.Context) error 
 // is bounded by SweepDeadline.
 func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	d := New(r.Client, r.Control, r.Config)
-	// Shared worker lifetime bounds come first and need only Kubernetes.
-	boundsErr := r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config))
 	deadline := r.SweepDeadline
 	if deadline <= 0 {
 		deadline = defaultSweepDeadline
 	}
-	parent := ctx
-	listCtx, cancelList := context.WithTimeout(parent, deadline)
+	listCtx, cancelList := context.WithTimeout(ctx, deadline)
 	profiles := &profile.SubstrateWorkspaceProfileList{}
 	started := sharedNow()
 	profilesErr := r.List(listCtx, profiles)
@@ -538,24 +535,34 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 		sharedProfileInventoryHealth.succeeded(started)
 	}
 	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
-	// Shared isolation work (foreign templates, hosted suspicion, outage
-	// retirement) comes first, on its own deadline, so private spare
-	// maintenance, which is only latency work, can never starve it. It runs
-	// even when the profiles cannot be listed.
-	sharedCtx, cancelShared := context.WithTimeout(parent, deadline)
-	sharedErr := r.sweepShared(sharedCtx, d, profiles.Items, workers, profilesErr == nil)
+	// Shared isolation work (foreign templates, hosted suspicion, workers
+	// and assignments, outage retirement) comes first, each check on a budget
+	// of its own, so neither private spare maintenance (latency work) nor
+	// pool deletes can starve it. It runs even when the profiles cannot be
+	// listed.
+	sharedCtx, cancelShared := context.WithTimeout(withSweepBudget(ctx, deadline), deadline)
+	errs := []error{r.sweepShared(sharedCtx, d, profiles.Items, workers, profilesErr == nil), profilesErr}
 	cancelShared()
-	if profilesErr != nil {
-		// Spare replenishment needs the profiles.
-		return errors.Join(boundsErr, sharedErr, profilesErr)
+	if profilesErr == nil {
+		// Spare replenishment needs the profiles, and its own budget.
+		spareCtx, cancelSpare := context.WithTimeout(ctx, deadline)
+		errs = append(errs, r.sweepSpares(spareCtx, d, workers, profiles.Items))
+		cancelSpare()
 	}
-	ctx, cancel := context.WithTimeout(parent, deadline)
-	defer cancel()
+	// The bounds loop (SharedWorkerBounds) enforces lifetime bounds on its
+	// own period. This pass's copy runs last, so its pool deletes never delay
+	// the isolation work above.
+	errs = append(errs, r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config)))
+	return errors.Join(errs...)
+}
+
+// sweepSpares replenishes and collects private spare worker pools.
+func (r *SpareWorkerReplenisher) sweepSpares(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, profiles []profile.SubstrateWorkspaceProfile) error {
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion(workerPoolAPIVersion())
 	pools.SetKind("WorkerPoolList")
 	if err := r.List(ctx, pools, client.HasLabels{spareProfileLabel}); err != nil {
-		return errors.Join(boundsErr, sharedErr, err)
+		return err
 	}
 	byProfile := map[string][]*unstructured.Unstructured{}
 	for i := range pools.Items {
@@ -563,8 +570,8 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 		byProfile[pool.GetLabels()[spareProfileLabel]] = append(byProfile[pool.GetLabels()[spareProfileLabel]], pool)
 	}
 	var errs []error
-	for i := range profiles.Items {
-		item := &profiles.Items[i]
+	for i := range profiles {
+		item := &profiles[i]
 		want := r.wanted(ctx, item)
 		errs = append(errs, r.replenish(ctx, d, workers, item, want, byProfile[string(item.UID)]))
 		delete(byProfile, string(item.UID))
@@ -577,7 +584,6 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 			}
 		}
 	}
-	errs = append(errs, boundsErr, sharedErr)
 	r.mu.Lock()
 	due := time.Since(r.lastOrphan) >= spareOrphanPeriod
 	if due {
