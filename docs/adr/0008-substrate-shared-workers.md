@@ -91,7 +91,8 @@ paired with revocation of everything a leaked sandbox could use.
 
   Any foreign template fails closed: the pool is quarantined and strongly retired, and the admission is refused.
   - The provider keeps the recorded templates in memory. A journal save adds the templates it records, and each leader sweep replaces the set from the journals, archived records and checkpoint catalogs.
-  - A check whose templates are all in that set makes no ConfigMap call. When a template that reaches the pool is missing, the check rereads the records once, with two Lists and no per-catalog Gets, before it treats the template as foreign. A stale set can therefore only cause a reread, never a template counted as recorded that is not.
+  - Each save's entry is stamped. A reread never replaces an entry saved after the reread began, so a reread that listed a journal before its template's UID was written cannot restore the unknown UID over the known one.
+  - A check whose templates are all in that set makes no ConfigMap call. When a template that reaches the pool is missing, or its recorded UID is still unknown, the check rereads the records once, with two Lists and no per-catalog Gets, before it treats the template as foreign. A stale set can therefore only cause a reread, never a template counted as recorded that is not. A recorded name whose UID is still unknown matches a template only on that authoritative reread, never from the in-memory set.
 
   This check runs:
   - before a slot is claimed or a pool is created;
@@ -239,6 +240,7 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - the ledger's birth plus lifetime;
   - the creation-time `substrate.workspace.orka.ai/shared-deadline` annotation, which no ledger update touches;
   - the pool's server-set `metadata.creationTimestamp` plus the shortest lifetime frozen in any journal or archived record that recorded the pool's UID;
+  - for a pool no journal recorded, such as an unused warm pool: that creation time plus the `maxWorkerLifetime` of the profile its ledger scope names. Profiles are immutable and hashed, so the profile in the scope's namespace with the scope's UID applies only if its hash still equals the scope's. A profile that is gone, mismatched, unreadable or no longer opted in gives the 3h minimum instead. Both loops read profiles with one List per namespace;
   - that creation time plus the 24h maximum, an absolute ceiling.
 
   If the journal inventory cannot be listed, provenance is unavailable, and every pool is then bounded by its creation time plus the 3h minimum, never by its annotations.
@@ -254,6 +256,8 @@ Retiring one Actor never touches its neighbours except through this explicit str
   - A name alone is never evidence, so an operator pool named `ate-shared-...` is never touched.
   - A pool with shared evidence but without its intact provider-owned label is doubt and is strongly retired.
 - **Recorded markers.** An unreleased strong marker or failure in any journal that recorded a pool's UID retires the pool, whatever the mutable entry list says.
+  - So does a tainted, quarantined or `Failed` workspace of such an unreleased journal, under the journal's exact workspace UID. Removing an entry from the ledger therefore cannot hide a suspect workspace.
+  - The bounds loop reads those workspaces with one ExecutionWorkspace List per namespace. A namespace whose List fails is reported, and its pools are still checked entry by entry.
 - **Hard retirement.** It is never blocked by a ledger write.
   - Every strong retirement issues the UID-preconditioned Delete first, on its own fresh bounded context. A deletionTimestamp already stops admission and startup.
   - The retirement state and reason are written afterwards, best effort, with a separate 5 s timeout. Neither the result nor the duration of that write can affect the Delete.
