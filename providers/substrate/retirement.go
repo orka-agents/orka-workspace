@@ -395,14 +395,17 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 		}
 		if record.Pending != nil {
 			absent := false
+			var absenceErr error
 			if shared := record.SharedWorker; shared != nil && shared.Strong != "" {
 				// A persisted strong path drives the pool's deletion and the
 				// absence proof to completion whatever the checkpoint does,
-				// including after a crash right after Strong was saved.
-				var err error
-				if absent, err = d.strongSharedAbsence(ctx, record); err != nil {
-					return err
-				}
+				// including after a crash right after Strong was saved. Its
+				// error never stops the capture: the worker Pod may already be
+				// terminating under a bounded grace, so the suspension is
+				// continued and its Tag captured in this same pass, and the
+				// error is returned afterwards so the next pass retries it.
+				absent, absenceErr = d.strongSharedAbsence(ctx, record)
+				absent = absent && absenceErr == nil
 			}
 			err := d.capture(ctx, cm, record)
 			if absent && err != nil && captureUnrecoverable(err) {
@@ -422,14 +425,19 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 				// After the suspension intent is persisted, every error on a
 				// shared worker is doubt: the strong path never waits on the
 				// checkpoint, and the suspend is never replayed.
-				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
+				return errors.Join(err, absenceErr, d.sharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
 			}
 			if err != nil {
-				return err
+				return errors.Join(err, absenceErr)
 			}
 			if record.Pending != nil {
 				observed = record.Observation
-				return nil
+				return absenceErr
+			}
+			if absenceErr != nil {
+				// The data is captured; the strong path's absence proof is
+				// retried next pass before the instance stops.
+				return absenceErr
 			}
 		}
 		if err := d.stop(ctx, cm, record); err != nil {

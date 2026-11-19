@@ -4347,3 +4347,56 @@ func TestSharedRetiredIsLoggedOncePerTransition(t *testing.T) {
 		t.Fatalf("the retirement was logged %d times, want once", count)
 	}
 }
+
+func TestSharedFailingPoolDeleteNeverStopsTheSuspensionContinuation(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// Pod deletes succeed; every WorkerPool delete fails.
+	var podDeletes atomic.Int64
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			switch o := obj.(type) {
+			case *unstructured.Unstructured:
+				if o.GetKind() == "WorkerPool" {
+					return apierrors.NewInternalError(errors.New("pool delete refused"))
+				}
+			case *corev1.Pod:
+				podDeletes.Add(1)
+				// The Pod is terminating under its bounded grace, not gone.
+				return nil
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+	// FinalizeSuspended fails, leaving the Actor SUSPENDING; the strong path
+	// starts.
+	native.failFinalizeOnce = true
+	for range 24 {
+		tick()
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Checkpoint != nil {
+			break
+		}
+		_, _ = sharedDriver(failing, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || podDeletes.Load() == 0 {
+		t.Fatal("the strong path did not delete the worker Pod first")
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("the fixture's pool delete did not fail")
+	}
+	if record.Checkpoint == nil || native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil {
+		t.Fatal("a failing pool delete stopped the suspension continuation from capturing the Tag")
+	}
+	if native.suspendCalls != 2 {
+		t.Fatalf("SuspendActor calls = %d, want the original and one continuation", native.suspendCalls)
+	}
+	if pool, _ := getPool(t, c, recordA.SharedWorker.Pool); !sharedRetireIntended(pool) {
+		t.Fatal("the failed pool delete left no retirement intent to retry")
+	}
+}
