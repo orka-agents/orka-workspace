@@ -1,0 +1,126 @@
+# kagent latency baseline objects, applied after `kagent install` on the
+# kindctl --tag kagent-baseline cluster. No external model or API is used:
+# the ModelConfig points at the in-cluster deterministic mock, and its key is
+# a placeholder.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mock-llm-key
+  namespace: kagent
+stringData:
+  OPENAI_API_KEY: placeholder-not-a-real-key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm
+  namespace: kagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mock-llm}
+  template:
+    metadata:
+      labels: {app: mock-llm}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: mock
+          image: ai.orka.local/kagent-baseline-mock:dev
+          imagePullPolicy: Never
+          env:
+            - {name: MOCK_DELAY, value: 2s}
+          ports: [{containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /healthz, port: 8080}}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-llm
+  namespace: kagent
+spec:
+  selector: {app: mock-llm}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata:
+  name: mock-llm
+  namespace: kagent
+spec:
+  provider: OpenAI
+  model: mock-fixture
+  apiKeySecret: mock-llm-key
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: true
+  openAI:
+    baseUrl: http://mock-llm.kagent.svc.cluster.local:8080/v1
+    apiFormat: chatCompletions
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: lat-baseline
+  namespace: kagent
+spec:
+  harnessRef: {name: kagent-default}
+  template:
+    inline:
+      description: Deterministic latency baseline agent; its model sleeps 2s and returns fixed text.
+      systemPrompt: Reply with the fixed fixture text.
+      modelConfig: {name: mock-llm}
+---
+# Read-only Actor state watcher. ate-client is a bootstrap owner of this
+# dedicated install (kagent install values); its token is projected for the
+# ate-api audience and never printed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: atewatch
+  namespace: ate-system
+  labels: {app: atewatch}
+spec:
+  serviceAccountName: ate-client
+  restartPolicy: Always
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: watch
+      image: ai.orka.local/kagent-baseline-mock:dev
+      imagePullPolicy: Never
+      command: [/atewatch]
+      env:
+        - {name: ATE_API_ENDPOINT, value: "dns:///api.ate-system.svc:443"}
+        - {name: ATE_API_CA_FILE, value: /run/ate-ca/trust-bundle.pem}
+        - {name: ATE_API_TOKEN_FILE, value: /run/ate-token/token}
+        - {name: WATCH_INTERVAL, value: 100ms}
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts:
+        - {name: token, mountPath: /run/ate-token, readOnly: true}
+        - {name: ca, mountPath: /run/ate-ca, readOnly: true}
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken: {audience: api.ate-system.svc, expirationSeconds: 3600, path: token}
+    - name: ca
+      projected:
+        sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector: {matchLabels: {podcert.ate.dev/canarying: live}}
+              path: trust-bundle.pem
+---
+# ate-system denies ingress by default; admit only the watcher above to the
+# ate-api gRPC port. It holds no other access.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: atewatch-to-ate-api
+  namespace: ate-system
+spec:
+  podSelector: {matchLabels: {app: ate-api-server}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app: atewatch}}}]
+      ports: [{port: 443, protocol: TCP}]

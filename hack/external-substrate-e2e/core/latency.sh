@@ -118,6 +118,32 @@ while true; do
 done
 kubectl -n "${client_namespace}" logs "job/${job_name}" >"${run_dir}/latency.log" || true
 grep -E '^native Core' "${run_dir}/latency.log" || true
+# The deterministic agent's session/prompt receipt travels in each Task's
+# result; read them through Core's API from a run-namespace identity that may
+# only read Tasks (Core authenticates it by TokenReview, see install.py).
+results_job="native-core-latency-results-${run_id}"
+jq -n --arg ns "${namespace}" --arg name "${results_job}" --arg image "${client_image}" '
+  {apiVersion:"v1",kind:"List",items:[
+    {apiVersion:"v1",kind:"ServiceAccount",metadata:{name:"native-core-latency-results",namespace:$ns}},
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"Role",metadata:{name:"native-core-latency-results",namespace:$ns},rules:[
+      {apiGroups:["core.orka.ai"],resources:["tasks"],verbs:["get","list"]}]},
+    {apiVersion:"rbac.authorization.k8s.io/v1",kind:"RoleBinding",metadata:{name:"native-core-latency-results",namespace:$ns},
+      roleRef:{apiGroup:"rbac.authorization.k8s.io",kind:"Role",name:"native-core-latency-results"},
+      subjects:[{kind:"ServiceAccount",name:"native-core-latency-results",namespace:$ns}]},
+    {apiVersion:"batch/v1",kind:"Job",metadata:{name:$name,namespace:$ns,labels:{"orka.workspace.e2e/latency":"native-core-results"}},spec:{
+      backoffLimit:0,activeDeadlineSeconds:600,template:{metadata:{labels:{"orka.workspace.e2e/latency":"native-core-results"}},spec:{
+        serviceAccountName:"native-core-latency-results",restartPolicy:"Never",
+        securityContext:{runAsNonRoot:true,runAsUser:65532,runAsGroup:65532,seccompProfile:{type:"RuntimeDefault"}},
+        containers:[{name:"results",image:$image,imagePullPolicy:"IfNotPresent",
+          securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},
+          env:[{name:"RESULT_FETCH",value:"1"},{name:"POD_NAMESPACE",value:$ns},
+            {name:"CORE_API_URL",value:("http://external-substrate-core." + $ns + ".svc.cluster.local:8080")}]}]}}}}]}' |
+  kubectl apply -f - >/dev/null
+if kubectl -n "${namespace}" wait --for=condition=complete "job/${results_job}" --timeout=300s >/dev/null; then
+  kubectl -n "${namespace}" logs "job/${results_job}" | grep -E '^TASK_PROMPT_RECEIVED' >"${run_dir}/prompt-receipts.log" || true
+else
+  printf 'The prompt receipt Job did not complete; agent receipt times are unavailable.\n' >&2
+fi
 touch "${run_dir}/.done"
 sleep 2
 # Timing lines only; everything else stays in the cluster.

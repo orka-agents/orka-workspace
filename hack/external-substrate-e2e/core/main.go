@@ -660,7 +660,7 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 }
 
 func main() {
-	if os.Getenv("SESSION_CLEANUP") == "1" {
+	if os.Getenv("SESSION_CLEANUP") == "1" || os.Getenv("RESULT_FETCH") == "1" {
 		// Runs as a run-namespace identity without native credentials.
 		sessionCleanupMain()
 		return
@@ -737,7 +737,11 @@ func sessionCleanupMain() {
 		if c, err = client.New(config, client.Options{}); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			report, err = cleanupSessions(ctx, c, namespace, endpoint)
+			if os.Getenv("RESULT_FETCH") == "1" {
+				report, err = fetchPromptReceipts(ctx, c, namespace, endpoint)
+			} else {
+				report, err = cleanupSessions(ctx, c, namespace, endpoint)
+			}
 		}
 	}
 	if err != nil {

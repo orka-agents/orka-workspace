@@ -64,6 +64,12 @@ core = lines(run / 'core-timings.log')
 provider = lines(run / 'provider-timings.log')
 supervisor = [entry for path in sorted((run / 'workers').glob('*.log')) for entry in lines(path)]
 pods = {entry['pod']: entry for entry in lines(run / 'workers' / 'pods.jsonl') if entry.get('pod')}
+receipts = {}
+if (run / 'prompt-receipts.log').exists():
+    for line in (run / 'prompt-receipts.log').read_text().splitlines():
+        if line.startswith('TASK_PROMPT_RECEIVED '):
+            entry = json.loads(line[len('TASK_PROMPT_RECEIVED '):])
+            receipts[entry['task']] = entry['promptReceivedAt']
 
 
 def when(text):
@@ -141,6 +147,9 @@ def turn_sample(event):
     # Client-observed first sighting of the pre-dispatch execution states.
     for state in ('Queued', 'Reserved', 'SessionStarting', 'Submitting'):
         sample['clientState.%sMs' % state] = task['statesFirstSeenMs'].get('state:' + state)
+    if task['name'] in receipts and when(receipts[task['name']]) and when(task.get('createdAt')):
+        # The deterministic agent's own session/prompt receipt, from Task creation.
+        sample['clientAgentPromptReceivedMs'] = int((when(receipts[task['name']]) - when(task['createdAt'])) * 1000)
     for key, value in (task.get('attach') or {}).items():
         sample['clientAttach.' + key] = value
     predispatch = find(core, 'ACP pre-dispatch timings', task=task['name'])
