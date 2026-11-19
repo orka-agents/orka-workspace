@@ -529,18 +529,26 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	parent := ctx
 	listCtx, cancelList := context.WithTimeout(parent, deadline)
 	profiles := &profile.SubstrateWorkspaceProfileList{}
-	err := r.List(listCtx, profiles)
+	started := sharedNow()
+	profilesErr := r.List(listCtx, profiles)
 	cancelList()
-	if err != nil {
-		return errors.Join(boundsErr, err)
+	if profilesErr != nil {
+		sharedProfileInventoryHealth.failed(started)
+	} else {
+		sharedProfileInventoryHealth.succeeded(started)
 	}
 	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
 	// Shared isolation work (foreign templates, hosted suspicion, outage
 	// retirement) comes first, on its own deadline, so private spare
-	// maintenance, which is only latency work, can never starve it.
+	// maintenance, which is only latency work, can never starve it. It runs
+	// even when the profiles cannot be listed.
 	sharedCtx, cancelShared := context.WithTimeout(parent, deadline)
-	sharedErr := r.sweepShared(sharedCtx, d, profiles.Items, workers)
+	sharedErr := r.sweepShared(sharedCtx, d, profiles.Items, workers, profilesErr == nil)
 	cancelShared()
+	if profilesErr != nil {
+		// Spare replenishment needs the profiles.
+		return errors.Join(boundsErr, sharedErr, profilesErr)
+	}
 	ctx, cancel := context.WithTimeout(parent, deadline)
 	defer cancel()
 	pools := &unstructured.UnstructuredList{}

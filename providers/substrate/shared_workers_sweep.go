@@ -47,6 +47,7 @@ type sharedProfileShape struct {
 // re-deleted with a one-second grace.
 func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lifecycle) error {
 	d = d.withSharedPass()
+	defer d.flushOutageMarks(ctx)
 	// Escalations due by the latest bound any provenance could give go out
 	// first, while discovery runs alongside under its own deadline.
 	discovered := make(chan sharedDiscovery, 1)
@@ -120,6 +121,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			retire(sharedRetiring, errSharedWorkersNotDedicated.Error())
 		case !evidence:
 			retire(sharedRetiring, "the shared worker's lifetime evidence is unreadable or inconsistent")
+		case r.Config.DedicatedInstall && d.nativeDegradedPast(ctx, pool):
+			// Native control could not be set up at startup, so no native
+			// sweep verifies the pool's templates or assignments.
+			retire(sharedRetiring, "native control has been unavailable to this provider since startup, past its bound: "+NativeDegradedReason())
 		case recorded.strong:
 			// A journal that recorded this pool's UID holds an unreleased
 			// strong marker or failure, whatever the mutable entry list now
@@ -587,6 +592,11 @@ var sharedProvenanceHealth = &provenanceHealth{}
 // outage of this inventory that never ends.
 var sharedTemplateInventoryHealth = &provenanceHealth{}
 
+// sharedProfileInventoryHealth tracks the sweep's profile List by the same
+// outage rule. While it fails, shared admission is closed; the sweep still
+// runs every shared-pool safety check without profiles.
+var sharedProfileInventoryHealth = &provenanceHealth{}
+
 // sharedNativeTemplateHealth tracks the native ActorTemplate inventory
 // (listAllActorTemplates) with the same rule and bound. Only a complete,
 // successful inventory refreshes it.
@@ -645,10 +655,13 @@ func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.U
 	return ""
 }
 
-// recordOutageSince returns an outage's start for the pool, the earlier of
-// this process's start and the pool's annotation key, writing the annotation
-// (best effort, on its own short context) when it is missing.
-func (d *Lifecycle) recordOutageSince(ctx context.Context, pool *unstructured.Unstructured, key string, start time.Time) time.Time {
+// recordOutageSince returns an outage's start for the pool: the earlier of
+// this process's start and the pool's durable annotation key. It never
+// writes: a missing annotation is queued on the pass and written after the
+// pass's safety actions (flushOutageMarks), so a stalled write can never hold
+// up a quarantine or retirement. Durability may lag by a pass; the in-process
+// age applies meanwhile.
+func (d *Lifecycle) recordOutageSince(_ context.Context, pool *unstructured.Unstructured, key string, start time.Time) time.Time {
 	if raw, ok := pool.GetAnnotations()[key]; ok {
 		if recorded, err := time.Parse(time.RFC3339Nano, raw); err == nil {
 			if start.IsZero() || recorded.Before(start) {
@@ -657,41 +670,120 @@ func (d *Lifecycle) recordOutageSince(ctx context.Context, pool *unstructured.Un
 			return start
 		}
 	}
-	if start.IsZero() {
-		return start
-	}
-	marked := pool.DeepCopy()
-	annotations := maps.Clone(marked.GetAnnotations())
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations[key] = start.UTC().Format(time.RFC3339Nano)
-	marked.SetAnnotations(annotations)
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
-	defer cancel()
-	if err := d.client.Update(writeCtx, marked); err == nil {
-		pool.SetAnnotations(annotations)
-		pool.SetResourceVersion(marked.GetResourceVersion())
+	if !start.IsZero() {
+		d.sharedPass.queueOutageMark(pool, key, start.UTC().Format(time.RFC3339Nano))
 	}
 	return start
 }
 
-// clearOutageMark removes the pool's outage annotation key after the
-// success that covers it, best effort.
-func (d *Lifecycle) clearOutageMark(ctx context.Context, pool *unstructured.Unstructured, key string) {
-	if _, ok := pool.GetAnnotations()[key]; !ok {
+// clearOutageMark queues the removal of the pool's outage annotation key
+// after the success that covers it.
+func (d *Lifecycle) clearOutageMark(_ context.Context, pool *unstructured.Unstructured, key string) {
+	if _, ok := pool.GetAnnotations()[key]; ok {
+		d.sharedPass.queueOutageMark(pool, key, "")
+	}
+}
+
+// outageMark is one queued durable outage annotation change: a value to set
+// when missing, or "" to remove.
+type outageMark struct {
+	namespace, name string
+	uid             types.UID
+	key, value      string
+}
+
+func (p *sharedPassReads) queueOutageMark(pool *unstructured.Unstructured, key, value string) {
+	if p == nil {
 		return
 	}
-	cleared := pool.DeepCopy()
-	annotations := maps.Clone(cleared.GetAnnotations())
-	delete(annotations, key)
-	cleared.SetAnnotations(annotations)
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
-	defer cancel()
-	if err := d.client.Update(writeCtx, cleared); err == nil {
-		pool.SetAnnotations(annotations)
-		pool.SetResourceVersion(cleared.GetResourceVersion())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.marks = append(p.marks, outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: key, value: value})
+}
+
+// sharedOutageMarkConcurrency and sharedOutageMarkBudget bound one pass's
+// durable outage annotation writes.
+const sharedOutageMarkConcurrency = 8
+
+var sharedOutageMarkBudget = 30 * time.Second
+
+// flushOutageMarks writes the pass's queued outage annotations, best effort:
+// concurrently and capped, within its own overall budget detached from the
+// pass's deadline, each pool read fresh and written only if it still has the
+// same UID. It runs after the pass's safety actions.
+func (d *Lifecycle) flushOutageMarks(ctx context.Context) {
+	p := d.sharedPass
+	if p == nil {
+		return
 	}
+	p.mu.Lock()
+	byPool := map[types.UID][]outageMark{}
+	var order []types.UID
+	for _, mark := range p.marks {
+		if _, seen := byPool[mark.uid]; !seen {
+			order = append(order, mark.uid)
+		}
+		byPool[mark.uid] = append(byPool[mark.uid], mark)
+	}
+	p.marks = nil
+	p.mu.Unlock()
+	if len(order) == 0 {
+		return
+	}
+	budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedOutageMarkBudget)
+	defer cancel()
+	work := make(chan []outageMark)
+	var group sync.WaitGroup
+	for range min(sharedOutageMarkConcurrency, len(order)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for marks := range work {
+				d.writeOutageMarks(budget, marks)
+			}
+		}()
+	}
+feed:
+	for _, uid := range order {
+		select {
+		case work <- byPool[uid]:
+		case <-budget.Done():
+			break feed
+		}
+	}
+	close(work)
+	group.Wait()
+}
+
+// writeOutageMarks applies one pool's queued outage annotation changes.
+func (d *Lifecycle) writeOutageMarks(ctx context.Context, marks []outageMark) {
+	writeCtx, cancel := context.WithTimeout(ctx, sharedLedgerWriteTimeout)
+	defer cancel()
+	current := poolObject()
+	if err := d.client.Get(writeCtx, types.NamespacedName{Namespace: marks[0].namespace, Name: marks[0].name}, current); err != nil || current.GetUID() != marks[0].uid || current.GetDeletionTimestamp() != nil {
+		return
+	}
+	annotations := maps.Clone(current.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	changed := false
+	for _, mark := range marks {
+		_, present := annotations[mark.key]
+		switch {
+		case mark.value == "" && present:
+			delete(annotations, mark.key)
+			changed = true
+		case mark.value != "" && !present:
+			annotations[mark.key] = mark.value
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	current.SetAnnotations(annotations)
+	_ = d.client.Update(writeCtx, current)
 }
 
 // sharedNativeProbeTimeout bounds the reachability probe that gates
@@ -824,6 +916,46 @@ func (d *Lifecycle) assignmentChecksSucceeded(ctx context.Context, pool *unstruc
 	d.clearOutageMark(ctx, pool, sharedAssignmentRejectedAnnotation)
 }
 
+// nativeDegradation records that native control could not be set up when
+// this process started, and why.
+type nativeDegradation struct {
+	since  time.Time
+	reason string
+}
+
+var sharedNativeDegraded atomic.Pointer[nativeDegradation]
+
+// SetNativeDegraded records that native control could not be set up at
+// startup (an invalid configuration, or a dial that failed). The native sweep
+// then never runs, so the Kubernetes-only bounds loop enforces the native
+// outage bound on existing shared pools itself. Such a failure is always this
+// provider's own local misconfiguration (unreadable or invalid TLS material,
+// token or endpoint), since the dial does not connect, so it takes the
+// credential bound of 60 s, not the control-plane-down grace.
+func SetNativeDegraded(reason string) {
+	sharedNativeDegraded.Store(&nativeDegradation{since: sharedNow(), reason: reason})
+}
+
+// NativeDegradedReason returns why native control was unavailable at
+// startup, or "".
+func NativeDegradedReason() string {
+	if degraded := sharedNativeDegraded.Load(); degraded != nil {
+		return degraded.reason
+	}
+	return ""
+}
+
+// nativeDegradedPast reports a degraded start that has lasted past the
+// outage bound for the pool, durably stamping its start on the pool.
+func (d *Lifecycle) nativeDegradedPast(ctx context.Context, pool *unstructured.Unstructured) bool {
+	degraded := sharedNativeDegraded.Load()
+	if degraded == nil {
+		return false
+	}
+	start := d.recordOutageSince(ctx, pool, sharedNativeOutageAnnotation, degraded.since)
+	return !sharedNow().Before(start.Add(sharedProvenanceOutageBound))
+}
+
 // NativeCredentialsRejected returns why the native control plane rejects the
 // provider's own credentials, or "" when it does not.
 func NativeCredentialsRejected() string {
@@ -884,6 +1016,13 @@ func (h *provenanceHealth) fresh(now time.Time) bool {
 	return h.failingSince.IsZero() && !h.verifiedAt.IsZero() && now.Sub(h.verifiedAt) < sharedProvenanceFreshness
 }
 
+// failing reports a failure not yet cleared by a later success.
+func (h *provenanceHealth) failing() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.failingSince.IsZero()
+}
+
 // since returns when the current outage began, or the zero time.
 func (h *provenanceHealth) since() time.Time {
 	h.mu.Lock()
@@ -910,6 +1049,9 @@ func (h *provenanceHealth) reset() {
 // rests on its mutable annotations alone, so admission fails closed; the pool
 // is not retired for that until the outage bound passes.
 func (d *Lifecycle) requireSharedProvenance(ctx context.Context) error {
+	if sharedProfileInventoryHealth.failing() {
+		return errors.New("shared worker profiles cannot be listed, so shared admission is closed")
+	}
 	if sharedProvenanceHealth.fresh(sharedNow()) {
 		return nil
 	}
@@ -1253,9 +1395,15 @@ func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructur
 // permits it, collects orphaned entries and idle pools, and keeps each
 // profile's requested warm slots. With no opted-in profile and no shared pool
 // it makes no native call.
-func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache) error {
+//
+// When the profiles could not be listed (profilesKnown false), every safety
+// check still runs; only the work that needs profile shapes (closing on a
+// changed scope, collection, ledger writes and warm creation) is skipped.
+func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache, profilesKnown bool) error {
 	// One snapshot of journals and workspaces is shared by every pool.
 	d = d.withSharedPass()
+	// Durable outage stamps are written after every safety action.
+	defer d.flushOutageMarks(ctx)
 	discovered, err := listSharedPools(ctx, r.Client, nil)
 	if err != nil {
 		return err
@@ -1334,7 +1482,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 				continue
 			}
 		}
-		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr))
+		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr, profilesKnown))
 	}
 	if err := errors.Join(templatesErr, inventoryErr); err != nil {
 		// Without a verified template inventory nothing new is created.
@@ -1426,7 +1574,7 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 }
 
 //nolint:gocyclo // Every pool-wide rule is evaluated in one pass, in priority order.
-func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) error {
+func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, pool *unstructured.Unstructured, shapes map[string]*sharedProfileShape, free map[string]int, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error, profilesKnown bool) error {
 	if pool.GetDeletionTimestamp() != nil {
 		return nil
 	}
@@ -1535,6 +1683,11 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 		// Neighbours are suspended through Orka core's eviction drain of the
 		// terminating worker; the suspect Actor retires through the strong path.
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "a hosted workspace is tainted, quarantined or failed")
+	}
+	if !profilesKnown {
+		// Every safety check ran; closing, collection and ledger writes
+		// need the profiles' shapes.
+		return nil
 	}
 	if closing == "" && (templatesErr != nil || unclassified) {
 		closing = "the install's ActorTemplates could not be verified"
@@ -1832,6 +1985,8 @@ type sharedPassReads struct {
 	// listed marks a namespace whose List succeeded, failed one whose List
 	// failed this pass (its lookups then use live Gets, never a re-List).
 	listed, failed map[string]bool
+	// marks are the pass's queued durable outage annotation changes.
+	marks []outageMark
 }
 
 func newSharedPassReads() *sharedPassReads {

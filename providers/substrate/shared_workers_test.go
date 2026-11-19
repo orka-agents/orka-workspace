@@ -72,8 +72,12 @@ func useTestClock(t *testing.T) {
 	sharedNativeTemplateHealth.reset()
 	sharedNativeCredentials.Store(nil)
 	sharedAssignmentRejections.reset()
+	sharedNativeDegraded.Store(nil)
+	sharedProfileInventoryHealth.reset()
 	t.Cleanup(func() {
 		sharedAssignmentRejections.reset()
+		sharedNativeDegraded.Store(nil)
+		sharedProfileInventoryHealth.reset()
 		sharedNativeTemplateHealth.reset()
 		sharedNativeCredentials.Store(nil)
 		sharedNow = previous
@@ -4948,5 +4952,111 @@ func TestSharedOnePoolsRejectedAssignmentsAreNotResetByOtherPools(t *testing.T) 
 	}
 	if _, found := getPool(t, c, recordC.SharedWorker.Pool); !found {
 		t.Fatal("a healthy pool was retired with the rejected one")
+	}
+}
+
+func TestSharedDegradedStartRetiresExistingPoolsAtTheBound(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	// The provider starts with native control unavailable: no native sweep
+	// runs; only the bounds loop does.
+	start := sharedNow()
+	SetNativeDegraded("native control could not be reached: cannot read native control CA file")
+	bounds := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
+	_ = bounds.EnforceSharedBounds(t.Context())
+	pool, found := getPool(t, c, record.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("a degraded start retired the pool before its bound")
+	}
+	if pool.GetAnnotations()[sharedNativeOutageAnnotation] == "" {
+		t.Fatal("a degraded start did not stamp the outage durably")
+	}
+	// The provider restarts, still degraded, 50 s later: the stamp keeps the
+	// original start.
+	setNow(t, start.Add(50*time.Second))
+	SetNativeDegraded("native control could not be reached: cannot read native control CA file")
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+		t.Fatal("a restarted degraded start retired the pool before its bound")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a degraded start did not retire the existing shared pool at its bound")
+	}
+}
+
+func TestSharedProfileListFailureStillQuarantinesForeignTemplates(t *testing.T) {
+	c, native, record, _ := sharedTemplateFixture(t)
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*profile.SubstrateWorkspaceProfileList); ok {
+				return apierrors.NewServiceUnavailable("profiles unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	_ = sharedReplenisher(failing, native).Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("a failing profile List kept the foreign-template quarantine from running")
+	}
+	if err := sharedDriver(c, native).requireSharedProvenance(t.Context()); err == nil {
+		t.Fatal("admission stayed open while the profiles could not be listed")
+	}
+}
+
+func TestSharedStalledOutageStampsNeverDelayAQuarantine(t *testing.T) {
+	previous := sharedOutageMarkBudget
+	sharedOutageMarkBudget = time.Second
+	t.Cleanup(func() { sharedOutageMarkBudget = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	names := manySharedPools(t, c, native, first, binding, 8)
+	slices.Sort(names)
+	// The last pool by name is reached by a foreign template; every pool's
+	// assignment reads are rejected, so earlier pools queue outage stamps.
+	journals := &corev1.ConfigMapList{}
+	if err := c.List(t.Context(), journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
+		t.Fatal(err)
+	}
+	var target *journalRecord
+	for i := range journals.Items {
+		if record, ok := decodeClaimRecord(&journals.Items[i]); ok && record.SharedWorker != nil && record.SharedWorker.Pool == names[len(names)-1] && record.Template.Name != "" {
+			target = record
+		}
+	}
+	if target == nil {
+		t.Fatal("no record holds the last pool")
+	}
+	native.templates[refKey(&pb.ObjectRef{Atespace: target.Atespace, Name: target.Template.Name})].Metadata.Uid = "foreign-template-uid"
+	native.assignmentsRejected = true
+	// Every outage stamp write stalls.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GetAnnotations()[sharedAssignmentRejectedAnnotation] != "" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+	}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sharedReplenisher(stalling, native).Sweep(t.Context())
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, found := getPool(t, c, target.SharedWorker.Pool); !found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stalled outage stamp writes delayed the quarantine of a foreign-reachable pool")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stamp writes outlasted their budget")
 	}
 }

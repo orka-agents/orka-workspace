@@ -132,6 +132,10 @@ func nativeControl(config provider.Config) (native pb.ControlClient, unavailable
 func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, nativeUnavailable string) []func(ctrl.Manager) error {
 	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config, NativeUnavailable: nativeUnavailable}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
+		// No native sweep runs, and no lifecycle controller admits anything;
+		// the bounds loop retires existing shared pools past the outage
+		// bound.
+		provider.SetNativeDegraded(nativeUnavailable)
 		return setups
 	}
 	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
