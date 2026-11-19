@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"reflect"
+	"syscall"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -848,9 +852,16 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 
 // captureUnrecoverable reports a capture error that retrying cannot change:
 // one raised by this provider's own evidence checks. Native RPC status
-// errors, Kubernetes API errors and context errors may be transient.
+// errors, Kubernetes API errors, transport errors (a Kubernetes client's
+// refused or reset connection, a TLS or network timeout, an unexpected EOF)
+// and context errors may be transient.
 func captureUnrecoverable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	var netErr net.Error
+	var urlErr *url.Error
+	if errors.As(err, &netErr) || errors.As(err, &urlErr) {
 		return false
 	}
 	if _, ok := status.FromError(err); ok {

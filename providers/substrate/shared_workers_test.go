@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,6 +26,8 @@ import (
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -5466,5 +5472,26 @@ func TestSharedFailedNamespaceInventoryIsListedOncePerPass(t *testing.T) {
 		if !found || !sharedPoolUnverified(pool) {
 			t.Fatalf("pool %s was not marked unverified", name)
 		}
+	}
+}
+
+func TestCaptureTreatsKubernetesTransportErrorsAsRecoverable(t *testing.T) {
+	refused := &url.Error{Op: "Get", URL: "https://kubernetes.default.svc/api/v1/namespaces/tenant/configmaps/journal", Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}}
+	timeout := &url.Error{Op: "Get", URL: "https://kubernetes.default.svc", Err: errors.New("net/http: TLS handshake timeout")}
+	for name, err := range map[string]error{
+		"connection refused":    fmt.Errorf("reading the journal: %w", refused),
+		"tls handshake timeout": timeout,
+		"connection reset":      fmt.Errorf("listing: %w", syscall.ECONNRESET),
+		"unexpected eof":        fmt.Errorf("decoding: %w", io.ErrUnexpectedEOF),
+		"kubernetes api":        apierrors.NewServiceUnavailable("etcd timeout"),
+		"native rpc":            status.Error(codes.Internal, "postgres timeout"),
+		"context":               context.DeadlineExceeded,
+	} {
+		if captureUnrecoverable(err) {
+			t.Errorf("%s was treated as final; a transient error must never mark an instance lost", name)
+		}
+	}
+	if !captureUnrecoverable(errors.New("the suspension exposed no new completed data-only snapshot")) {
+		t.Error("the provider's own evidence failure was treated as transient")
 	}
 }
