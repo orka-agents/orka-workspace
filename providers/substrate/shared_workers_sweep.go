@@ -592,6 +592,108 @@ var sharedTemplateInventoryHealth = &provenanceHealth{}
 // successful inventory refreshes it.
 var sharedNativeTemplateHealth = &provenanceHealth{}
 
+// sharedNativeOutageAnnotation durably records, on each shared pool, when
+// the provider first saw the native ActorTemplate inventory fail, so a
+// restarting provider cannot reset the outage clock. It is cleared by the
+// next successful inventory.
+const sharedNativeOutageAnnotation = "substrate.workspace.orka.ai/native-outage-since"
+
+// sharedControlPlaneDownGrace is the total outage after which a native
+// ActorTemplate inventory outage retires shared pools even while the control
+// plane looks down from the provider. A provider-side transport failure does
+// not prove other clients cannot place, so the exception covers short
+// outages only.
+const sharedControlPlaneDownGrace = 5 * time.Minute
+
+// nativeTemplateOutage decides, per pool, the strong retirement a native
+// ActorTemplate inventory outage requires. Its age runs from the earlier of
+// this process's first failure and the pool's durable outage annotation.
+// Past the outage bound the pool is retired, unless the control plane looks
+// down from the provider through a transport or availability failure; that
+// defers retirement only until the outage reaches
+// sharedControlPlaneDownGrace. A rejection of the provider's own credentials
+// never defers it.
+type nativeTemplateOutage struct {
+	d       *Lifecycle
+	failing bool
+	probed  bool
+	down    bool
+}
+
+func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.Unstructured) string {
+	if !o.failing {
+		o.d.clearOutageMark(ctx, pool, sharedNativeOutageAnnotation)
+		return ""
+	}
+	start := o.d.recordOutageSince(ctx, pool, sharedNativeOutageAnnotation, sharedNativeTemplateHealth.since())
+	elapsed := sharedNow().Sub(start)
+	if start.IsZero() || elapsed < sharedProvenanceOutageBound {
+		return ""
+	}
+	if !o.probed {
+		o.down, o.probed = o.d.nativeControlDown(ctx), true
+	}
+	switch {
+	case !o.down:
+		if rejected := NativeCredentialsRejected(); rejected != "" {
+			return "the native ActorTemplate inventory stayed unavailable past its bound: " + rejected
+		}
+		return "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"
+	case elapsed >= sharedControlPlaneDownGrace:
+		return "the native ActorTemplate inventory stayed unavailable past the control-plane-down grace; a provider-side outage does not prove other clients cannot place"
+	}
+	return ""
+}
+
+// recordOutageSince returns an outage's start for the pool, the earlier of
+// this process's start and the pool's annotation key, writing the annotation
+// (best effort, on its own short context) when it is missing.
+func (d *Lifecycle) recordOutageSince(ctx context.Context, pool *unstructured.Unstructured, key string, start time.Time) time.Time {
+	if raw, ok := pool.GetAnnotations()[key]; ok {
+		if recorded, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			if start.IsZero() || recorded.Before(start) {
+				start = recorded
+			}
+			return start
+		}
+	}
+	if start.IsZero() {
+		return start
+	}
+	marked := pool.DeepCopy()
+	annotations := maps.Clone(marked.GetAnnotations())
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[key] = start.UTC().Format(time.RFC3339Nano)
+	marked.SetAnnotations(annotations)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	defer cancel()
+	if err := d.client.Update(writeCtx, marked); err == nil {
+		pool.SetAnnotations(annotations)
+		pool.SetResourceVersion(marked.GetResourceVersion())
+	}
+	return start
+}
+
+// clearOutageMark removes the pool's outage annotation key after the
+// success that covers it, best effort.
+func (d *Lifecycle) clearOutageMark(ctx context.Context, pool *unstructured.Unstructured, key string) {
+	if _, ok := pool.GetAnnotations()[key]; !ok {
+		return
+	}
+	cleared := pool.DeepCopy()
+	annotations := maps.Clone(cleared.GetAnnotations())
+	delete(annotations, key)
+	cleared.SetAnnotations(annotations)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
+	defer cancel()
+	if err := d.client.Update(writeCtx, cleared); err == nil {
+		pool.SetAnnotations(annotations)
+		pool.SetResourceVersion(cleared.GetResourceVersion())
+	}
+}
+
 // sharedNativeProbeTimeout bounds the reachability probe that gates
 // retirement for a native template inventory outage.
 const sharedNativeProbeTimeout = 10 * time.Second
@@ -658,26 +760,68 @@ func noteNativeCredentials(ctx context.Context, err error) {
 	}
 }
 
-// sharedNativeAssignmentHealth tracks the sweep's native worker and
-// assignment reads by the same outage rule. It is separate from the
-// template inventory's, so a template List that keeps succeeding cannot clear
-// a rejection that only affects assignments.
-var sharedNativeAssignmentHealth = &provenanceHealth{}
+// sharedAssignmentRejectedAnnotation durably records, on a pool, when its
+// native worker or assignment checks were first rejected for the provider's
+// own credentials, so a restarting provider cannot reset that clock.
+const sharedAssignmentRejectedAnnotation = "substrate.workspace.orka.ai/assignments-rejected-since"
+
+// poolRejections tracks, per pool UID and in process, when each pool's
+// assignment checks were first rejected. A pool's entry is cleared only by
+// that pool's own complete, successful checks, so another pool's success,
+// or a pool with no worker to read, never resets it.
+type poolRejections struct {
+	mu    sync.Mutex
+	since map[types.UID]time.Time
+}
+
+var sharedAssignmentRejections = &poolRejections{}
+
+func (p *poolRejections) failed(uid types.UID, now time.Time) time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.since == nil {
+		p.since = map[types.UID]time.Time{}
+	}
+	if start, ok := p.since[uid]; ok {
+		return start
+	}
+	p.since[uid] = now
+	return now
+}
+
+func (p *poolRejections) succeeded(uid types.UID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.since, uid)
+}
+
+func (p *poolRejections) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.since = nil
+}
 
 // assignmentReadFailed handles a failed native worker or assignment read in
 // a pool's maintenance. A rejection of the provider's own credentials that
-// has lasted past the outage bound fails closed: the pool's assignments
-// cannot be checked while other clients may still place, so it is strongly
-// retired. Any other failure is returned for the next pass.
+// has lasted past the outage bound for this pool fails closed: its
+// assignments cannot be checked while other clients may still place, so it
+// is strongly retired. Any other failure is returned for the next pass.
 func (d *Lifecycle) assignmentReadFailed(ctx context.Context, pool *unstructured.Unstructured, hostedErr, err error) error {
 	noteNativeCredentials(ctx, err)
 	if nativeCredentialsRejected(err) {
-		sharedNativeAssignmentHealth.failed(sharedNow())
-		if sharedNativeAssignmentHealth.outlasted(sharedNow()) {
+		start := d.recordOutageSince(ctx, pool, sharedAssignmentRejectedAnnotation, sharedAssignmentRejections.failed(pool.GetUID(), sharedNow()))
+		if !sharedNow().Before(start.Add(sharedProvenanceOutageBound)) {
 			return errors.Join(err, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker's assignments cannot be checked: "+NativeCredentialsRejected()+", past its bound"))
 		}
 	}
 	return errors.Join(hostedErr, err)
+}
+
+// assignmentChecksSucceeded clears a pool's rejection record after all of
+// its own assignment checks succeeded.
+func (d *Lifecycle) assignmentChecksSucceeded(ctx context.Context, pool *unstructured.Unstructured) {
+	sharedAssignmentRejections.succeeded(pool.GetUID())
+	d.clearOutageMark(ctx, pool, sharedAssignmentRejectedAnnotation)
 }
 
 // NativeCredentialsRejected returns why the native control plane rejects the
@@ -738,6 +882,13 @@ func (h *provenanceHealth) fresh(now time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.failingSince.IsZero() && !h.verifiedAt.IsZero() && now.Sub(h.verifiedAt) < sharedProvenanceFreshness
+}
+
+// since returns when the current outage began, or the zero time.
+func (h *provenanceHealth) since() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failingSince
 }
 
 // outlasted reports reads failing for at least the outage bound.
@@ -1164,7 +1315,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// selectors unchecked: every shared pool is then strongly retired. The
 	// probe runs on its own context, so the sweep's deadline cannot postpone
 	// it.
-	nativeOutage := templatesErr != nil && sharedNativeTemplateHealth.outlasted(sharedNow()) && !d.nativeControlDown(ctx)
+	outage := &nativeTemplateOutage{d: d, failing: templatesErr != nil}
 	free := map[string]int{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
@@ -1177,13 +1328,11 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		}
 	}
 	for i := range pools.Items {
-		if pool := &pools.Items[i]; nativeOutage && pool.GetDeletionTimestamp() == nil {
-			reason := "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"
-			if rejected := NativeCredentialsRejected(); rejected != "" {
-				reason = "the native ActorTemplate inventory stayed unavailable past its bound: " + rejected
+		if pool := &pools.Items[i]; pool.GetDeletionTimestamp() == nil {
+			if reason := outage.retires(ctx, pool); reason != "" {
+				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
+				continue
 			}
-			errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
-			continue
 		}
 		errs = append(errs, r.maintainSharedPool(ctx, d, workers, &pools.Items[i], shapes, free, now, templates, ours, templatesErr, inventoryErr))
 	}
@@ -1377,9 +1526,11 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	if err != nil {
 		return d.assignmentReadFailed(ctx, pool, nil, err)
 	}
-	// Every check this tracker covers succeeded; only now is a rejection
-	// cleared, so a later check that keeps being rejected cannot reset it.
-	sharedNativeAssignmentHealth.succeeded(sharedNow())
+	// Every check the pool's rejection record covers succeeded; only now is
+	// it cleared, so a later check that keeps being rejected cannot reset it.
+	if len(poolWorkers) > 0 {
+		d.assignmentChecksSucceeded(ctx, pool)
+	}
 	if hostedSuspect {
 		// Neighbours are suspended through Orka core's eviction drain of the
 		// terminating worker; the suspect Actor retires through the strong path.

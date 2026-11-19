@@ -71,9 +71,9 @@ func useTestClock(t *testing.T) {
 	sharedTemplateInventoryHealth.reset()
 	sharedNativeTemplateHealth.reset()
 	sharedNativeCredentials.Store(nil)
-	sharedNativeAssignmentHealth.reset()
+	sharedAssignmentRejections.reset()
 	t.Cleanup(func() {
-		sharedNativeAssignmentHealth.reset()
+		sharedAssignmentRejections.reset()
 		sharedNativeTemplateHealth.reset()
 		sharedNativeCredentials.Store(nil)
 		sharedNow = previous
@@ -4707,14 +4707,15 @@ func TestSharedForeignTemplateOutsideTheAtespaceIsQuarantinedWithoutTheInventory
 
 func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		break_  func(*nativeFixture)
-		retired bool
+		name   string
+		break_ func(*nativeFixture)
+		// bound is when the pool must be retired, and not before.
+		bound time.Duration
 	}{
-		{name: "template listing fails while the control plane places", break_: func(f *nativeFixture) { f.failTemplateList = true }, retired: true},
-		{name: "template listing stalls past the sweep deadline", break_: func(f *nativeFixture) { f.blockTemplateList = true }, retired: true},
-		{name: "the whole control plane is down", break_: func(f *nativeFixture) { f.nativeDown = true }, retired: false},
-		{name: "the provider's own credentials are rejected", break_: func(f *nativeFixture) { f.credentialsRejected = true }, retired: true},
+		{name: "template listing fails while the control plane places", break_: func(f *nativeFixture) { f.failTemplateList = true }, bound: sharedProvenanceOutageBound},
+		{name: "template listing stalls past the sweep deadline", break_: func(f *nativeFixture) { f.blockTemplateList = true }, bound: sharedProvenanceOutageBound},
+		{name: "the provider's own credentials are rejected", break_: func(f *nativeFixture) { f.credentialsRejected = true }, bound: sharedProvenanceOutageBound},
+		{name: "the control plane looks down from the provider", break_: func(f *nativeFixture) { f.nativeDown = true }, bound: sharedControlPlaneDownGrace},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 2)
@@ -4730,20 +4731,75 @@ func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
 				t.Fatal("admission stayed open without a native template inventory")
 			}
 			start := sharedNow()
-			_ = sweep.Sweep(t.Context())
-			if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
-				t.Fatal("a native template inventory outage retired the pool before its bound")
+			for _, at := range []time.Duration{0, sharedProvenanceOutageBound, tc.bound - time.Second} {
+				if at >= tc.bound {
+					continue
+				}
+				setNow(t, start.Add(at))
+				_ = sweep.Sweep(t.Context())
+				if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
+					t.Fatalf("the pool was retired at %s, before its %s bound", at, tc.bound)
+				}
 			}
-			setNow(t, start.Add(sharedProvenanceOutageBound))
+			setNow(t, start.Add(tc.bound))
 			_ = sweep.Sweep(t.Context())
-			_, found := getPool(t, c, record.SharedWorker.Pool)
-			if tc.retired && found {
-				t.Fatal("a native template inventory outage past its bound did not retire the pool")
-			}
-			if !tc.retired && !found {
-				t.Fatal("a whole control-plane outage, which places nothing, retired the pool and stranded its Actors")
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatalf("a native template inventory outage did not retire the pool at %s", tc.bound)
 			}
 		})
+	}
+}
+
+func TestSharedNativeOutageClockSurvivesProviderRestarts(t *testing.T) {
+	for _, down := range []bool{false, true} {
+		t.Run(fmt.Sprintf("controlPlaneDown=%t", down), func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			if down {
+				native.nativeDown = true
+			} else {
+				native.failTemplateList = true
+			}
+			bound := sharedProvenanceOutageBound
+			if down {
+				bound = sharedControlPlaneDownGrace
+			}
+			start := sharedNow()
+			// A provider that restarts before every sweep keeps no memory.
+			for at := time.Duration(0); at < bound; at += 20 * time.Second {
+				setNow(t, start.Add(at))
+				sharedNativeTemplateHealth.reset()
+				_ = sharedReplenisher(c, native).Sweep(t.Context())
+			}
+			setNow(t, start.Add(bound))
+			sharedNativeTemplateHealth.reset()
+			_ = sharedReplenisher(c, native).Sweep(t.Context())
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatal("restarts reset the native outage clock")
+			}
+		})
+	}
+}
+
+func TestSharedStalledSpareMaintenanceNeverStarvesSharedSafety(t *testing.T) {
+	c, native, record, _ := sharedTemplateFixture(t)
+	// The private spare pool lookup stalls until its context ends.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			options := &client.ListOptions{}
+			options.ApplyOptions(opts)
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GetKind() == "WorkerPoolList" && options.LabelSelector != nil && strings.Contains(options.LabelSelector.String(), spareProfileLabel) {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	sweep := sharedReplenisher(stalling, native)
+	sweep.SweepDeadline = 300 * time.Millisecond
+	_ = sweep.Sweep(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("stalled spare maintenance kept the foreign-template quarantine from running")
 	}
 }
 
@@ -4849,5 +4905,48 @@ func TestSharedPartialAssignmentSuccessNeverResetsTheRejectionBound(t *testing.T
 	_ = sharedReplenisher(c, native).Sweep(t.Context())
 	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
 		t.Fatal("a successful first assignment List reset the rejection bound of its confirmation")
+	}
+}
+
+func TestSharedOnePoolsRejectedAssignmentsAreNotResetByOtherPools(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	_, recordA := sharedReady(t, c, native, first)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	sharedReady(t, c, native, second)
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	_, recordC := sharedReady(t, c, native, third)
+	if recordC.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("the fixture did not create a second occupied pool")
+	}
+	// A warm pool joins the pass.
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "3"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if len(sharedPools(t, c)) < 3 {
+		t.Fatal("the fixture did not create a warm pool")
+	}
+	// Only the first pool's assignment reads are rejected.
+	native.rejectAssignmentsFor = map[string]bool{recordA.Worker.Name: true}
+	start := sharedNow()
+	for _, at := range []time.Duration{0, 20 * time.Second, 40 * time.Second} {
+		setNow(t, start.Add(at))
+		_ = sharedReplenisher(c, native).Sweep(t.Context())
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("the rejected pool was retired before its bound")
+	}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+		t.Fatal("other pools' successful checks reset one pool's assignment rejection")
+	}
+	if _, found := getPool(t, c, recordC.SharedWorker.Pool); !found {
+		t.Fatal("a healthy pool was retired with the rejected one")
 	}
 }

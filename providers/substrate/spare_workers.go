@@ -526,24 +526,34 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	if deadline <= 0 {
 		deadline = defaultSweepDeadline
 	}
-	ctx, cancel := context.WithTimeout(ctx, deadline)
-	defer cancel()
+	parent := ctx
+	listCtx, cancelList := context.WithTimeout(parent, deadline)
 	profiles := &profile.SubstrateWorkspaceProfileList{}
-	if err := r.List(ctx, profiles); err != nil {
+	err := r.List(listCtx, profiles)
+	cancelList()
+	if err != nil {
 		return errors.Join(boundsErr, err)
 	}
+	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
+	// Shared isolation work (foreign templates, hosted suspicion, outage
+	// retirement) comes first, on its own deadline, so private spare
+	// maintenance, which is only latency work, can never starve it.
+	sharedCtx, cancelShared := context.WithTimeout(parent, deadline)
+	sharedErr := r.sweepShared(sharedCtx, d, profiles.Items, workers)
+	cancelShared()
+	ctx, cancel := context.WithTimeout(parent, deadline)
+	defer cancel()
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion(workerPoolAPIVersion())
 	pools.SetKind("WorkerPoolList")
 	if err := r.List(ctx, pools, client.HasLabels{spareProfileLabel}); err != nil {
-		return err
+		return errors.Join(boundsErr, sharedErr, err)
 	}
 	byProfile := map[string][]*unstructured.Unstructured{}
 	for i := range pools.Items {
 		pool := &pools.Items[i]
 		byProfile[pool.GetLabels()[spareProfileLabel]] = append(byProfile[pool.GetLabels()[spareProfileLabel]], pool)
 	}
-	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
 	var errs []error
 	for i := range profiles.Items {
 		item := &profiles.Items[i]
@@ -559,7 +569,7 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 			}
 		}
 	}
-	errs = append(errs, boundsErr, r.sweepShared(ctx, d, profiles.Items, workers))
+	errs = append(errs, boundsErr, sharedErr)
 	r.mu.Lock()
 	due := time.Since(r.lastOrphan) >= spareOrphanPeriod
 	if due {
