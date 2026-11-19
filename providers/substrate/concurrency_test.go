@@ -23,106 +23,103 @@ import (
 type lockedNative struct {
 	mu sync.Mutex
 	*nativeFixture
+	// onCall, when set, observes each call before it takes the lock and
+	// returns a function run when the call completes.
+	onCall func(method string) func()
+}
+
+func (l *lockedNative) enter(method string) func() {
+	// The observer's simulated round trip runs before the lock, so calls in
+	// flight at once overlap as they would against a real control plane.
+	done := func() {}
+	if l.onCall != nil {
+		done = l.onCall(method)
+	}
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		done()
+	}
 }
 
 func (l *lockedNative) GetActorTemplate(ctx context.Context, req *pb.GetActorTemplateRequest, opts ...grpc.CallOption) (*pb.ActorTemplate, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("GetActorTemplate")()
 	return l.nativeFixture.GetActorTemplate(ctx, req, opts...)
 }
 func (l *lockedNative) CreateActorTemplate(ctx context.Context, req *pb.CreateActorTemplateRequest, opts ...grpc.CallOption) (*pb.ActorTemplate, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("CreateActorTemplate")()
 	return l.nativeFixture.CreateActorTemplate(ctx, req, opts...)
 }
 func (l *lockedNative) DeleteActorTemplate(ctx context.Context, req *pb.DeleteActorTemplateRequest, opts ...grpc.CallOption) (*pb.ActorTemplate, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("DeleteActorTemplate")()
 	return l.nativeFixture.DeleteActorTemplate(ctx, req, opts...)
 }
 func (l *lockedNative) ListActorTemplates(ctx context.Context, req *pb.ListActorTemplatesRequest, opts ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("ListActorTemplates")()
 	return l.nativeFixture.ListActorTemplates(ctx, req, opts...)
 }
 func (l *lockedNative) GetActor(ctx context.Context, req *pb.GetActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("GetActor")()
 	return l.nativeFixture.GetActor(ctx, req, opts...)
 }
 func (l *lockedNative) CreateActor(ctx context.Context, req *pb.CreateActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("CreateActor")()
 	return l.nativeFixture.CreateActor(ctx, req, opts...)
 }
 func (l *lockedNative) UpdateActor(ctx context.Context, req *pb.UpdateActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("UpdateActor")()
 	return l.nativeFixture.UpdateActor(ctx, req, opts...)
 }
 func (l *lockedNative) ResumeActor(ctx context.Context, req *pb.ResumeActorRequest, opts ...grpc.CallOption) (*pb.ResumeActorResponse, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("ResumeActor")()
 	return l.nativeFixture.ResumeActor(ctx, req, opts...)
 }
 func (l *lockedNative) SuspendActor(ctx context.Context, req *pb.SuspendActorRequest, opts ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("SuspendActor")()
 	return l.nativeFixture.SuspendActor(ctx, req, opts...)
 }
 func (l *lockedNative) DeleteActor(ctx context.Context, req *pb.DeleteActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("DeleteActor")()
 	return l.nativeFixture.DeleteActor(ctx, req, opts...)
 }
 func (l *lockedNative) GetActorEgressPolicy(ctx context.Context, req *pb.GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*pb.EgressPolicy, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("GetActorEgressPolicy")()
 	return l.nativeFixture.GetActorEgressPolicy(ctx, req, opts...)
 }
 func (l *lockedNative) CreateActorEgressPolicy(ctx context.Context, req *pb.CreateActorEgressPolicyRequest, opts ...grpc.CallOption) (*pb.EgressPolicy, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("CreateActorEgressPolicy")()
 	return l.nativeFixture.CreateActorEgressPolicy(ctx, req, opts...)
 }
 func (l *lockedNative) UpdateActorEgressPolicy(ctx context.Context, req *pb.UpdateActorEgressPolicyRequest, opts ...grpc.CallOption) (*pb.EgressPolicy, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("UpdateActorEgressPolicy")()
 	return l.nativeFixture.UpdateActorEgressPolicy(ctx, req, opts...)
 }
 func (l *lockedNative) GetWorker(ctx context.Context, req *pb.GetWorkerRequest, opts ...grpc.CallOption) (*pb.Worker, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("GetWorker")()
 	return l.nativeFixture.GetWorker(ctx, req, opts...)
 }
 func (l *lockedNative) ListWorkers(ctx context.Context, req *pb.ListWorkersRequest, opts ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("ListWorkers")()
 	return l.nativeFixture.ListWorkers(ctx, req, opts...)
 }
 func (l *lockedNative) ListWorkerActorAssignments(ctx context.Context, req *pb.ListWorkerActorAssignmentsRequest, opts ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("ListWorkerActorAssignments")()
 	return l.nativeFixture.ListWorkerActorAssignments(ctx, req, opts...)
 }
 func (l *lockedNative) CreateTag(ctx context.Context, req *pb.CreateTagRequest, opts ...grpc.CallOption) (*pb.Tag, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("CreateTag")()
 	return l.nativeFixture.CreateTag(ctx, req, opts...)
 }
 func (l *lockedNative) GetTag(ctx context.Context, req *pb.GetTagRequest, opts ...grpc.CallOption) (*pb.Tag, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("GetTag")()
 	return l.nativeFixture.GetTag(ctx, req, opts...)
 }
 func (l *lockedNative) DeleteTag(ctx context.Context, req *pb.DeleteTagRequest, opts ...grpc.CallOption) (*pb.Tag, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("DeleteTag")()
 	return l.nativeFixture.DeleteTag(ctx, req, opts...)
 }
 func (l *lockedNative) Get(ctx context.Context, endpoint, target string) (bootstrapChallenge, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.enter("Get")()
 	return l.nativeFixture.Get(ctx, endpoint, target)
 }
 
