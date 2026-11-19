@@ -179,9 +179,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			}
 		}()
 	}
-	for _, item := range retirements {
-		work <- item
-	}
+	feed(ctx, work, retirements)
 	close(work)
 	group.Wait()
 	if len(deleted) > 0 {
@@ -454,6 +452,9 @@ func (d *Lifecycle) prefetchSharedWorkspaces(ctx context.Context, namespaces map
 		}()
 	}
 	for namespace := range namespaces {
+		if rootCancelled(ctx) {
+			break
+		}
 		work <- namespace
 	}
 	close(work)
@@ -1150,9 +1151,7 @@ func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructur
 			}
 		}()
 	}
-	for _, pool := range pools {
-		work <- pool
-	}
+	feed(ctx, work, pools)
 	close(work)
 	group.Wait()
 	return errors.Join(errs...)
@@ -1514,20 +1513,25 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// Every known strong trigger first, for every pool, before any pool's
 	// fallible checks.
 	var candidates []*sharedCandidate
+	var actions []*sharedAction
 	for i := range pools.Items {
 		pool := &pools.Items[i]
 		if pool.GetDeletionTimestamp() == nil {
 			if reason := outage.retires(ctx, pool); reason != "" {
-				errs = append(errs, d.retireSharedPool(ctx, pool, sharedRetiring, reason))
+				actions = append(actions, &sharedAction{pool: pool, state: sharedRetiring, reason: reason})
 				continue
 			}
 		}
-		candidate, err := r.sharedKnownTriggers(ctx, d, pool, now, templates, ours, templatesErr, inventoryErr)
-		errs = append(errs, err)
+		candidate, action := r.sharedKnownTriggers(ctx, d, pool, now, templates, ours, templatesErr, inventoryErr)
+		if action != nil {
+			actions = append(actions, action)
+		}
 		if candidate != nil {
 			candidates = append(candidates, candidate)
 		}
 	}
+	// The decided retirements, quarantines first, concurrently and capped.
+	errs = append(errs, d.issueSharedActions(ctx, actions)...)
 	// Then each pool's fallible checks, concurrently and capped, each on
 	// budgets of its own.
 	results := make([]*sharedIsolation, len(candidates))
@@ -1543,9 +1547,11 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 			}
 		}()
 	}
-	for i := range candidates {
-		work <- i
+	indexes := make([]int, len(candidates))
+	for i := range indexes {
+		indexes[i] = i
 	}
+	feed(ctx, work, indexes)
 	close(work)
 	group.Wait()
 	errs = append(errs, checkErrs...)
@@ -1575,6 +1581,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		// Without the profiles every safety check above still ran; closing,
 		// collection and ledger writes need their shapes.
 		for _, isolated := range verified {
+			if rootCancelled(ctx) {
+				break
+			}
 			errs = append(errs, r.maintainSharedPool(maintainCtx, d, workers, isolated, shapes, free, now, templatesErr))
 		}
 	}
@@ -1583,7 +1592,7 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 		return errors.Join(append(errs, err)...)
 	}
 	for uid, shape := range shapes {
-		for free[uid] < shape.warm {
+		for free[uid] < shape.warm && !rootCancelled(ctx) {
 			if err := d.createWarmSharedPool(maintainCtx, shape, templates, ours); err != nil {
 				errs = append(errs, err)
 				break
@@ -1773,6 +1782,86 @@ func passBudget(ctx context.Context, budget time.Duration) time.Duration {
 // that fails or does not finish within its own budget makes the pool
 // unverified (verificationFailed); only a pool whose checks all completed is
 // returned for maintenance.
+// sharedAction is a strong retirement a pass decided from data in hand.
+type sharedAction struct {
+	pool          *unstructured.Unstructured
+	state, reason string
+}
+
+// rootCancelled reports the loop's own context cancelled (shutdown or lost
+// leadership). A deadline the pass already spent does not count: every loop
+// checks this between iterations, so the provider stops promptly when the
+// manager stops, while work in flight finishes within its own short bound.
+func rootCancelled(ctx context.Context) bool {
+	return errors.Is(rootContext(ctx).Err(), context.Canceled)
+}
+
+// rootContext is the loop's own context, without any deadline the pass
+// derived from it.
+func rootContext(ctx context.Context) context.Context {
+	if sweep, ok := ctx.Value(sweepBudgetKey{}).(sweepBudget); ok && sweep.root != nil {
+		return sweep.root
+	}
+	return ctx
+}
+
+// feed hands items to workers until the loop's own context is cancelled,
+// including while a hand-off is waiting for a free worker.
+func feed[T any](ctx context.Context, work chan<- T, items []T) {
+	done := rootContext(ctx).Done()
+	for _, item := range items {
+		if rootCancelled(ctx) {
+			return
+		}
+		select {
+		case work <- item:
+		case <-done:
+			if rootCancelled(ctx) {
+				return
+			}
+			work <- item
+		}
+	}
+}
+
+// sharedRetireConcurrency caps a pass's concurrent decided retirements.
+const sharedRetireConcurrency = 8
+
+// issueSharedActions issues decided strong retirements concurrently,
+// capped, quarantines first, each on its own short bound (strong cleanup),
+// and stops issuing new ones once the loop is cancelled.
+func (d *Lifecycle) issueSharedActions(ctx context.Context, actions []*sharedAction) []error {
+	slices.SortStableFunc(actions, func(a, b *sharedAction) int {
+		switch {
+		case a.state == sharedQuarantined && b.state != sharedQuarantined:
+			return -1
+		case a.state != sharedQuarantined && b.state == sharedQuarantined:
+			return 1
+		}
+		return 0
+	})
+	errs := make([]error, len(actions))
+	work := make(chan int)
+	var group sync.WaitGroup
+	for range min(sharedRetireConcurrency, len(actions)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := range work {
+				errs[i] = d.retireSharedPool(ctx, actions[i].pool, actions[i].state, actions[i].reason)
+			}
+		}()
+	}
+	indexes := make([]int, len(actions))
+	for i := range indexes {
+		indexes[i] = i
+	}
+	feed(ctx, work, indexes)
+	close(work)
+	group.Wait()
+	return errs
+}
+
 // sharedCandidate is a pool whose known strong triggers did not retire it,
 // awaiting its fallible isolation checks.
 type sharedCandidate struct {
@@ -1787,17 +1876,17 @@ type sharedCandidate struct {
 // fallible checks, so stalled reads on other pools can never postpone a
 // known quarantine. It returns the pool as a candidate for its fallible
 // checks, or nil when it was retired or needs none.
-func (r *SpareWorkerReplenisher) sharedKnownTriggers(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) (*sharedCandidate, error) {
+func (r *SpareWorkerReplenisher) sharedKnownTriggers(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, now time.Time, templates []*pb.ActorTemplate, ours map[string]string, templatesErr, inventoryErr error) (*sharedCandidate, *sharedAction) {
 	if pool.GetDeletionTimestamp() != nil {
 		return nil, nil
 	}
 	ledger, err := readSharedLedger(pool)
 	if err != nil {
 		// Unreadable lifetime evidence is doubt: retire strongly at once.
-		return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker ledger is unreadable")
+		return nil, &sharedAction{pool: pool, state: sharedRetiring, reason: "the shared worker ledger is unreadable"}
 	}
 	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
-		return nil, d.retireSharedPool(ctx, pool, ledger.State, ledger.Reason)
+		return nil, &sharedAction{pool: pool, state: ledger.State, reason: ledger.Reason}
 	}
 	if !now.Before(sharedRetireAt(pool, ledger)) || !r.Config.DedicatedInstall {
 		// enforceSharedBounds already retired it, without native reads.
@@ -1805,16 +1894,16 @@ func (r *SpareWorkerReplenisher) sharedKnownTriggers(ctx context.Context, d *Lif
 	}
 	unclassified := false
 	if templatesErr == nil && inventoryErr == nil && templatesReach(templates, ledger.Scope.Atespace, pool.GetLabels(), ours) {
-		return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+		return nil, &sharedAction{pool: pool, state: sharedQuarantined, reason: errForeignTemplate.Error()}
 	}
 	if templatesErr == nil && inventoryErr != nil {
 		var foreign bool
 		foreign, unclassified = classifyWithoutInventory(templates, ledger.Scope.Atespace, pool.GetLabels(), recordedTemplates.snapshot())
 		if foreign {
-			return nil, d.retireSharedPool(ctx, pool, sharedQuarantined, errForeignTemplate.Error())
+			return nil, &sharedAction{pool: pool, state: sharedQuarantined, reason: errForeignTemplate.Error()}
 		}
 		if unclassified && sharedTemplateInventoryHealth.outlasted(sharedNow()) {
-			return nil, d.retireSharedPool(ctx, pool, sharedRetiring, "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound")
+			return nil, &sharedAction{pool: pool, state: sharedRetiring, reason: "an unrecorded ActorTemplate reaches the shared worker and the provider's template inventory stayed unavailable past its bound"}
 		}
 	}
 	return &sharedCandidate{pool: pool, ledger: ledger, unclassified: unclassified}, nil

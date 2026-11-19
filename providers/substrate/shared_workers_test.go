@@ -5283,3 +5283,102 @@ func TestSharedFreshBudgetsEndOnCancellationAfterTheSweepDeadline(t *testing.T) 
 		t.Fatal("a fresh budget outlived the cancellation of the sweep's original context")
 	}
 }
+
+// stalledPoolDeletes stalls every WorkerPool delete until its context ends
+// and counts them; Pod deletes are recorded by UID with their time.
+func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(string) time.Time) {
+	var poolDeletes atomic.Int64
+	var mu sync.Mutex
+	podDeleted := map[string]time.Time{}
+	wrapped := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			switch o := obj.(type) {
+			case *unstructured.Unstructured:
+				if o.GetKind() == "WorkerPool" {
+					poolDeletes.Add(1)
+					<-ctx.Done()
+					return ctx.Err()
+				}
+			case *corev1.Pod:
+				mu.Lock()
+				if _, seen := podDeleted[string(o.UID)]; !seen {
+					podDeleted[string(o.UID)] = time.Now()
+				}
+				mu.Unlock()
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	}))
+	return wrapped, &poolDeletes, func(uid string) time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return podDeleted[uid]
+	}
+}
+
+func TestSharedShutdownStopsIssuingNewRetirements(t *testing.T) {
+	previous := sharedCleanupTimeout
+	sharedCleanupTimeout = 2 * time.Second
+	t.Cleanup(func() { sharedCleanupTimeout = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	due := manySharedPools(t, c, native, first, binding, 20)
+	pool, ledger := poolLedger(t, c, due[0])
+	setNow(t, sharedRetireAt(pool, ledger).Add(time.Minute))
+	stalling, poolDeletes, _ := stalledPoolDeletes(c)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		defer close(done)
+		_ = (&SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}).EnforceSharedBounds(ctx)
+	}()
+	for poolDeletes.Load() == 0 {
+		if time.Since(started) > 5*time.Second {
+			t.Fatal("no pool delete was issued")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The manager stops while the first round of deletes is in flight.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2*sharedCleanupTimeout + 2*time.Second):
+		t.Fatal("the bounds pass did not stop promptly on shutdown")
+	}
+	if issued := poolDeletes.Load(); issued > sharedDeleteConcurrency {
+		t.Fatalf("%d pool deletes were issued after shutdown began, beyond the %d in flight", issued, sharedDeleteConcurrency)
+	}
+}
+
+func TestSharedDecidedRetirementsNeverDelayAQuarantine(t *testing.T) {
+	previous := sharedCleanupTimeout
+	sharedCleanupTimeout = 2 * time.Second
+	t.Cleanup(func() { sharedCleanupTimeout = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	retiring := manySharedPools(t, c, native, first, binding, 20)
+	// Every one of these pools has a persisted retirement whose pool delete
+	// stalls.
+	for _, name := range retiring {
+		pool, ledger := poolLedger(t, c, name)
+		ledger.State, ledger.Reason = sharedRetiring, "persisted before a crash"
+		if err := setSharedLedger(pool, ledger); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Update(t.Context(), pool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A further pool is reached by a foreign template.
+	young := sharedWorkspace(t, c, first, "tenant", "young", "young-uid", binding)
+	_, record := sharedReady(t, c, native, young)
+	if slices.Contains(retiring, record.SharedWorker.Pool) {
+		t.Fatal("the allocation joined a retiring pool")
+	}
+	native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})].Metadata.Uid = "foreign-template-uid"
+	stalling, _, podDeleted := stalledPoolDeletes(c)
+	started := time.Now()
+	_ = sharedReplenisher(stalling, native).Sweep(t.Context())
+	if at := podDeleted(record.Worker.PodUID); at.IsZero() || at.Sub(started) > time.Second {
+		t.Fatalf("decided retirements delayed a required quarantine: %v", at.Sub(started))
+	}
+}
