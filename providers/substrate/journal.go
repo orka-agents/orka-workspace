@@ -175,6 +175,9 @@ type Lifecycle struct {
 	control         pb.ControlClient
 	config          Config
 	challengeClient challengeGetter
+	// sharedPass, set only by a shared bounds or sweep pass, shares that
+	// pass's Kubernetes reads across its pools.
+	sharedPass *sharedPassReads
 }
 
 var _ sdk.Lifecycle = (*Lifecycle)(nil)

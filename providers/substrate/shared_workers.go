@@ -1822,7 +1822,7 @@ func (d *Lifecycle) sharedPoolHostsSuspect(ctx context.Context, pool *unstructur
 			return true, nil
 		}
 		workspace := &api.ExecutionWorkspace{}
-		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+		if err := d.sharedWorkspace(ctx, clientKey(record.Request.Key), workspace); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
@@ -1973,6 +1973,7 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (map[string]string, e
 	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
 		return nil, err
 	}
+	d.sharedPass.noteJournals(journals.Items)
 	for i := range journals.Items {
 		if record, ok := decodeClaimRecord(&journals.Items[i]); ok {
 			add(record.Atespace, record.Template)

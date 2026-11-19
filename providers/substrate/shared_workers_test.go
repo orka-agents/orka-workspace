@@ -20,6 +20,7 @@ import (
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -3077,6 +3078,13 @@ func TestSharedEscalationNeverDeletesAReplacementPoolsPods(t *testing.T) {
 						replacement.SetResourceVersion("")
 						replacement.SetUID("replacement-pool-uid")
 						replacement.SetCreationTimestamp(metav1.NewTime(sharedNow()))
+						// A healthy replacement: born now, with its own deadline.
+						fresh := *ledger
+						fresh.BornAt = metav1.NewTime(sharedNow())
+						if err := setSharedLedger(replacement, &fresh); err != nil {
+							return err
+						}
+						setSharedDeadline(replacement, &fresh)
 						if err := w.Create(ctx, replacement); err != nil {
 							return err
 						}
@@ -3447,5 +3455,235 @@ func TestSharedOverlappingTemplateRefreshesKeepASavedUID(t *testing.T) {
 	// A refresh that began after everything still drops a deleted entry.
 	if merged := cache.replace(map[string]string{}, cache.begin()); len(merged) != 0 {
 		t.Fatalf("a later complete refresh kept a deleted journal's entry: %v", merged)
+	}
+}
+
+func TestSharedEscalationNeverWaitsOnProvenanceDiscovery(t *testing.T) {
+	for _, loop := range []string{"escalation", "bounds"} {
+		t.Run(loop, func(t *testing.T) {
+			c, _, _, pool, ledger := warmSharedPool(t, 24*time.Hour)
+			setNow(t, sharedEscalateAt(pool, ledger).Add(time.Minute))
+			var discovering atomic.Int64
+			// Every provenance List stalls until its context ends.
+			stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					switch list.(type) {
+					case *corev1.ConfigMapList, *api.ExecutionWorkspaceList:
+						discovering.Add(1)
+						<-ctx.Done()
+						return ctx.Err()
+					case *unstructured.UnstructuredList:
+						if list.(*unstructured.UnstructuredList).GetKind() == "SubstrateWorkspaceProfileList" {
+							discovering.Add(1)
+							<-ctx.Done()
+							return ctx.Err()
+						}
+					}
+					return w.List(ctx, list, opts...)
+				},
+			}))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				r := &SpareWorkerReplenisher{Client: stalling, Config: sharedConfig()}
+				if loop == "escalation" {
+					_ = r.EnforceSharedEscalation(ctx)
+				} else {
+					_ = r.EnforceSharedBounds(ctx)
+				}
+			}()
+			deadline := time.Now().Add(3 * time.Second)
+			for workerPodCount(t, c, pool.GetName()) != 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("a due escalation waited on provenance discovery")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if discovering.Load() == 0 {
+				t.Fatal("provenance discovery was not exercised")
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the pass did not end after its context")
+			}
+		})
+	}
+}
+
+func TestSharedProvenanceDiscoveryIsBounded(t *testing.T) {
+	c, _, _, _, _ := warmSharedPool(t, 24*time.Hour)
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GetKind() == "SubstrateWorkspaceProfileList" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	previous := sharedDiscoveryTimeout
+	sharedDiscoveryTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { sharedDiscoveryTimeout = previous })
+	started := time.Now()
+	found := sharedDriver(stalling, nil).withSharedPass().discoverShared(t.Context(), true)
+	if elapsed := time.Since(started); elapsed > sharedDiscoveryTimeout+2*time.Second {
+		t.Fatalf("discovery took %s past its deadline", elapsed)
+	}
+	if len(found.errs) == 0 {
+		t.Fatal("a stalled profile List was not reported")
+	}
+}
+
+func TestSharedSlowProvenanceSuccessNeverClearsANewerFailure(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var calls atomic.Int64
+	interleaved := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); !ok {
+				return w.List(ctx, list, opts...)
+			}
+			switch calls.Add(1) {
+			case 1:
+				// Read A is slow, and succeeds.
+				close(entered)
+				<-release
+			case 2:
+				// Read B starts later and fails.
+				return apierrors.NewServiceUnavailable("journal inventory unavailable")
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	d := sharedDriver(interleaved, native)
+	start := sharedNow()
+	slow := make(chan error, 1)
+	go func() {
+		_, err := d.sharedJournalProvenance(t.Context())
+		slow <- err
+	}()
+	<-entered
+	setNow(t, start.Add(time.Second))
+	if _, err := d.sharedJournalProvenance(t.Context()); err == nil {
+		t.Fatal("read B did not fail")
+	}
+	close(release)
+	if err := <-slow; err != nil {
+		t.Fatal(err)
+	}
+	now := start.Add(2 * time.Second)
+	setNow(t, now)
+	if sharedProvenanceHealth.fresh(now) {
+		t.Fatal("a slow success that started before a newer failure reopened admission")
+	}
+	if !sharedProvenanceHealth.outlasted(start.Add(time.Second + sharedProvenanceOutageBound)) {
+		t.Fatal("the slow success cleared the newer failure's outage")
+	}
+	// A success that starts after the failure reopens admission.
+	setNow(t, now.Add(time.Second))
+	if _, err := d.sharedJournalProvenance(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !sharedProvenanceHealth.fresh(sharedNow()) {
+		t.Fatal("a success that started after the failure did not reopen admission")
+	}
+}
+
+type countingControl struct {
+	pb.ControlClient
+	mu    sync.Mutex
+	calls map[string]int
+}
+
+func (c *countingControl) count(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls[name]++
+}
+
+func (c *countingControl) ListWorkerActorAssignments(ctx context.Context, req *pb.ListWorkerActorAssignmentsRequest, opts ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+	c.count("native ListWorkerActorAssignments")
+	return c.ControlClient.ListWorkerActorAssignments(ctx, req, opts...)
+}
+
+func (c *countingControl) ListWorkers(ctx context.Context, req *pb.ListWorkersRequest, opts ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
+	c.count("native ListWorkers")
+	return c.ControlClient.ListWorkers(ctx, req, opts...)
+}
+
+func (c *countingControl) ListActorTemplates(ctx context.Context, req *pb.ListActorTemplatesRequest, opts ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	c.count("native ListActorTemplates")
+	return c.ControlClient.ListActorTemplates(ctx, req, opts...)
+}
+
+func countingKubernetes(c client.Client, calls map[string]int, mu *sync.Mutex) client.Client {
+	kind := func(obj runtime.Object) string {
+		switch typed := obj.(type) {
+		case *unstructured.Unstructured:
+			return typed.GetKind()
+		case *unstructured.UnstructuredList:
+			return typed.GetKind()
+		}
+		return strings.TrimPrefix(fmt.Sprintf("%T", obj), "*")
+	}
+	note := func(verb string, obj runtime.Object) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls[verb+" "+kind(obj)]++
+	}
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			note("Get", obj)
+			return w.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			note("List", list)
+			return w.List(ctx, list, opts...)
+		},
+	})
+}
+
+func TestSharedPassReadCounts(t *testing.T) {
+	for _, shape := range []struct{ namespaces, workspaces int }{{1, 4}, {1, 8}, {2, 8}} {
+		t.Run(fmt.Sprintf("M=%d,workspaces=%d", shape.namespaces, shape.workspaces), func(t *testing.T) {
+			c, native, request := fixture(t, true)
+			useTestClock(t)
+			for m := range shape.namespaces {
+				namespace := fmt.Sprintf("tenant%d", m)
+				binding := createSharedProfile(t, c, namespace, "shared", types.UID(namespace+"-profile-uid"), 2)
+				for k := range shape.workspaces {
+					item := sharedWorkspace(t, c, request, namespace, fmt.Sprintf("w%02d", k), types.UID(fmt.Sprintf("%s-w%02d-uid", namespace, k)), binding)
+					sharedReady(t, c, native, item)
+				}
+			}
+			pools := len(sharedPools(t, c))
+			measure := func(run func(client.Client, pb.ControlClient)) (map[string]int, map[string]int) {
+				var mu sync.Mutex
+				kube := map[string]int{}
+				control := &countingControl{ControlClient: native, calls: map[string]int{}}
+				run(countingKubernetes(c, kube, &mu), control)
+				return kube, control.calls
+			}
+			bounds, _ := measure(func(k client.Client, _ pb.ControlClient) {
+				_ = (&SpareWorkerReplenisher{Client: k, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+			})
+			sweepKube, sweepNative := measure(func(k client.Client, n pb.ControlClient) {
+				_ = (&SpareWorkerReplenisher{Client: k, Control: n, Config: sharedConfig()}).Sweep(t.Context())
+			})
+			t.Logf("N=%d pools, M=%d namespaces, %d Actors", pools, shape.namespaces, shape.namespaces*shape.workspaces)
+			t.Logf("bounds pass: %v", bounds)
+			t.Logf("sweep pass: kube %v native %v", sweepKube, sweepNative)
+			if bounds["Get v1.ConfigMap"] != 0 || bounds["Get v1alpha1.ExecutionWorkspace"] != 0 || bounds["List v1alpha1.ExecutionWorkspaceList"] > shape.namespaces {
+				t.Fatalf("the bounds pass still reads per pool: %v", bounds)
+			}
+			if sweepNative["native ListWorkerActorAssignments"] > pools || sweepKube["Get v1.ConfigMap"] != 0 || sweepKube["Get v1alpha1.ExecutionWorkspace"] != 0 {
+				t.Fatalf("the sweep pass still reads per pool: kube %v native %v", sweepKube, sweepNative)
+			}
+		})
 	}
 }

@@ -41,28 +41,23 @@ type sharedProfileShape struct {
 // dedicated, and a worker Pod still present when the hard bound nears is
 // re-deleted with a one-second grace.
 func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lifecycle) error {
-	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
-	pools, err := listSharedPools(ctx, r.Client, provenance)
-	if err != nil {
-		return err
+	d = d.withSharedPass()
+	// Escalations due by the latest bound any provenance could give go out
+	// first, while discovery runs alongside under its own deadline.
+	discovered := make(chan sharedDiscovery, 1)
+	go func() { discovered <- d.discoverShared(ctx, true) }()
+	escalatedEarly, earlyErr := d.escalateDueByAnnotations(ctx)
+	found := <-discovered
+	if found.listErr != nil {
+		return errors.Join(earlyErr, found.listErr)
 	}
-	var errs []error
-	if provenanceErr == nil {
-		if err := d.sharedProfileProvenance(ctx, pools, provenance); err != nil {
-			errs = append(errs, err)
-		}
-	}
+	provenance, provenanceErr, pools := found.provenance, found.provenanceErr, found.pools
+	errs := append([]error{earlyErr}, found.errs...)
 	if provenanceErr != nil {
 		// Unavailable provenance is doubt: the mutable annotations cannot be
 		// checked, so every pool is bounded by its server-set creation time
 		// plus the minimum lifetime, never by the annotations' value.
 		errs = append(errs, provenanceErr)
-	}
-	if provenanceErr == nil {
-		// Each recorded workspace's suspicion, independent of the entries.
-		if err := d.sharedProvenanceSuspects(ctx, provenance); err != nil {
-			errs = append(errs, err)
-		}
 	}
 	// A short outage only closes admission. One that outlasts its bound
 	// is doubt about every pool, including a strong marker a tampered entry
@@ -86,7 +81,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		recorded := provenance[pool.GetUID()]
 		retireAt, escalateAt, evidence := sharedBoundsOf(pool, recorded, provenanceErr == nil)
 		now := sharedNow()
-		if !now.Before(escalateAt) {
+		if !now.Before(escalateAt) && !escalatedEarly[pool.GetUID()] {
 			escalations = append(escalations, pool)
 		}
 		if pool.GetDeletionTimestamp() != nil {
@@ -237,11 +232,15 @@ type sharedProvenance struct {
 // only) and groups the frozen scopes they recorded by shared pool UID.
 func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]sharedProvenance, error) {
 	journals := &corev1.ConfigMapList{}
+	// Health updates carry the time their read started, so a slow read never
+	// overrides a newer one's result.
+	started := sharedNow()
 	if err := d.client.List(ctx, journals, client.HasLabels{ownershipLabel, providerLabel}); err != nil {
-		sharedProvenanceHealth.failed(sharedNow())
+		sharedProvenanceHealth.failed(started)
 		return nil, err
 	}
-	defer sharedProvenanceHealth.succeeded(sharedNow())
+	defer sharedProvenanceHealth.succeeded(started)
+	d.sharedPass.noteJournals(journals.Items)
 	out := map[types.UID]sharedProvenance{}
 	for i := range journals.Items {
 		record, ok := decodeClaimRecord(&journals.Items[i])
@@ -302,40 +301,50 @@ func (d *Lifecycle) sharedProfileProvenance(ctx context.Context, pools []unstruc
 			}
 		}
 	}
-	var errs []error
-	for namespace, namespacePools := range wanted {
-		profiles := &unstructured.UnstructuredList{}
-		profiles.SetGroupVersionKind(profile.GroupVersion.WithKind("SubstrateWorkspaceProfileList"))
-		if err := d.client.List(ctx, profiles, client.InNamespace(namespace)); err != nil {
-			errs = append(errs, err)
+	if len(wanted) == 0 {
+		return nil
+	}
+	// One cluster-wide List, whatever the number of namespaces.
+	profiles := &unstructured.UnstructuredList{}
+	profiles.SetGroupVersionKind(profile.GroupVersion.WithKind("SubstrateWorkspaceProfileList"))
+	if err := d.client.List(ctx, profiles); err != nil {
+		return err
+	}
+	lifetimes := map[string]map[types.UID]map[string]time.Duration{}
+	for i := range profiles.Items {
+		raw := &profiles.Items[i]
+		if wanted[raw.GetNamespace()] == nil {
 			continue
 		}
-		lifetimes := map[types.UID]map[string]time.Duration{}
-		for i := range profiles.Items {
-			raw := &profiles.Items[i]
-			hash, err := sdk.ParametersProfileHash(raw)
-			if err != nil {
-				continue
-			}
-			item := &profile.SubstrateWorkspaceProfile{}
-			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw.Object, item); err != nil || item.Validate() != nil || item.Spec.Placement == nil || item.Spec.Placement.SharedWorkers == nil {
-				continue
-			}
-			if lifetimes[raw.GetUID()] == nil {
-				lifetimes[raw.GetUID()] = map[string]time.Duration{}
-			}
-			lifetimes[raw.GetUID()][hash] = item.Spec.Placement.SharedWorkers.WorkerLifetime()
+		hash, err := sdk.ParametersProfileHash(raw)
+		if err != nil {
+			continue
 		}
+		item := &profile.SubstrateWorkspaceProfile{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw.Object, item); err != nil || item.Validate() != nil || item.Spec.Placement == nil || item.Spec.Placement.SharedWorkers == nil {
+			continue
+		}
+		byUID := lifetimes[raw.GetNamespace()]
+		if byUID == nil {
+			byUID = map[types.UID]map[string]time.Duration{}
+			lifetimes[raw.GetNamespace()] = byUID
+		}
+		if byUID[raw.GetUID()] == nil {
+			byUID[raw.GetUID()] = map[string]time.Duration{}
+		}
+		byUID[raw.GetUID()][hash] = item.Spec.Placement.SharedWorkers.WorkerLifetime()
+	}
+	for namespace, namespacePools := range wanted {
 		for _, pool := range namespacePools {
 			ledger, _ := readSharedLedger(pool)
-			if lifetime, found := lifetimes[types.UID(ledger.Scope.ProfileUID)][ledger.Scope.ProfileHash]; found {
+			if lifetime, found := lifetimes[namespace][types.UID(ledger.Scope.ProfileUID)][ledger.Scope.ProfileHash]; found {
 				entry := provenance[pool.GetUID()]
 				entry.profileLifetime = lifetime
 				provenance[pool.GetUID()] = entry
 			}
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // sharedProvenanceSuspects marks every pool whose unreleased journals record
@@ -352,30 +361,54 @@ func (d *Lifecycle) sharedProvenanceSuspects(ctx context.Context, provenance map
 			namespaces[key.Namespace] = true
 		}
 	}
-	suspects := map[types.NamespacedName]types.UID{}
-	listed := map[string]bool{}
-	var errs []error
-	for namespace := range namespaces {
-		workspaces := &api.ExecutionWorkspaceList{}
-		if err := d.client.List(ctx, workspaces, client.InNamespace(namespace)); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		listed[namespace] = true
-		for i := range workspaces.Items {
-			if workspaceSuspect(&workspaces.Items[i]) {
-				suspects[client.ObjectKeyFromObject(&workspaces.Items[i])] = workspaces.Items[i].UID
-			}
-		}
-	}
+	err := d.prefetchSharedWorkspaces(ctx, namespaces)
 	for uid, entry := range provenance {
 		for _, key := range entry.workspaces {
-			if workspaceUID, found := suspects[clientKey(key)]; listed[key.Namespace] && found && workspaceUID == key.WorkspaceUID {
+			workspace := &api.ExecutionWorkspace{}
+			if d.sharedWorkspace(ctx, clientKey(key), workspace) == nil && workspace.UID == key.WorkspaceUID && workspaceSuspect(workspace) {
 				entry.suspect = true
 			}
 		}
 		provenance[uid] = entry
 	}
+	return err
+}
+
+// sharedListConcurrency caps a pass's concurrent per-namespace Lists.
+const sharedListConcurrency = 8
+
+// prefetchSharedWorkspaces lists each namespace's ExecutionWorkspaces into
+// the pass's snapshot concurrently, capped, and reports the failed Lists.
+func (d *Lifecycle) prefetchSharedWorkspaces(ctx context.Context, namespaces map[string]bool) error {
+	if d.sharedPass == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	var errs []error
+	work := make(chan string)
+	var group sync.WaitGroup
+	for range min(sharedListConcurrency, len(namespaces)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for namespace := range work {
+				workspaces := &api.ExecutionWorkspaceList{}
+				if err := d.client.List(ctx, workspaces, client.InNamespace(namespace)); err != nil {
+					d.sharedPass.noteWorkspaceListFailed(namespace)
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+					continue
+				}
+				d.sharedPass.noteWorkspaces(namespace, workspaces.Items)
+			}
+		}()
+	}
+	for namespace := range namespaces {
+		work <- namespace
+	}
+	close(work)
+	group.Wait()
 	return errors.Join(errs...)
 }
 
@@ -392,25 +425,42 @@ const sharedProvenanceOutageBound = 60 * time.Second
 // when one last succeeded, and since when they have been failing. A new
 // leader starts with neither, so it admits nothing until its own read
 // succeeds, and its outage bound starts from its own first failure.
+//
+// Every update carries the time its read started. A success clears a
+// failure only if it started after the latest failure started, so a slow
+// success that finishes after a newer failure never reopens admission. A
+// failure always counts (fail closed), whenever it started.
 type provenanceHealth struct {
-	mu           sync.Mutex
-	verifiedAt   time.Time
-	failingSince time.Time
+	mu sync.Mutex
+	// verifiedAt is the start of the latest success that counted.
+	verifiedAt time.Time
+	// failingSince is the start of the first failure of the current outage;
+	// lastFailure the start of the latest failure.
+	failingSince, lastFailure time.Time
 }
 
 var sharedProvenanceHealth = &provenanceHealth{}
 
-func (h *provenanceHealth) succeeded(now time.Time) {
+func (h *provenanceHealth) succeeded(started time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.verifiedAt, h.failingSince = now, time.Time{}
+	if !h.lastFailure.IsZero() && !started.After(h.lastFailure) {
+		return
+	}
+	if started.After(h.verifiedAt) {
+		h.verifiedAt = started
+	}
+	h.failingSince = time.Time{}
 }
 
-func (h *provenanceHealth) failed(now time.Time) {
+func (h *provenanceHealth) failed(started time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.failingSince.IsZero() {
-		h.failingSince = now
+	if started.After(h.lastFailure) {
+		h.lastFailure = started
+	}
+	if h.failingSince.IsZero() || started.Before(h.failingSince) {
+		h.failingSince = started
 	}
 }
 
@@ -431,7 +481,7 @@ func (h *provenanceHealth) outlasted(now time.Time) bool {
 func (h *provenanceHealth) reset() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.verifiedAt, h.failingSince = time.Time{}, time.Time{}
+	h.verifiedAt, h.failingSince, h.lastFailure = time.Time{}, time.Time{}, time.Time{}
 }
 
 // requireSharedProvenance closes admission (a new claim, a new pool, or a
@@ -499,27 +549,98 @@ const sharedEscalationPeriod = 10 * time.Second
 // shared pool past its escalation time has its worker Pods re-deleted with a
 // one-second grace. It never issues or waits on a pool Delete.
 func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) error {
-	d := New(r.Client, nil, r.Config)
-	provenance, provenanceErr := d.sharedJournalProvenance(ctx)
-	pools, err := listSharedPools(ctx, r.Client, provenance)
-	if err != nil {
-		return err
+	d := New(r.Client, nil, r.Config).withSharedPass()
+	discovered := make(chan sharedDiscovery, 1)
+	go func() { discovered <- d.discoverShared(ctx, false) }()
+	escalatedEarly, earlyErr := d.escalateDueByAnnotations(ctx)
+	found := <-discovered
+	if found.listErr != nil {
+		return errors.Join(earlyErr, found.listErr)
 	}
-	var errs []error
-	if provenanceErr != nil {
-		errs = append(errs, provenanceErr)
-	} else if err := d.sharedProfileProvenance(ctx, pools, provenance); err != nil {
-		errs = append(errs, err)
+	errs := append([]error{earlyErr}, found.errs...)
+	if found.provenanceErr != nil {
+		errs = append(errs, found.provenanceErr)
 	}
+	// Provenance can only bring an escalation earlier than the bound the
+	// first step used, so this adds the escalations it made due.
 	var due []*unstructured.Unstructured
-	for i := range pools {
-		pool := &pools[i]
-		if _, escalateAt, _ := sharedBoundsOf(pool, provenance[pool.GetUID()], provenanceErr == nil); !sharedNow().Before(escalateAt) {
+	for i := range found.pools {
+		pool := &found.pools[i]
+		if escalatedEarly[pool.GetUID()] {
+			continue
+		}
+		if _, escalateAt, _ := sharedBoundsOf(pool, found.provenance[pool.GetUID()], found.provenanceErr == nil); !sharedNow().Before(escalateAt) {
 			due = append(due, pool)
 		}
 	}
-	errs = append(errs, d.escalateSharedPools(ctx, due, provenance))
+	errs = append(errs, d.escalateSharedPools(ctx, due, found.provenance))
 	return errors.Join(errs...)
+}
+
+// sharedDiscoveryTimeout bounds one pass's provenance discovery: the journal
+// inventory, the pool List, the profile List and the workspace Lists. A
+// discovery that runs out of it reports unavailable provenance.
+var sharedDiscoveryTimeout = 60 * time.Second
+
+// sharedDiscovery is one pass's provenance and pool inventory.
+type sharedDiscovery struct {
+	provenance    map[types.UID]sharedProvenance
+	provenanceErr error
+	pools         []unstructured.Unstructured
+	listErr       error
+	errs          []error
+}
+
+// discoverShared reads the pass's provenance under its own deadline: the
+// journal inventory, the shared pools, each journal-less pool's profile and,
+// for the bounds pass (suspects), each recorded workspace.
+func (d *Lifecycle) discoverShared(ctx context.Context, suspects bool) sharedDiscovery {
+	ctx, cancel := context.WithTimeout(ctx, sharedDiscoveryTimeout)
+	defer cancel()
+	var out sharedDiscovery
+	out.provenance, out.provenanceErr = d.sharedJournalProvenance(ctx)
+	if out.pools, out.listErr = listSharedPools(ctx, d.client, out.provenance); out.listErr != nil || out.provenanceErr != nil {
+		return out
+	}
+	if err := d.sharedProfileProvenance(ctx, out.pools, out.provenance); err != nil {
+		out.errs = append(out.errs, err)
+	}
+	if suspects {
+		// Each recorded workspace's suspicion, independent of the entries.
+		if err := d.sharedProvenanceSuspects(ctx, out.provenance); err != nil {
+			out.errs = append(out.errs, err)
+		}
+	}
+	return out
+}
+
+// sharedLatestEscalateAt is the latest escalation time any provenance could
+// give a pool: its annotations' bound under the 24h ceiling. Journal and
+// profile provenance can only bring it earlier, never later. It is not the
+// unavailable-provenance bound of creation plus 3h, which would escalate a
+// healthy longer-lived pool before its retirement and eviction.
+func sharedLatestEscalateAt(pool *unstructured.Unstructured) time.Time {
+	_, escalateAt, _ := sharedBoundsOf(pool, sharedProvenance{found: true, lifetime: profile.MaxSharedWorkerLifetime}, true)
+	return escalateAt
+}
+
+// escalateDueByAnnotations escalates every pool already due by
+// sharedLatestEscalateAt, without waiting for provenance, and returns them.
+func (d *Lifecycle) escalateDueByAnnotations(ctx context.Context) (map[types.UID]bool, error) {
+	pools, err := listSharedPools(ctx, d.client, nil)
+	if err != nil {
+		return nil, err
+	}
+	escalated := map[types.UID]bool{}
+	var due []*unstructured.Unstructured
+	for i := range pools {
+		pool := &pools[i]
+		if !sharedNow().Before(sharedLatestEscalateAt(pool)) {
+			due = append(due, pool)
+			escalated[pool.GetUID()] = true
+		}
+	}
+	return escalated, d.escalateSharedPools(ctx, due, nil)
 }
 
 // RunSharedEscalation runs EnforceSharedEscalation every period until ctx
@@ -671,6 +792,8 @@ func (d *Lifecycle) escalateSharedWorkerPods(ctx context.Context, pool *unstruct
 // profile's requested warm slots. With no opted-in profile and no shared pool
 // it makes no native call.
 func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache) error {
+	// One snapshot of journals and workspaces is shared by every pool.
+	d = d.withSharedPass()
 	discovered, err := listSharedPools(ctx, r.Client, nil)
 	if err != nil {
 		return err
@@ -857,6 +980,8 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	if len(poolWorkers) > 1 {
 		return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker pool has more than one worker")
 	}
+	// Each worker's assignments are listed once and shared by both checks.
+	assignments := map[string][]*pb.ActorAssignment{}
 	for _, worker := range poolWorkers {
 		if ledger.Worker != nil && (worker.GetMetadata().GetUid() != ledger.Worker.UID || worker.GetWorkerPodUid() != ledger.Worker.PodUID) {
 			return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker was replaced")
@@ -866,7 +991,12 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 			// and retire through the strong path, which this anticipates.
 			return d.retireSharedPool(ctx, pool, sharedRetiring, "the shared worker process restarted")
 		}
-		foreign, err := sharedForeignAssignment(ctx, d, pool, worker.GetMetadata().GetName())
+		listed, err := d.listWorkerAssignments(ctx, worker.GetMetadata().GetName())
+		if err != nil {
+			return err
+		}
+		assignments[worker.GetMetadata().GetName()] = listed
+		foreign, err := sharedForeignAssignment(ctx, d, pool, ledger, worker.GetMetadata().GetName(), listed)
 		if err != nil {
 			return err
 		}
@@ -894,7 +1024,7 @@ func (r *SpareWorkerReplenisher) maintainSharedPool(ctx context.Context, d *Life
 	case !sharedScopeCurrent(shape, ledger.Scope) || shape.source.GetNamespace() != pool.GetNamespace():
 		closing = "the shared worker's operator pool or profile changed"
 	}
-	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers)
+	hostedSuspect, orphans, err := d.sharedLedgerHosts(ctx, pool, ledger, poolWorkers, assignments)
 	if err != nil {
 		return err
 	}
@@ -966,10 +1096,14 @@ func (r *SpareWorkerReplenisher) writeLedger(ctx context.Context, pool *unstruct
 // sharedForeignAssignment lists a worker's assignments, then re-reads the
 // pool's ledger, and reports an assigned Actor that is not a ledger entry with
 // the same UID and that a second listing still reports.
-func sharedForeignAssignment(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, worker string) (bool, error) {
-	assignments, err := d.listWorkerAssignments(ctx, worker)
-	if err != nil || len(assignments) == 0 {
-		return false, err
+//
+// The worker's assignments are passed in, listed after the pass's pool
+// snapshot (snapshot) was read. Every assignment that snapshot already
+// holds, by Actor and UID, is not foreign, so the pool is re-read only when
+// some assignment is missing from it.
+func sharedForeignAssignment(ctx context.Context, d *Lifecycle, pool *unstructured.Unstructured, snapshot *sharedLedger, worker string, assignments []*pb.ActorAssignment) (bool, error) {
+	if len(assignments) == 0 || !slices.ContainsFunc(assignments, func(assignment *pb.ActorAssignment) bool { return !ledgerHolds(snapshot, assignment) }) {
+		return false, nil
 	}
 	current := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKeyFromObject(pool), current); err != nil {
@@ -989,20 +1123,23 @@ func sharedForeignAssignment(ctx context.Context, d *Lifecycle, pool *unstructur
 // whether any hosted workspace is tainted, quarantined or failed, and which
 // entries are orphans: their exact record positively disowns the slot and
 // their Actor is not assigned. A missing or replaced journal is not proof.
-func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger, poolWorkers []*pb.Worker) (bool, []string, error) {
+func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Unstructured, ledger *sharedLedger, poolWorkers []*pb.Worker, listed map[string][]*pb.ActorAssignment) (bool, []string, error) {
 	assigned := map[string]bool{}
 	for _, worker := range poolWorkers {
-		response, err := d.control.ListWorkerActorAssignments(ctx, &pb.ListWorkerActorAssignmentsRequest{Worker: &pb.ObjectRef{Name: worker.GetMetadata().GetName()}, Options: &pb.ListOptions{PageSize: 1000}})
-		if err != nil {
-			return false, nil, err
+		assignments, found := listed[worker.GetMetadata().GetName()]
+		if !found {
+			var err error
+			if assignments, err = d.listWorkerAssignments(ctx, worker.GetMetadata().GetName()); err != nil {
+				return false, nil, err
+			}
 		}
-		for _, assignment := range response.GetActorAssignments() {
-			assigned[assignment.GetActor().GetAtespace()+"/"+assignment.GetActor().GetName()] = true
-		}
-		if response.GetNextPageToken() != "" {
+		if len(assignments) > sharedAssignmentPage {
 			// More than a page of Actors on a worker of at most 16 slots is
 			// itself foreign; collect nothing this pass.
 			return false, nil, nil
+		}
+		for _, assignment := range assignments {
+			assigned[assignment.GetActor().GetAtespace()+"/"+assignment.GetActor().GetName()] = true
 		}
 	}
 	suspect := false
@@ -1036,7 +1173,7 @@ func (d *Lifecycle) sharedLedgerHosts(ctx context.Context, pool *unstructured.Un
 			continue
 		}
 		workspace := &api.ExecutionWorkspace{}
-		if err := d.client.Get(ctx, clientKey(record.Request.Key), workspace); err != nil {
+		if err := d.sharedWorkspace(ctx, clientKey(record.Request.Key), workspace); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
@@ -1064,6 +1201,9 @@ func sharedRetirementPersisted(pool *unstructured.Unstructured) bool {
 	return state != ""
 }
 
+// sharedAssignmentPage is one native assignment page.
+const sharedAssignmentPage = 1000
+
 // errSharedJournalUndecodable marks a hosted entry whose exact journal (or
 // archived) record exists but cannot be decoded. Its Strong and Failure
 // markers and its workspace are unreadable, so it is doubt.
@@ -1082,7 +1222,7 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 		return nil, false, nil
 	}
 	journal := &corev1.ConfigMap{}
-	if err := d.client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, journal); err != nil {
+	if err := d.sharedConfigMap(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, journal); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, false, nil
 		}
@@ -1101,7 +1241,7 @@ func (d *Lifecycle) sharedEntryRecord(ctx context.Context, marker string) (*jour
 	}
 	if record.Request.Sequence > sequence {
 		archived := &corev1.ConfigMap{}
-		if err := d.client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: historyName(parts[1], sequence)}, archived); err != nil {
+		if err := d.sharedConfigMap(ctx, types.NamespacedName{Namespace: parts[0], Name: historyName(parts[1], sequence)}, archived); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil, false, nil
 			}
@@ -1154,4 +1294,117 @@ func sharedScopeCurrent(shape *sharedProfileShape, scope sharedScope) bool {
 // template-sized scope, in the operator pool's namespace.
 func sharedCountsAsFree(pool *unstructured.Unstructured, ledger *sharedLedger, shape *sharedProfileShape, now time.Time) bool {
 	return shape != nil && ledger.Scope == shape.scope && pool.GetNamespace() == shape.source.GetNamespace() && sharedAdmits(pool, ledger, now)
+}
+
+// sharedPassReads is one bounds or sweep pass's snapshot of the Kubernetes
+// reads every pool's checks need: the labeled journal and archived-record
+// ConfigMaps (from the pass's one inventory List) and each namespace's
+// ExecutionWorkspaces (one List per namespace, on first use). A pass then
+// reads each once instead of once per pool or entry. A lookup the snapshot
+// cannot answer (an object outside the labeled inventory, or a namespace
+// whose List failed) falls back to a live Get, so the snapshot never turns a
+// present object into an absent one. Admission and retirement of one
+// allocation never use it; they read live.
+type sharedPassReads struct {
+	mu         sync.Mutex
+	journals   map[types.NamespacedName]*corev1.ConfigMap
+	workspaces map[string]map[string]*api.ExecutionWorkspace
+	// listed marks a namespace whose List succeeded, failed one whose List
+	// failed this pass (its lookups then use live Gets, never a re-List).
+	listed, failed map[string]bool
+}
+
+func newSharedPassReads() *sharedPassReads {
+	return &sharedPassReads{workspaces: map[string]map[string]*api.ExecutionWorkspace{}, listed: map[string]bool{}, failed: map[string]bool{}}
+}
+
+// noteWorkspaceListFailed records a namespace whose List failed this pass.
+func (p *sharedPassReads) noteWorkspaceListFailed(namespace string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failed[namespace] = true
+}
+
+// withSharedPass returns a Lifecycle that shares one pass's reads.
+func (d *Lifecycle) withSharedPass() *Lifecycle {
+	pass := *d
+	pass.sharedPass = newSharedPassReads()
+	return &pass
+}
+
+// noteJournals records the pass's labeled journal inventory.
+func (p *sharedPassReads) noteJournals(items []corev1.ConfigMap) {
+	if p == nil {
+		return
+	}
+	journals := make(map[types.NamespacedName]*corev1.ConfigMap, len(items))
+	for i := range items {
+		journals[client.ObjectKeyFromObject(&items[i])] = &items[i]
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.journals = journals
+}
+
+// noteWorkspaces records one namespace's complete workspace List.
+func (p *sharedPassReads) noteWorkspaces(namespace string, items []api.ExecutionWorkspace) {
+	if p == nil {
+		return
+	}
+	byName := make(map[string]*api.ExecutionWorkspace, len(items))
+	for i := range items {
+		byName[items[i].Name] = &items[i]
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.workspaces[namespace], p.listed[namespace] = byName, true
+}
+
+// sharedConfigMap reads a journal or archived record, from the pass's
+// inventory when it holds it.
+func (d *Lifecycle) sharedConfigMap(ctx context.Context, key types.NamespacedName, cm *corev1.ConfigMap) error {
+	if p := d.sharedPass; p != nil {
+		p.mu.Lock()
+		cached, found := p.journals[key]
+		p.mu.Unlock()
+		if found {
+			cached.DeepCopyInto(cm)
+			return nil
+		}
+	}
+	return d.client.Get(ctx, key, cm)
+}
+
+// sharedWorkspace reads an ExecutionWorkspace, from the pass's List of its
+// namespace (made once, on first use) when one succeeded.
+func (d *Lifecycle) sharedWorkspace(ctx context.Context, key types.NamespacedName, workspace *api.ExecutionWorkspace) error {
+	p := d.sharedPass
+	if p == nil {
+		return d.client.Get(ctx, key, workspace)
+	}
+	p.mu.Lock()
+	listed, failed := p.listed[key.Namespace], p.failed[key.Namespace]
+	p.mu.Unlock()
+	if failed {
+		return d.client.Get(ctx, key, workspace)
+	}
+	if !listed {
+		workspaces := &api.ExecutionWorkspaceList{}
+		if err := d.client.List(ctx, workspaces, client.InNamespace(key.Namespace)); err != nil {
+			p.noteWorkspaceListFailed(key.Namespace)
+			return d.client.Get(ctx, key, workspace)
+		}
+		p.noteWorkspaces(key.Namespace, workspaces.Items)
+	}
+	p.mu.Lock()
+	cached, found := p.workspaces[key.Namespace][key.Name]
+	p.mu.Unlock()
+	if !found {
+		return apierrors.NewNotFound(api.GroupVersion.WithResource("executionworkspaces").GroupResource(), key.Name)
+	}
+	cached.DeepCopyInto(workspace)
+	return nil
 }
