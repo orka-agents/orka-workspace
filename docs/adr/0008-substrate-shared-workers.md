@@ -89,7 +89,11 @@ paired with revocation of everything a leaked sandbox could use.
   - it is outside the pool's Atespace; or
   - it is inside that Atespace but is not a derived template this provider recorded (in a journal, an archived record, or a checkpoint catalog), with the recorded UID once known.
 
-  Any foreign template fails closed: the pool is quarantined and strongly retired, and the admission is refused. This check runs:
+  Any foreign template fails closed: the pool is quarantined and strongly retired, and the admission is refused.
+  - The provider keeps the recorded templates in memory. A journal save adds the templates it records, and each leader sweep replaces the set from the journals, archived records and checkpoint catalogs.
+  - A check whose templates are all in that set makes no ConfigMap call. When a template that reaches the pool is missing, the check rereads the records once, with two Lists and no per-catalog Gets, before it treats the template as foreign. A stale set can therefore only cause a reread, never a template counted as recorded that is not.
+
+  This check runs:
   - before a slot is claimed or a pool is created;
   - immediately before each Resume;
   - on every leader sweep.
@@ -195,7 +199,10 @@ These take the strong path:
   - any Tag-capture step fails;
   - the evidence-only suspend issued by a Stop is rejected or times out, or any later step of that Stop's interim evidence fails, including a journal write (a write conflict is retried). The strong reason is persisted, and the pool's retirement started, before that pass returns.
 
-  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued.
+  Retirement of the pool starts at once, and the data capture still proceeds when it can. A suspend whose outcome is unresolved is never reissued against a `RUNNING` Actor.
+  - **Continuing a stalled suspension.** A SuspendActor call can fail after the Actor was marked `SUSPENDING`, for example on a transient database timeout in `FinalizeSuspended`. The Actor then stays `SUSPENDING`, and the strong path's pool deletion would crash it and reclaim its node state (`workflow_worker_delete.go`), losing the data. The provider therefore re-issues the same synchronous SuspendActor for a shared Actor seen `SUSPENDING`, at most 10 times, at least 10 s apart, recording each attempt in the journal before it is sent.
+  - This continues the same upstream suspension and is not a replay. Agent Substrate's workflow is re-entrant (`workflow_suspend.go`): it skips `MarkSuspending` for a `SUSPENDING` Actor, so no new snapshot is minted. It sends the persisted snapshot to atelet, which answers a checkpoint it already committed without taking another. `FinalizeSuspended` then records it. The Actor lease serializes the workflow, so a continuation sent while the original call is still running is refused with `Aborted` and has no effect.
+  - The continuation must finish before the worker Pod is gone. A pool deleted for the strong path keeps its Pod for its termination grace, which leaves room for it, but a continuation that loses that race leaves the instance lost and keeps its last verified checkpoint. A private worker, which faces no such deletion, keeps observing without resubmitting.
   - Once the worker Pod is proven absent, a capture that still fails one of the provider's own evidence checks (not a retryable native or Kubernetes error) is final. That instance is reported lost and retires through Stop, keeping its last verified checkpoint; no Tag is invented.
   - A Stop whose shared worker, ledger or workspace cannot be verified before its proof also takes the strong path.
 - **A persisted strong marker always finishes.** The marker is saved before the pool is deleted. Every later retirement pass drives the pool's deletion and the absence proof whatever the checkpoint does. The bounds loop, reading Kubernetes alone, also deletes a pool when:
@@ -204,7 +211,8 @@ These take the strong path:
     - Doubt holds only if a pool read taken after the journal still shows the entry. A release removes the entry before its journal records `Released`, so this never mistakes a concurrent release for doubt.
     - Every retirement it triggers is preconditioned on that pool snapshot's resourceVersion.
   - a hosted workspace is operator-tainted, quarantined or `Failed`;
-  - its ledger was saved as `Retiring` or `Quarantined`.
+  - its ledger was saved as `Retiring` or `Quarantined`;
+  - it carries the retirement-intent annotation `substrate.workspace.orka.ai/shared-retire`.
 
   A crash between saving any of these intents and deleting the pool therefore cannot leave the pool running, even when the native sweep runs out of time or the native API is down. Every strong trigger (the marker, a failure, a pool's retirement) is persisted, and the pool's deletion started, under a fresh context bounded to 30 s and detached from the request's own deadline, so a native call that outlived the request cannot prevent it.
 - **The Actor or worker is already lost:** the Actor crashed, the worker Pod is terminating or gone, or the pool is deleting, closed for retirement, or no longer holds the entry.
@@ -238,10 +246,11 @@ Retiring one Actor never touches its neighbours except through this explicit str
 - **Hard retirement.** It is never blocked by a ledger write.
   - Every strong retirement issues the UID-preconditioned Delete first, on its own fresh bounded context. A deletionTimestamp already stops admission and startup.
   - The retirement state and reason are written afterwards, best effort, with a separate 5 s timeout. Neither the result nor the duration of that write can affect the Delete.
+  - **A failed Delete keeps the decision.** If the Delete itself fails, the provider still writes the retirement state, and also the single retirement-intent annotation, each on its own short context, and returns the error. Admission and startup refuse a pool that carries the annotation, and every bounds pass retries its Delete. A decision to retire therefore survives a failed Delete and a restart, and no claim lands on the pool in between.
   - A bounds pass works in phases:
     1. It decides every action, re-reading the clock per pool.
-    2. It issues every due escalation, each Pod delete on its own short context.
-    3. It issues the pool Deletes concurrently, at most 8 at a time, so one slow DELETE never holds up the others.
+    2. It issues every due escalation. Pools escalate concurrently, at most 16 at a time, and each Pod list and Pod delete runs on its own 10 s context. A pool takes at most two such calls, so even when every call stalls to its timeout, one pass reaches 240 due pools within the 5-minute margin.
+    3. It issues the pool Deletes concurrently, at most 8 at a time, so one slow DELETE never holds up the others. A Delete that fails records the retirement intent described above.
     4. It runs the bookkeeping writes within a 30 s total budget.
 
     Escalation also runs in its own 10 s loop that never waits on a pool Delete, so a slow pass cannot push a worker Pod's escalation past its deadline.
@@ -307,4 +316,5 @@ The ready and stopped timing logs report `workerSource: shared`. The stopped log
   - the capacity arithmetic for `N` Actors;
   - `observed_epoch` behaviour;
   - egress revocation and its settle window on a running Actor;
-  - the eviction path and one-second escalation on a strongly retired shared worker.
+  - the eviction path and one-second escalation on a strongly retired shared worker;
+  - a suspension continued after a `FinalizeSuspended` failure, finishing before the deleted pool's worker Pod is gone.
