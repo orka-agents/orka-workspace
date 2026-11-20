@@ -69,6 +69,21 @@ for obj in objects:
                 "signerName": "servicedns.podcert.ate.dev/identity",
                 "labelSelector": {"matchLabels": {"podcert.ate.dev/canarying": "live"}},
                 "path": "trust-bundle.pem"}}]}}])
+        # Optional clean-room publication wiring for write-intent latency runs
+        # (round 10): the Workspace/Publisher and its Secrets come from
+        # ORKA_CORE_PRE_INSTALL_HOOK, so Core starts wired and never restarts.
+        if os.environ.get("ORKA_CORE_PUBLICATION") == "1":
+            manager.setdefault("env", []).extend([
+                {"name": "ORKA_WORKSPACE_PUBLISHER_URL", "value": f"http://r10-publisher.{namespace}.svc:8080"},
+                {"name": "ORKA_WORKSPACE_PUBLISHER_CONTROLLER_TOKEN_FILE", "value": "/var/run/orka/publisher-auth/controller-token"},
+                {"name": "ORKA_WORKSPACE_PUBLISHER_CAPABILITY_SECRET_FILE", "value": "/var/run/orka/publisher-auth/operation-capability-secret"},
+                {"name": "ORKA_ACP_ARTIFACT_CAPABILITY_SECRET_FILE", "value": "/var/run/orka/artifact/secret"}])
+            manager["volumeMounts"].extend([
+                {"name": "r10-publisher-auth", "mountPath": "/var/run/orka/publisher-auth", "readOnly": True},
+                {"name": "r10-artifact", "mountPath": "/var/run/orka/artifact", "readOnly": True}])
+            pod_spec["volumes"].extend([
+                {"name": "r10-publisher-auth", "secret": {"secretName": "r10-publisher-auth", "defaultMode": 0o440}},
+                {"name": "r10-artifact", "secret": {"secretName": "r10-artifact-capability", "defaultMode": 0o440}}])
         # Agent Substrate's DNS relay answers only allowlisted names, and the
         # sandbox resolver (ndots:5 with the worker Pod's search list) never
         # sends the absolute short "<svc>.<ns>.svc." form kube-dns resolves.

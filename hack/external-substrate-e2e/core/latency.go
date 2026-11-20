@@ -62,7 +62,11 @@ type latency struct {
 	// agentFor names the Agent a class's turns use; unset classes use the
 	// Codex-typed native-core Agent.
 	agentFor map[string]string
-	skipFinalExpiry                                bool
+	// writeClasses run write-intent turns against LATENCY_WRITE_REPO
+	// (round 10): each turn's fixture prompt asks for one file change, and
+	// the clean-room publisher pushes it to branch latency/<session>.
+	writeClasses    map[string]bool
+	skipFinalExpiry bool
 }
 
 // emit prints one machine-readable event and keeps it for the final report.
@@ -115,13 +119,27 @@ func (l *latency) createTurn(ctx context.Context, name, session, class string, c
 	if mapped := l.agentFor[class]; mapped != "" {
 		agentName = mapped
 	}
+	prompt := "Run the deterministic external native workspace fixture (latency turn)."
+	tools := []any{"Glob", "Grep", "Read"}
+	if l.writeClasses[class] {
+		prompt += " [latency-write:" + session + "]"
+		tools = append(tools, "Write", "Edit")
+	}
 	task := l.object("Task", name, map[string]any{"type": "agent", "agentRef": map[string]any{"name": agentName},
-		"prompt":     "Run the deterministic external native workspace fixture (latency turn).",
+		"prompt":     prompt,
 		"timeout":    "5m",
 		"sessionRef": map[string]any{"name": session, "create": create, "append": true},
 		"execution": map[string]any{"workspace": map[string]any{"classRef": map[string]any{"name": class},
 			"reusePolicy": "session", "onDetach": "Suspend"}},
-		"agentRuntime": map[string]any{"maxTurns": int64(1), "allowedTools": []any{"Glob", "Grep", "Read"}, "allowBash": false}})
+		"agentRuntime": map[string]any{"maxTurns": int64(1), "allowedTools": tools, "allowBash": false}})
+	if l.writeClasses[class] {
+		repo := os.Getenv("LATENCY_WRITE_REPO")
+		ref := func(role string) map[string]any { return map[string]any{"name": "r10-cred-" + role, "key": "token"} }
+		_ = unstructured.SetNestedField(task.Object, map[string]any{"intent": "write", "gitRepo": repo, "branch": "main",
+			"readCredentialRef": ref("read"), "publicationGitRepo": repo, "publicationReadCredentialRef": ref("publication-read"),
+			"publicationCredentialRef": ref("push"), "forgeCredentialRef": ref("forge"),
+			"pushBranch": "latency/" + session, "prBaseBranch": "main", "createPR": false}, "spec", "workspace")
+	}
 	t := &turn{Name: name, Session: session, States: map[string]int64{}, AcceptedMs: -1, DoneMs: -1}
 	t.CreatedAt = time.Now()
 	if err := l.c.Create(ctx, task); err != nil {
@@ -534,14 +552,14 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		// creates a new one; either way the Session and its UID are the same
 		// and the prompt is new. Which one happened is recorded, not checked.
 		"sameSessionNewPrompt": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["promptID"] != t1.Identity["promptID"],
-		"newAttachmentEpoch":       warm2.AttachmentEpoch > warm1.AttachmentEpoch,
+		"newAttachmentEpoch":   warm2.AttachmentEpoch > warm1.AttachmentEpoch,
 		// Other Sessions' windows can expire meanwhile when the last window
 		// is left idle, so the namespace-wide Tag check applies only otherwise.
 		"noNewTag": l.skipFinalExpiry || len(newTags(warm1, warm2)) == 0,
 	}
 	l.emit("warmAttach", map[string]any{"scenario": l.warmLabel, "rep": rep, "checks": direct,
 		"sameGeneration": t2.Identity["runtimeSessionGeneration"] == t1.Identity["runtimeSessionGeneration"],
-		"generations": []string{t1.Identity["runtimeSessionGeneration"], t2.Identity["runtimeSessionGeneration"]}})
+		"generations":    []string{t1.Identity["runtimeSessionGeneration"], t2.Identity["runtimeSessionGeneration"]}})
 	for check, ok := range direct {
 		if !ok {
 			l.violate("warm continuation %s failed %s", t2.Name, check)
@@ -683,7 +701,7 @@ func (l *latency) ensureClass(ctx context.Context, name string, options classOpt
 func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 	l := &latency{proof: p, start: time.Now(), window: 2 * time.Minute, sharedWorkspaces: map[string]bool{},
 		warmClass: "lat-warm", warmLabel: "warm", sharedClass: "lat-shared", sharedLabel: "shared",
-		skipFinalExpiry: os.Getenv("LATENCY_SKIP_FINAL_EXPIRY") == "1", agentFor: map[string]string{}}
+		skipFinalExpiry: os.Getenv("LATENCY_SKIP_FINAL_EXPIRY") == "1", agentFor: map[string]string{}, writeClasses: map[string]bool{}}
 	// LATENCY_CLAUDE_CLASSES lists classes whose turns use a Claude-typed
 	// Agent over the same deterministic fixture: Codex native sessions are
 	// never reused (ADR 0059), so warm-reuse scenarios need a non-Codex type.
@@ -781,6 +799,19 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 				l.window, l.sharedClass, l.sharedLabel = window.Duration, "lat-shared", "shared"
 				return l.sharedScenario(ctx, rep, uid, sharedSessions)
 			}
+		case "writeprivate", "writeshared":
+			// Round 10: write-intent turns, three per Session inside Core's
+			// default window, so turns 2 and 3 are warm write follow-ups.
+			class, options := "lat-write-p", classOptions{}
+			if scenario == "writeshared" {
+				class, options = "lat-write-s", classOptions{placement: shared}
+			}
+			l.writeClasses[class] = true
+			if err := l.ensureClassOnce(ctx, class, options); err != nil {
+				return nil, err
+			}
+			name := scenario
+			run = func(rep int) (map[string]any, error) { return l.writeScenario(ctx, name, class, rep) }
 		case "shareddefault":
 			// Shared workers under Core's default window (ADR 0057).
 			if err := l.ensureClassOnce(ctx, "lat-shared-d", classOptions{placement: shared,
@@ -946,4 +977,54 @@ func (l *latency) ensureClaudeAgent(ctx context.Context) error {
 		return fmt.Errorf("Claude fixture Agent admission: %w", err)
 	}
 	return nil
+}
+
+// writeScenario runs three write-intent turns of one Session back to back:
+// a cold first turn and two warm follow-ups inside the default window. It
+// records each turn's delivery so the forge read-back can check what was
+// published.
+func (l *latency) writeScenario(ctx context.Context, scenario, class string, rep int) (map[string]any, error) {
+	session := fmt.Sprintf("lat-%s-%d", map[string]string{"writeprivate": "wp", "writeshared": "ws"}[scenario], rep)
+	var previous *snapshot
+	turns := []any{}
+	for i, kind := range []string{"cold", "warm", "warm"} {
+		ordinal := fmt.Sprintf("t%d", i+1)
+		t, err := l.createTurn(ctx, session+"-"+ordinal, session, class, i == 0)
+		if err != nil {
+			return nil, err
+		}
+		w, err := l.waitSettled(ctx, t)
+		if err != nil {
+			return nil, err
+		}
+		after, err := l.snapshot(ctx, w, t.Identity["runtimePoolName"])
+		if err != nil {
+			return nil, err
+		}
+		l.logTurnKind(scenario, rep, ordinal, kind, t, previous, after)
+		task := l.object("Task", t.Name, nil)
+		var delivery map[string]any
+		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err = wait(waitCtx, func() (bool, error) {
+			if err := l.c.Get(waitCtx, client.ObjectKeyFromObject(task), task); err != nil {
+				return false, err
+			}
+			delivery, _, _ = unstructured.NestedMap(task.Object, "status", "delivery")
+			return delivery["outcome"] != nil && delivery["outcome"] != "", nil
+		})
+		cancel()
+		if err != nil {
+			l.violate("write turn %s published no delivery outcome: %v", t.Name, err)
+		}
+		l.emit("writeTurn", map[string]any{"scenario": scenario, "rep": rep, "turn": ordinal, "task": t.Name, "session": session,
+			"generation": t.Identity["runtimeSessionGeneration"], "outcome": delivery["outcome"], "verifiedRemoteSHA": delivery["verifiedRemoteSHA"],
+			"startingSHA": delivery["startingSHA"], "remoteBeforeSHA": delivery["remoteBeforeSHA"], "branch": delivery["branch"],
+			"deliveredAt": delivery["lastTransitionTime"], "doneMs": t.DoneMs, "settledMs": t.SettledMs})
+		if delivery["outcome"] != "VerifiedExact" {
+			l.violate("write turn %s delivery %v", t.Name, delivery["outcome"])
+		}
+		turns = append(turns, t)
+		previous = after
+	}
+	return map[string]any{"session": session, "turns": turns}, nil
 }
