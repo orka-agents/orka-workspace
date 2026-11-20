@@ -101,6 +101,11 @@ func main() {
 	}
 	var sequence uint64
 	sessionID := ""
+	// cwd is the session working directory from session/new or session/load;
+	// write-intent latency turns (prompt marker writeMarker) change one file
+	// there per turn, plus one file a moment after the turn ends.
+	cwd := ""
+	turn := 0
 	for scanner.Scan() {
 		var message struct {
 			ID     json.RawMessage `json:"id"`
@@ -115,6 +120,14 @@ func main() {
 			result = map[string]any{"protocolVersion": 1, "agentInfo": map[string]any{"name": "external-workspace-fixture", "version": "1"}, "agentCapabilities": map[string]any{"loadSession": true, "sessionCapabilities": map[string]any{"resume": map[string]any{}}, "mcpCapabilities": map[string]any{"http": true}}, "authMethods": []any{map[string]any{"id": "api-key", "name": "Fixture API key"}}}
 		case "authenticate":
 		case "session/new":
+			var params struct {
+				Params struct {
+					Cwd string `json:"cwd"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &params) == nil && params.Params.Cwd != "" {
+				cwd = params.Params.Cwd
+			}
 			sequence++
 			sessionID = fmt.Sprintf("external-workspace-%d", sequence)
 			if sequence == 1 && publishRollout() {
@@ -125,10 +138,14 @@ func main() {
 			var params struct {
 				Params struct {
 					SessionID string `json:"sessionId"`
+					Cwd       string `json:"cwd"`
 				} `json:"params"`
 			}
 			if err := json.Unmarshal(scanner.Bytes(), &params); err != nil {
 				os.Exit(2)
+			}
+			if params.Params.Cwd != "" {
+				cwd = params.Params.Cwd
 			}
 			if !nativeSessionRestored(os.Getenv("CODEX_HOME"), params.Params.SessionID) {
 				if len(message.ID) != 0 {
@@ -142,6 +159,10 @@ func main() {
 			// agent stderr private; latency measurements compare it with the
 			// Task's creation (hack/external-substrate-e2e/core/latency.sh).
 			received := time.Now().UTC().Format(time.RFC3339Nano)
+			if marker := writeMarkerIn(scanner.Bytes()); marker != "" && cwd != "" {
+				turn++
+				writeTurnFiles(cwd, marker, turn, received)
+			}
 			// Leave time for the independent proof client to observe Serving
 			// and verify the selected Pod before terminal settlement retires it.
 			time.Sleep(2 * time.Second)
@@ -162,4 +183,36 @@ func main() {
 	if scanner.Err() != nil {
 		os.Exit(2)
 	}
+}
+
+// writeMarker in a prompt asks for one workspace change per turn:
+// "[latency-write:<name>]" writes latency/<name>/turn-<n>.txt now and
+// latency/<name>/after-<n>.txt once the turn has ended, retrying while the
+// workspace is frozen, so it can only reach a later turn's delta.
+var writeMarker = regexp.MustCompile(`\[latency-write:([a-z0-9-]{1,40})\]`)
+
+func writeMarkerIn(message []byte) string {
+	match := writeMarker.FindSubmatch(message)
+	if match == nil {
+		return ""
+	}
+	return string(match[1])
+}
+
+func writeTurnFiles(cwd, name string, turn int, received string) {
+	dir := filepath.Join(cwd, "latency", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("turn-%d.txt", turn)), []byte(fmt.Sprintf("turn %d received %s\n", turn, received)), 0o644)
+	go func() {
+		time.Sleep(3 * time.Second)
+		deadline := time.Now().Add(2 * time.Minute)
+		for time.Now().Before(deadline) {
+			if os.WriteFile(filepath.Join(dir, fmt.Sprintf("after-%d.txt", turn)), []byte(fmt.Sprintf("after turn %d\n", turn)), 0o644) == nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
 }
