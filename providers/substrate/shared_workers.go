@@ -1280,17 +1280,28 @@ func (d *Lifecycle) verifyEgressDenyAll(ctx context.Context, record *journalReco
 // caches no longer hold the admitted allowlist.
 func (d *Lifecycle) prepareSharedSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (bool, error) {
 	shared := record.SharedWorker
+	// A resourceVersion conflict is ordinary contention, never doubt: it is
+	// returned, and the next pass rereads and retries.
 	reason, err := d.sharedStrongReason(ctx, cm, record)
+	if apierrors.IsConflict(err) {
+		return false, err
+	}
 	if err != nil {
 		reason = "the shared worker could not be verified before suspension: " + err.Error()
 	}
 	if reason == "" {
 		if err := d.verifyRetiringSharedWorker(ctx, record); err != nil {
+			if apierrors.IsConflict(err) {
+				return false, err
+			}
 			reason = "the shared worker could not be verified before suspension: " + err.Error()
 		}
 	}
 	if reason == "" {
 		if err := d.revokeSharedEgress(ctx, cm, record); err != nil {
+			if apierrors.IsConflict(err) {
+				return false, err
+			}
 			reason = "egress could not be revoked before suspension: " + err.Error()
 		}
 	}
@@ -1350,7 +1361,7 @@ func (d *Lifecycle) verifyRetiringSharedWorker(ctx context.Context, record *jour
 // worker version moved and the proof should be retried.
 //
 //nolint:gocyclo // The interim evidence is a fixed sequence of exact checks.
-func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (*sharedTerminationProof, string) {
+func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, actor *pb.Actor) (*sharedTerminationProof, string, error) {
 	shared := record.SharedWorker
 	fence := shared.Suspend
 	f := record.Worker
@@ -1360,56 +1371,60 @@ func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.Confi
 	if fence == nil || !fence.Issued || fence.SnapshotDigest == "" || actor.GetMetadata().GetUid() != record.Actor.UID || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED ||
 		actor.GetStatus().GetWorkerAssignment() != nil || actor.GetMetadata().GetVersion() <= fence.PriorVersion ||
 		snapshotDigest(snapshot) != fence.SnapshotDigest || verifyDataSnapshot(snapshot, pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR) != nil || snapshot.GetGeneration() <= fence.PriorGeneration {
-		return nil, "the suspended Actor does not match the issued suspend"
+		return nil, "the suspended Actor does not match the issued suspend", nil
 	}
 	// (2) Its assignment is absent from the same fenced worker, at the same
 	// settled epoch and an unchanged worker version.
 	before, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
 	if err != nil {
-		return nil, "the fenced worker could not be read: " + status.Code(err).String()
+		return nil, "the fenced worker could not be read: " + status.Code(err).String(), nil
 	}
 	if !sharedWorkerIdentityMatches(before, f) || before.GetStatus().GetRegisteredEpoch() != f.Epoch || before.GetStatus().GetObservedEpoch() != f.Epoch {
-		return nil, "the fenced worker's identity or epoch changed"
+		return nil, "the fenced worker's identity or epoch changed", nil
 	}
 	if before.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
-		return nil, "the fenced worker is " + before.GetStatus().GetState().String()
+		return nil, "the fenced worker is " + before.GetStatus().GetState().String(), nil
 	}
 	assigned, _, err := d.sharedAssignmentsInLedger(ctx, record, f.Name)
 	if err != nil {
-		return nil, "the fenced worker's assignments are in doubt: " + err.Error()
+		return nil, "the fenced worker's assignments are in doubt: " + err.Error(), nil
 	}
 	if assigned {
-		return nil, "the fenced worker still lists the suspended Actor"
+		return nil, "the fenced worker still lists the suspended Actor", nil
 	}
 	after, err := d.control.GetWorker(ctx, &pb.GetWorkerRequest{Worker: &pb.ObjectRef{Name: f.Name}})
 	if err != nil {
-		return nil, "the fenced worker could not be re-read: " + status.Code(err).String()
+		return nil, "the fenced worker could not be re-read: " + status.Code(err).String(), nil
 	}
 	if !sharedWorkerIdentityMatches(after, f) || after.GetStatus().GetRegisteredEpoch() != f.Epoch || after.GetStatus().GetObservedEpoch() != f.Epoch {
-		return nil, "the fenced worker's identity or epoch changed during the proof"
+		return nil, "the fenced worker's identity or epoch changed during the proof", nil
 	}
 	if after.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
-		return nil, "the fenced worker is " + after.GetStatus().GetState().String()
+		return nil, "the fenced worker is " + after.GetStatus().GetState().String(), nil
 	}
 	if after.GetMetadata().GetVersion() != before.GetMetadata().GetVersion() {
 		if shared.ProofAttempts+1 >= sharedMaxProofAttempts {
-			return nil, "the fenced worker kept changing during the proof"
+			return nil, "the fenced worker kept changing during the proof", nil
 		}
 		shared.ProofAttempts++
 		if err := d.save(ctx, cm, record); err != nil {
-			return nil, "the proof attempt could not be recorded"
+			if apierrors.IsConflict(err) {
+				// Ordinary journal contention: reread and retry the proof.
+				return nil, "", err
+			}
+			return nil, "the proof attempt could not be recorded", nil
 		}
-		return nil, ""
+		return nil, "", nil
 	}
 	// (3) Egress is still deny-all: no credential-injection effect remains.
 	if err := d.verifyEgressDenyAll(ctx, record); err != nil {
-		return nil, "the revoked egress could not be verified"
+		return nil, "the revoked egress could not be verified", nil
 	}
 	current, err := d.actor(ctx, record)
 	if err != nil || current == nil || current.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() || current.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED || current.GetStatus().GetWorkerAssignment() != nil {
-		return nil, "the suspended Actor changed during the proof"
+		return nil, "the suspended Actor changed during the proof", nil
 	}
-	return &sharedTerminationProof{WorkerUID: f.UID, Epoch: f.Epoch, WorkerVersion: after.GetMetadata().GetVersion(), ActorVersion: actor.GetMetadata().GetVersion(), At: *milestone()}, ""
+	return &sharedTerminationProof{WorkerUID: f.UID, Epoch: f.Epoch, WorkerVersion: after.GetMetadata().GetVersion(), ActorVersion: actor.GetMetadata().GetVersion(), At: *milestone()}, "", nil
 }
 
 // stopShared retires a record on a shared worker. A never-booted Actor only
@@ -1570,7 +1585,10 @@ func (d *Lifecycle) advanceSharedInterim(ctx context.Context, cm *corev1.ConfigM
 			return false, "", err
 		}
 	}
-	proof, doubt := d.proveSharedTermination(ctx, cm, record, actor)
+	proof, doubt, err := d.proveSharedTermination(ctx, cm, record, actor)
+	if err != nil {
+		return false, "", err
+	}
 	if proof == nil {
 		return false, doubt, nil
 	}

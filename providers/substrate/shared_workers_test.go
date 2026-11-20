@@ -5857,3 +5857,43 @@ func TestSharedDeletingPoolStillGetsItsCappedPodDelete(t *testing.T) {
 		t.Fatalf("a deleting pool's worker Pod never got its capped delete retried: %+v", deletes())
 	}
 }
+
+func TestSharedProofAttemptSaveConflictIsRetriedNotDoubt(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 2)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	_, recordB := sharedReady(t, c, native, second)
+	// A neighbour changes the worker's version during the proof, and the save
+	// recording that proof attempt conflicts once.
+	native.churnWorker = recordA.Worker.Name
+	var conflicted atomic.Bool
+	contended := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if cm, ok := obj.(*corev1.ConfigMap); ok && strings.Contains(cm.Data[journalDataKey], `"proofAttempts":1`) && conflicted.CompareAndSwap(false, true) {
+				return apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, cm.Name, errors.New("the journal changed"))
+			}
+			return w.Update(ctx, obj, opts...)
+		},
+	})
+	for range 6 {
+		tick()
+		_, _ = sharedDriver(contended, native).StopInstance(t.Context(), first.Key, a.Identity)
+		if conflicted.Load() {
+			break
+		}
+	}
+	if !conflicted.Load() {
+		t.Fatal("the proof attempt's save was not exercised")
+	}
+	native.churnWorker = ""
+	_, record := sharedRetired(t, c, native, first, a.Identity, false)
+	if record.SharedWorker.Strong != "" || record.SharedWorker.Proof == nil {
+		t.Fatalf("a journal write conflict during the proof took the strong path: %q", record.SharedWorker.Strong)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); !found {
+		t.Fatal("ordinary journal contention deleted the shared pool")
+	}
+	if actor := native.actors[refKey(actorRef(recordB))]; actor == nil || actor.Status.State != pb.ActorState_ACTOR_STATE_RUNNING {
+		t.Fatal("ordinary journal contention disturbed the neighbour")
+	}
+}
