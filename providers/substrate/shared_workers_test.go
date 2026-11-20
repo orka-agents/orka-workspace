@@ -1259,6 +1259,72 @@ func TestSharedSuspensionReservationFailureTakesTheStrongPath(t *testing.T) {
 	}
 }
 
+// Every exit of a shared data suspension after its capture follows the
+// post-evidence rule: a lasting definite failure at any step starts the
+// pool's strong retirement before the pass returns.
+func TestSharedEveryPostCaptureFailureTakesTheStrongPath(t *testing.T) {
+	transition := func(changed func(before, after *journalRecord) bool) func(*sharedStepFault) {
+		return func(f *sharedStepFault) { f.journal = changed }
+	}
+	for _, tc := range []struct {
+		name   string
+		inject func(*sharedStepFault)
+	}{
+		{"source snapshot digest save", transition(func(before, after *journalRecord) bool {
+			return before.Pending != nil && after.Pending != nil && before.Pending.SourceSnapshotDigest == "" && after.Pending.SourceSnapshotDigest != ""
+		})},
+		{"Tag creation intent save", transition(func(before, after *journalRecord) bool {
+			return before.Pending != nil && after.Pending != nil && !before.Pending.Tag.CreateIssued && after.Pending.Tag.CreateIssued
+		})},
+		{"captured checkpoint save", transition(func(before, after *journalRecord) bool { return before.Checkpoint == nil && after.Checkpoint != nil })},
+		{"CreateTag", func(f *sharedStepFault) { f.native.failCreateTag = 1 << 20 }},
+		{"GetTag", func(f *sharedStepFault) { f.afterSuspend = func(n *nativeFixture) { n.failGetTag = 1 << 20 } }},
+		{"workload absence save", transition(func(before, after *journalRecord) bool { return !before.WorkloadAbsent && after.WorkloadAbsent })},
+		{"slot release save", transition(func(before, after *journalRecord) bool {
+			return !before.SharedWorker.Released && after.SharedWorker.Released
+		})},
+		{"journal finalization save", transition(func(before, after *journalRecord) bool {
+			return before.Observation.State != sdk.AllocationStopped && after.Observation.State == sdk.AllocationStopped
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 3)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			fault := &sharedStepFault{native: native}
+			tc.inject(fault)
+			if native.failCreateTag > 0 {
+				fault.fired.Store(true)
+			}
+			native.afterSuspend = func(*pb.Actor) {
+				if fault.afterSuspend != nil {
+					fault.fired.Store(true)
+					fault.afterSuspend(native)
+				}
+			}
+			faulty := fault.client(t, c)
+			started := func() bool {
+				pool, found := getPool(t, c, recordA.SharedWorker.Pool)
+				return !found || pool.GetDeletionTimestamp() != nil || sharedRetireDecided(pool)
+			}
+			for range 24 {
+				tick()
+				_, _ = sharedDriver(faulty, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+				if started() {
+					break
+				}
+			}
+			if !fault.fired.Load() {
+				t.Fatal("the fixture never injected its failure")
+			}
+			if !started() {
+				t.Fatal("a lasting failure after the capture never started the pool's strong retirement")
+			}
+		})
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture
