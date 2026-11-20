@@ -160,6 +160,9 @@ type ExecutionWorkspaceReconciler struct {
 	polls pendingPolls
 	// challengeClient replaces the router challenge reader in tests.
 	challengeClient challengeGetter
+	// fullPass disables the steady-Ready fast path, so tests can compare
+	// its outcome with EnsureAllocation's.
+	fullPass bool
 }
 
 func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

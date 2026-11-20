@@ -174,7 +174,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 			case !missing && current.Spec.Retirement != nil && workspaceprovider.ValidateWorkloadRetirement(workload, &observed, current.Spec.Retirement, workspacev1alpha1.WorkloadRetirementStop) == nil:
 				observed, operationErr = driver.StopInstance(ctx, key, observed.Identity)
 			case !disabled && workloadErr == nil && !revoking && current.Spec.Retirement == nil && current.Spec.Workload != nil:
-				if steady = !missing && driver.steadyReady(ctx, snap, current, provider, *current.Spec.Workload); steady {
+				if steady = !missing && !r.fullPass && driver.steadyReady(ctx, snap, current, provider, *current.Spec.Workload); steady {
 					// EnsureAllocation would only repeat this pass's
 					// verification and rewrite the same journal.
 					observed = snap.observed
