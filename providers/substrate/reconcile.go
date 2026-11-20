@@ -84,6 +84,9 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 		}
 		before = current.DeepCopy()
 		driver := r.lifecycle()
+		// The pass's two challenge reads share one router connection; the
+		// next pass dials again with freshly loaded TLS material.
+		defer driver.release()
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation
 		// snap is this pass's verified journal and observation, while nothing
