@@ -2,10 +2,14 @@ package substrate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"reflect"
+	"syscall"
+	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
@@ -143,8 +147,21 @@ func (d *Lifecycle) captureRetirementWorker(ctx context.Context, cm *corev1.Conf
 }
 
 func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if record.SharedWorker != nil && record.BootRequested {
+		// Every pass of a booted shared retirement, before and after its
+		// proof through deletion, slot release and journal finalization,
+		// follows one rule (sharedStopDoubt).
+		return d.sharedStopDoubt(ctx, cm, record, "the shared retirement could not complete", d.stopBooted(ctx, cm, record))
+	}
+	return d.stopBooted(ctx, cm, record)
+}
+
+func (d *Lifecycle) stopBooted(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	actor, err := d.actor(ctx, record)
 	if err != nil {
+		if record.SharedWorker != nil && record.BootRequested {
+			return d.sharedStopDoubt(ctx, cm, record, "the Actor could not be read during retirement", err)
+		}
 		return err
 	}
 	if actor == nil && record.Actor.UID == "" && record.Actor.CreateIssued {
@@ -155,6 +172,9 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
 		}
+	}
+	if record.SharedWorker != nil {
+		return d.stopShared(ctx, cm, record, actor)
 	}
 	if actor != nil {
 		if err := d.captureRetirementWorker(ctx, cm, record, actor); err != nil {
@@ -251,32 +271,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		}
 		return nil
 	}
-	first := record.Observation.State != sdk.AllocationStopped && record.Timing.StoppedAt == nil
-	record.Observation.State = sdk.AllocationStopped
-	record.Observation.Startup = nil
-	if first {
-		stamp(&record.Timing.StoppedAt)
-	}
-	if record.Operation == "suspend" {
-		if record.Checkpoint == nil {
-			return fmt.Errorf("native suspension has no verified Data Tag")
-		}
-		if err := d.verifyCheckpoint(ctx, record.Checkpoint); err != nil {
-			return err
-		}
-		data, err := json.Marshal(record.Checkpoint)
-		if err != nil {
-			return err
-		}
-		record.Observation.RetainedData = &sdk.RetainedDataReference{ID: record.Checkpoint.Tag.Name, SourceInstance: record.Observation.Identity, ProofSHA256: digest(data)}
-	}
-	if err := d.save(ctx, cm, record); err != nil {
-		return err
-	}
-	if first {
-		logRuntimeStopped(ctx, record)
-	}
-	return nil
+	return d.finishStop(ctx, cm, record)
 }
 
 // latestSnapshot returns the Actor's highest-generation snapshot.
@@ -368,6 +363,12 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 		}
 		if record.Operation == "suspend" {
 			if err := d.reserveSuspended(ctx, record); err != nil {
+				if record.SharedWorker != nil && record.BootRequested && record.Observation.State != sdk.AllocationStopped && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
+					// After the suspension intent, before or after capture,
+					// an unverifiable retained-data reservation is doubt
+					// like any other definite failure.
+					return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, "the suspension's retained-data reservation could not be verified: "+err.Error()))
+				}
 				return err
 			}
 		}
@@ -378,6 +379,12 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			return fmt.Errorf("native suspension is unsupported or already retired")
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
+			if record.SharedWorker != nil && record.BootRequested && record.Operation == "suspend" && record.Observation.State != sdk.AllocationStopped && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
+				// After the suspension intent, before or after the capture
+				// and until Stopped, an unverifiable journal requirement is
+				// doubt like any other error.
+				return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
+			}
 			return err
 		}
 		if record.Operation != "suspend" {
@@ -386,9 +393,15 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 			actor, err := d.actor(ctx, record)
 			if err != nil {
+				if record.SharedWorker != nil && !requestCancelled(ctx, err) {
+					return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read when its suspension began"))
+				}
 				return err
 			}
 			if actor == nil || actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+				if record.SharedWorker != nil {
+					return errors.Join(fmt.Errorf("native checkpoint requires the admitted running Actor"), d.sharedDoubt(ctx, cm, record, "the Actor was not running when its suspension began"))
+				}
 				return fmt.Errorf("native checkpoint requires the admitted running Actor")
 			}
 			name, err := randomName("orka-data-")
@@ -407,19 +420,52 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 		}
 		if record.Pending != nil {
+			absent := false
+			var absenceErr error
+			if shared := record.SharedWorker; shared != nil && shared.Strong != "" {
+				// A persisted strong path drives the pool's deletion and the
+				// absence proof to completion whatever the checkpoint does,
+				// including after a crash right after Strong was saved. Its
+				// error never stops the capture: the worker Pod may already be
+				// terminating under a bounded grace, so the suspension is
+				// continued and its Tag captured in this same pass, and the
+				// error is returned afterwards so the next pass retries it.
+				absent, absenceErr = d.strongSharedAbsence(ctx, record)
+				absent = absent && absenceErr == nil
+			}
 			err := d.capture(ctx, cm, record)
+			if absent && err != nil && captureUnrecoverable(err) {
+				// The worker is proven gone, so this capture can never be
+				// retried against a live source: its evidence is final. The
+				// instance is lost; no Tag is invented, the last verified
+				// checkpoint stays retained, and it retires through Stop.
+				err = lostInstance(record, "the strongly retired shared worker is gone and the suspension's data could not be captured ("+err.Error()+"); the last verified checkpoint is retained and uncertain work is never replayed")
+			}
 			if lost := (*nativeInstanceLostError)(nil); errors.As(err, &lost) {
 				// The capture source is gone, so this capture can never finish.
 				// The failed instance retires through the exact Stop path.
 				observed, err = d.fail(ctx, cm, record, lost.reason)
 				return err
 			}
+			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) && !suspensionPending(err, record) && !holdRetry(ctx, err, record) {
+				// After the suspension intent is persisted, every error on a
+				// shared worker is doubt, and the suspend is never replayed.
+				// A failure inside the issued suspension is recorded as doubt
+				// whose deletion waits, within a bounded window, for the
+				// continuation (suspensionPending).
+				return errors.Join(err, absenceErr, d.durableSharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
+			}
 			if err != nil {
-				return err
+				return errors.Join(err, absenceErr)
 			}
 			if record.Pending != nil {
 				observed = record.Observation
-				return nil
+				return absenceErr
+			}
+			if absenceErr != nil {
+				// The data is captured; the strong path's absence proof is
+				// retried next pass before the instance stops.
+				return absenceErr
 			}
 		}
 		if err := d.stop(ctx, cm, record); err != nil {
@@ -431,10 +477,25 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 	return observed, err
 }
 
-func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (captureErr error) {
 	operation := record.Pending
 	actor, err := d.actor(ctx, record)
 	if err != nil {
+		if record.SharedWorker != nil {
+			if suspendContinuationOpen(record) {
+				// The suspension is in flight: the doubt is recorded and the
+				// read retried within the continuation window, rather than
+				// starting a deletion that would reclaim the snapshot's node
+				// state.
+				return d.deferSuspendDoubt(ctx, cm, record, "the Actor could not be read during suspension", err)
+			}
+			if requestCancelled(ctx, err) {
+				return err
+			}
+			// On a shared worker an unreadable Actor is doubt: retire the
+			// whole worker rather than wait on evidence that may never come.
+			return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read during suspension"))
+		}
 		return err
 	}
 	if actor == nil && record.Actor.UID != "" {
@@ -452,27 +513,71 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	}
 	if !operation.SuspendIssued {
 		if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
+			if record.SharedWorker != nil {
+				return errors.Join(fmt.Errorf("native Actor stopped before checkpoint intent was issued"), d.sharedDoubt(ctx, cm, record, "the Actor left RUNNING before its suspension was issued"))
+			}
 			return fmt.Errorf("native Actor stopped before checkpoint intent was issued")
 		}
-		if err := d.verifyRetiringWorker(ctx, record); err != nil {
+		var retireErr error
+		if record.SharedWorker != nil {
+			// Egress is revoked, and settles, before the suspend; doubt about
+			// the shared worker only selects the strong termination proof, so
+			// the data capture still proceeds, even when the strong path's
+			// retirement fails (its error is returned after the suspend).
+			ready, err := d.prepareSharedSuspend(ctx, cm, record, actor)
+			if !ready {
+				return err
+			}
+			retireErr = err
+		} else if err := d.verifyRetiringWorker(ctx, record); err != nil {
 			return err
 		}
 		operation.SuspendIssued = true
 		stamp(&record.Timing.SuspendIssuedAt)
 		if err := d.save(ctx, cm, record); err != nil {
-			return err
+			return errors.Join(err, retireErr)
 		}
 		// Synchronous durability returns only after the snapshot is uploaded,
 		// so CreateTag copies it without changing the Actor.
 		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
-		return err
+		if err != nil && record.SharedWorker != nil {
+			// The doubt is recorded, and the next read decides when its
+			// deletion starts: SUSPENDING is continued first, SUSPENDED
+			// starts it before the capture, and any other state at once.
+			err = d.deferSuspendDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error(), err)
+		}
+		return errors.Join(err, retireErr)
 	}
 	state := actor.GetStatus().GetState()
 	if state == pb.ActorState_ACTOR_STATE_SUSPENDING {
+		if record.SharedWorker != nil {
+			return d.continueSuspend(ctx, cm, record, operation)
+		}
 		return nil
 	}
 	if state != pb.ActorState_ACTOR_STATE_SUSPENDED {
+		if record.SharedWorker != nil {
+			// The suspend may never have taken effect. It is never replayed:
+			// the whole shared worker is retired, and once its exact Pod is
+			// absent this instance is lost and retires through Stop.
+			if err := d.sharedDoubt(ctx, cm, record, fmt.Sprintf("the suspension outcome is unresolved for Actor state %s after request issuance", state)); err != nil {
+				return err
+			}
+			gone, err := d.strongSharedAbsence(ctx, record)
+			if err != nil || !gone {
+				return err
+			}
+			return lostInstance(record, nativeActorStopped)
+		}
 		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
+	}
+	if record.SharedWorker != nil && operation.Doubt != "" && record.SharedWorker.Strong == "" {
+		// SUSPENDED: upstream released the Actor from the worker with its
+		// snapshot recorded, so the held strong path starts now. A failing
+		// retirement never stops the capture; its error is returned with it.
+		if retireErr := d.sharedDoubt(ctx, cm, record, operation.Doubt); retireErr != nil {
+			defer func() { captureErr = errors.Join(captureErr, retireErr) }()
+		}
 	}
 	snapshot := latestSnapshot(actor)
 	hash := snapshotDigest(snapshot)
@@ -482,6 +587,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 	if operation.SourceSnapshotDigest == "" {
 		operation.SourceSnapshotDigest = hash
 		operation.SourceVersion = actor.GetMetadata().GetVersion()
+		if fence := sharedSuspendFenceOf(record); fence != nil {
+			fence.SnapshotDigest, fence.ObservedVersion = hash, operation.SourceVersion
+		}
 		stamp(&record.Timing.SuspendedObservedAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return err
@@ -788,4 +896,203 @@ func (d *Lifecycle) cleanupRecord(ctx context.Context, cm *corev1.ConfigMap, rec
 		return false, nil
 	}
 	return true, nil
+}
+
+// captureUnrecoverable reports a capture error that retrying cannot change:
+// one raised by this provider's own evidence checks. Native RPC status
+// errors, Kubernetes API errors, transport errors (a Kubernetes client's
+// refused or reset connection, a TLS or network timeout, an unexpected EOF)
+// and context errors may be transient.
+func captureUnrecoverable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	var netErr net.Error
+	var urlErr *url.Error
+	if errors.As(err, &netErr) || errors.As(err, &urlErr) {
+		return false
+	}
+	if _, ok := status.FromError(err); ok {
+		return false
+	}
+	var api apierrors.APIStatus
+	return !errors.As(err, &api)
+}
+
+// suspendContinuationInterval spaces re-issues of a stalled suspension, and
+// maxSuspendContinuations bounds them. suspendContinuationWindow, from the
+// suspend's issue, bounds how long a failure the continuation resolves is
+// retried before it is doubt.
+const (
+	suspendContinuationInterval = 10 * time.Second
+	maxSuspendContinuations     = 10
+	suspendContinuationWindow   = (maxSuspendContinuations + 2) * suspendContinuationInterval
+)
+
+// suspendPendingError is a failure inside an issued data-keeping suspension
+// on a shared worker that the continuation resolves: the suspend call or a
+// continuation returned an error, or the Actor could not be read. Its doubt is
+// recorded (checkpointIntent.Doubt), and within the continuation window the
+// strong path's deletion waits for the Actor to leave SUSPENDING.
+type suspendPendingError struct{ err error }
+
+func (e *suspendPendingError) Error() string { return e.err.Error() }
+func (e *suspendPendingError) Unwrap() error { return e.err }
+
+// suspendContinuationOpen reports whether an issued suspension is still
+// inside its continuation window, with continuations left.
+func suspendContinuationOpen(record *journalRecord) bool {
+	return holdWindowOpen(record) && record.Pending.Continuations < maxSuspendContinuations
+}
+
+// holdWindowOpen reports whether an issued suspension is still inside its
+// continuation window.
+func holdWindowOpen(record *journalRecord) bool {
+	operation, issued := record.Pending, record.Timing.SuspendIssuedAt
+	return operation != nil && operation.SuspendIssued && issued != nil && sharedNow().Before(issued.Add(suspendContinuationWindow))
+}
+
+// suspendRetryError is a failure on the hold path that says nothing about
+// the suspension: a journal write that conflicted, was cancelled or ran out
+// of time. It is retried by rereading the journal, never doubt.
+type suspendRetryError struct{ err error }
+
+func (e *suspendRetryError) Error() string { return e.err.Error() }
+func (e *suspendRetryError) Unwrap() error { return e.err }
+
+// holdRetry reports an error on the hold path that must be retried rather
+// than start the strong path: a suspendRetryError, or any failure once this
+// request's own context has ended (a cancelled reconcile, a lost lease, a
+// shutdown). The strong path runs detached from the request, so taking it
+// there would delete the worker mid-continuation. Both are bounded by the
+// continuation window; past it, doubt applies as before.
+func holdRetry(ctx context.Context, err error, record *journalRecord) bool {
+	if requestCancelled(ctx, err) {
+		// A cancellation or a deadline is always a retry, inside the window
+		// or not.
+		return true
+	}
+	if !holdWindowOpen(record) {
+		return false
+	}
+	retry := (*suspendRetryError)(nil)
+	return errors.As(err, &retry)
+}
+
+// suspensionPending reports whether err is a failure the continuation
+// resolves, inside its window.
+func suspensionPending(err error, record *journalRecord) bool {
+	pending := (*suspendPendingError)(nil)
+	return errors.As(err, &pending) && suspendContinuationOpen(record)
+}
+
+// continueSuspend resumes the same upstream suspension when a SuspendActor
+// call failed after the Actor was marked SUSPENDING, for example a transient
+// control-plane database timeout in FinalizeSuspended. Agent Substrate's
+// SuspendActor is a re-entrant workflow (workflow_suspend.go): it skips
+// MarkSuspending for a SUSPENDING Actor, so no new snapshot generation is
+// minted; it re-sends the same snapshot to atelet, which answers a Checkpoint
+// it already committed without checkpointing again (atelet Checkpoint,
+// BeginCheckpoint committed); and FinalizeSuspended then records it. This is
+// therefore not a replay: a RUNNING Actor whose suspend outcome is unresolved
+// is never suspended again. The workflow holds the Actor lease
+// (acquireActorLease), so a continuation issued while the original call is
+// still running is refused with Aborted and has no effect. It must finish
+// before the worker Pod is gone, because the worker-delete workflow that runs
+// then crashes a SUSPENDING Actor and reclaims its node state, and a worker
+// with no running sandbox exits within seconds of its delete. So a failure
+// inside this suspension records its doubt and holds the strong path's
+// deletion until the Actor leaves SUSPENDING, within the continuation window
+// (deferSuspendDoubt). Only shared workers continue: their strong path deletes
+// the pool, so waiting loses the data, while a private worker keeps observing
+// without resubmitting.
+func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, operation *checkpointIntent) error {
+	last := record.Timing.SuspendIssuedAt
+	if operation.ContinuedAt != nil {
+		last = operation.ContinuedAt
+	}
+	now := sharedNow()
+	if operation.Continuations >= maxSuspendContinuations {
+		// Every continuation ended without a result (for example a crash
+		// each time): the suspension is doubt, so the strong path takes over
+		// rather than wait for the lifetime bound.
+		return fmt.Errorf("the suspension stayed SUSPENDING after %d continuations", operation.Continuations)
+	}
+	if operation.Doubt != "" && record.SharedWorker.Strong == "" && !suspendContinuationOpen(record) {
+		// A recorded doubt holds the strong path's deletion only inside the
+		// continuation window. The window ends the hold, not the
+		// continuations: once the strong path has started, the remaining
+		// ones still run while the worker exists.
+		return fmt.Errorf("the suspension stayed SUSPENDING past its continuation window: %s", operation.Doubt)
+	}
+	if last != nil && now.Sub(last.Time) < suspendContinuationInterval {
+		return nil
+	}
+	operation.Continuations++
+	continued := metav1.NewMicroTime(now.Truncate(time.Microsecond))
+	operation.ContinuedAt = &continued
+	if err := d.save(ctx, cm, record); err != nil {
+		return err
+	}
+	_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
+	if err != nil {
+		return d.deferSuspendDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error(), err)
+	}
+	return nil
+}
+
+// sharedHoldAnnotation durably records, on a shared pool, when the
+// suspension whose doubt holds its strong deletion was issued. From then on
+// the pool admits nobody: no claim and no Resume. The Kubernetes-only bounds
+// loop retires the pool once the hold has outlived its continuation window,
+// whether or not the held record is reconciled again. A hold always ends in
+// the strong path, so the stamp is never cleared.
+const sharedHoldAnnotation = "substrate.workspace.orka.ai/shared-hold-since"
+
+// stampSharedHold writes the hold stamp on the record's pool, best effort
+// and on its own bounded context. The bounds loop stamps it too, from the
+// journal's persisted doubt, so a failed write here closes admission within
+// one bounds pass.
+func (d *Lifecycle) stampSharedHold(ctx context.Context, record *journalRecord) {
+	shared, issued := record.SharedWorker, record.Timing.SuspendIssuedAt
+	if shared == nil || shared.UID == "" || issued == nil {
+		return
+	}
+	writeCtx, cancel := strongCleanupContext(ctx)
+	defer cancel()
+	d.writeOutageMarks(writeCtx, []outageMark{{namespace: record.Placement.Namespace, name: shared.Pool, uid: types.UID(shared.UID), key: sharedHoldAnnotation, value: issued.UTC().Format(time.RFC3339Nano)}})
+}
+
+// deferSuspendDoubt records reason as the issued suspension's doubt and
+// returns cause as a failure the continuation resolves. The strong path is
+// decided; its deletion is held while the Actor stays SUSPENDING, within the
+// continuation window, and starts once it is SUSPENDED, in any other state,
+// or when the window or the continuations run out.
+func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, cause error) error {
+	if requestCancelled(ctx, cause) {
+		// A cancelled or timed-out call is no doubt at all: nothing is
+		// recorded, and the next read decides.
+		return &suspendRetryError{err: cause}
+	}
+	pending := &suspendPendingError{err: cause}
+	if record.Pending.Doubt != "" {
+		return pending
+	}
+	record.Pending.Doubt = reason
+	if err := d.save(ctx, cm, record); err == nil {
+		// The strong path is decided: the pool admits nobody from now on,
+		// although its deletion waits for the continuation.
+		d.stampSharedHold(ctx, record)
+	} else {
+		// An unrecorded doubt is never held. A write that conflicted, was
+		// cancelled or ran out of time is retried by rereading the journal,
+		// as after a crash before the result was handled. Only a definite
+		// write failure takes the strong path at once.
+		record.Pending.Doubt = ""
+		if apierrors.IsConflict(err) || requestCancelled(ctx, err) {
+			return &suspendRetryError{err: errors.Join(cause, err)}
+		}
+		return errors.Join(cause, err)
+	}
+	return pending
 }

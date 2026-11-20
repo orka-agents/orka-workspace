@@ -2,7 +2,7 @@
 
 Date: 2026-11-18
 
-Status: Accepted. Extends ADR 0006 for the native Substrate provider.
+Status: Accepted. Extends ADR 0006 for the native Substrate provider. ADR 0008 replaces spares for profiles that set `spec.placement.sharedWorkers`.
 
 ## Context
 

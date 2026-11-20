@@ -109,32 +109,42 @@ func (d *Lifecycle) readCatalog(ctx context.Context, key types.NamespacedName) (
 	if err := d.client.Get(ctx, key, cm); err != nil {
 		return nil, nil, err
 	}
+	artifact, err := decodeCatalog(cm, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cm, artifact, nil
+}
+
+// decodeCatalog validates and decodes a catalog ConfigMap already read, for
+// example from a List, without another API call.
+func decodeCatalog(cm *corev1.ConfigMap, key types.NamespacedName) (*checkpointArtifact, error) {
 	raw := cm.Data[catalogDataKey]
 	if len(raw) == 0 || len(raw) > 512<<10 {
-		return nil, nil, fmt.Errorf("checkpoint catalog size is invalid")
+		return nil, fmt.Errorf("checkpoint catalog size is invalid")
 	}
 	if cm.Labels[catalogLabel] == legacyCatalogVersion {
-		return nil, nil, errLegacyNativeState
+		return nil, errLegacyNativeState
 	}
 	artifact := &checkpointArtifact{}
 	if err := json.Unmarshal([]byte(raw), artifact); err != nil {
-		return nil, nil, fmt.Errorf("checkpoint catalog is unreadable")
+		return nil, fmt.Errorf("checkpoint catalog is unreadable")
 	}
 	if artifact.TemplateSpec == nil || !compatibleRuntimePool(artifact.RuntimePoolSpec, artifact.RuntimePoolSpec) {
-		return nil, nil, fmt.Errorf("checkpoint catalog has no valid immutable template or worker specification")
+		return nil, fmt.Errorf("checkpoint catalog has no valid immutable template or worker specification")
 	}
 	hash, err := artifactDigest(artifact.Checkpoint)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	templateHash, err := templateDigest(artifact.TemplateSpec)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if artifact.Version != catalogVersion || artifact.Checkpoint.Atespace == "" || artifact.Checkpoint.Tag.UID == "" || artifact.Checkpoint.Template.UID == "" || artifact.Checkpoint.SnapshotURI == "" || artifact.Checkpoint.CreatedAt.IsZero() || artifact.Placement.UID == "" || artifact.Digest != hash || artifact.Checkpoint.Template.Digest != templateHash || artifact.Owners == nil || artifact.ProviderBinding.UID == "" || cm.UID == "" || key != catalogKey(cm.Namespace, artifact.Checkpoint.Tag.UID) || cm.Labels[catalogLabel] != catalogVersion || cm.Labels[providerLabel] != string(artifact.ProviderBinding.UID) || (artifact.Collected && (!artifact.Deleting || activeOwners(artifact) != 0)) {
-		return nil, nil, fmt.Errorf("checkpoint catalog identity or immutable provenance is invalid")
+		return nil, fmt.Errorf("checkpoint catalog identity or immutable provenance is invalid")
 	}
-	return cm, artifact, nil
+	return artifact, nil
 }
 func (d *Lifecycle) readCatalogReference(ctx context.Context, namespace string, ref *catalogReference) (*corev1.ConfigMap, *checkpointArtifact, error) {
 	if ref == nil || ref.Name == "" || ref.UID == "" || ref.Digest == "" {

@@ -493,10 +493,23 @@ func nativeBootRejected(err error) bool {
 // withdrawn; physical cleanup waits for Core's exact Stop authorization.
 func (d *Lifecycle) fail(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) (sdk.AllocationObservation, error) {
 	if record.Failure == "" {
+		// A failure often follows a native call that outlived the request;
+		// it is a strong trigger on a shared worker, so it is persisted under
+		// a fresh bounded context.
+		ctx, cancel := strongCleanupContext(ctx)
+		defer cancel()
 		record.Failure = reason
 		record.Observation = pendingObservation(record)
-		if err := d.save(ctx, cm, record); err != nil {
-			return sdk.AllocationObservation{}, err
+		persistErr := d.save(ctx, cm, record)
+		if shared := record.SharedWorker; shared != nil && record.BootRequested && shared.UID != "" {
+			// A booted shared instance's failure takes the strong path; its
+			// pool deletion never waits on the failure being durable.
+			if err := d.initiateSharedStrongRetirement(ctx, record); err != nil {
+				persistErr = errors.Join(persistErr, err)
+			}
+		}
+		if persistErr != nil {
+			return sdk.AllocationObservation{}, persistErr
 		}
 	}
 	return record.Observation, nil
@@ -567,14 +580,14 @@ func (d *Lifecycle) StopInstance(ctx context.Context, key sdk.AllocationKey, ide
 			return nil
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
-			return err
+			return d.sharedStopFailure(ctx, cm, record, "the workspace's journal requirement could not be verified during retirement", err)
 		}
 		if record.Operation != "stop" {
 			record.Operation = "stop"
 			stamp(&record.Timing.RetirementStartedAt)
 			record.Observation = pendingObservation(record)
 			if err := d.save(ctx, cm, record); err != nil {
-				return err
+				return d.sharedStopFailure(ctx, cm, record, "the retirement could not be recorded", err)
 			}
 		}
 		if err := d.stop(ctx, cm, record); err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +67,69 @@ type nativeFixture struct {
 	foreignWorkers map[string]bool
 	// staleWorkerLabels delays copying changed WorkerPool labels to Workers.
 	staleWorkerLabels bool
+	// beforeSuspend observes an Actor as SuspendActor is applied.
+	beforeSuspend func(*pb.Actor)
+	// afterSuspend runs once a suspension has been applied.
+	afterSuspend func(*pb.Actor)
+	// lingering keeps reporting these Actors' assignments after release, as
+	// stale control-plane bookkeeping.
+	lingering map[string]*pb.ActorAssignment
+	// failGetWorker fails the next GetWorker calls.
+	failGetWorker int
+	// failSuspendBeforeEffect rejects the next SuspendActor before it takes
+	// effect; suspendCalls counts every SuspendActor request.
+	failSuspendBeforeEffect bool
+	suspendCalls            int
+	// failFinalizeOnce makes the next SuspendActor fail after its
+	// checkpoint, leaving the Actor SUSPENDING.
+	failFinalizeOnce bool
+	// finalizePending marks the Actor whose finalize failed; a re-entered
+	// SuspendActor then finalizes the snapshot already taken.
+	finalizePending string
+	// failTemplateList fails, and blockTemplateList stalls, every
+	// ListActorTemplates call while other native calls work.
+	failTemplateList, blockTemplateList bool
+	// credentialsRejected rejects the provider's own credentials on
+	// ListActorTemplates and ListWorkers, as an expired token or a revoked
+	// viewer permission would, while other clients may still place.
+	credentialsRejected bool
+	// assignmentsRejected rejects, and assignmentsUnavailable fails, only
+	// ListWorkerActorAssignments.
+	assignmentsRejected, assignmentsUnavailable bool
+	// rejectEverySecondAssignmentList rejects every second assignment List,
+	// so a first List succeeds and its confirmation is rejected.
+	rejectEverySecondAssignmentList bool
+	// rejectAssignmentsFor rejects assignment Lists for these workers only.
+	rejectAssignmentsFor map[string]bool
+	// blockAssignments stalls every assignment List until its context ends.
+	blockAssignments bool
+	// hiddenWorkers omits these workers from ListWorkers.
+	hiddenWorkers map[string]bool
+	// workersMu guards workers against concurrent per-pool listings.
+	workersMu       sync.Mutex
+	assignmentLists int
+	// rejectTemplateList rejects ActorTemplate Lists as PermissionDenied,
+	// whatever else the fixture returns.
+	rejectTemplateList bool
+	// failGetActor fails the next GetActor calls.
+	failGetActor int
+	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
+	failEgressUpdate int
+	// block makes Worker and template reads wait for their context, as a
+	// stalled native control plane; blockSuspend and blockGetActor do the
+	// same for SuspendActor and GetActor.
+	block, blockSuspend, blockGetActor bool
+	// failGetTemplate, failCreateTag and failGetTag fail the next calls
+	// before they take effect.
+	failGetTemplate, failCreateTag, failGetTag int
+	// staleOnce reports these assignments in only the next listing of their
+	// worker, as a listing taken just before a retirement released them.
+	staleOnce map[string]*pb.ActorAssignment
+	// nativeDown fails every Worker read, as an unavailable control plane.
+	nativeDown bool
+	// churnWorker bumps a Worker's version on every read, as concurrent
+	// placements on a shared worker do.
+	churnWorker string
 }
 
 func (f *nativeFixture) runtimeVersion() *pb.VersionedSandboxCompat {
@@ -112,7 +176,15 @@ func applyNativeTemplateDefaults(t *pb.ActorTemplate) {
 		}
 	}
 }
-func (f *nativeFixture) GetActorTemplate(_ context.Context, req *pb.GetActorTemplateRequest, _ ...grpc.CallOption) (*pb.ActorTemplate, error) {
+func (f *nativeFixture) GetActorTemplate(ctx context.Context, req *pb.GetActorTemplateRequest, _ ...grpc.CallOption) (*pb.ActorTemplate, error) {
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.failGetTemplate > 0 {
+		f.failGetTemplate--
+		return nil, status.Error(codes.Unavailable, "template read unavailable")
+	}
 	v := f.templates[refKey(req.ActorTemplate)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "template absent")
@@ -146,7 +218,42 @@ func (f *nativeFixture) DeleteActorTemplate(_ context.Context, req *pb.DeleteAct
 	delete(f.templates, key)
 	return cloneTemplate(v), f.effect("deleteTemplate")
 }
-func (f *nativeFixture) GetActor(_ context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorTemplatesRequest, _ ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	if err := ctx.Err(); err != nil {
+		// Like a real call, an ended context fails.
+		return nil, status.FromContextError(err).Err()
+	}
+	if f.block || f.blockTemplateList {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.failTemplateList {
+		return nil, status.Error(codes.Unavailable, "template listing unavailable")
+	}
+	if f.rejectTemplateList {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for templates")
+	}
+	if f.credentialsRejected {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected")
+	}
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
+	out := &pb.ListActorTemplatesResponse{}
+	for _, template := range f.templates {
+		out.ActorTemplates = append(out.ActorTemplates, cloneTemplate(template))
+	}
+	return out, nil
+}
+func (f *nativeFixture) GetActor(ctx context.Context, req *pb.GetActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
+	if f.blockGetActor {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.failGetActor > 0 {
+		f.failGetActor--
+		return nil, status.Error(codes.Unavailable, "actor read unavailable")
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -223,8 +330,13 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	f.boots++
 	template := f.templates[refKey(v.ActorTemplate)]
 	var w *pb.Worker
+	limits := f.templates[refKey(v.ActorTemplate)].GetResources().GetLimits()
 	for _, candidate := range f.workers {
 		if candidate.Status.State != pb.WorkerState_WORKER_STATE_ACTIVE {
+			continue
+		}
+		// The native scheduler books Actor limits against capacity.
+		if allocated := candidate.Status.GetAllocated(); allocated.GetCpuMillicores()+limits.GetCpuMillicores() > candidate.Status.GetCapacity().GetCpuMillicores() || allocated.GetMemoryBytes()+limits.GetMemoryBytes() > candidate.Status.GetCapacity().GetMemoryBytes() {
 			continue
 		}
 		matches := true
@@ -241,8 +353,9 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 	if w == nil {
 		return nil, status.Error(codes.Unavailable, "private worker not prepared")
 	}
-	limits := template.GetResources().GetLimits()
-	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: limits.GetCpuMillicores(), MemoryBytes: limits.GetMemoryBytes(), Actors: 1}
+	allocated := w.Status.GetAllocated()
+	w.Status.Allocated = &pb.WorkerResources{CpuMillicores: allocated.GetCpuMillicores() + limits.GetCpuMillicores(), MemoryBytes: allocated.GetMemoryBytes() + limits.GetMemoryBytes(), Actors: allocated.GetActors() + 1}
+	w.Metadata.Version++
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_RUNNING
 	v.Status.WorkerAssignment = &pb.WorkerAssignment{Worker: &pb.ObjectRef{Name: w.Metadata.Name}, WorkerNamespace: w.WorkerNamespace, WorkerPool: w.WorkerPool, WorkerPod: w.WorkerPod, WorkerPodUid: w.WorkerPodUid, NodeName: "node", WorkerEpoch: w.Status.RegisteredEpoch, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}
@@ -266,11 +379,34 @@ func (f *nativeFixture) ResumeActor(ctx context.Context, req *pb.ResumeActorRequ
 }
 func (f *nativeFixture) releaseWorker(v *pb.Actor) {
 	if w := f.workers[v.Status.GetWorkerAssignment().GetWorker().GetName()]; w != nil {
-		w.Status.Allocated = &pb.WorkerResources{}
+		limits := f.templates[refKey(v.ActorTemplate)].GetResources().GetLimits()
+		allocated := w.Status.GetAllocated()
+		w.Status.Allocated = &pb.WorkerResources{CpuMillicores: max(0, allocated.GetCpuMillicores()-limits.GetCpuMillicores()), MemoryBytes: max(0, allocated.GetMemoryBytes()-limits.GetMemoryBytes()), Actors: max(0, allocated.GetActors()-1)}
+		w.Metadata.Version++
 	}
 	v.Status.WorkerAssignment = nil
 }
-func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRequest, _ ...grpc.CallOption) (*pb.SuspendActorResponse, error) {
+	f.suspendCalls++
+	if f.blockSuspend {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.failSuspendBeforeEffect {
+		f.failSuspendBeforeEffect = false
+		return nil, status.Error(codes.Unavailable, "suspend not applied")
+	}
+	if v := f.actors[refKey(req.Actor)]; v != nil && f.finalizePending == refKey(req.Actor) && v.Status.State == pb.ActorState_ACTOR_STATE_SUSPENDING {
+		// A re-entered workflow finalizes the snapshot already taken.
+		f.finalizePending = ""
+		snapshot := v.Status.Snapshots[len(v.Status.Snapshots)-1]
+		snapshot.DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+		v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDED
+		v.Metadata.Version++
+		f.releaseWorker(v)
+		f.suspends++
+		return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, nil
+	}
 	v := f.actors[refKey(req.Actor)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -281,6 +417,9 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 	if v.Status.State == pb.ActorState_ACTOR_STATE_SUSPENDED {
 		return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, nil
 	}
+	if f.beforeSuspend != nil {
+		f.beforeSuspend(v)
+	}
 	template := f.templates[refKey(v.ActorTemplate)]
 	fidelity := template.GetSnapshotConfig().GetPreferredFidelity()
 	if f.suspendFidelity != pb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED {
@@ -289,11 +428,25 @@ func (f *nativeFixture) SuspendActor(_ context.Context, req *pb.SuspendActorRequ
 	f.suspends++
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDED
-	f.releaseWorker(v)
 	generation := v.Status.LastAssignedGeneration + 1
 	v.Status.LastAssignedGeneration = generation
 	uuid := fmt.Sprintf("snap-%s-%d", v.Metadata.Uid, generation)
 	v.Status.Snapshots = []*pb.Snapshot{{Uuid: uuid, Generation: generation, Owner: pb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, Fidelity: fidelity, ActorTemplateUid: template.GetMetadata().GetUid(), Locality: "node", DurableSnapshot: &pb.SnapshotStorage{State: pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED, Object: &pb.ObjectSnapshot{SnapshotUri: "gs://native/snapshots/atespaces/" + uuid}}, SandboxRuntime: &pb.ActorSandboxRuntime{SandboxClass: "gvisor", Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}
+	if f.afterSuspend != nil {
+		f.afterSuspend(v)
+	}
+	if f.failFinalizeOnce {
+		// FinalizeSuspended failed after the checkpoint: the Actor stays
+		// SUSPENDING, its snapshot's durable copy PENDING.
+		f.failFinalizeOnce = false
+		f.finalizePending = refKey(req.Actor)
+		f.suspends--
+		v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDING
+		v.Status.Snapshots[len(v.Status.Snapshots)-1].DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+		// Only a FinalizeSuspended that succeeds releases the worker.
+		return nil, status.Error(codes.Unavailable, "workflow failed at step FinalizeSuspended: timeout")
+	}
+	f.releaseWorker(v)
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {
@@ -340,6 +493,10 @@ func (f *nativeFixture) CreateActorEgressPolicy(_ context.Context, req *pb.Creat
 	return proto.Clone(v).(*pb.EgressPolicy), f.effect("egress")
 }
 func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.UpdateActorEgressPolicyRequest, _ ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	if f.failEgressUpdate > 0 {
+		f.failEgressUpdate--
+		return nil, status.Error(codes.Unavailable, "egress update unavailable")
+	}
 	key := refKey(req.Actor)
 	v := f.egress[key]
 	if v == nil {
@@ -353,9 +510,16 @@ func (f *nativeFixture) UpdateActorEgressPolicy(_ context.Context, req *pb.Updat
 	return proto.Clone(v).(*pb.EgressPolicy), f.effect("updateEgress")
 }
 func (f *nativeFixture) GetWorker(_ context.Context, req *pb.GetWorkerRequest, _ ...grpc.CallOption) (*pb.Worker, error) {
+	if f.failGetWorker > 0 {
+		f.failGetWorker--
+		return nil, status.Error(codes.Unavailable, "worker read unavailable")
+	}
 	v := f.workers[req.Worker.Name]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
+	}
+	if f.churnWorker == req.Worker.Name {
+		v.Metadata.Version++
 	}
 	return proto.Clone(v).(*pb.Worker), nil
 }
@@ -377,14 +541,31 @@ func nativeWorkerCapacity(pool unstructured.Unstructured) (*pb.WorkerResources, 
 	return &pb.WorkerResources{CpuMillicores: cpu.MilliValue(), MemoryBytes: memory.Value() - 64<<20, Actors: 1000}, nil
 }
 func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersRequest, _ ...grpc.CallOption) (*pb.ListWorkersResponse, error) {
+	if err := ctx.Err(); err != nil {
+		// Like a real call, an ended context fails.
+		return nil, status.FromContextError(err).Err()
+	}
+	if f.credentialsRejected {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected")
+	}
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.nativeDown {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion("ate.dev/v1")
 	pools.SetKind("WorkerPoolList")
 	if err := f.client.List(ctx, pools); err != nil {
 		return nil, err
 	}
+	// The provider lists workers from concurrent per-pool checks.
+	f.workersMu.Lock()
+	defer f.workersMu.Unlock()
 	for _, pool := range pools.Items {
-		if pool.GetLabels()[workerInstanceLabel] == "" || pool.GetDeletionTimestamp() != nil {
+		if pool.GetLabels()[workerInstanceLabel] == "" && pool.GetLabels()[sharedPoolLabel] == "" || pool.GetDeletionTimestamp() != nil {
 			continue
 		}
 		name := pool.GetName() + "-worker"
@@ -412,20 +593,50 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 		f.workers[name] = &pb.Worker{Metadata: &pb.ResourceMetadata{Name: name, Uid: name + "-native-uid", Version: 1}, Labels: maps.Clone(pool.GetLabels()), WorkerNamespace: pod.Namespace, WorkerPool: pool.GetName(), WorkerPod: pod.Name, WorkerPodUid: string(pod.UID), Status: &pb.WorkerStatus{State: pb.WorkerState_WORKER_STATE_ACTIVE, Capacity: capacity, Allocated: &pb.WorkerResources{}, SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: "gvisor", DefaultRuntime: &pb.WorkerSandboxRuntime{Version: proto.Clone(f.runtimeVersion()).(*pb.VersionedSandboxCompat)}}}, RegisteredEpoch: 1, IssuedEpoch: 1, ObservedEpoch: 1}}
 	}
 	out := &pb.ListWorkersResponse{}
-	for _, worker := range f.workers {
+	for name, worker := range f.workers {
+		if f.hiddenWorkers[name] {
+			continue
+		}
 		out.Workers = append(out.Workers, proto.Clone(worker).(*pb.Worker))
 	}
 	return out, nil
 }
-func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+func (f *nativeFixture) ListWorkerActorAssignments(ctx context.Context, req *pb.ListWorkerActorAssignmentsRequest, _ ...grpc.CallOption) (*pb.ListWorkerActorAssignmentsResponse, error) {
+	if f.blockAssignments {
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	if f.nativeDown || f.assignmentsUnavailable {
+		return nil, status.Error(codes.Unavailable, "native control plane unavailable")
+	}
+	if f.assignmentsRejected || f.rejectAssignmentsFor[req.GetWorker().GetName()] {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for assignments")
+	}
+	if f.rejectEverySecondAssignmentList {
+		f.assignmentLists++
+		if f.assignmentLists%2 == 0 {
+			return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for assignments")
+		}
+	}
 	if f.failAfter == "assignments" {
 		f.failAfter = ""
 		return nil, status.Error(codes.Unavailable, "assignment listing unavailable")
 	}
+	f.workersMu.Lock()
+	defer f.workersMu.Unlock()
 	out := &pb.ListWorkerActorAssignmentsResponse{}
 	for _, v := range f.actors {
 		if v.Status.GetWorkerAssignment().GetWorker().GetName() == req.Worker.Name {
 			out.ActorAssignments = append(out.ActorAssignments, &pb.ActorAssignment{Actor: &pb.ObjectRef{Atespace: v.Metadata.Atespace, Name: v.Metadata.Name}, ActorUid: v.Metadata.Uid})
+		}
+	}
+	if stale := f.staleOnce[req.Worker.Name]; stale != nil {
+		delete(f.staleOnce, req.Worker.Name)
+		out.ActorAssignments = append(out.ActorAssignments, proto.Clone(stale).(*pb.ActorAssignment))
+	}
+	for name, assignment := range f.lingering {
+		if f.workers[req.Worker.Name] != nil && strings.HasPrefix(name, req.Worker.Name+"|") {
+			out.ActorAssignments = append(out.ActorAssignments, proto.Clone(assignment).(*pb.ActorAssignment))
 		}
 	}
 	if f.foreignAssignment || f.foreignWorkers[req.Worker.Name] {
@@ -434,6 +645,10 @@ func (f *nativeFixture) ListWorkerActorAssignments(_ context.Context, req *pb.Li
 	return out, nil
 }
 func (f *nativeFixture) CreateTag(_ context.Context, req *pb.CreateTagRequest, _ ...grpc.CallOption) (*pb.Tag, error) {
+	if f.failCreateTag > 0 {
+		f.failCreateTag--
+		return nil, status.Error(codes.Unavailable, "tag create unavailable")
+	}
 	key := metaKey(req.Tag.Metadata)
 	if f.tags[key] != nil {
 		return nil, status.Error(codes.AlreadyExists, "exists")
@@ -460,6 +675,10 @@ func (f *nativeFixture) CreateTag(_ context.Context, req *pb.CreateTagRequest, _
 	return proto.Clone(v).(*pb.Tag), f.effect("tag")
 }
 func (f *nativeFixture) GetTag(_ context.Context, req *pb.GetTagRequest, _ ...grpc.CallOption) (*pb.Tag, error) {
+	if f.failGetTag > 0 {
+		f.failGetTag--
+		return nil, status.Error(codes.Unavailable, "tag read unavailable")
+	}
 	v := f.tags[refKey(req.Tag)]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "absent")
@@ -574,6 +793,11 @@ func fixture(t *testing.T, suspend bool) (client.Client, *nativeFixture, sdk.Wor
 		if obj.GetUID() == "" {
 			uid++
 			obj.SetUID(types.UID(fmt.Sprintf("api-uid-%d", uid)))
+		}
+		// The API server sets creationTimestamp, which the fake does not;
+		// shared pool lifetimes are bounded by it.
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == "WorkerPool" && u.GetCreationTimestamp().Time.IsZero() {
+			obj.SetCreationTimestamp(metav1.NewTime(sharedNow().UTC().Truncate(time.Second)))
 		}
 		return c.Create(ctx, obj, opts...)
 	}}).Build()

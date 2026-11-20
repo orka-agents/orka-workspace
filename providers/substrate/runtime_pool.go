@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
@@ -34,7 +35,10 @@ func poolObject() *unstructured.Unstructured {
 // spares > 0 the request first selects an existing spare built by the same
 // copy logic (spare_workers.go); the claim itself happens later, after the
 // journal records it.
-func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecord, spares int, profileUID types.UID) error {
+//
+// A profile that opts in to shared workers (ADR 0008) instead binds the record
+// to a shared pool of its scope; spares do not apply to it.
+func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecord, spares int, profileUID types.UID, shared *profile.SharedWorkersPolicy) error {
 	source := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.Placement.Name}, source); err != nil {
 		return err
@@ -55,6 +59,9 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 	if err := bindPrivatePool(record, record.Actor.Name+"-workers", source.GetLabels()); err != nil {
 		return err
 	}
+	if shared != nil {
+		return d.prepareSharedPlacement(record, source, shared, profileUID)
+	}
 	if spares > 0 {
 		return d.selectSpare(ctx, record, profileUID)
 	}
@@ -64,7 +71,7 @@ func (d *Lifecycle) prepareRuntimePool(ctx context.Context, record *journalRecor
 // checkSourceSelector refuses an operator selector or pool that already uses
 // a reserved confinement label.
 func checkSourceSelector(selector map[string]string, source *unstructured.Unstructured) error {
-	for _, key := range []string{workerAllocationLabel, workerInstanceLabel, spareProfileLabel} {
+	for _, key := range []string{workerAllocationLabel, workerInstanceLabel, spareProfileLabel, sharedPoolLabel} {
 		if _, found := selector[key]; found {
 			return fmt.Errorf("operator native selector uses a reserved confinement label")
 		}
@@ -320,7 +327,13 @@ func inheritWorkerImageProvenance(previous []workerImageTransition, transition *
 
 // operatorPoolLabels returns the operator's own WorkerPool labels, without
 // the provider's per-allocation ownership and confinement labels.
+//
+// A shared pool carries only provider-owned labels, so a shared record keeps
+// the operator pool's labels as provenance for resume and checkpoints.
 func operatorPoolLabels(record *journalRecord) map[string]string {
+	if record.SharedWorker != nil {
+		return maps.Clone(record.SharedWorker.OperatorLabels)
+	}
 	out := maps.Clone(record.RuntimePoolLabels)
 	for key := range labels(record) {
 		delete(out, key)
@@ -370,6 +383,9 @@ func (d *Lifecycle) ensureRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 	if record.RuntimePool.Name == "" || len(record.RuntimePoolSpec) == 0 || len(record.SourceSelector) == 0 || record.RuntimePoolDeleting {
 		return sdk.ErrStaleIdentity
 	}
+	if record.SharedWorker != nil {
+		return d.ensureSharedRuntimePool(ctx, cm, record)
+	}
 	if record.SpareWorker != nil {
 		if record.SpareWorker.Released {
 			return sdk.ErrStaleIdentity
@@ -416,6 +432,9 @@ func (d *Lifecycle) ensureRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 }
 
 func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord) error {
+	if record.SharedWorker != nil {
+		return d.verifySharedRuntimePoolReadOnly(ctx, record)
+	}
 	pool := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.RuntimePool.Name}, pool); err != nil {
 		return err
@@ -447,6 +466,9 @@ func (d *Lifecycle) privatePoolWorker(ctx context.Context, record *journalRecord
 }
 
 func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	if record.SharedWorker != nil {
+		return d.prepareSharedWorker(ctx, cm, record)
+	}
 	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
 		return false, err
 	}

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -71,6 +72,16 @@ type checkpointIntent struct {
 	SourceVersion        int64           `json:"sourceVersion,omitempty"`
 	SourceSnapshotDigest string          `json:"sourceSnapshotDigest,omitempty"`
 	Tag                  nativeReference `json:"tag"`
+	// Continuations counts re-issues of SuspendActor that resume the same
+	// upstream workflow for an Actor left SUSPENDING by a failed call, and
+	// ContinuedAt is the last one. Both are saved before each re-issue.
+	Continuations int               `json:"continuations,omitempty"`
+	ContinuedAt   *metav1.MicroTime `json:"continuedAt,omitempty"`
+	// Doubt is the strong-path reason of a failure inside this issued
+	// suspension on a shared worker. The strong path is decided but its
+	// deletion is held until the Actor leaves SUSPENDING, so upstream's
+	// worker-delete cannot reclaim the node state the continuation needs.
+	Doubt string `json:"doubt,omitempty"`
 }
 type checkpointRecord struct {
 	Tag        nativeReference `json:"tag"`
@@ -108,6 +119,10 @@ type journalRecord struct {
 	// SpareWorker records a selected pre-created spare WorkerPool. When set,
 	// RuntimePool names the spare and its birth labels are the worker labels.
 	SpareWorker *spareClaim `json:"spareWorker,omitempty"`
+	// SharedWorker records a slot in a shared pool (ADR 0008). When set,
+	// RuntimePool names that pool and RuntimePoolSpec stays the private
+	// single-Actor shape, which is the lineage's resume provenance.
+	SharedWorker *sharedPlacement `json:"sharedWorker,omitempty"`
 	// WorkerImageProvenance records each data-only resume or restore of this
 	// lineage that followed the operator pool to a new worker image.
 	WorkerImageProvenance []workerImageTransition `json:"workerImageProvenance,omitempty"`
@@ -165,6 +180,9 @@ type Lifecycle struct {
 	control         pb.ControlClient
 	config          Config
 	challengeClient challengeGetter
+	// sharedPass, set only by a shared bounds or sweep pass, shares that
+	// pass's Kubernetes reads across its pools.
+	sharedPass *sharedPassReads
 }
 
 var _ sdk.Lifecycle = (*Lifecycle)(nil)
@@ -201,6 +219,25 @@ func workspaceOwner(key sdk.AllocationKey) metav1.OwnerReference {
 }
 func labels(record *journalRecord) map[string]string {
 	return map[string]string{ownershipLabel: string(record.Request.Key.WorkspaceUID), providerLabel: string(record.Request.Key.ProviderUID)}
+}
+
+// sharedRecordLabel marks a journal or archived record that has recorded a
+// shared placement. It is set in the same write that first records one, is
+// copied into archives, and is never removed by the provider, so the shared
+// inventory lists only these records.
+const sharedRecordLabel = "substrate.workspace.orka.ai/shared"
+
+// journalLabelsMatch reports a journal's labels exactly as the provider
+// writes them: labels(record), optionally with sharedRecordLabel "true".
+func journalLabelsMatch(actual map[string]string, record *journalRecord) bool {
+	expected := labels(record)
+	if value, marked := actual[sharedRecordLabel]; marked {
+		if value != "true" {
+			return false
+		}
+		expected[sharedRecordLabel] = "true"
+	}
+	return maps.Equal(actual, expected)
 }
 func (d *Lifecycle) read(ctx context.Context, key sdk.AllocationKey) (*corev1.ConfigMap, *journalRecord, error) {
 	return d.readAt(ctx, key, journalKey(key))
@@ -244,7 +281,7 @@ func (d *Lifecycle) readAtChecked(ctx context.Context, key sdk.AllocationKey, na
 	if err := json.Unmarshal([]byte(raw), record); err != nil {
 		return nil, nil, fmt.Errorf("native journal is unreadable")
 	}
-	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !reflect.DeepEqual(cm.Labels, labels(record)) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
+	if record.Version != journalVersion || record.Request.Key != key || record.Observation.Key != key || record.Observation.Sequence != record.Request.Sequence || record.Observation.Identity.RequestRevision != record.Request.Revision || !record.Observation.Identity.Valid() || !journalLabelsMatch(cm.Labels, record) || !reflect.DeepEqual(cm.OwnerReferences, []metav1.OwnerReference{workspaceOwner(key)}) {
 		return nil, nil, sdk.ErrStaleIdentity
 	}
 	if err := validate(record); err != nil {
@@ -271,6 +308,9 @@ func validateJournalStructure(record *journalRecord) error {
 		return sdk.ErrStaleIdentity
 	}
 	if spare := record.SpareWorker; spare != nil && (spare.Name != record.RuntimePool.Name || spare.UID == "" || spare.ProfileUID == "" || spare.Birth == "" || record.RuntimePool.CreateIssued || record.RuntimePool.UID != "" && (record.RuntimePool.UID != spare.UID || spare.Released || !spare.ClaimIssued)) {
+		return sdk.ErrStaleIdentity
+	}
+	if shared := record.SharedWorker; shared != nil && (record.SpareWorker != nil || record.RuntimePool.CreateIssued || record.RuntimePoolDeleting || shared.Pool == "" || shared.Pool != record.RuntimePool.Name || shared.Label == "" || shared.SpecDigest != record.RuntimePool.Digest || shared.UID != record.RuntimePool.UID || !shared.Scope.valid() || !maps.Equal(record.RuntimePoolLabels, sharedLabels(shared.Label))) {
 		return sdk.ErrStaleIdentity
 	}
 	if len(record.RetirementWorkers) > 16 {
@@ -303,7 +343,26 @@ func (d *Lifecycle) save(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	cm.Data = map[string]string{journalDataKey: data}
-	return d.client.Update(ctx, cm)
+	if record.SharedWorker != nil && cm.Labels[sharedRecordLabel] != "true" {
+		// Set in the same write that first records a shared placement.
+		labeled := maps.Clone(cm.Labels)
+		if labeled == nil {
+			labeled = map[string]string{}
+		}
+		labeled[sharedRecordLabel] = "true"
+		cm.Labels = labeled
+	}
+	if err := d.client.Update(ctx, cm); err != nil {
+		return err
+	}
+	// Templates this process recorded join the in-process provider record.
+	// Only shared placements consult that record; a private template never
+	// reaches a shared pool, whose only label is its random shared label.
+	if record.SharedWorker != nil {
+		recordedTemplates.add(record.Atespace, record.Template)
+		recordedTemplates.add(record.Atespace, record.CreateTemplate)
+	}
+	return nil
 }
 func (d *Lifecycle) archive(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	archived := cm.DeepCopy()
@@ -480,5 +539,9 @@ func (d *Lifecycle) resolveProfile(ctx context.Context, record *journalRecord) e
 	// The spare count is a mutable annotation outside the profile hash; an
 	// invalid value disables spares and the replenisher reports it.
 	spares, _ := spareWorkerCount(object.Annotations)
-	return d.prepareRuntimePool(ctx, record, spares, object.UID)
+	shared, err := d.sharedPolicyFor(object, workspace, record)
+	if err != nil {
+		return err
+	}
+	return d.prepareRuntimePool(ctx, record, spares, object.UID, shared)
 }

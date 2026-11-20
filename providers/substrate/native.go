@@ -135,6 +135,9 @@ func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *jo
 // workerLabels are the birth labels of the record's private workers: its own
 // identity, or a claimed spare's labels, which were fixed before the claim.
 func workerLabels(record *journalRecord) map[string]string {
+	if record.SharedWorker != nil {
+		return sharedLabels(record.SharedWorker.Label)
+	}
 	if record.SpareWorker != nil {
 		return spareBirth(record.SpareWorker.Birth)
 	}
@@ -142,8 +145,11 @@ func workerLabels(record *journalRecord) map[string]string {
 }
 
 // expectedWorkerCapacity is the capacity a private worker sized for exactly
-// one template-sized Actor reports.
+// one template-sized Actor reports, or a shared worker sized for its scope.
 func expectedWorkerCapacity(record *journalRecord) (cpu, memory int64) {
+	if record.SharedWorker != nil {
+		return record.SharedWorker.Scope.capacity()
+	}
 	limits := record.TemplateSpec.GetResources().GetLimits()
 	return limits.GetCpuMillicores(), limits.GetMemoryBytes()
 }
@@ -165,6 +171,16 @@ func verifySingleActorWorkerShape(record *journalRecord, worker *pb.Worker, allo
 	if !registering && (len(classes) != 1 || classes[0].GetSandboxClass() != gvisorSandboxClass) {
 		return fmt.Errorf("native worker must run only the gVisor sandbox class")
 	}
+	// The sizing assumes gVisor books no per-Actor overhead (as in Agent
+	// Substrate v1.0.0). A runtime that books one would let fewer Actors fit
+	// than were sized for, so it fails closed.
+	for _, class := range classes {
+		for _, runtime := range append([]*pb.WorkerSandboxRuntime{class.GetDefaultRuntime()}, class.GetRestorableRuntimes()...) {
+			if overhead := runtime.GetActorOverhead(); overhead.GetMemoryBytes() != 0 || overhead.GetMemoryBytesPerGib() != 0 {
+				return fmt.Errorf("native worker runtime books a per-Actor overhead its sizing does not cover")
+			}
+		}
+	}
 	cpu, memory := expectedWorkerCapacity(record)
 	capacity := worker.GetStatus().GetCapacity()
 	if cpu <= 0 || memory <= 0 || capacity.GetCpuMillicores() != cpu || capacity.GetMemoryBytes() != memory || capacity.GetActors() < 1 {
@@ -175,7 +191,20 @@ func verifySingleActorWorkerShape(record *journalRecord, worker *pb.Worker, allo
 
 // verifyWorkerExclusive lists the worker's assignments and fails closed when
 // any Actor other than this record's exact lifetime is placed there.
+//
+// A shared worker instead requires every assignment to be an Actor in its
+// pool's ledger, and fails closed on any other.
 func (d *Lifecycle) verifyWorkerExclusive(ctx context.Context, record *journalRecord, workerName string, requireAssigned bool) error {
+	if record.SharedWorker != nil {
+		assigned, _, err := d.sharedAssignmentsInLedger(ctx, record, workerName)
+		if err != nil {
+			return err
+		}
+		if requireAssigned && !assigned {
+			return fmt.Errorf("native worker does not report the recorded Actor assignment")
+		}
+		return nil
+	}
 	ref := &pb.ObjectRef{Name: workerName}
 	page := ""
 	seen := map[string]bool{}

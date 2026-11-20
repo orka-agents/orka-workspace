@@ -255,6 +255,110 @@ ownerReference to collect. Each spare costs one idle worker Pod, the Actor size
 plus 64Mi of requests, so `N` spares per profile reserve `N` such Pods. Spares
 need `update` on `workerpools`.
 
+**Shared workers (interim).** A profile may opt in to sharing one gVisor
+worker among up to `N` data-only Actors of one namespace, profile and Actor
+size ([ADR 0008](../../docs/adr/0008-substrate-shared-workers.md), Orka ADR
+0056):
+
+```yaml
+spec:
+  suspend:
+    mode: DataOnly            # required
+  placement:
+    sharedWorkers:
+      maxActorsPerWorker: 4   # 2 to 16
+      maxWorkerLifetime: 12h  # 3h to 24h, default 24h
+```
+
+The field is part of the immutable, hashed spec, so opting in means creating
+a new profile. Without it the allocation path is unchanged. The leader sweep
+adds one Kubernetes list of shared pools per pass, and no native call while no
+pool or opted-in profile exists.
+
+- **Dedicated installs only.** Start the provider with
+  `--substrate-dedicated-install` to assert that only this Orka creates Actors
+  and ActorTemplates on the Agent Substrate install. Without it:
+  - an opted-in profile's allocations are refused, and the error reaches the
+    workspace's `Provisioned` condition;
+  - existing shared pools are strongly retired.
+- **Continuous verification.** Even with the flag, the provider lists every
+  ActorTemplate before each claim, before each Resume, and on every sweep. It
+  quarantines and strongly retires any shared pool that a template outside the
+  pool's Atespace could reach, with an empty selector or one the pool's labels
+  satisfy. Your own templates outside Orka's Atespaces must therefore select
+  their workers.
+- **What shares.** Only allocations whose egress injects the provider-proxy
+  credential at the gateway share, so no long-lived provider token enters a
+  shared sandbox. Never shared:
+  - restores from a public checkpoint;
+  - operator-tainted, quarantined, or `Failed` workspaces.
+
+  The workspace is re-checked when the slot is claimed (a suspect workspace
+  moves to a private worker) and immediately before Resume (fails closed).
+- **Pools.** A shared pool is a single-replica WorkerPool named
+  `ate-shared-<commitment>-<random>`, where the commitment hashes the pool's
+  scope (profile UID, profile hash, lifetime and shape), so the immutable name
+  binds the pool to the scope its ledger may claim:
+  - its only label is a random `substrate.workspace.orka.ai/shared-pool`
+    value the derived template selects, never the operator pool's labels;
+  - it is sized `cpu=N·C, memory=N·M+64Mi`, and has no owner;
+  - its `substrate.workspace.orka.ai/shared-ledger` annotation records the
+    scope, birth, admission state, fenced worker, and each hosted journal and
+    Actor UID. Every write is a resourceVersion-preconditioned Update.
+- **Retirement.** Retiring one Actor touches only that Actor:
+  1. Deny-all egress is applied, verified, and left to settle before
+     `SuspendActor`. The window is longer than the larger of the gateway's
+     policy cache and the DNS relay's 5 s cache, plus 5 s: 15 s by default.
+     Set `--substrate-egress-policy-cache-ttl` to the egress gateway's own
+     `--egress-policy-cache-ttl`, since the provider cannot read it. A Stop
+     also suspends, as evidence only.
+  2. The Actor must be `SUSPENDED` at a later version with the expected new
+     `VOLUMES` snapshot.
+  3. The fenced worker must still be `ACTIVE`, with the same UID, Pod UID,
+     registered and observed epoch, and an unchanged version on re-read. It
+     must no longer list the Actor, and must list no Actor outside the ledger.
+  4. Then the Actor is deleted and its slot released.
+- **Doubt.** Any doubt retires the whole pool and proves exact worker Pod UID
+  absence for every hosted Actor, and Orka core suspends the neighbours through
+  worker eviction. Doubt includes:
+  - an assignment that is still present;
+  - an epoch, identity or state change;
+  - an upstream error;
+  - any error after the suspension intent is persisted (a write conflict is
+    retried). An unresolved suspend is never replayed, and a persisted strong
+    marker always drives the pool's deletion to completion;
+  - a failed egress revocation;
+  - a terminating worker;
+  - a tainted, quarantined, or failed workspace on the pool.
+- **Lifetime.** `maxWorkerLifetime` is a hard bound on the worker Pod:
+  - strong retirement starts the Pod's 3600 s grace plus 5 minutes before it;
+  - admission closes an hour before that, so a pool admits for
+    `maxWorkerLifetime − 2h05m` after birth: 55 minutes at the 3h minimum,
+    21h55m at the 24h default;
+  - a Pod still present 5 minutes before the bound is re-deleted with a
+    one-second grace;
+  - this enforcement runs in its own leader loop every 10 s, using Kubernetes
+    alone, never behind the native sweep, which has a one-minute deadline;
+  - unreadable or inconsistent lifetime evidence (the ledger, or the
+    creation-time `substrate.workspace.orka.ai/shared-deadline` annotation)
+    retires the pool at once.
+- **Leader sweep.** A leader-only pass, every 10 seconds:
+  - quarantines a pool that hosts an Actor outside its ledger;
+  - removes entries that their exact journal disowns;
+  - deletes empty pools after 5 minutes.
+- **Warm capacity.** For these profiles the `spare-workers` annotation counts
+  free shared slots to keep warm, and private spares are not created. A pool
+  is created only after a complete template inventory shows no foreign
+  template that could reach it.
+- **Residual risk.** This evidence is weaker than Pod absence:
+  - a leaked sandbox keeps its memory, with no tunnel and no TCP egress, until
+    the worker Pod is gone. Its DNS relay session is stopped only by the
+    best-effort teardown, and may answer with a stale allowlist if its last
+    refresh failed;
+  - a foreign template created between checks is caught only by the next
+    check;
+  - a compromised worker exposes its co-hosted Actors.
+
 ## Workload translation
 
 Orka supplies the immutable public supervisor request. The provider compiles it
@@ -486,7 +590,8 @@ missing, for example in journals written before timing existed.
 `Substrate runtime ready` carries `workspaceNamespace`, `workspaceName`,
 `runtimePool` (the Orka RuntimePool binding), `sequence`, `path` (`cold`, or
 `resume` from a Tag), `workerSource` (`spare` when the private WorkerPool was a
-claimed spare, otherwise `fresh`), and these durations in milliseconds. For a
+claimed spare, `shared` for a shared worker slot, otherwise `fresh`), and these
+durations in milliseconds. For a
 spare, `workerPoolMs` ends when the claim is saved and `workerActiveMs` measures
 only the post-claim checks, not worker birth:
 
@@ -504,7 +609,9 @@ only the post-claim checks, not worker birth:
 
 `Substrate runtime stopped` carries `workspaceNamespace`, `workspaceName`,
 `runtimePool`, `sequence`, `operation` (`stop` or `suspend`), and these
-durations in milliseconds:
+durations in milliseconds. A shared worker adds `workerSource: shared` and
+`terminationProof` (`interim` or `strong`), and `workerTeardownMs` then ends
+when that evidence is journaled:
 
 | Field | From | To |
 | --- | --- | --- |

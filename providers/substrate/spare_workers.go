@@ -420,12 +420,57 @@ type SpareWorkerReplenisher struct {
 	Control pb.ControlClient
 	Config  Config
 
+	// SweepDeadline bounds one sweep's native work; zero selects
+	// defaultSweepDeadline. Shared worker bounds run in their own loop and
+	// are never behind it.
+	SweepDeadline time.Duration
+
 	mu         sync.Mutex
 	lastOrphan time.Time
 	invalid    map[types.UID]string
 }
 
-// SetupWithManager runs the replenisher on the elected leader.
+// defaultSweepDeadline bounds a sweep whose native calls stall.
+const defaultSweepDeadline = time.Minute
+
+// sharedBoundsPeriod is how often shared worker lifetime bounds are enforced.
+const sharedBoundsPeriod = 10 * time.Second
+
+// SharedWorkerBounds runs the Kubernetes-only shared worker bounds loop on
+// the elected leader. It needs no native control, so it is registered even
+// when native configuration is missing or invalid, and existing shared pools
+// keep their lifetime and persisted-retirement enforcement.
+type SharedWorkerBounds struct {
+	client.Client
+	Config Config
+}
+
+// SetupWithManager registers the bounds loop as a leader-elected runnable.
+func (b *SharedWorkerBounds) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedBounds(ctx, sharedBoundsPeriod)
+		return nil
+	})); err != nil {
+		return err
+	}
+	// Escalation runs in its own loop, so slow pool deletes in a bounds pass
+	// can never push a worker Pod's escalation past its deadline.
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedEscalation(ctx, sharedEscalationPeriod)
+		return nil
+	})); err != nil {
+		return err
+	}
+	// Labelling shared journals written before the shared label runs in its
+	// own loop too, off every enforcement path.
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		(&SpareWorkerReplenisher{Client: b.Client, Config: b.Config}).RunSharedLabelBackfill(ctx, sharedLabelBackfillPeriod)
+		return nil
+	}))
+}
+
+// SetupWithManager runs the replenisher on the elected leader. The shared
+// worker bounds loop is registered separately (SharedWorkerBounds).
 func (r *SpareWorkerReplenisher) SetupWithManager(mgr ctrl.Manager) error {
 	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		ticker := time.NewTicker(spareResyncPeriod)
@@ -449,13 +494,70 @@ type spareShape struct {
 	digest      string
 }
 
-// Sweep runs one replenishment and garbage-collection pass.
+// RunSharedBounds enforces shared worker lifetime bounds every period, using
+// Kubernetes alone, independently of the native sweep, until ctx ends.
+func (r *SpareWorkerReplenisher) RunSharedBounds(ctx context.Context, period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for {
+		if err := r.EnforceSharedBounds(ctx); err != nil && ctx.Err() == nil {
+			ctrl.LoggerFrom(ctx).Error(err, "Substrate shared worker bounds enforcement failed")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// EnforceSharedBounds runs one Kubernetes-only shared worker bounds pass.
+func (r *SpareWorkerReplenisher) EnforceSharedBounds(ctx context.Context) error {
+	return r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config))
+}
+
+// Sweep runs one replenishment and garbage-collection pass. Its native work
+// is bounded by SweepDeadline.
 func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 	d := New(r.Client, r.Control, r.Config)
-	profiles := &profile.SubstrateWorkspaceProfileList{}
-	if err := r.List(ctx, profiles); err != nil {
-		return err
+	deadline := r.SweepDeadline
+	if deadline <= 0 {
+		deadline = defaultSweepDeadline
 	}
+	listCtx, cancelList := context.WithTimeout(ctx, deadline)
+	profiles := &profile.SubstrateWorkspaceProfileList{}
+	started := sharedNow()
+	profilesErr := r.List(listCtx, profiles)
+	cancelList()
+	if profilesErr != nil {
+		sharedProfileInventoryHealth.failed(started)
+	} else {
+		sharedProfileInventoryHealth.succeeded(started)
+	}
+	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
+	// Shared isolation work (foreign templates, hosted suspicion, workers
+	// and assignments, outage retirement) comes first, each check on a budget
+	// of its own, so neither private spare maintenance (latency work) nor
+	// pool deletes can starve it. It runs even when the profiles cannot be
+	// listed.
+	sharedCtx, cancelShared := context.WithTimeout(withSweepBudget(ctx, deadline), deadline)
+	errs := []error{r.sweepShared(sharedCtx, d, profiles.Items, workers, profilesErr == nil), profilesErr}
+	cancelShared()
+	if profilesErr == nil {
+		// Spare replenishment needs the profiles, and its own budget.
+		spareCtx, cancelSpare := context.WithTimeout(ctx, deadline)
+		errs = append(errs, r.sweepSpares(spareCtx, d, workers, profiles.Items))
+		cancelSpare()
+	}
+	// The bounds loop (SharedWorkerBounds) enforces lifetime bounds on its
+	// own period. This pass's copy runs last, so its pool deletes never delay
+	// the isolation work above.
+	errs = append(errs, r.enforceSharedBounds(ctx, New(r.Client, nil, r.Config)))
+	return errors.Join(errs...)
+}
+
+// sweepSpares replenishes and collects private spare worker pools.
+func (r *SpareWorkerReplenisher) sweepSpares(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, profiles []profile.SubstrateWorkspaceProfile) error {
 	pools := &unstructured.UnstructuredList{}
 	pools.SetAPIVersion(workerPoolAPIVersion())
 	pools.SetKind("WorkerPoolList")
@@ -467,10 +569,9 @@ func (r *SpareWorkerReplenisher) Sweep(ctx context.Context) error {
 		pool := &pools.Items[i]
 		byProfile[pool.GetLabels()[spareProfileLabel]] = append(byProfile[pool.GetLabels()[spareProfileLabel]], pool)
 	}
-	workers := &spareWorkerCache{d: d, byNamespace: map[string]map[string][]*pb.Worker{}}
 	var errs []error
-	for i := range profiles.Items {
-		item := &profiles.Items[i]
+	for i := range profiles {
+		item := &profiles[i]
 		want := r.wanted(ctx, item)
 		errs = append(errs, r.replenish(ctx, d, workers, item, want, byProfile[string(item.UID)]))
 		delete(byProfile, string(item.UID))
@@ -513,6 +614,10 @@ func (r *SpareWorkerReplenisher) wanted(ctx context.Context, item *profile.Subst
 	}
 	delete(r.invalid, item.UID)
 	if item.DeletionTimestamp != nil || item.Validate() != nil {
+		return 0
+	}
+	if item.Spec.Placement != nil && item.Spec.Placement.SharedWorkers != nil {
+		// Free slots in shared pools are this profile's warm capacity.
 		return 0
 	}
 	return want
@@ -622,17 +727,27 @@ func (d *Lifecycle) createSpare(ctx context.Context, item *profile.SubstrateWork
 // spareWorkerCache lists native Workers at most once per namespace per sweep.
 type spareWorkerCache struct {
 	d           *Lifecycle
+	mu          sync.Mutex
+	namespaces  keyedMutex
 	byNamespace map[string]map[string][]*pb.Worker
 }
 
+// pool returns a pool's native workers from a per-namespace listing, made
+// once per pass. It is safe for concurrent per-pool checks, which list each
+// namespace once.
 func (c *spareWorkerCache) pool(ctx context.Context, pool *unstructured.Unstructured) ([]*pb.Worker, error) {
+	defer c.namespaces.lock(pool.GetNamespace())()
+	c.mu.Lock()
 	workers, found := c.byNamespace[pool.GetNamespace()]
+	c.mu.Unlock()
 	if !found {
 		var err error
 		if workers, err = c.d.namespaceWorkers(ctx, pool.GetNamespace()); err != nil {
 			return nil, err
 		}
+		c.mu.Lock()
 		c.byNamespace[pool.GetNamespace()] = workers
+		c.mu.Unlock()
 	}
 	return workers[pool.GetName()], nil
 }

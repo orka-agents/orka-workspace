@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -37,6 +40,8 @@ func main() {
 	flag.StringVar(&config.RouterKeyFile, "native-router-key-file", "", "rotating router client key file; may equal --native-router-cert-file for a credential bundle")
 	flag.StringVar(&config.RouterServerName, "native-router-server-name", "", "router TLS server name; defaults to the endpoint host")
 	flag.DurationVar(&config.BootTimeout, "native-boot-timeout", 6*time.Minute, "fail a native allocation that has no process evidence after this long")
+	flag.BoolVar(&config.DedicatedInstall, "substrate-dedicated-install", false, "assert that only this Orka creates Actors and ActorTemplates on the Agent Substrate install; required before any profile may share workers (ADR 0008)")
+	flag.DurationVar(&config.EgressPolicyCacheTTL, "substrate-egress-policy-cache-ttl", 10*time.Second, "must equal the Agent Substrate egress gateway's --egress-policy-cache-ttl; shared workers wait longer than it after revoking egress before suspending an Actor")
 	flag.StringVar(&config.EgressCredentialProvider, "egress-credential-provider", "", "credential provider class the Substrate egress gateway was installed with (only k8s.io); empty disables egress credential injection")
 	flag.Func("egress-credential-namespace", "namespace, besides each workload's own, whose Secrets egress credential rules may name; repeatable (Orka core needs its runtime namespace)", func(value string) error {
 		config.EgressCredentialNamespaces = append(config.EgressCredentialNamespaces, strings.TrimSpace(value))
@@ -46,10 +51,11 @@ func main() {
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&options)))
-	if err := config.ValidateEgressCredentials(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
+	// Configuration errors, including invalid egress credentials, never exit
+	// before run: config.Validate covers them, and run degrades to the
+	// provider status reconciler and the Kubernetes-only shared worker bounds
+	// so existing shared pools stay bounded. Only flag parsing fails fast,
+	// which a previously working install with the same arguments cannot hit.
 	if err := run(leader, leaderNamespace, config); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -57,17 +63,11 @@ func main() {
 }
 func run(leader bool, leaderNamespace string, config provider.Config) error {
 	// Without acknowledged native control, run only the provider reconciler so
-	// it withdraws any stale advertisement instead of crash-looping.
-	var native pb.ControlClient
-	if err := config.Validate(); err != nil {
-		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
-	} else {
-		conn, err := provider.Dial(config)
-		if err != nil {
-			return err
-		}
-		defer conn.Close()
-		native = pb.NewControlClient(conn)
+	// it withdraws any stale advertisement, and the Kubernetes-only shared
+	// worker bounds loop, instead of crash-looping.
+	native, unavailable, closer, redial := nativeControl(config)
+	if closer != nil {
+		defer closer.Close()
 	}
 	scheme := runtime.NewScheme()
 	for _, register := range []func(*runtime.Scheme) error{corev1.AddToScheme, api.AddToScheme, profile.AddToScheme} {
@@ -83,8 +83,16 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	if err != nil {
 		return err
 	}
-	for _, setup := range controllerSetups(c, config, native) {
+	for _, setup := range controllerSetups(c, config, native, unavailable) {
 		if err := setup(mgr); err != nil {
+			return err
+		}
+	}
+	if redial {
+		// A failed dial may be transient, such as TLS material mounted late.
+		// Keep retrying; once native control is reachable, stop so the
+		// restarted process runs every lifecycle controller.
+		if err := mgr.Add(nativeRedialer{dial: func() (io.Closer, error) { return provider.Dial(config) }, interval: nativeRedialInterval}); err != nil {
 			return err
 		}
 	}
@@ -97,11 +105,73 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	return mgr.Start(ctrl.SetupSignalHandler())
 }
 
+// nativeControl dials native control. An invalid configuration, or a valid
+// one whose dial fails (for example unreadable TLS material), degrades the
+// same way: it is logged, no native client is returned, and the reason is
+// reported so the provider status withdraws its advertisement.
+//
+// redial is true only for a failed dial, which may be transient; an invalid
+// configuration (including invalid egress credentials) is not retried.
+func nativeControl(config provider.Config) (native pb.ControlClient, unavailable string, closer io.Closer, redial bool) {
+	if err := config.Validate(); err != nil {
+		ctrl.Log.Info("native control is not configured; publishing unconfigured provider status only", "reason", err.Error())
+		return nil, "native control is not configured: " + err.Error(), nil, false
+	}
+	conn, err := provider.Dial(config)
+	if err != nil {
+		ctrl.Log.Error(err, "native control could not be reached; withdrawing the provider advertisement and running only Kubernetes-only shared worker bounds")
+		return nil, "native control could not be reached: " + err.Error(), nil, true
+	}
+	return pb.NewControlClient(conn), "", conn, false
+}
+
 // controllerSetups registers lifecycle controllers only with native control.
-func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient) []func(ctrl.Manager) error {
-	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager}
+// The Kubernetes-only shared worker bounds loop always runs, so existing
+// shared pools stay bounded while native configuration or connection is
+// broken.
+func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, nativeUnavailable string) []func(ctrl.Manager) error {
+	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config, NativeUnavailable: nativeUnavailable}).SetupWithManager, (&provider.SharedWorkerBounds{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
+		// No native sweep runs, and no lifecycle controller admits anything;
+		// the bounds loop retires existing shared pools past the outage
+		// bound.
+		provider.SetNativeDegraded(nativeUnavailable)
 		return setups
 	}
 	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
 }
+
+const nativeRedialInterval = 30 * time.Second
+
+// errNativeControlRecovered stops a degraded provider once native control is
+// reachable, so its restart runs with every lifecycle controller.
+var errNativeControlRecovered = errors.New("native control became reachable; restarting with lifecycle controllers")
+
+// nativeRedialer retries a native dial that failed at startup. It runs on
+// every replica, so a degraded replica recovers whether or not it leads.
+type nativeRedialer struct {
+	dial     func() (io.Closer, error)
+	interval time.Duration
+}
+
+func (r nativeRedialer) Start(ctx context.Context) error {
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			conn, err := r.dial()
+			if err != nil {
+				ctrl.Log.V(1).Info("native control is still unreachable", "reason", err.Error())
+				continue
+			}
+			_ = conn.Close()
+			ctrl.Log.Info("native control is reachable; restarting to start lifecycle controllers")
+			return errNativeControlRecovered
+		}
+	}
+}
+
+func (nativeRedialer) NeedLeaderElection() bool { return false }

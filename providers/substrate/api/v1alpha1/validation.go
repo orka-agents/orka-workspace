@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -44,6 +45,21 @@ func (p *SubstrateWorkspaceProfile) Validate() error {
 		}
 		if p.Spec.Suspend == nil || p.Spec.Suspend.Mode != SubstrateSuspendModeDataOnly {
 			return fmt.Errorf("suspendAfterDetach requires suspend.mode DataOnly")
+		}
+	}
+	if p.Spec.Placement != nil && p.Spec.Placement.SharedWorkers != nil {
+		shared := p.Spec.Placement.SharedWorkers
+		if shared.MaxActorsPerWorker < MinSharedActorsPerWorker || shared.MaxActorsPerWorker > MaxSharedActorsPerWorker {
+			return fmt.Errorf("sharedWorkers.maxActorsPerWorker %d must be from %d to %d", shared.MaxActorsPerWorker, MinSharedActorsPerWorker, MaxSharedActorsPerWorker)
+		}
+		if lifetime := shared.WorkerLifetime(); lifetime%time.Second != 0 {
+			return fmt.Errorf("sharedWorkers.maxWorkerLifetime %s must be a whole number of seconds", lifetime)
+		}
+		if lifetime := shared.WorkerLifetime(); lifetime < MinSharedWorkerLifetime || lifetime > MaxSharedWorkerLifetime {
+			return fmt.Errorf("sharedWorkers.maxWorkerLifetime %s must be at least %s and at most %s", lifetime, MinSharedWorkerLifetime, MaxSharedWorkerLifetime)
+		}
+		if p.Spec.Suspend == nil || p.Spec.Suspend.Mode != SubstrateSuspendModeDataOnly {
+			return fmt.Errorf("sharedWorkers requires suspend.mode DataOnly")
 		}
 	}
 	return nil

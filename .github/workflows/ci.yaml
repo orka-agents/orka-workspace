@@ -21,4 +21,8 @@ jobs:
           cache-dependency-path: |
             go.sum
             providers/go.sum
+      - name: Install envtest assets
+        # The CRD install test runs the generated CRDs through a real
+        # kube-apiserver, so CEL rule cost is checked as on a cluster.
+        run: echo "KUBEBUILDER_ASSETS=$(go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3 use 1.37.0 --bin-dir "$RUNNER_TEMP/envtest" -p path)" >> "$GITHUB_ENV"
       - run: make check

@@ -2,7 +2,7 @@
 
 Date: 2026-11-06
 
-Status: Accepted. Extends ADRs 0002, 0004 and 0005 for the native Substrate provider.
+Status: Accepted. Extends ADRs 0002, 0004 and 0005 for the native Substrate provider. For profiles that set `spec.placement.sharedWorkers`, ADR 0008 supersedes its single-Actor worker sizing and its worker Pod UID absence termination proof.
 
 ## Context
 
