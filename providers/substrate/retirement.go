@@ -961,9 +961,11 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 		// rather than wait for the lifetime bound.
 		return fmt.Errorf("the suspension stayed SUSPENDING after %d continuations", operation.Continuations)
 	}
-	if operation.Doubt != "" && !suspendContinuationOpen(record) {
+	if operation.Doubt != "" && record.SharedWorker.Strong == "" && !suspendContinuationOpen(record) {
 		// A recorded doubt holds the strong path's deletion only inside the
-		// continuation window.
+		// continuation window. The window ends the hold, not the
+		// continuations: once the strong path has started, the remaining
+		// ones still run while the worker exists.
 		return fmt.Errorf("the suspension stayed SUSPENDING past its continuation window: %s", operation.Doubt)
 	}
 	if last != nil && now.Sub(last.Time) < suspendContinuationInterval {

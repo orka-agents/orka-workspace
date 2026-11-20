@@ -2807,6 +2807,57 @@ func TestSharedSuspensionDoubtHoldsTheDeletionUntilTheContinuationFinishes(t *te
 	}
 }
 
+// The window ends only the hold. Once the strong path has started, the
+// remaining continuations still run while the worker exists.
+func TestSharedContinuationsOutliveTheHoldWindow(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	// The worker Pod lingers while it terminates.
+	pod := &corev1.Pod{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: recordA.Worker.Namespace, Name: recordA.Worker.Pod}, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.SetFinalizers([]string{"test.invalid/hold"})
+	if err := c.Update(t.Context(), pod); err != nil {
+		t.Fatal(err)
+	}
+	native.failFinalizeOnce = true
+	var issued time.Time
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Pending != nil && record.Pending.Doubt != "" {
+			issued = record.Timing.SuspendIssuedAt.Time
+			break
+		}
+	}
+	if issued.IsZero() {
+		t.Fatal("the failed suspend recorded no doubt")
+	}
+	// An Actor-read outage outlasts the window without any continuation.
+	native.failGetActor = 1 << 20
+	setNow(t, issued.Add(suspendContinuationWindow))
+	_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err != nil || record.SharedWorker.Strong == "" {
+		t.Fatalf("the window did not start the strong path: %v", err)
+	}
+	native.failGetActor = 0
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Checkpoint != nil {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.suspendCalls != 2 || record.Checkpoint == nil || native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil {
+		t.Fatalf("the remaining continuations stopped with the hold: calls=%d", native.suspendCalls)
+	}
+}
+
 // The held deletion is bounded: an Actor that cannot be read after a failed
 // suspend takes the strong path once the continuation window ends, and not
 // before.
