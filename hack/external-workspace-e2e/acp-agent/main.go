@@ -138,10 +138,14 @@ func main() {
 			}
 			sessionID = params.Params.SessionID
 		case "session/prompt":
+			// The receipt time travels in the reply, since the supervisor keeps
+			// agent stderr private; latency measurements compare it with the
+			// Task's creation (hack/external-substrate-e2e/core/latency.sh).
+			received := time.Now().UTC().Format(time.RFC3339Nano)
 			// Leave time for the independent proof client to observe Serving
 			// and verify the selected Pod before terminal settlement retires it.
 			time.Sleep(2 * time.Second)
-			write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "External workspace fixture completed."}}}})
+			write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": sessionID, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "External workspace fixture completed. promptReceivedAt=" + received}}}})
 			result["stopReason"] = "end_turn"
 		case "session/cancel":
 			continue
