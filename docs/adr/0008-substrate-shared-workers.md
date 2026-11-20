@@ -204,7 +204,7 @@ These take the strong path:
   - the worker's identity, epoch or `ACTIVE` state changes;
   - a foreign assignment or template appears;
   - any upstream error occurs.
-- **Uncertainty in the suspend path, never replayed.** Once the suspension intent is persisted, every error on a shared worker selects the strong path, apart from a journal write conflict, which is retried. That includes:
+- **Uncertainty in the suspend path, never replayed.** Once the suspension intent is persisted, every error on a shared worker selects the strong path, apart from a journal write conflict, which is retried. A resourceVersion conflict is never doubt anywhere, including the save that records an interim proof attempt and the journal writes before the suspend: it is returned so the next pass rereads the journal and retries, and ordinary contention never retires a pool. That includes:
   - the Actor cannot be read, or is not `RUNNING` when its suspension begins or before the suspend is issued;
   - egress revocation fails, or the shared worker cannot be verified;
   - the template cannot be verified;
