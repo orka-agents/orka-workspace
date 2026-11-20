@@ -80,7 +80,9 @@ func useTestClock(t *testing.T) {
 	sharedUnverifiedPools.reset()
 	sharedNativeDegraded.Store(nil)
 	sharedProfileInventoryHealth.reset()
+	sharedDecidedStamps.reset()
 	t.Cleanup(func() {
+		sharedDecidedStamps.reset()
 		sharedUnverifiedPools.reset()
 		sharedNativeDegraded.Store(nil)
 		sharedProfileInventoryHealth.reset()
@@ -5760,4 +5762,32 @@ func shortSharedBudgets(t *testing.T) {
 		sharedCleanupTimeout, sharedEscalationTimeout, sharedLedgerWriteTimeout, sharedBookkeepingBudget = cleanup, escalation, ledger, bookkeeping
 		sharedInventoryTimeout, sharedDiscoveryTimeout, sharedOutageMarkBudget, sharedIsolationCheckTimeout = inventory, discovery, marks, check
 	})
+}
+
+func TestSharedRecoveryRecordsItsClearEvenBeforeTheStampLands(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	failed := sharedDriver(c, native).withSharedPass()
+	start := sharedNow()
+	// A failing pass decides the stamp, but its write is still in flight:
+	// the pool snapshot the next pass reads has no stamp yet.
+	stale := outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: start.UTC().Format(time.RFC3339Nano), decidedAt: start}
+	sharedDecidedStamps.add(pool.GetUID(), sharedUnverifiedAnnotation)
+	// The next pass verifies the pool and records its recovery.
+	setNow(t, start.Add(time.Second))
+	recovered := sharedDriver(c, native).withSharedPass()
+	recovered.verificationSucceeded(t.Context(), pool)
+	recovered.flushOutageMarks(t.Context())
+	// The stale write lands only now.
+	failed.writeOutageMarks(t.Context(), []outageMark{stale})
+	current, _ := getPool(t, c, record.SharedWorker.Pool)
+	if current.GetAnnotations()[sharedUnverifiedAnnotation] != "" {
+		t.Fatal("a stale stamp write landed after a recorded recovery")
+	}
+	setNow(t, start.Add(sharedControlPlaneDownGrace+time.Minute))
+	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+		t.Fatal("a recovered pool was retired on a stale stamp")
+	}
 }
