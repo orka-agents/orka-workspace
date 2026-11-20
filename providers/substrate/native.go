@@ -339,12 +339,53 @@ type challengeGetter interface {
 
 // routerChallengeGetter reads the public challenge through the native router
 // over mTLS, presenting the provider's allowlisted client identity.
-type routerChallengeGetter struct{ config Config }
+//
+// One getter serves one reconcile pass, which reads the challenge twice (the
+// startup evidence and the Ready observation). Both reads share one
+// keep-alive connection, so the second costs no TLS handshake. The TLS
+// configuration is loaded once per getter, so every pass still reloads the
+// router CA and client identity from disk. The router routes each request by
+// its target header, and every response is still checked against the exact
+// Actor, so reuse changes no fence.
+type routerChallengeGetter struct {
+	config Config
+
+	mu     sync.Mutex
+	client *http.Client
+}
+
+// routerChallengeIdleTimeout closes a pass's connection if its owner never
+// releases it.
+const routerChallengeIdleTimeout = 30 * time.Second
 
 var errChallengeClosed = errors.New("native bootstrap listener closed")
 
-func (g routerChallengeGetter) Get(ctx context.Context, endpoint, target string) (bootstrapChallenge, error) {
+func (g *routerChallengeGetter) httpClient() (*http.Client, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.client != nil {
+		return g.client, nil
+	}
 	tlsConfig, err := routerTLSConfig(g.config)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true, MaxIdleConnsPerHost: 1, IdleConnTimeout: routerChallengeIdleTimeout}
+	g.client = &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return g.client, nil
+}
+
+// closeIdle releases the pass's idle router connection.
+func (g *routerChallengeGetter) closeIdle() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.client != nil {
+		g.client.CloseIdleConnections()
+	}
+}
+
+func (g *routerChallengeGetter) Get(ctx context.Context, endpoint, target string) (bootstrapChallenge, error) {
+	c, err := g.httpClient()
 	if err != nil {
 		return bootstrapChallenge{}, err
 	}
@@ -353,9 +394,6 @@ func (g routerChallengeGetter) Get(ctx context.Context, endpoint, target string)
 		return bootstrapChallenge{}, err
 	}
 	request.Header.Set(routerTargetHeader, target)
-	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true}
-	defer transport.CloseIdleConnections()
-	c := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := c.Do(request)
 	if err != nil {
 		return bootstrapChallenge{}, err
@@ -389,7 +427,7 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor 
 	}
 	getter := d.challengeClient
 	if getter == nil {
-		getter = routerChallengeGetter{config: d.config}
+		getter = d.routerChallenges()
 	}
 	endpoint := d.endpoint()
 	if endpoint == "" {

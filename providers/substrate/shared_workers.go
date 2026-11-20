@@ -1154,6 +1154,7 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 	}
 	status := selected.GetStatus()
 	if status.GetState() == pb.WorkerState_WORKER_STATE_UNAVAILABLE || len(status.GetSandboxClasses()) == 0 || status.GetRegisteredEpoch() <= 0 {
+		d.noteNativeLag(ctx, selected)
 		return false, nil
 	}
 	if selected.GetMetadata().GetUid() == "" || status.GetState() != pb.WorkerState_WORKER_STATE_ACTIVE {
