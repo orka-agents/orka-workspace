@@ -87,7 +87,7 @@ paired with revocation of everything a leaked sandbox could use.
 - **Without the flag.** An allocation whose profile opts in is refused with an error that reaches the workspace's `Provisioned` condition. The leader logs the refusal for each such profile, and strongly retires any shared pool that exists.
 - **Verified even with the flag.** The provider holds global viewer and lists every ActorTemplate. A template is foreign if its worker selector is empty or is satisfied by a shared pool's labels, and either:
   - it is outside the pool's Atespace; or
-  - it is inside that Atespace but is not a derived template this provider recorded (in a journal, an archived record, or a checkpoint catalog), with the recorded UID once known.
+  - it is inside that Atespace but is not a derived template this provider recorded (in a journal, an archived record, or a checkpoint catalog). Once its UID is recorded, the template must have that UID. While a journal records only the template's name and frozen spec digest (its creation may not have succeeded yet), the template must match that digest; a recorded name with neither fails closed. A same-name template whose spec differs, for example with an empty selector, is foreign.
 
   Any foreign template fails closed: the pool is quarantined and strongly retired, and the admission is refused.
   - The provider keeps the recorded templates in memory. A journal save adds the templates it records, and each leader sweep replaces the set from the journals, archived records and checkpoint catalogs.
