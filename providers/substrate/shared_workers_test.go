@@ -5861,6 +5861,50 @@ func TestSharedBoundsLoopEnforcesTheClassifiedNativeOutageBound(t *testing.T) {
 	}
 }
 
+// The in-process per-pool trackers are pruned only from a complete,
+// successful List of all WorkerPools: a deleted pool's entries are dropped, a
+// failed List drops nothing, and a live pool's decision is kept, so its
+// in-flight writes are still outranked.
+func TestSharedPoolTrackersArePrunedOnlyFromACompleteList(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	live, gone := pool.GetUID(), types.UID("deleted-pool-uid")
+	for _, uid := range []types.UID{live, gone} {
+		sharedDecidedStamps.record(uid, sharedUnverifiedAnnotation, decidedClear)
+		sharedUnverifiedPools.failed(uid, sharedNow())
+	}
+	// A failed List prunes nothing.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if u, ok := list.(*unstructured.UnstructuredList); ok && u.GetKind() == "WorkerPoolList" {
+			return apierrors.NewInternalError(errors.New("list refused"))
+		}
+		return w.List(ctx, list, opts...)
+	}})
+	_ = (&SpareWorkerReplenisher{Client: failing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if sharedDecidedStamps.last(gone, sharedUnverifiedAnnotation) == "" || !sharedUnverifiedPools.pending(gone) {
+		t.Fatal("a failed WorkerPool List pruned a pool's trackers")
+	}
+	// A complete List drops the deleted pool's entries and keeps the live
+	// pool's.
+	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if sharedDecidedStamps.last(gone, sharedUnverifiedAnnotation) != "" || sharedUnverifiedPools.pending(gone) {
+		t.Fatal("a deleted pool's trackers outlived a complete List")
+	}
+	if sharedDecidedStamps.last(live, sharedUnverifiedAnnotation) != decidedClear || !sharedUnverifiedPools.pending(live) {
+		t.Fatal("a complete List pruned a live pool's trackers")
+	}
+	// The live pool's newer decision still outranks a stale write.
+	d := sharedDriver(c, native)
+	decided := sharedNow()
+	d.writeOutageMarks(t.Context(), []outageMark{{namespace: pool.GetNamespace(), name: pool.GetName(), uid: live, key: sharedNativeOutageAnnotation, value: decided.UTC().Format(time.RFC3339Nano), decidedAt: decided}})
+	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	d.writeOutageMarks(t.Context(), []outageMark{{namespace: pool.GetNamespace(), name: pool.GetName(), uid: live, key: sharedNativeOutageAnnotation, decidedAt: decided.Add(-time.Second)}})
+	if current, found := getPool(t, c, record.SharedWorker.Pool); !found || current.GetAnnotations()[sharedNativeOutageAnnotation] == "" {
+		t.Fatal("a stale write undid a live pool's newer decision after a prune")
+	}
+}
+
 func TestSharedNativeOutageClockSurvivesProviderRestarts(t *testing.T) {
 	for _, down := range []bool{false, true} {
 		t.Run(fmt.Sprintf("controlPlaneDown=%t", down), func(t *testing.T) {

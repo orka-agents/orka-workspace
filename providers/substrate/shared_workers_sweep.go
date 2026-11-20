@@ -220,6 +220,9 @@ func listSharedPools(ctx context.Context, c client.Client, provenance map[types.
 	if err := c.List(ctx, all); err != nil {
 		return nil, err
 	}
+	// Only a complete, successful List prunes the in-process per-pool
+	// trackers; a failed List returned above prunes nothing.
+	pruneSharedPoolTrackers(all.Items)
 	var out []unstructured.Unstructured
 	for _, pool := range all.Items {
 		_, labeled := pool.GetLabels()[sharedPoolLabel]
@@ -782,6 +785,31 @@ func (s *decidedStamps) last(uid types.UID, key string) string {
 	return s.keys[uid][key]
 }
 
+// retain drops the decisions of every pool UID not in live.
+func (s *decidedStamps) retain(live map[types.UID]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for uid := range s.keys {
+		if !live[uid] {
+			delete(s.keys, uid)
+		}
+	}
+}
+
+// pruneSharedPoolTrackers drops the in-process per-pool trackers of every
+// pool absent from a complete, successful List of all WorkerPools. Pool UIDs
+// are never reused, so a pool gone from such a List never needs its decision
+// again. A pool that is still deleting is still listed, so its in-flight
+// writes keep the decision that outranks them.
+func pruneSharedPoolTrackers(pools []unstructured.Unstructured) {
+	live := make(map[types.UID]bool, len(pools))
+	for i := range pools {
+		live[pools[i].GetUID()] = true
+	}
+	sharedDecidedStamps.retain(live)
+	sharedUnverifiedPools.retain(live)
+}
+
 func (s *decidedStamps) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1085,6 +1113,17 @@ func (p *poolRejections) failed(uid types.UID, now time.Time) time.Time {
 	}
 	p.since[uid] = now
 	return now
+}
+
+// retain drops the entries of every pool UID not in live.
+func (p *poolRejections) retain(live map[types.UID]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for uid := range p.since {
+		if !live[uid] {
+			delete(p.since, uid)
+		}
+	}
 }
 
 func (p *poolRejections) succeeded(uid types.UID) {
