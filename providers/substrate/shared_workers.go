@@ -563,7 +563,7 @@ func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) 
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
-	return pool.GetDeletionTimestamp() == nil && !sharedRetireIntended(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+	return pool.GetDeletionTimestamp() == nil && !sharedRetireDecided(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
 }
 
 func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
@@ -848,7 +848,7 @@ func (d *Lifecycle) verifySharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	if err != nil {
 		return nil, err
 	}
-	retiring := pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || ledger.State == sharedRetiring || ledger.State == sharedQuarantined || !sharedLifetimeConsistent(pool, ledger)
+	retiring := pool.GetDeletionTimestamp() != nil || sharedRetireDecided(pool) || ledger.State == sharedRetiring || ledger.State == sharedQuarantined || !sharedLifetimeConsistent(pool, ledger)
 	if retiring && !allowRetiring {
 		return nil, fmt.Errorf("shared worker is retiring: %w", sdk.ErrStaleIdentity)
 	}
@@ -1200,7 +1200,7 @@ func (d *Lifecycle) sharedStrongReason(ctx context.Context, cm *corev1.ConfigMap
 		return "the shared worker pool was replaced", nil
 	case pool.GetDeletionTimestamp() != nil:
 		return "the shared worker pool is deleting", nil
-	case sharedRetireIntended(pool):
+	case sharedRetireDecided(pool):
 		return "the shared worker's strong retirement was decided but its deletion has not completed", nil
 	}
 	ledger, err := sharedPoolIdentity(pool, record)
@@ -2397,6 +2397,9 @@ func (d *Lifecycle) initiateSharedStrongRetirement(ctx context.Context, record *
 		return nil
 	}
 	if err != nil {
+		// Nothing durable could be written: this process still refuses the
+		// pool and keeps retrying its retirement.
+		sharedUndurableRetirements.add(types.UID(shared.UID))
 		return err
 	}
 	if string(pool.GetUID()) != shared.UID {
@@ -2497,6 +2500,7 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 		d.persistSharedRetireDecision(ctx, pool, state, reason, err)
 		return err
 	}
+	sharedUndurableRetirements.drop(pool.GetUID())
 	if !issued {
 		// Already deleting: logged once, when this provider issued it. A
 		// capped Pod delete that failed is still reported.
@@ -2591,6 +2595,13 @@ func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructur
 var sharedLedgerWriteTimeout = 5 * time.Second
 
 // sharedRetireIntended reports a decided strong retirement not yet deleted.
+// sharedRetireDecided reports a pool whose strong retirement is decided:
+// durably, by its retirement-intent annotation, or in this process when
+// neither its Delete nor that annotation could be written.
+func sharedRetireDecided(pool *unstructured.Unstructured) bool {
+	return sharedRetireIntended(pool) || sharedUndurableRetirements.has(pool.GetUID())
+}
+
 func sharedRetireIntended(pool *unstructured.Unstructured) bool {
 	_, intended := pool.GetAnnotations()[sharedRetireIntentAnnotation]
 	return intended
@@ -2625,6 +2636,7 @@ func (d *Lifecycle) persistSharedRetireDecision(ctx context.Context, pool *unstr
 			break
 		}
 		if current.GetUID() != uid || current.GetDeletionTimestamp() != nil {
+			sharedUndurableRetirements.drop(uid)
 			return
 		}
 		changed := false
@@ -2645,11 +2657,21 @@ func (d *Lifecycle) persistSharedRetireDecision(ctx context.Context, pool *unstr
 			}
 		}
 		if !changed {
+			sharedUndurableRetirements.drop(uid)
 			return
 		}
 		if err = d.client.Update(writeCtx, current); !apierrors.IsConflict(err) {
 			break
 		}
+	}
+	switch {
+	case err == nil, apierrors.IsNotFound(err):
+		sharedUndurableRetirements.drop(uid)
+	default:
+		// Neither the Delete nor the intent could be written. This process
+		// still refuses admission and Resume on the pool, and its bounds
+		// loop keeps retrying the retirement.
+		sharedUndurableRetirements.add(uid)
 	}
 	if err != nil && !apierrors.IsNotFound(err) {
 		ctrl.LoggerFrom(ctx).Info("Substrate shared worker retirement decision not recorded", "reason", err.Error())

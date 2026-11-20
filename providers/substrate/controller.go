@@ -100,7 +100,9 @@ func (r *ProviderReconciler) reportNativeCredentials(ctx context.Context, provid
 		namespace = metav1.NamespaceDefault
 	}
 	event := &corev1.Event{
-		ObjectMeta:          metav1.ObjectMeta{Namespace: namespace, Name: provider.Name + ".native-credentials-rejected"},
+		// The name carries the provider's UID: a provider recreated under
+		// the same name gets its own Event, never the deleted one's.
+		ObjectMeta:          metav1.ObjectMeta{Namespace: namespace, Name: provider.Name + ".native-credentials-rejected." + string(provider.UID)},
 		InvolvedObject:      corev1.ObjectReference{APIVersion: workspacev1alpha1.GroupVersion.String(), Kind: "ExecutionWorkspaceProvider", Name: provider.Name, Namespace: provider.Namespace, UID: provider.UID},
 		Reason:              nativeCredentialsEventReason,
 		Message:             message,

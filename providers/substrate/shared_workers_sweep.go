@@ -142,7 +142,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			// The workspace of an unreleased journal that recorded this pool's
 			// UID is suspect, even if its entry was removed from the ledger.
 			retire(sharedRetiring, "a workspace a journal recorded on this shared worker is tainted, quarantined or failed")
-		case sharedRetireIntended(pool):
+		case sharedRetireDecided(pool):
 			// A retirement decided earlier whose Delete failed.
 			retire(sharedRetiring, pool.GetAnnotations()[sharedRetireIntentAnnotation])
 		case sharedRetirementPersisted(pool):
@@ -825,6 +825,61 @@ func pruneSharedPoolTrackers(pools []unstructured.Unstructured, listed uint64) {
 	}
 	sharedDecidedStamps.retain(live, listed)
 	sharedUnverifiedPools.retain(live, listed)
+	sharedUndurableRetirements.retain(live, listed)
+}
+
+// undurableRetirements holds, in process, the pools whose strong retirement
+// was decided but whose Delete and retirement intent could not be written
+// (with every Kubernetes write failing, for example). Admission and Resume
+// refuse them, and the bounds loop retries their retirement every pass. A
+// restart forgets them; the trigger that decided the retirement fires again
+// on its own pass.
+type undurableRetirements struct {
+	mu      sync.Mutex
+	touched map[types.UID]uint64
+}
+
+var sharedUndurableRetirements = &undurableRetirements{}
+
+func (u *undurableRetirements) add(uid types.UID) {
+	if uid == "" {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.touched == nil {
+		u.touched = map[types.UID]uint64{}
+	}
+	u.touched[uid] = sharedTrackerClock.Add(1)
+}
+
+func (u *undurableRetirements) drop(uid types.UID) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	delete(u.touched, uid)
+}
+
+func (u *undurableRetirements) has(uid types.UID) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	_, ok := u.touched[uid]
+	return ok
+}
+
+func (u *undurableRetirements) retain(live map[types.UID]bool, listed uint64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for uid, touched := range u.touched {
+		if !live[uid] && touched <= listed {
+			delete(u.touched, uid)
+		}
+	}
+}
+
+func (u *undurableRetirements) reset() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.touched = nil
 }
 
 func (s *decidedStamps) reset() {

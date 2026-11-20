@@ -81,7 +81,9 @@ func useTestClock(t *testing.T) {
 	sharedNativeDegraded.Store(nil)
 	sharedProfileInventoryHealth.reset()
 	sharedDecidedStamps.reset()
+	sharedUndurableRetirements.reset()
 	t.Cleanup(func() {
+		sharedUndurableRetirements.reset()
 		sharedDecidedStamps.reset()
 		sharedUnverifiedPools.reset()
 		sharedNativeDegraded.Store(nil)
@@ -6088,6 +6090,108 @@ func TestSharedRejectedNativeCredentialsAreSurfacedOnTheProvider(t *testing.T) {
 	_ = sharedReplenisher(c, native).Sweep(t.Context())
 	if rejected := NativeCredentialsRejected(); rejected != "" {
 		t.Fatalf("a successful native read kept the rejection: %q", rejected)
+	}
+}
+
+// A provider recreated under the same name gets its own credential Warning
+// Event; the deleted provider's Event is never patched in its place.
+func TestSharedCredentialWarningFollowsARecreatedProvider(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	sharedReady(t, c, native, first)
+	native.credentialsRejected = true
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	r := &ProviderReconciler{Client: c}
+	reconcile := func() *api.ExecutionWorkspaceProvider {
+		t.Helper()
+		provider := &api.ExecutionWorkspaceProvider{}
+		if err := c.Get(t.Context(), types.NamespacedName{Name: "substrate"}, provider); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatal(err)
+		}
+		return provider
+	}
+	old := reconcile()
+	recreated := old.DeepCopy()
+	if err := c.Delete(t.Context(), old); err != nil {
+		t.Fatal(err)
+	}
+	recreated.ResourceVersion, recreated.UID = "", "recreated-provider-uid"
+	recreated.Status = api.ExecutionWorkspaceProviderStatus{}
+	if err := c.Create(t.Context(), recreated); err != nil {
+		t.Fatal(err)
+	}
+	current := reconcile()
+	events := &corev1.EventList{}
+	if err := c.List(t.Context(), events); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(events.Items, func(event corev1.Event) bool {
+		return event.Reason == nativeCredentialsEventReason && event.InvolvedObject.UID == current.UID
+	}) {
+		t.Fatalf("the recreated provider's credential warning was attributed to the deleted one: %+v", events.Items)
+	}
+}
+
+// A strong retirement whose Delete and retirement intent both fail (every
+// Kubernetes write failing) still closes admission in this process, and the
+// bounds loop keeps retrying it until a write lands.
+func TestSharedUndurableRetirementStillClosesAdmission(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	native.failDelete = true
+	var broken atomic.Bool
+	refused := apierrors.NewInternalError(errors.New("kubernetes write refused"))
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if broken.Load() {
+				return refused
+			}
+			if err := w.Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+			if o, ok := obj.(*corev1.ConfigMap); ok {
+				if after, ok := decodeClaimRecord(o); ok && after.DeleteIssued {
+					// From here on every Kubernetes write fails.
+					broken.Store(true)
+				}
+			}
+			return nil
+		},
+		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if broken.Load() {
+				return refused
+			}
+			return w.Delete(ctx, obj, opts...)
+		},
+	})
+	for range 24 {
+		tick()
+		_, _ = sharedDriver(failing, native).StopInstance(t.Context(), first.Key, a.Identity)
+		if broken.Load() {
+			break
+		}
+	}
+	if !broken.Load() {
+		t.Fatal("the fixture never reached the Actor's deletion")
+	}
+	pool, found := getPool(t, c, recordA.SharedWorker.Pool)
+	if !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) {
+		t.Fatal("the fixture let a Kubernetes write land")
+	}
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	if _, recordC := sharedReady(t, c, native, third); recordC.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("a pool whose strong retirement could not be written kept admitting")
+	}
+	// Once writes land again, the bounds loop retires the pool.
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); found && current.GetDeletionTimestamp() == nil {
+		t.Fatal("the bounds loop did not retry the undurable retirement")
 	}
 }
 
