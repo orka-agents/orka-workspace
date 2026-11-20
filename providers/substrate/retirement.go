@@ -373,7 +373,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			return fmt.Errorf("native suspension is unsupported or already retired")
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
-			if record.SharedWorker != nil && record.Pending != nil && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) && ctx.Err() == nil {
+			if record.SharedWorker != nil && record.Pending != nil && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
 				// After the suspension intent, an unverifiable journal
 				// requirement is doubt like any other error.
 				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
@@ -386,7 +386,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			}
 			actor, err := d.actor(ctx, record)
 			if err != nil {
-				if record.SharedWorker != nil {
+				if record.SharedWorker != nil && !requestCancelled(ctx, err) {
 					return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read when its suspension began"))
 				}
 				return err
@@ -481,6 +481,9 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 				// starting a deletion that would reclaim the snapshot's node
 				// state.
 				return d.deferSuspendDoubt(ctx, cm, record, "the Actor could not be read during suspension", err)
+			}
+			if requestCancelled(ctx, err) {
+				return err
 			}
 			// On a shared worker an unreadable Actor is doubt: retire the
 			// whole worker rather than wait on evidence that may never come.
@@ -957,11 +960,16 @@ func (e *suspendRetryError) Unwrap() error { return e.err }
 // there would delete the worker mid-continuation. Both are bounded by the
 // continuation window; past it, doubt applies as before.
 func holdRetry(ctx context.Context, err error, record *journalRecord) bool {
+	if requestCancelled(ctx, err) {
+		// A cancellation or a deadline is always a retry, inside the window
+		// or not.
+		return true
+	}
 	if !holdWindowOpen(record) {
 		return false
 	}
 	retry := (*suspendRetryError)(nil)
-	return errors.As(err, &retry) || ctx.Err() != nil
+	return errors.As(err, &retry)
 }
 
 // suspensionPending reports whether err is a failure the continuation
@@ -1032,6 +1040,11 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 // continuation window, and starts once it is SUSPENDED, in any other state,
 // or when the window or the continuations run out.
 func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, cause error) error {
+	if requestCancelled(ctx, cause) {
+		// A cancelled or timed-out call is no doubt at all: nothing is
+		// recorded, and the next read decides.
+		return &suspendRetryError{err: cause}
+	}
 	pending := &suspendPendingError{err: cause}
 	if record.Pending.Doubt != "" {
 		return pending
@@ -1043,7 +1056,7 @@ func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap,
 		// as after a crash before the result was handled. Only a definite
 		// write failure takes the strong path at once.
 		record.Pending.Doubt = ""
-		if apierrors.IsConflict(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		if apierrors.IsConflict(err) || requestCancelled(ctx, err) {
 			return &suspendRetryError{err: errors.Join(cause, err)}
 		}
 		return errors.Join(cause, err)

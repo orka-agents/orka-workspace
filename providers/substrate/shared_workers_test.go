@@ -767,6 +767,152 @@ func TestSharedCancelledPostProofFailureIsRetried(t *testing.T) {
 	}
 }
 
+// deadlineControl fails chosen native calls with a cancellation or deadline
+// while the request itself is still live.
+type deadlineControl struct {
+	*nativeFixture
+	getWorker, getActor, deleteActor func() error
+}
+
+func (c *deadlineControl) GetWorker(ctx context.Context, req *pb.GetWorkerRequest, opts ...grpc.CallOption) (*pb.Worker, error) {
+	if c.getWorker != nil {
+		if err := c.getWorker(); err != nil {
+			return nil, err
+		}
+	}
+	return c.nativeFixture.GetWorker(ctx, req, opts...)
+}
+
+func (c *deadlineControl) GetActor(ctx context.Context, req *pb.GetActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
+	if c.getActor != nil {
+		if err := c.getActor(); err != nil {
+			return nil, err
+		}
+	}
+	return c.nativeFixture.GetActor(ctx, req, opts...)
+}
+
+func (c *deadlineControl) DeleteActor(ctx context.Context, req *pb.DeleteActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
+	if c.deleteActor != nil {
+		if err := c.deleteActor(); err != nil {
+			return nil, err
+		}
+	}
+	return c.nativeFixture.DeleteActor(ctx, req, opts...)
+}
+
+// The other half of the rule, at every kind of post-evidence step: a
+// cancellation or a deadline is always a retry, never doubt, also when it
+// comes from a child context that timed out while the request was live, or
+// as a gRPC status, or wrapped. A live pass then finishes the Stop on its
+// interim proof, and no pool is retired.
+func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
+	childTimeout := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 0)
+		defer cancel()
+		<-ctx.Done()
+		return fmt.Errorf("child budget: %w", ctx.Err())
+	}
+	grpcDeadline := func() error {
+		return fmt.Errorf("wrapped: %w", status.Error(codes.DeadlineExceeded, "upstream deadline"))
+	}
+	grpcCanceled := func() error {
+		return status.Error(codes.Canceled, "workflow failed at step FinalizeSuspended: context canceled")
+	}
+	for _, tc := range []struct {
+		name string
+		// stage selects where the failure is injected.
+		stage string
+		err   func() error
+	}{
+		{"GetWorker during the proof, gRPC deadline", "proof", grpcDeadline},
+		{"GetActor after the proof, gRPC canceled", "getActor", grpcCanceled},
+		{"DeleteActor, gRPC deadline", "delete", grpcDeadline},
+		{"DeleteActor, child timeout", "delete", childTimeout},
+		{"workload absence save, child timeout", "absentSave", childTimeout},
+		{"slot release ledger write, child timeout", "ledger", childTimeout},
+		{"journal finalization save, child timeout", "finishSave", childTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 3)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			var remaining atomic.Int64
+			remaining.Store(3)
+			var suspended, absent atomic.Bool
+			fail := func(active bool) error {
+				if !active || remaining.Load() <= 0 {
+					return nil
+				}
+				remaining.Add(-1)
+				return tc.err()
+			}
+			native.afterSuspend = func(*pb.Actor) { suspended.Store(true) }
+			control := &deadlineControl{nativeFixture: native,
+				getWorker:   func() error { return fail(tc.stage == "proof" && suspended.Load()) },
+				getActor:    func() error { return fail(tc.stage == "getActor" && absent.Load()) },
+				deleteActor: func() error { return fail(tc.stage == "delete") },
+			}
+			faulty := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				switch o := obj.(type) {
+				case *corev1.ConfigMap:
+					after, ok := decodeClaimRecord(o)
+					stored := &corev1.ConfigMap{}
+					if ok && w.Get(ctx, client.ObjectKeyFromObject(o), stored) == nil {
+						if before, ok := decodeClaimRecord(stored); ok && before.SharedWorker != nil {
+							if !before.WorkloadAbsent && after.WorkloadAbsent {
+								if err := fail(tc.stage == "absentSave"); err != nil {
+									return err
+								}
+								absent.Store(true)
+							}
+							if before.Observation.State != sdk.AllocationStopped && after.Observation.State == sdk.AllocationStopped {
+								if err := fail(tc.stage == "finishSave"); err != nil {
+									return err
+								}
+							}
+						}
+					}
+				case *unstructured.Unstructured:
+					if o.GetKind() == "WorkerPool" && absent.Load() {
+						if err := fail(tc.stage == "ledger"); err != nil {
+							return err
+						}
+					}
+				}
+				return w.Update(ctx, obj, opts...)
+			}})
+			var observed sdk.AllocationObservation
+			for range 24 {
+				tick()
+				d := sharedDriver(faulty, native)
+				d.control = control
+				observed, _ = d.StopInstance(t.Context(), first.Key, a.Identity)
+				if observed.State == sdk.AllocationStopped {
+					break
+				}
+			}
+			_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if remaining.Load() > 0 {
+				t.Fatal("the fixture never injected its failure")
+			}
+			if record.SharedWorker.Strong != "" {
+				t.Fatalf("a cancellation or deadline started the strong path: %q", record.SharedWorker.Strong)
+			}
+			if pool, found := getPool(t, c, recordA.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) {
+				t.Fatal("a cancellation or deadline retired the pool and its neighbours")
+			}
+			if observed.State != sdk.AllocationStopped {
+				t.Fatalf("the retried Stop did not finish: %s", observed.State)
+			}
+		})
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture
@@ -1866,13 +2012,20 @@ func TestSharedStrongMarkerWinsOverAJournaledInterimProof(t *testing.T) {
 	}
 }
 
-func TestSharedStrongTriggersPersistAfterTheRequestContextExpires(t *testing.T) {
+// A request deadline is never doubt by itself: it is retried. A suspend
+// that outlived the request and never took effect is still doubt on the next
+// pass, from the evidence (the Actor is still RUNNING after the issued
+// suspend, which is never replayed), and its marker persists although the
+// request is gone. An Actor read that outlives the request is only retried,
+// and the suspension finishes once native answers again.
+func TestSharedRequestDeadlinesAreRetriedAndEvidenceStillRetires(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		block func(*nativeFixture)
+		name   string
+		block  func(*nativeFixture)
+		strong bool
 	}{
-		{"suspend outlives the request", func(native *nativeFixture) { native.blockSuspend = true }},
-		{"actor read outlives the request", func(native *nativeFixture) { native.blockGetActor = true }},
+		{"suspend outlives the request", func(native *nativeFixture) { native.blockSuspend = true }, true},
+		{"actor read outlives the request", func(native *nativeFixture) { native.blockGetActor = true }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, binding := sharedFixture(t, 2)
@@ -1891,27 +2044,34 @@ func TestSharedStrongTriggersPersistAfterTheRequestContextExpires(t *testing.T) 
 			for range 3 {
 				tick()
 				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-				_, err := sharedDriver(contextAwareClient(c), native).SuspendInstance(ctx, first.Key, a.Identity)
+				_, _ = sharedDriver(contextAwareClient(c), native).SuspendInstance(ctx, first.Key, a.Identity)
 				cancel()
-				if err == nil {
-					continue
-				}
-				if _, record, _ := sharedDriver(c, native).read(t.Context(), first.Key); record.SharedWorker.Strong != "" {
-					break
-				}
 			}
+			native.blockSuspend, native.blockGetActor = false, false
+			tick()
+			_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
 			_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if record.SharedWorker.Strong == "" {
-				t.Fatal("a strong trigger after the request deadline was not persisted")
-			}
-			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
-				t.Fatal("the pool's retirement did not start after the request deadline")
-			}
 			if native.suspendCalls > 1 {
 				t.Fatalf("SuspendActor was replayed: %d calls", native.suspendCalls)
+			}
+			if !tc.strong {
+				if record.SharedWorker.Strong != "" {
+					t.Fatalf("a request deadline started the strong path: %q", record.SharedWorker.Strong)
+				}
+				observed, _ := sharedRetired(t, c, native, first, a.Identity, true)
+				if observed.RetainedData == nil {
+					t.Fatal("the retried suspension retained no data")
+				}
+				return
+			}
+			if record.SharedWorker.Strong == "" || strings.Contains(record.SharedWorker.Strong, "deadline") || strings.Contains(record.SharedWorker.Strong, "Canceled") {
+				t.Fatalf("an unresolved suspend did not take the strong path from its evidence: %q", record.SharedWorker.Strong)
+			}
+			if _, found := getPool(t, c, recordA.SharedWorker.Pool); found {
+				t.Fatal("the pool's retirement did not start")
 			}
 		})
 	}
