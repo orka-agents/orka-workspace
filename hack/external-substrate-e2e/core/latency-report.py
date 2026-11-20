@@ -179,6 +179,23 @@ def turn_sample(event):
             sample.update(ms_fields(ready[-1], 'providerReady.'))
             evidence['providerPath'] = ready[-1].get('path')
             evidence['workerSource'] = ready[-1].get('workerSource')
+    # ADR 0059: a persistent-session hit reuses the resident RuntimeSession
+    # generation, so no "session created" line belongs to this turn; the
+    # supervisor match below is skipped for hits.
+    reuse = find(core, 'ACP persistent session reuse', task=task['name'])
+    hit = False
+    if reuse:
+        sample['label.reuse'] = str(reuse[-1].get('result'))
+        sample['label.reuseReason'] = str(reuse[-1].get('reason'))
+        sample['label.reuseStage'] = str(reuse[-1].get('stage'))
+        sample.update(ms_fields(reuse[-1], 'reuse.'))
+        hit = sample['label.reuse'] == 'hit'
+        evidence['reuse'] = sample['label.reuse']
+        evidence['reuseReason'] = sample['label.reuseReason']
+    retained = find(core, 'ACP persistent session retained', task=task['name'])
+    if retained:
+        sample['label.retained'] = '%s/%s' % (retained[-1].get('result'), retained[-1].get('reason'))
+        sample.update(ms_fields(retained[-1], 'retained.'))
     # The supervisor names each RuntimeSession generation
     # runtime-<RuntimeSession UID>-g<generation>; a Session keeps its UID
     # across turns. Without a recorded generation, the turn's own time window
@@ -193,7 +210,7 @@ def turn_sample(event):
         if begin is not None:
             end = begin + task['doneMs'] / 1000.0
             created = [entry for entry in created if (when(entry.get('time')) or 0) >= begin and (when(entry.get('time')) or 0) <= end]
-    if created:
+    if created and not hit:
         sample.update(ms_fields(created[-1], 'supervisor.'))
         created_at = when(task.get('createdAt'))
         at = when(created[-1].get('time'))

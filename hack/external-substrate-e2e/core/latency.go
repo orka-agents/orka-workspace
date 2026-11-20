@@ -59,6 +59,9 @@ type latency struct {
 	// warmClass/warmLabel and sharedClass/sharedLabel name the class and
 	// report label of the running warm and shared scenario variant.
 	warmClass, warmLabel, sharedClass, sharedLabel string
+	// agentFor names the Agent a class's turns use; unset classes use the
+	// Codex-typed native-core Agent.
+	agentFor map[string]string
 	skipFinalExpiry                                bool
 }
 
@@ -108,7 +111,11 @@ type turn struct {
 var acceptedOrLater = map[string]bool{"Accepted": true, "Running": true, "Settling": true, "Succeeded": true}
 
 func (l *latency) createTurn(ctx context.Context, name, session, class string, create bool) (*turn, error) {
-	task := l.object("Task", name, map[string]any{"type": "agent", "agentRef": map[string]any{"name": "native-core"},
+	agentName := "native-core"
+	if mapped := l.agentFor[class]; mapped != "" {
+		agentName = mapped
+	}
+	task := l.object("Task", name, map[string]any{"type": "agent", "agentRef": map[string]any{"name": agentName},
 		"prompt":     "Run the deterministic external native workspace fixture (latency turn).",
 		"timeout":    "5m",
 		"sessionRef": map[string]any{"name": session, "create": create, "append": true},
@@ -523,13 +530,18 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 		"sameSupervisorBoot":       t2.Identity["runtimeSessionSupervisorBootID"] == t1.Identity["runtimeSessionSupervisorBootID"],
 		"samePool":                 t2.Identity["runtimePoolUID"] == t1.Identity["runtimePoolUID"],
 		"poolCredentialsUnchanged": len(warm1.PoolSecrets) > 0 && fmt.Sprint(warm1.PoolSecrets) == fmt.Sprint(warm2.PoolSecrets),
-		"sameSessionNewGeneration": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["runtimeSessionGeneration"] != t1.Identity["runtimeSessionGeneration"] && t2.Identity["promptID"] != t1.Identity["promptID"],
+		// ADR 0059: a persistent-session hit keeps the generation and a miss
+		// creates a new one; either way the Session and its UID are the same
+		// and the prompt is new. Which one happened is recorded, not checked.
+		"sameSessionNewPrompt": t2.Identity["runtimeSessionUID"] == t1.Identity["runtimeSessionUID"] && t2.Identity["promptID"] != t1.Identity["promptID"],
 		"newAttachmentEpoch":       warm2.AttachmentEpoch > warm1.AttachmentEpoch,
 		// Other Sessions' windows can expire meanwhile when the last window
 		// is left idle, so the namespace-wide Tag check applies only otherwise.
 		"noNewTag": l.skipFinalExpiry || len(newTags(warm1, warm2)) == 0,
 	}
-	l.emit("warmAttach", map[string]any{"scenario": l.warmLabel, "rep": rep, "checks": direct})
+	l.emit("warmAttach", map[string]any{"scenario": l.warmLabel, "rep": rep, "checks": direct,
+		"sameGeneration": t2.Identity["runtimeSessionGeneration"] == t1.Identity["runtimeSessionGeneration"],
+		"generations": []string{t1.Identity["runtimeSessionGeneration"], t2.Identity["runtimeSessionGeneration"]}})
 	for check, ok := range direct {
 		if !ok {
 			l.violate("warm continuation %s failed %s", t2.Name, check)
@@ -671,7 +683,18 @@ func (l *latency) ensureClass(ctx context.Context, name string, options classOpt
 func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 	l := &latency{proof: p, start: time.Now(), window: 2 * time.Minute, sharedWorkspaces: map[string]bool{},
 		warmClass: "lat-warm", warmLabel: "warm", sharedClass: "lat-shared", sharedLabel: "shared",
-		skipFinalExpiry: os.Getenv("LATENCY_SKIP_FINAL_EXPIRY") == "1"}
+		skipFinalExpiry: os.Getenv("LATENCY_SKIP_FINAL_EXPIRY") == "1", agentFor: map[string]string{}}
+	// LATENCY_CLAUDE_CLASSES lists classes whose turns use a Claude-typed
+	// Agent over the same deterministic fixture: Codex native sessions are
+	// never reused (ADR 0059), so warm-reuse scenarios need a non-Codex type.
+	if raw := os.Getenv("LATENCY_CLAUDE_CLASSES"); raw != "" {
+		if err := l.ensureClaudeAgent(ctx); err != nil {
+			return nil, err
+		}
+		for _, class := range strings.Split(raw, ",") {
+			l.agentFor[strings.TrimSpace(class)] = "native-core-claude"
+		}
+	}
 	if raw := os.Getenv("LATENCY_WINDOW"); raw != "" {
 		window, err := time.ParseDuration(raw)
 		if err != nil {
@@ -906,4 +929,21 @@ func (w *attachWatch) result(start time.Time) map[string]int64 {
 		out[key+"Ms"] = ms(at.Sub(start))
 	}
 	return out
+}
+
+// ensureClaudeAgent creates, once per namespace, the Claude-typed Agent that
+// the fixture runtime serves exactly like the Codex-typed native-core Agent.
+func (l *latency) ensureClaudeAgent(ctx context.Context) error {
+	existing := l.object("Agent", "native-core-claude", nil)
+	if err := l.c.Get(ctx, client.ObjectKeyFromObject(existing), existing); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+	agent := l.object("Agent", "native-core-claude", map[string]any{"runtime": map[string]any{"contractVersion": "orka.harness.v2", "type": "claude", "defaultMaxTurns": int64(1),
+		"defaultAllowedTools": []any{"Glob", "Grep", "Read"}, "defaultAllowBash": false}, "model": map[string]any{"name": "claude-sonnet-4-5"}})
+	if err := l.c.Create(ctx, agent); err != nil {
+		return fmt.Errorf("Claude fixture Agent admission: %w", err)
+	}
+	return nil
 }

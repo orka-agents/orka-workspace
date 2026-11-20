@@ -51,6 +51,13 @@ for obj in objects:
             manager["args"].append("--task-max-concurrent-reconciles=" + os.environ["ORKA_TASK_MAX_CONCURRENT_RECONCILES"])
         if os.environ.get("ORKA_CORE_LOG_LEVEL"):
             manager["args"].append("--zap-log-level=" + os.environ["ORKA_CORE_LOG_LEVEL"])
+        # A Claude-typed fixture profile runs the same deterministic runtime
+        # image: Core selects the provider through ORKA_ACP_PROVIDER, which
+        # overrides the image's default.
+        if os.environ.get("ORKA_CORE_CLAUDE_FIXTURE") == "1":
+            manager["args"].append("--acp-claude-runtime-image=" + runtime_image)
+        # Extra Core flags for a measured variant, space separated.
+        manager["args"].extend(os.environ.get("ORKA_CORE_EXTRA_ARGS", "").split())
         manager.setdefault("volumeMounts", []).extend([
             {"name": "substrate-client", "mountPath": "/run/substrate-client", "readOnly": True},
             {"name": "substrate-server", "mountPath": "/run/substrate-server", "readOnly": True}])

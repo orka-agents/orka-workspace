@@ -100,7 +100,7 @@ jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "
   .spec.template.spec.containers[0].image = $image |
   .spec.template.spec.containers[0].env += [{name:"LATENCY_MEASURE",value:"1"},{name:"LATENCY_REPEATS",value:$repeats},
     {name:"LATENCY_WINDOW",value:$window},{name:"LATENCY_SCENARIOS",value:$scenarios},{name:"LATENCY_RUN_ID",value:$sequence}] +
-    ($ARGS.named.extra | to_entries | map({name: .key, value: .value}))' --argjson extra "$(jq -n 'env | with_entries(select(.key | test("^LATENCY_(SPARE_WORKERS|SHARED_ACTORS|SHARED_SESSIONS|SHARED_SPARES|SHARED_LIFETIME|DEFAULT_WINDOW|SKIP_FINAL_EXPIRY)$")))')" <<<"${job}" |
+    ($ARGS.named.extra | to_entries | map({name: .key, value: .value}))' --argjson extra "$(jq -n 'env | with_entries(select(.key | test("^LATENCY_(SPARE_WORKERS|SHARED_ACTORS|SHARED_SESSIONS|SHARED_SPARES|SHARED_LIFETIME|DEFAULT_WINDOW|SKIP_FINAL_EXPIRY|CLAUDE_CLASSES)$")))')" <<<"${job}" |
   kubectl create -f -
 start="$(date +%s)"
 status=0
@@ -148,10 +148,15 @@ touch "${run_dir}/.done"
 sleep 2
 # Timing lines only; everything else stays in the cluster.
 kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="${since}" |
-  grep -E 'ACP workspace runtime (started|stopped|admission timings)|ACP turn timings|ACP pre-dispatch timings|ACP dispatch scan timings|ACP reservation timings|ACP session plan timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
+  grep -E 'ACP workspace runtime (started|stopped|admission timings)|ACP turn timings|ACP pre-dispatch timings|ACP dispatch scan timings|ACP reservation timings|ACP session plan timings|ACP persistent session (reuse|retained)|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
+# ADR 0059's reuse counter, when a variant serves plain-HTTP metrics on
+# :9091 (ORKA_CORE_EXTRA_ARGS); read through the API server's Pod proxy.
+core_pod="$(kubectl -n "${namespace}" get pods -o name 2>/dev/null | sed -n 's#^pod/\(external-substrate-core-[a-z0-9]*-[a-z0-9]*\)$#\1#p' | head -1)"
+[[ -n "${core_pod}" ]] && kubectl get --raw "/api/v1/namespaces/${namespace}/pods/${core_pod}:9091/proxy/metrics" 2>/dev/null |
+  grep -E '^orka_acp_persistent_session_total' >"${run_dir}/persistent-session-metric.txt" || true
 # Core's and the provider's rendered tuning flags, for the record.
 kubectl -n "${namespace}" get deployment external-substrate-core -o json |
-  jq -c '[.spec.template.spec.containers[0].args[] | select(test("concurrent|zap-log-level"))]' >"${run_dir}/core-flags.json" || true
+  jq -c '[.spec.template.spec.containers[0].args[] | select(test("concurrent|zap-log-level|persistent|interlock|claude-runtime|metrics"))]' >"${run_dir}/core-flags.json" || true
 kubectl -n "${provider_namespace}" get deployment orka-workspace-substrate -o json |
   jq -c '[.spec.template.spec.containers[0].args[] | select(test("concurrent|dedicated|ttl"))]' >"${run_dir}/provider-flags.json" || true
 # Every provider replica: only the elected leader reconciles and logs.
