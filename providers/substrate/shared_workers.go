@@ -60,6 +60,9 @@ const (
 	sharedPoolPrefix         = "ate-shared-"
 	// sharedIdleGrace keeps an empty admitting pool warm for a follow-up turn.
 	sharedIdleGrace = 5 * time.Minute
+	// sharedClaimAttempts bounds slot claims that lose a ledger write race
+	// within one pass.
+	sharedClaimAttempts = 5
 	// sharedMaxProofAttempts bounds interim proofs that keep observing a
 	// changing worker version; then the strong path applies.
 	sharedMaxProofAttempts = 5
@@ -566,7 +569,7 @@ func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) 
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
-	return pool.GetDeletionTimestamp() == nil && !sharedRetireDecided(pool) && !sharedPoolHeld(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+	return sharedPoolBlocked(pool) == "" && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
 }
 
 func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
@@ -692,6 +695,16 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	}
 	movable := !record.Template.CreateIssued && !shared.CreateIssued
 	if movable {
+		// Workspaces reconcile in parallel. Choosing between joining a pool
+		// and creating one is serialized per scope in this process, so a
+		// burst of cold starts fills one pool instead of each creating its
+		// own. Correctness never depends on it: every claim is still a
+		// resourceVersion-preconditioned ledger write.
+		unlock, err := sharedScopeLocks.lock(ctx, shared.Scope)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		// The workspace may have become tainted, quarantined or failed since
 		// its allocation was prepared; before any template exists it simply
 		// takes the private single-Actor path.
@@ -780,14 +793,17 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	} else if err != nil {
 		return err
 	}
-	if pool.GetDeletionTimestamp() != nil {
-		return abandon("the shared worker is deleting")
-	}
-	ledger, err := sharedPoolMatches(pool, record)
-	if err != nil {
-		return abandon("the shared worker no longer matches: " + err.Error())
-	}
-	if ledgerEntry(ledger, marker) == nil {
+	for attempt := 1; ; attempt++ {
+		if pool.GetDeletionTimestamp() != nil {
+			return abandon("the shared worker is deleting")
+		}
+		ledger, err := sharedPoolMatches(pool, record)
+		if err != nil {
+			return abandon("the shared worker no longer matches: " + err.Error())
+		}
+		if ledgerEntry(ledger, marker) != nil {
+			break
+		}
 		if shared.Create != nil {
 			return abandon("the created shared worker does not hold this allocation")
 		}
@@ -818,7 +834,20 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 		}
 		// The read resourceVersion is the precondition: a claim never
 		// overfills a pool or lands on one that stopped admitting.
-		if err := d.client.Update(ctx, pool); err != nil {
+		err = d.client.Update(ctx, pool)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(err) || attempt == sharedClaimAttempts {
+			return err
+		}
+		// A neighbour's ledger write won. Re-read the pool and decide again,
+		// from every check above, while this scope is still held.
+		pool = poolObject()
+		if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: shared.Pool}, pool); err != nil {
+			if apierrors.IsNotFound(err) {
+				return abandon("the shared worker disappeared")
+			}
 			return err
 		}
 	}
@@ -826,6 +855,54 @@ func (d *Lifecycle) ensureSharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	record.RuntimePool.UID = shared.UID
 	stamp(&record.Timing.WorkerPoolCreatedAt)
 	return d.save(ctx, cm, record)
+}
+
+// sharedScopeLocks serializes shared pool selection and creation per scope.
+var sharedScopeLocks = &scopeLocks{}
+
+// scopeLocks is a set of context-aware mutexes keyed by shared scope. An
+// entry exists only while some caller holds or waits for it.
+type scopeLocks struct {
+	mu      sync.Mutex
+	entries map[sharedScope]*scopeLock
+}
+
+type scopeLock struct {
+	held chan struct{}
+	refs int
+}
+
+// lock waits for scope's mutex or ctx, and returns its release.
+func (l *scopeLocks) lock(ctx context.Context, scope sharedScope) (func(), error) {
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = map[sharedScope]*scopeLock{}
+	}
+	entry := l.entries[scope]
+	if entry == nil {
+		entry = &scopeLock{held: make(chan struct{}, 1)}
+		l.entries[scope] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+	select {
+	case entry.held <- struct{}{}:
+		return func() {
+			<-entry.held
+			l.release(scope, entry)
+		}, nil
+	case <-ctx.Done():
+		l.release(scope, entry)
+		return nil, ctx.Err()
+	}
+}
+
+func (l *scopeLocks) release(scope sharedScope, entry *scopeLock) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if entry.refs--; entry.refs == 0 {
+		delete(l.entries, scope)
+	}
 }
 
 // verifySharedRuntimePool re-reads the bound pool and its ledger. Observation
@@ -1041,16 +1118,11 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 	if ledger.State != sharedAdmitting && ledger.State != sharedDraining || !sharedNow().Before(sharedRetireAt(pool, ledger)) {
 		return false, fmt.Errorf("shared worker is past its lifetime or retiring: %w", sdk.ErrStaleIdentity)
 	}
-	if sharedPoolUnverified(pool) {
-		// An unverified pool admits nobody, a slot claimed before its
-		// isolation checks failed included: the Resume waits until they
-		// complete, or the pool retires at its bound.
-		return false, errors.New("the shared worker's isolation checks have not completed since they last failed, so its Resume waits")
-	}
-	if sharedPoolHeld(pool) {
-		// A neighbour's held suspension doubt has decided the pool's strong
-		// retirement; nothing new starts on it.
-		return false, fmt.Errorf("the shared worker's strong retirement is decided and held for a neighbour's suspension: %w", sdk.ErrStaleIdentity)
+	if blocked := sharedPoolBlocked(pool); blocked != "" {
+		// A pool that admits nobody resumes nobody either, a slot claimed
+		// before it was blocked included: the Resume waits until the block
+		// clears, or the pool retires.
+		return false, errors.New(blocked + ", so its Resume waits")
 	}
 	// Re-checked immediately before Resume, never only when the allocation was
 	// prepared: the template already selects this pool, so suspicion here
@@ -1134,7 +1206,28 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		if !found {
 			return false, sdk.ErrStaleIdentity
 		}
-		return false, nil
+		// The write is stored, so the remaining checks run in this pass. The
+		// write may have landed on a ledger that a neighbour or the sweeper
+		// moved to Retiring or Quarantined after the validation above, or on
+		// a pool a block was set on meanwhile, so a fresh, UID-validated read
+		// is checked against every fence admission uses before anything
+		// leads to Resume.
+		if _, err := d.verifySharedRuntimePool(ctx, cm, record, false); err != nil {
+			return false, err
+		}
+		fresh, err := d.getSharedPool(ctx, record)
+		if err != nil {
+			return false, err
+		}
+		if string(fresh.GetUID()) != shared.UID {
+			return false, sdk.ErrStaleIdentity
+		}
+		if blocked := sharedPoolBlocked(fresh); blocked != "" {
+			return false, errors.New(blocked + ", so its Resume waits")
+		}
+		if err := errSupersededTemplateInventory(); err != nil {
+			return false, err
+		}
 	}
 	assigned, count, err := d.sharedAssignmentsInLedger(ctx, record, selected.GetMetadata().GetName())
 	if err != nil {
@@ -2603,6 +2696,29 @@ func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructur
 var sharedLedgerWriteTimeout = 5 * time.Second
 
 // sharedRetireIntended reports a decided strong retirement not yet deleted.
+// sharedPoolBlocked reports why a shared pool starts nothing new, neither a
+// claim nor a Resume, or "". Admission and every boot check use it, so the
+// two can never drift apart: a deleting pool, a decided strong retirement
+// (durable intent or in process), a held suspension doubt, unverified
+// isolation checks (stamped or in process), and a native ActorTemplate
+// inventory outage stamped on the pool.
+func sharedPoolBlocked(pool *unstructured.Unstructured) string {
+	_, outage := pool.GetAnnotations()[sharedNativeOutageAnnotation]
+	switch {
+	case pool.GetDeletionTimestamp() != nil:
+		return "the shared worker pool is deleting"
+	case sharedRetireDecided(pool):
+		return "the shared worker's strong retirement is decided"
+	case sharedPoolHeld(pool):
+		return "the shared worker's strong retirement is decided and held for a neighbour's suspension"
+	case sharedPoolUnverified(pool):
+		return "the shared worker's isolation checks have not completed since they last failed"
+	case outage:
+		return "the native ActorTemplate inventory has been unavailable since the pool's durable stamp"
+	}
+	return ""
+}
+
 // sharedPoolHeld reports a pool stamped by a held suspension doubt.
 func sharedPoolHeld(pool *unstructured.Unstructured) bool {
 	_, held := pool.GetAnnotations()[sharedHoldAnnotation]
