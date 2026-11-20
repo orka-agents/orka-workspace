@@ -674,6 +674,11 @@ func (d *Lifecycle) recordOutageSince(ctx context.Context, pool *unstructured.Un
 			if start.IsZero() || recorded.Before(start) {
 				start = recorded
 			}
+			if sharedDecidedStamps.last(pool.GetUID(), key) == decidedClear {
+				// This process last decided a clear, which may still be in
+				// flight: the newer failure is recorded so it outranks it.
+				d.startOutageMark(ctx, pool, key, start.UTC().Format(time.RFC3339Nano))
+			}
 			return start
 		}
 	}
@@ -689,42 +694,44 @@ func (d *Lifecycle) recordOutageSince(ctx context.Context, pool *unstructured.Un
 // for the pool, whose write may still be in flight: the newer clear then
 // makes that stale write skip.
 func (d *Lifecycle) clearOutageMark(ctx context.Context, pool *unstructured.Unstructured, key string) {
-	if _, ok := pool.GetAnnotations()[key]; ok || sharedDecidedStamps.take(pool.GetUID(), key) {
+	if _, ok := pool.GetAnnotations()[key]; ok || sharedDecidedStamps.last(pool.GetUID(), key) == decidedSet {
 		d.startOutageMark(ctx, pool, key, "")
 	}
 }
 
-// decidedStamps records, in process, the pool stamps this process decided
-// to set, so a later success records its clear even when its snapshot does
-// not yet show the stamp.
+// decidedStamps records, in process, the last decision (set or clear) this
+// process made for each pool's stamp key. A decision whose write may still be
+// in flight is outranked by recording the next opposite decision even when
+// the pool's snapshot already looks right; repeating the same decision on a
+// snapshot that reflects it costs no write.
 type decidedStamps struct {
 	mu   sync.Mutex
-	keys map[types.UID]map[string]bool
+	keys map[types.UID]map[string]string
 }
+
+const (
+	decidedSet   = "set"
+	decidedClear = "clear"
+)
 
 var sharedDecidedStamps = &decidedStamps{}
 
-func (s *decidedStamps) add(uid types.UID, key string) {
+func (s *decidedStamps) record(uid types.UID, key, decision string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.keys == nil {
-		s.keys = map[types.UID]map[string]bool{}
+		s.keys = map[types.UID]map[string]string{}
 	}
 	if s.keys[uid] == nil {
-		s.keys[uid] = map[string]bool{}
+		s.keys[uid] = map[string]string{}
 	}
-	s.keys[uid][key] = true
+	s.keys[uid][key] = decision
 }
 
-// take reports and forgets a decided stamp.
-func (s *decidedStamps) take(uid types.UID, key string) bool {
+func (s *decidedStamps) last(uid types.UID, key string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.keys[uid][key] {
-		return false
-	}
-	delete(s.keys[uid], key)
-	return true
+	return s.keys[uid][key]
 }
 
 func (s *decidedStamps) reset() {
@@ -776,9 +783,11 @@ func (d *Lifecycle) startOutageMarks(ctx context.Context, marks ...outageMark) {
 		if marks[i].decidedAt.IsZero() {
 			marks[i].decidedAt = decided
 		}
+		decision := decidedClear
 		if marks[i].value != "" {
-			sharedDecidedStamps.add(marks[i].uid, marks[i].key)
+			decision = decidedSet
 		}
+		sharedDecidedStamps.record(marks[i].uid, marks[i].key, decision)
 	}
 	p := d.sharedPass
 	if p == nil {
@@ -1074,7 +1083,8 @@ func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.U
 	// Kubernetes-only bounds loop, which cannot probe native, applies the
 	// same bound.
 	marks := []outageMark{{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: start.UTC().Format(time.RFC3339Nano)}}
-	if pool.GetAnnotations()[sharedUnverifiedGraceAnnotation] != class || pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" {
+	outranks := sharedDecidedStamps.last(pool.GetUID(), sharedUnverifiedAnnotation) == decidedClear
+	if pool.GetAnnotations()[sharedUnverifiedGraceAnnotation] != class || pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" || outranks {
 		marks = append(marks, outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedGraceAnnotation, value: class, overwrite: true})
 	}
 	if pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" || len(marks) > 1 {
@@ -1094,10 +1104,7 @@ func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.U
 // own isolation checks completed.
 func (d *Lifecycle) verificationSucceeded(ctx context.Context, pool *unstructured.Unstructured) {
 	sharedUnverifiedPools.succeeded(pool.GetUID())
-	decided := sharedDecidedStamps.take(pool.GetUID(), sharedUnverifiedAnnotation)
-	if sharedDecidedStamps.take(pool.GetUID(), sharedUnverifiedGraceAnnotation) {
-		decided = true
-	}
+	decided := sharedDecidedStamps.last(pool.GetUID(), sharedUnverifiedAnnotation) == decidedSet || sharedDecidedStamps.last(pool.GetUID(), sharedUnverifiedGraceAnnotation) == decidedSet
 	if annotations := pool.GetAnnotations(); decided || annotations[sharedUnverifiedAnnotation] != "" || annotations[sharedUnverifiedGraceAnnotation] != "" {
 		d.startOutageMarks(ctx,
 			outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation},

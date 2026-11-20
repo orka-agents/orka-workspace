@@ -5773,7 +5773,7 @@ func TestSharedRecoveryRecordsItsClearEvenBeforeTheStampLands(t *testing.T) {
 	// A failing pass decides the stamp, but its write is still in flight:
 	// the pool snapshot the next pass reads has no stamp yet.
 	stale := outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: start.UTC().Format(time.RFC3339Nano), decidedAt: start}
-	sharedDecidedStamps.add(pool.GetUID(), sharedUnverifiedAnnotation)
+	sharedDecidedStamps.record(pool.GetUID(), sharedUnverifiedAnnotation, decidedSet)
 	// The next pass verifies the pool and records its recovery.
 	setNow(t, start.Add(time.Second))
 	recovered := sharedDriver(c, native).withSharedPass()
@@ -5789,5 +5789,33 @@ func TestSharedRecoveryRecordsItsClearEvenBeforeTheStampLands(t *testing.T) {
 	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
 	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
 		t.Fatal("a recovered pool was retired on a stale stamp")
+	}
+}
+
+func TestSharedNewFailureOutranksAnInFlightRecoveryClear(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	start := sharedNow()
+	// The pool was unverified, and its stamp is durable.
+	d := sharedDriver(c, native).withSharedPass()
+	d.writeOutageMarks(t.Context(), []outageMark{
+		{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: start.UTC().Format(time.RFC3339Nano), decidedAt: start},
+		{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedGraceAnnotation, value: sharedUnverifiedGraceNone, decidedAt: start},
+	})
+	pool, _ = getPool(t, c, record.SharedWorker.Pool)
+	// A recovery decides a clear, whose write is still in flight.
+	setNow(t, start.Add(time.Second))
+	staleClear := outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, decidedAt: sharedNow()}
+	sharedDecidedStamps.record(pool.GetUID(), sharedUnverifiedAnnotation, decidedClear)
+	// The pool fails again; its snapshot still shows the stamp.
+	setNow(t, start.Add(2*time.Second))
+	failing := sharedDriver(c, native).withSharedPass()
+	_ = failing.verificationFailed(t.Context(), pool, false, errors.New("hosted check failed"))
+	failing.flushOutageMarks(t.Context())
+	// The recovery's clear lands only now.
+	d.writeOutageMarks(t.Context(), []outageMark{staleClear})
+	if current, _ := getPool(t, c, record.SharedWorker.Pool); current.GetAnnotations()[sharedUnverifiedAnnotation] == "" {
+		t.Fatal("an in-flight recovery clear erased a newer failure's stamp")
 	}
 }
