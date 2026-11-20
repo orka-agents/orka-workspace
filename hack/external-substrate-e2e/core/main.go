@@ -692,11 +692,16 @@ func main() {
 				// need more than one proof's budget.
 				timeout = 85 * time.Minute
 			}
+			if os.Getenv("NATIVE_WATCH") == "1" {
+				timeout = nativeWatchDuration()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			p := &proof{c: c, native: pb.NewControlClient(conn), namespace: namespace, image: image}
 			if os.Getenv("LATENCY_MEASURE") == "1" {
 				report, err = p.measure(ctx)
+			} else if os.Getenv("NATIVE_WATCH") == "1" {
+				report, err = p.nativeWatch(ctx)
 			} else if os.Getenv("CORE_PROOF_CLEANUP") == "1" {
 				report, err = p.cleanupNative(ctx)
 			} else if os.Getenv("RETIRED_TASK_UID") != "" {
