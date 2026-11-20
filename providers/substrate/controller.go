@@ -15,8 +15,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
@@ -158,6 +160,8 @@ type ExecutionWorkspaceReconciler struct {
 	MaxConcurrentReconciles int
 
 	polls pendingPolls
+	// wakes maps worker pool events to the workspaces waiting on them.
+	wakes workerWakes
 	// challengeClient replaces the router challenge reader in tests.
 	challengeClient challengeGetter
 	// fullPass disables the steady-Ready fast path, so tests can compare
@@ -169,15 +173,18 @@ func (r *ExecutionWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.R
 	workspace := &workspacev1alpha1.ExecutionWorkspace{}
 	if err := r.Get(ctx, req.NamespacedName, workspace); err != nil {
 		r.polls.reset(req.NamespacedName)
+		r.wakes.forget(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
 	if err := r.Get(ctx, types.NamespacedName{Name: workspace.Spec.ProviderBinding.Name}, provider); err != nil {
 		r.polls.reset(req.NamespacedName)
+		r.wakes.forget(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if provider.UID != workspace.Spec.ProviderBinding.UID || provider.Spec.ControllerName != ControllerName {
 		r.polls.reset(req.NamespacedName)
+		r.wakes.forget(req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 	return r.reconcileRead(ctx, workspace, provider)
@@ -197,5 +204,15 @@ func (r *ExecutionWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	if err := ValidateMaxConcurrentReconciles(r.maxConcurrentReconciles()); err != nil {
 		return err
 	}
-	return ctrl.NewControllerManagedBy(mgr).For(&workspacev1alpha1.ExecutionWorkspace{}).WithEventFilter(predicate.GenerationChangedPredicate{}).WithOptions(controller.Options{MaxConcurrentReconciles: r.maxConcurrentReconciles()}).Named("substrate-execution-workspace").Complete(r)
+	// Workspace events wake only on spec generation changes; the provider's
+	// own status writes do not. Worker Pod and WorkerPool events wake only
+	// the workspaces whose pass waits on that pool (worker_wakes.go).
+	wake := handler.EnqueueRequestsFromMapFunc(r.wakeWorkerWaiters)
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&workspacev1alpha1.ExecutionWorkspace{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&corev1.Pod{}, wake).
+		Watches(poolObject(), wake).
+		WithOptions(controller.Options{MaxConcurrentReconciles: r.maxConcurrentReconciles()}).
+		Named("substrate-execution-workspace").
+		Complete(r)
 }

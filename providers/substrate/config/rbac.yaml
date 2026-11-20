@@ -33,7 +33,9 @@ rules:
     verbs: [get, list, watch, create, update, delete]
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list]
+    # watch wakes a workspace waiting on its worker; the watch is narrowed
+    # to Pods labelled ate.dev/worker-pool, and every decision rereads.
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [pods]
     verbs: [delete]
@@ -41,7 +43,8 @@ rules:
     resources: [workerpools]
     # update claims a spare worker pool, and writes a shared worker pool's
     # ledger and retirement intent, with a resourceVersion precondition.
-    verbs: [get, list, create, update, delete]
+    # watch wakes a workspace waiting on its worker pool.
+    verbs: [get, list, watch, create, update, delete]
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
