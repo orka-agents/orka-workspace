@@ -6132,6 +6132,13 @@ func TestSharedCredentialWarningFollowsARecreatedProvider(t *testing.T) {
 	}) {
 		t.Fatalf("the recreated provider's credential warning was attributed to the deleted one: %+v", events.Items)
 	}
+	// The Event name does not grow with the provider's name, so it stays
+	// within Kubernetes' 253-character limit for any valid provider name.
+	for _, event := range events.Items {
+		if event.Reason == nativeCredentialsEventReason && event.InvolvedObject.UID == current.UID && strings.Contains(event.Name, current.Name) {
+			t.Fatalf("the credential Event name grows with the provider's name: %q", event.Name)
+		}
+	}
 }
 
 // A strong retirement whose Delete and retirement intent both fail (every
