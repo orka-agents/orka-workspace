@@ -603,6 +603,44 @@ func TestSharedWorkerMaxLifetimeIsAHardBound(t *testing.T) {
 	}
 }
 
+// A failure after the interim proof is doubt too: a DeleteActor that keeps
+// failing persists the strong marker and starts the pool's retirement before
+// the pass returns, so the bounds loop has a marker and the worker stops
+// admitting.
+func TestSharedFailureAfterTheInterimProofTakesTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	native.failDelete = true
+	var record *journalRecord
+	for range 24 {
+		tick()
+		_, _ = sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity)
+		_, current, err := sharedDriver(c, native).read(t.Context(), first.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record = current
+		if record.DeleteIssued {
+			break
+		}
+	}
+	if record == nil || !record.DeleteIssued || record.SharedWorker.Proof == nil {
+		t.Fatal("the fixture did not reach the Actor's deletion after an interim proof")
+	}
+	if record.SharedWorker.Strong == "" {
+		t.Fatal("a failing DeleteActor after the interim proof left no strong marker")
+	}
+	if pool, found := getPool(t, c, recordA.SharedWorker.Pool); found && pool.GetDeletionTimestamp() == nil && !sharedRetireIntended(pool) {
+		t.Fatal("a failing DeleteActor after the interim proof did not start the pool's retirement")
+	}
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	if _, recordC := sharedReady(t, c, native, third); recordC.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("the worker kept admitting after a failure past its interim proof")
+	}
+}
+
 func TestSharedTaintOrQuarantineRetiresThroughTheStrongPath(t *testing.T) {
 	for _, quarantine := range []bool{false, true} {
 		t.Run(map[bool]string{false: "taint", true: "quarantine"}[quarantine], func(t *testing.T) {
@@ -639,13 +677,15 @@ func TestSharedTaintOrQuarantineRetiresThroughTheStrongPath(t *testing.T) {
 func TestSharedRetirementRecoversFromTheJournalWithoutReplay(t *testing.T) {
 	for _, operation := range []string{"updateEgress", "suspend", "tag", "deleteActor"} {
 		t.Run(operation, func(t *testing.T) {
-			// After the suspension intent, any lost response before the proof
-			// is doubt, so it takes the strong path without replay.
-			strong := operation != "deleteActor"
+			// After the suspension intent, any lost response is doubt, so it
+			// takes the strong path without replay. Before the proof none is
+			// journaled; a lost DeleteActor response comes after it, and is
+			// doubt too.
+			proofJournaled := operation == "deleteActor"
 			c, native, first, binding := sharedFixture(t, 2)
 			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
 			a, _ := sharedReady(t, c, native, first)
-			_, recordB := sharedReady(t, c, native, second)
+			sharedReady(t, c, native, second)
 			native.failAfter = operation
 			lost := false
 			var stopped sdk.AllocationObservation
@@ -669,14 +709,8 @@ func TestSharedRetirementRecoversFromTheJournalWithoutReplay(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (operation == "updateEgress") == lost || stopped.RetainedData == nil || native.suspends != 1 || native.deletes != 1 || (record.SharedWorker.Proof == nil) != strong || (record.SharedWorker.Strong != "") != strong {
+			if (operation == "updateEgress") == lost || stopped.RetainedData == nil || native.suspends != 1 || native.deletes != 1 || (record.SharedWorker.Proof != nil) != proofJournaled || record.SharedWorker.Strong == "" {
 				t.Fatalf("recovery replayed a mutation or lost the proof: lost=%v suspends=%d deletes=%d %#v", lost, native.suspends, native.deletes, record.SharedWorker)
-			}
-			if strong {
-				return
-			}
-			if _, ledger := poolLedger(t, c, recordB.SharedWorker.Pool); len(ledger.Entries) != 1 {
-				t.Fatalf("recovery left the retired slot held: %#v", ledger.Entries)
 			}
 		})
 	}
@@ -5132,6 +5166,30 @@ func TestSharedStaleInventorySuccessKeepsTheNativeOutageStamp(t *testing.T) {
 	_ = sharedReplenisher(c, native).Sweep(t.Context())
 	if current, found := getPool(t, c, record.SharedWorker.Pool); !found || current.GetAnnotations()[sharedNativeOutageAnnotation] != "" {
 		t.Fatal("a success that cleared the outage left its stamp")
+	}
+}
+
+// An inventory a newer failed read superseded never authorizes placement:
+// admission and Resume refuse it, as if the newer read's failure had been
+// theirs.
+func TestSharedSupersededTemplateInventoryNeverAuthorizesPlacement(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	racing := &racingTemplateControl{nativeFixture: native, during: func() {
+		// A newer List (for example the sweep's, after the provider's
+		// template viewer permission was revoked) starts and fails first.
+		testClock.Add(int64(time.Second))
+		sharedNativeTemplateHealth.failed(sharedNow())
+	}}
+	d := sharedDriver(c, native)
+	d.control = racing
+	if err := d.refuseForeignTemplates(t.Context(), record.Atespace, sharedLabels(record.SharedWorker.Label), nil); err == nil {
+		t.Fatal("a superseded template inventory authorized placement")
+	}
+	// A later inventory that clears the outage authorizes it again.
+	testClock.Add(int64(time.Second))
+	if err := sharedDriver(c, native).refuseForeignTemplates(t.Context(), record.Atespace, sharedLabels(record.SharedWorker.Label), nil); err != nil {
+		t.Fatalf("a fresh inventory did not authorize placement: %v", err)
 	}
 }
 

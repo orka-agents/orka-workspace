@@ -1517,7 +1517,7 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		record.WorkloadAbsent = true
 		stamp(&record.Timing.WorkerAbsentAt)
 		if err := d.save(ctx, cm, record); err != nil {
-			return err
+			return d.sharedStopDoubt(ctx, cm, record, "the termination proof could not be recorded", err)
 		}
 	}
 	if actor != nil {
@@ -1525,12 +1525,12 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 			record.DeleteIssued = true
 			stamp(&record.Timing.ActorDeleteIssuedAt)
 			if err := d.save(ctx, cm, record); err != nil {
-				return err
+				return d.sharedStopDoubt(ctx, cm, record, "the Actor's deletion could not be recorded", err)
 			}
 		}
 		_, err := d.control.DeleteActor(ctx, &pb.DeleteActorRequest{Actor: actorRef(record), Options: &pb.DeleteOptions{Uid: actor.GetMetadata().GetUid()}})
 		if err != nil && status.Code(err) != codes.NotFound {
-			return err
+			return d.sharedStopDoubt(ctx, cm, record, "the Actor could not be deleted", err)
 		}
 		return nil
 	}
@@ -1546,6 +1546,21 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		return err
 	}
 	return d.finishStop(ctx, cm, record)
+}
+
+// sharedStopDoubt handles a failure in a shared Stop after its evidence
+// suspend: the journal write that records the proof, the one that records
+// the Actor's deletion, or DeleteActor itself. Every such failure is doubt:
+// the strong marker is persisted and the pool's retirement started before
+// the pass returns, so the bounds loop has a marker and the worker stops
+// admitting. A write conflict is retried, and so is any failure once the
+// request's own context has ended (a cancelled reconcile, a lost lease, a
+// shutdown), since the strong path runs detached from it.
+func (d *Lifecycle) sharedStopDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, err error) error {
+	if apierrors.IsConflict(err) || ctx.Err() != nil {
+		return err
+	}
+	return errors.Join(err, d.sharedDoubt(ctx, cm, record, reason+": "+err.Error()))
 }
 
 // advanceSharedInterim moves the interim path forward by one step. It
@@ -1918,7 +1933,7 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 		return true, nil
 	}
 	if !unclassified {
-		return false, nil
+		return false, errSupersededTemplateInventory()
 	}
 	began := recordedTemplates.begin()
 	all, shared, err := d.providerTemplates(ctx)
@@ -1926,7 +1941,22 @@ func (d *Lifecycle) foreignTemplateMatches(ctx context.Context, atespace string,
 		return false, err
 	}
 	// The authoritative reread, merged with anything recorded since it began.
-	return templatesReach(templates, atespace, poolLabels, recordedTemplates.refresh(all, shared, began)), nil
+	if templatesReach(templates, atespace, poolLabels, recordedTemplates.refresh(all, shared, began)) {
+		return true, nil
+	}
+	return false, errSupersededTemplateInventory()
+}
+
+// errSupersededTemplateInventory refuses placement on an inventory that a
+// newer failed read superseded (by the started-at order of
+// sharedNativeTemplateHealth), for example after the provider's template
+// viewer permission was revoked while this List was in flight. A foreign
+// template the inventory shows still counts.
+func errSupersededTemplateInventory() error {
+	if sharedNativeTemplateHealth.failing() {
+		return errors.New("the native ActorTemplate inventory was superseded by a newer failed read, so shared admission is closed")
+	}
+	return nil
 }
 
 // recordedTemplateMiss reports a template inside the pool's Atespace that
