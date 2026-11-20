@@ -768,7 +768,13 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 			}
 		case "warmdefault":
 			// ADR 0057: no profile or class window, so Core's default applies.
-			if err := l.ensureClassOnce(ctx, "lat-warmd", classOptions{}); err != nil {
+			// LATENCY_WARMD_SPARES (provider spare-workers annotation, default
+			// none) lets turn 3's resume after the window claim a spare.
+			warmdOptions := classOptions{}
+			if n := envInt("LATENCY_WARMD_SPARES", 0); n > 0 {
+				warmdOptions.annotations = map[string]string{spareWorkersAnnotation: strconv.Itoa(n)}
+			}
+			if err := l.ensureClassOnce(ctx, "lat-warmd", warmdOptions); err != nil {
 				return nil, err
 			}
 			run = func(rep int) (map[string]any, error) {
