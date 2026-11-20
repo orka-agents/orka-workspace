@@ -829,6 +829,9 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 		{"GetActor after the proof, gRPC canceled", "getActor", grpcCanceled},
 		{"DeleteActor, gRPC deadline", "delete", grpcDeadline},
 		{"DeleteActor, child timeout", "delete", childTimeout},
+		{"DeleteActor, a deadline joined behind another status", "delete", func() error {
+			return errors.Join(status.Error(codes.Unavailable, "attempt failed"), status.Error(codes.DeadlineExceeded, "retry budget expired"))
+		}},
 		{"workload absence save, child timeout", "absentSave", childTimeout},
 		{"slot release ledger write, child timeout", "ledger", childTimeout},
 		{"journal finalization save, child timeout", "finishSave", childTimeout},

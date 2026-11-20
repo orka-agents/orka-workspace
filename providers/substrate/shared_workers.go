@@ -1601,9 +1601,27 @@ func requestCancelled(ctx context.Context, err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	switch status.Code(err) {
-	case codes.Canceled, codes.DeadlineExceeded:
-		return true
+	return grpcCancelled(err)
+}
+
+// grpcCancelled reports a gRPC Canceled or DeadlineExceeded status anywhere
+// in err's tree, every branch of a joined error included: status.Code stops
+// at the first status it finds.
+func grpcCancelled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if carrier, ok := err.(interface{ GRPCStatus() *status.Status }); ok {
+		switch carrier.GRPCStatus().Code() {
+		case codes.Canceled, codes.DeadlineExceeded:
+			return true
+		}
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		return slices.ContainsFunc(wrapped.Unwrap(), grpcCancelled)
+	case interface{ Unwrap() error }:
+		return grpcCancelled(wrapped.Unwrap())
 	}
 	return false
 }
