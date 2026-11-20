@@ -322,7 +322,11 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 				entry.podUIDs[fence.PodUID] = true
 			}
 		}
-		if !record.SharedWorker.Released && (record.SharedWorker.Strong != "" || record.Failure != "") {
+		// A persisted strong marker always drives the pool's retirement,
+		// whatever the release state: one decided after the slot release (a
+		// finalization that failed) has no ledger entry left to carry it. An
+		// ordinary recorded failure counts only while the slot is held.
+		if record.SharedWorker.Strong != "" || !record.SharedWorker.Released && record.Failure != "" {
 			entry.strong = true
 		}
 		if !record.SharedWorker.Released {

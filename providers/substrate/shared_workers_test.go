@@ -1055,6 +1055,153 @@ func TestSharedUnreadableLedgerAtReleaseTakesTheStrongPath(t *testing.T) {
 	}
 }
 
+// A strong marker persisted after the slot release (a finalization that
+// failed, then a crash before the pool's deletion) still drives the pool's
+// retirement from the bounds loop, although no ledger entry carries it.
+func TestSharedPostReleaseStrongMarkerStillRetiresThePool(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	_, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	d := sharedDriver(c, native)
+	cm, record, err := d.read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, ledger := poolLedger(t, c, recordA.SharedWorker.Pool)
+	marker := claimMarker(cm, record)
+	ledger.Entries = slices.DeleteFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.Journal == marker })
+	if err := setSharedLedger(pool, ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	record.SharedWorker.Released = true
+	record.SharedWorker.Strong = "the shared retirement could not complete: finalization failed"
+	if err := d.save(t.Context(), cm, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); found && current.GetDeletionTimestamp() == nil && !sharedRetireIntended(current) {
+		t.Fatal("a post-release strong marker left the pool admitting")
+	}
+}
+
+// A strong path decided after the slot release starts the pool's deletion
+// before its marker is written, so a crash in between cannot leave the pool
+// admitting with no ledger entry to recover the decision from.
+func TestSharedPostReleaseDoubtStartsTheDeletionBeforeTheMarker(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	var finalized, crashed atomic.Bool
+	crashing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if o, ok := obj.(*corev1.ConfigMap); ok {
+			if after, ok := decodeClaimRecord(o); ok && after.SharedWorker != nil && after.SharedWorker.Released {
+				if after.Observation.State == sdk.AllocationStopped && !finalized.Load() {
+					finalized.Store(true)
+					return apierrors.NewInternalError(errors.New("journal write refused once"))
+				}
+				if after.SharedWorker.Strong != "" {
+					crashed.Store(true)
+					panic("provider crashed while saving the post-release marker")
+				}
+			}
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	for range 24 {
+		tick()
+		func() {
+			defer func() { _ = recover() }()
+			_, _ = sharedDriver(crashing, native).StopInstance(t.Context(), first.Key, a.Identity)
+		}()
+		if crashed.Load() {
+			break
+		}
+	}
+	if !crashed.Load() {
+		t.Fatal("the fixture never crashed on the post-release marker")
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); found && current.GetDeletionTimestamp() == nil && !sharedRetireIntended(current) {
+		t.Fatal("a crash before the post-release marker left the pool admitting")
+	}
+}
+
+// A slot claimed before the pool's isolation checks failed never boots while
+// the pool is unverified.
+func TestSharedUnverifiedPoolNeverResumesAClaimedSlot(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	_, recordA := sharedReady(t, c, native, first)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	var stamped atomic.Bool
+	stamping := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if err := w.Update(ctx, obj, opts...); err != nil {
+			return err
+		}
+		if o, ok := obj.(*unstructured.Unstructured); ok && o.GetKind() == "WorkerPool" && o.GetName() == recordA.SharedWorker.Pool && !stamped.Load() {
+			if ledger, err := readSharedLedger(o); err == nil && len(ledger.Entries) == 2 {
+				// The claim landed; an isolation check then fails.
+				stamped.Store(true)
+				pool := poolObject()
+				if err := w.Get(ctx, client.ObjectKeyFromObject(o), pool); err != nil {
+					return err
+				}
+				annotations := maps.Clone(pool.GetAnnotations())
+				annotations[sharedUnverifiedAnnotation] = sharedNow().UTC().Format(time.RFC3339Nano)
+				pool.SetAnnotations(annotations)
+				return w.Update(ctx, pool)
+			}
+		}
+		return nil
+	}})
+	boots := native.boots
+	for range 6 {
+		tick()
+		if observed, _ := sharedDriver(stamping, native).EnsureAllocation(t.Context(), second); observed.State == sdk.AllocationReady {
+			break
+		}
+	}
+	if !stamped.Load() {
+		t.Fatal("the second allocation never claimed the pool")
+	}
+	if native.boots != boots {
+		t.Fatal("a slot claimed before an isolation-check failure booted while the pool was unverified")
+	}
+}
+
+// A replacement-worker marker whose save fails for good still starts the
+// pool's retirement: only a durably persisted marker means the strong path
+// is under way.
+func TestSharedFailedReplacementMarkerSaveStillRetires(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	actor := native.actors[refKey(actorRef(recordA))]
+	assignment := proto.Clone(actor.Status.WorkerAssignment).(*pb.WorkerAssignment)
+	assignment.Worker = &pb.ObjectRef{Name: "replacement-worker"}
+	assignment.WorkerPod, assignment.WorkerPodUid = "replacement-pod", "replacement-pod-uid"
+	actor.Status.WorkerAssignment = assignment
+	refusing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if o, ok := obj.(*corev1.ConfigMap); ok {
+			if after, ok := decodeClaimRecord(o); ok && len(after.RetirementWorkers) > 0 {
+				return apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, o.GetName(), errors.New("update refused"))
+			}
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	tick()
+	_, _ = sharedDriver(refusing, native).StopInstance(t.Context(), first.Key, a.Identity)
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); found && current.GetDeletionTimestamp() == nil && !sharedRetireIntended(current) {
+		t.Fatal("a failed replacement-marker save skipped the pool's retirement")
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture

@@ -1038,6 +1038,12 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 	if ledger.State != sharedAdmitting && ledger.State != sharedDraining || !sharedNow().Before(sharedRetireAt(pool, ledger)) {
 		return false, fmt.Errorf("shared worker is past its lifetime or retiring: %w", sdk.ErrStaleIdentity)
 	}
+	if sharedPoolUnverified(pool) {
+		// An unverified pool admits nobody, a slot claimed before its
+		// isolation checks failed included: the Resume waits until they
+		// complete, or the pool retires at its bound.
+		return false, errors.New("the shared worker's isolation checks have not completed since they last failed, so its Resume waits")
+	}
 	// Re-checked immediately before Resume, never only when the allocation was
 	// prepared: the template already selects this pool, so suspicion here
 	// fails closed instead of moving the record.
@@ -1590,7 +1596,7 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 // before) is driven by strongSharedAbsence and the bounds loop, so its own
 // waits and retries return as they are.
 func (d *Lifecycle) sharedStopDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, err error) error {
-	if err == nil || apierrors.IsConflict(err) || requestCancelled(ctx, err) || record.SharedWorker.Strong != "" {
+	if err == nil || apierrors.IsConflict(err) || requestCancelled(ctx, err) {
 		return err
 	}
 	return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, reason+": "+err.Error()))
@@ -1611,6 +1617,13 @@ func (d *Lifecycle) durableSharedDoubt(ctx context.Context, cm *corev1.ConfigMap
 		return errors.Join(err, d.initiateSharedStrongRetirement(ctx, record))
 	}
 	*cm, *record = *durableCM, *durable
+	if record.SharedWorker.Strong != "" {
+		// The strong path is durably under way; every later pass and the
+		// bounds loop drive it. A marker only set in memory (its save
+		// failed) is not: the reread journal decides, never the in-memory
+		// value.
+		return nil
+	}
 	return d.sharedDoubt(ctx, cm, record, reason)
 }
 
@@ -2404,6 +2417,14 @@ func (d *Lifecycle) sharedDoubt(ctx context.Context, cm *corev1.ConfigMap, recor
 	// The deletion is attempted whether or not the marker is durable: a
 	// rejected journal write must never gate it. A deleting pool or an absent
 	// Pod is itself strong evidence on every later pass.
+	if record.SharedWorker.Released {
+		// After the slot release no ledger entry carries the marker, so the
+		// pool's deletion (or its durable retirement intent, when the Delete
+		// fails) is started first: it closes admission at once, and a crash
+		// before the marker is saved cannot leave the pool admitting.
+		retireErr := d.initiateSharedStrongRetirement(ctx, record)
+		return errors.Join(retireErr, d.markSharedStrong(ctx, cm, record, reason))
+	}
 	persistErr := d.markSharedStrong(ctx, cm, record, reason)
 	return errors.Join(persistErr, d.initiateSharedStrongRetirement(ctx, record))
 }
