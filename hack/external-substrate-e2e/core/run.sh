@@ -152,6 +152,11 @@ test -n "${namespace_uid}"
 kubectl label namespace "${namespace}" ate.dev/api-access=true
 kubectl -n "${namespace}" create secret generic external-substrate-core-fixture --from-file="${run_dir}/private/key" --from-file="${run_dir}/private/token"
 kubectl -n "${namespace}" create secret tls external-substrate-core-tls --key="${run_dir}/private/tls.key" --cert="${run_dir}/private/tls.crt"
+# Optional extra in-namespace fixtures (such as a forge and publisher for
+# write-intent latency runs) installed before Core so it starts wired.
+if [[ -n "${ORKA_CORE_PRE_INSTALL_HOOK:-}" ]]; then
+  bash "${ORKA_CORE_PRE_INSTALL_HOOK}" "${namespace}"
+fi
 kubectl create --dry-run=client -f "${core_snapshot}/config/rbac/role.yaml" -o json >"${run_dir}/core-role.json"
 python3 "${fixture}/install.py" "${namespace}" "${core_image}" "${runtime_image}" "${proof_image}" "${provider_image}" "${worker_image}" "${run_dir}/private/tls.crt" "${run_dir}/core-role.json" >"${run_dir}/install.json"
 # Grant this run's Atespace (the profile templateRef namespace, which is the
