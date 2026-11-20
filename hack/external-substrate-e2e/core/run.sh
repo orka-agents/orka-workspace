@@ -121,7 +121,19 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(zip(['runtime','core','prov
 PY
 
 kubectl apply --server-side -k "${shared_snapshot}/config"
-kubectl apply --server-side -f "${shared_snapshot}/providers/substrate/config/crd"
+if [[ "${SUBSTRATE_KEEP_INSTALLED_PROFILE_CRD:-}" == 1 ]]; then
+  # Diagnostic escape hatch: when the API server rejects the checkout's
+  # SubstrateWorkspaceProfile CRD (for example a CEL rule over the cost
+  # budget), keep the profile CRD already installed and say so loudly.
+  for crd in "${shared_snapshot}"/providers/substrate/config/crd/*.yaml; do
+    if ! kubectl apply --server-side -f "${crd}"; then
+      [[ "${crd}" == *substrateworkspaceprofiles* ]] && kubectl get crd substrateworkspaceprofiles.substrate.workspace.orka.ai >/dev/null || exit 1
+      printf 'WARNING: kept the installed SubstrateWorkspaceProfile CRD; the checkout CRD was rejected.\n' | tee "${run_dir}/profile-crd-kept.txt" >&2
+    fi
+  done
+else
+  kubectl apply --server-side -f "${shared_snapshot}/providers/substrate/config/crd"
+fi
 kubectl apply --server-side -k "${core_snapshot}/config/crd"
 kubectl wait --for=condition=Established crd --all --timeout=120s
 mkdir -m 700 "${run_dir}/private"
