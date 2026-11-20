@@ -624,6 +624,16 @@ var sharedNativeTemplateHealth = &provenanceHealth{}
 // next successful inventory.
 const sharedNativeOutageAnnotation = "substrate.workspace.orka.ai/native-outage-since"
 
+// sharedNativeOutageGraceAnnotation classifies a pool's native outage stamp,
+// as sharedUnverifiedGraceAnnotation does an unverified one: control-plane-
+// down when the control plane looked down from the provider through a
+// transport or availability failure, none otherwise (a credential rejection,
+// or worker reads that still succeed). The Kubernetes-only bounds loop then
+// enforces the matching bound, 60 s or the control-plane-down grace, however
+// long a sweep pass takes. A missing classification keeps the grace until the
+// sweep classifies the stamp, so the bounds loop never retires early.
+const sharedNativeOutageGraceAnnotation = "substrate.workspace.orka.ai/native-outage-grace"
+
 // sharedControlPlaneDownGrace is the total outage after which a native
 // ActorTemplate inventory outage retires shared pools even while the control
 // plane looks down from the provider. A provider-side transport failure does
@@ -656,20 +666,36 @@ func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.U
 		// started after this pass's) keeps it, by the same started-at order.
 		if !sharedNativeTemplateHealth.failing() {
 			o.d.clearOutageMark(ctx, pool, sharedNativeOutageAnnotation)
+			o.d.clearOutageMark(ctx, pool, sharedNativeOutageGraceAnnotation)
 		}
 		return ""
 	}
 	start := o.d.recordOutageSince(ctx, pool, sharedNativeOutageAnnotation, sharedNativeTemplateHealth.since())
-	elapsed := sharedNow().Sub(start)
-	if start.IsZero() || elapsed < sharedProvenanceOutageBound {
+	if start.IsZero() {
 		return ""
 	}
-	if !o.probed {
-		o.down, o.probed = o.d.sharedPass.nativeDown(ctx, o.d), true
-	}
+	elapsed := sharedNow().Sub(start)
 	rejected := o.rejected
 	if rejected == "" {
 		rejected = NativeCredentialsRejected()
+	}
+	if rejected == "" && !o.probed {
+		o.down, o.probed = o.d.sharedPass.nativeDown(ctx, o.d), true
+		if rejected = NativeCredentialsRejected(); rejected != "" {
+			o.down = false
+		}
+	}
+	// The classification is stamped durably from the outage's first pass, so
+	// the bounds loop applies the same bound however long a pass takes.
+	class := sharedUnverifiedGraceNone
+	if rejected == "" && o.down {
+		class = sharedUnverifiedGraceDown
+	}
+	if pool.GetAnnotations()[sharedNativeOutageGraceAnnotation] != class || sharedDecidedStamps.last(pool.GetUID(), sharedNativeOutageGraceAnnotation) == decidedClear {
+		o.d.startOutageMarks(ctx, outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedNativeOutageGraceAnnotation, value: class, overwrite: true})
+	}
+	if elapsed < sharedProvenanceOutageBound {
+		return ""
 	}
 	switch {
 	case rejected != "":
@@ -999,9 +1025,9 @@ func stampedTime(pool *unstructured.Unstructured, key string) (time.Time, bool) 
 
 // sharedStampedOutagePast reports, from the pool's durable stamps alone (so
 // the Kubernetes-only bounds loop can enforce them whatever the sweep's
-// progress), an unverified pool past its bound (60 s, or the
-// control-plane-down grace when so stamped) or a native template inventory
-// outage past the control-plane-down grace, the longest bound it can carry.
+// progress), an unverified pool or a native template inventory outage past
+// its bound: 60 s, or the control-plane-down grace when its classification
+// says so or is missing.
 func sharedStampedOutagePast(pool *unstructured.Unstructured, now time.Time) string {
 	annotations := pool.GetAnnotations()
 	if raw, ok := annotations[sharedUnverifiedAnnotation]; ok {
@@ -1018,8 +1044,14 @@ func sharedStampedOutagePast(pool *unstructured.Unstructured, now time.Time) str
 		}
 	}
 	if raw, ok := annotations[sharedNativeOutageAnnotation]; ok {
-		if since, err := time.Parse(time.RFC3339Nano, raw); err == nil && !now.Before(since.Add(sharedControlPlaneDownGrace)) {
-			return "the native ActorTemplate inventory has stayed unavailable since its durable stamp, past the control-plane-down grace"
+		if since, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			bound, why := sharedControlPlaneDownGrace, "past the control-plane-down grace"
+			if annotations[sharedNativeOutageGraceAnnotation] == sharedUnverifiedGraceNone {
+				bound, why = sharedProvenanceOutageBound, "past its bound while the control plane still places Actors or rejects the provider's credentials"
+			}
+			if !now.Before(since.Add(bound)) {
+				return "the native ActorTemplate inventory has stayed unavailable since its durable stamp, " + why
+			}
 		}
 	}
 	return ""

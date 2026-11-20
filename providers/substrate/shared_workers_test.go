@@ -5819,6 +5819,48 @@ func TestSharedSupersededTemplateInventoryNeverAuthorizesPlacement(t *testing.T)
 	}
 }
 
+// The native inventory outage's classification is stamped with it, so the
+// Kubernetes-only bounds loop enforces the matching bound on its own, however
+// long a sweep pass takes: 60 s unless the control plane looked down from the
+// provider, and never the grace for a credential rejection.
+func TestSharedBoundsLoopEnforcesTheClassifiedNativeOutageBound(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*nativeFixture)
+		bound  time.Duration
+		class  string
+	}{
+		{"template listing fails while worker reads succeed", func(f *nativeFixture) { f.failTemplateList = true }, sharedProvenanceOutageBound, sharedUnverifiedGraceNone},
+		{"template listing rejects credentials while the worker probe looks down", func(f *nativeFixture) { f.rejectTemplateList, f.nativeDown = true, true }, sharedProvenanceOutageBound, sharedUnverifiedGraceNone},
+		{"the control plane looks down from the provider", func(f *nativeFixture) { f.nativeDown = true }, sharedControlPlaneDownGrace, sharedUnverifiedGraceDown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			tc.break_(native)
+			start := sharedNow()
+			// One sweep pass stamps and classifies the outage; later passes
+			// are stuck, so only the bounds loop runs.
+			_ = sharedReplenisher(c, native).Sweep(t.Context())
+			pool, found := getPool(t, c, record.SharedWorker.Pool)
+			if !found || pool.GetAnnotations()[sharedNativeOutageAnnotation] == "" || pool.GetAnnotations()[sharedNativeOutageGraceAnnotation] != tc.class {
+				t.Fatalf("the outage was not stamped and classified %q: %v", tc.class, pool.GetAnnotations())
+			}
+			bounds := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
+			setNow(t, start.Add(tc.bound-time.Second))
+			_ = bounds.EnforceSharedBounds(t.Context())
+			if pool, found := getPool(t, c, record.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil {
+				t.Fatalf("the bounds loop retired the pool before its %s bound", tc.bound)
+			}
+			setNow(t, start.Add(tc.bound))
+			_ = bounds.EnforceSharedBounds(t.Context())
+			if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+				t.Fatalf("the bounds loop alone did not retire the pool at its %s bound", tc.bound)
+			}
+		})
+	}
+}
+
 func TestSharedNativeOutageClockSurvivesProviderRestarts(t *testing.T) {
 	for _, down := range []bool{false, true} {
 		t.Run(fmt.Sprintf("controlPlaneDown=%t", down), func(t *testing.T) {
