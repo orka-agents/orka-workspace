@@ -638,13 +638,21 @@ const sharedControlPlaneDownGrace = 5 * time.Minute
 type nativeTemplateOutage struct {
 	d       *Lifecycle
 	failing bool
-	probed  bool
-	down    bool
+	// rejected is the credential rejection that failed this pass's
+	// inventory, if any.
+	rejected string
+	probed   bool
+	down     bool
 }
 
 func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.Unstructured) string {
 	if !o.failing {
-		o.d.clearOutageMark(ctx, pool, sharedNativeOutageAnnotation)
+		// The stamp is cleared only by a success that cleared the tracked
+		// outage: a newer failure (for example an admission List that
+		// started after this pass's) keeps it, by the same started-at order.
+		if !sharedNativeTemplateHealth.failing() {
+			o.d.clearOutageMark(ctx, pool, sharedNativeOutageAnnotation)
+		}
 		return ""
 	}
 	start := o.d.recordOutageSince(ctx, pool, sharedNativeOutageAnnotation, sharedNativeTemplateHealth.since())
@@ -655,11 +663,16 @@ func (o *nativeTemplateOutage) retires(ctx context.Context, pool *unstructured.U
 	if !o.probed {
 		o.down, o.probed = o.d.sharedPass.nativeDown(ctx, o.d), true
 	}
+	rejected := o.rejected
+	if rejected == "" {
+		rejected = NativeCredentialsRejected()
+	}
 	switch {
+	case rejected != "":
+		// A rejection of the provider's own credentials never takes the
+		// control-plane-down grace, whatever the worker probe returns.
+		return "the native ActorTemplate inventory stayed unavailable past its bound: " + rejected
 	case !o.down:
-		if rejected := NativeCredentialsRejected(); rejected != "" {
-			return "the native ActorTemplate inventory stayed unavailable past its bound: " + rejected
-		}
 		return "the native ActorTemplate inventory stayed unavailable past its bound while the control plane still places Actors"
 	case elapsed >= sharedControlPlaneDownGrace:
 		return "the native ActorTemplate inventory stayed unavailable past the control-plane-down grace; a provider-side outage does not prove other clients cannot place"
@@ -1075,7 +1088,7 @@ func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.U
 	if native {
 		noteNativeCredentials(ctx, err)
 	}
-	grace := native && nativeUnavailable(err) && !nativeCredentialsRejected(err) && d.sharedPass.nativeDown(ctx, d)
+	grace := native && nativeUnavailable(err) && !nativeCredentialsRejected(err) && NativeCredentialsRejected() == "" && d.sharedPass.nativeDown(ctx, d)
 	bound, class := sharedProvenanceOutageBound, sharedUnverifiedGraceNone
 	if grace {
 		bound, class = sharedControlPlaneDownGrace, sharedUnverifiedGraceDown
@@ -1724,6 +1737,9 @@ func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, 
 	// outage bound leaves foreign selectors unchecked: shared pools are then
 	// strongly retired (nativeTemplateOutage).
 	outage := &nativeTemplateOutage{d: d, failing: templatesErr != nil}
+	if nativeCredentialsRejected(templatesErr) {
+		outage.rejected = "provider native credentials rejected: " + status.Code(templatesErr).String()
+	}
 	// Every known strong trigger first, for every pool, before any pool's
 	// fallible checks.
 	var candidates []*sharedCandidate

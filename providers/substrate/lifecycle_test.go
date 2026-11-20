@@ -108,6 +108,9 @@ type nativeFixture struct {
 	// workersMu guards workers against concurrent per-pool listings.
 	workersMu       sync.Mutex
 	assignmentLists int
+	// rejectTemplateList rejects ActorTemplate Lists as PermissionDenied,
+	// whatever else the fixture returns.
+	rejectTemplateList bool
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
@@ -226,6 +229,9 @@ func (f *nativeFixture) ListActorTemplates(ctx context.Context, _ *pb.ListActorT
 	}
 	if f.failTemplateList {
 		return nil, status.Error(codes.Unavailable, "template listing unavailable")
+	}
+	if f.rejectTemplateList {
+		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected for templates")
 	}
 	if f.credentialsRejected {
 		return nil, status.Error(codes.PermissionDenied, "provider credentials rejected")

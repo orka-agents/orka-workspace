@@ -425,7 +425,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 				observed, err = d.fail(ctx, cm, record, lost.reason)
 				return err
 			}
-			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) && !suspensionPending(err, record) {
+			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) && !suspensionPending(err, record) && !holdRetry(ctx, err, record) {
 				// After the suspension intent is persisted, every error on a
 				// shared worker is doubt, and the suspend is never replayed.
 				// A failure inside the issued suspension is recorded as doubt
@@ -915,11 +915,38 @@ func (e *suspendPendingError) Error() string { return e.err.Error() }
 func (e *suspendPendingError) Unwrap() error { return e.err }
 
 // suspendContinuationOpen reports whether an issued suspension is still
-// inside its continuation window.
+// inside its continuation window, with continuations left.
 func suspendContinuationOpen(record *journalRecord) bool {
+	return holdWindowOpen(record) && record.Pending.Continuations < maxSuspendContinuations
+}
+
+// holdWindowOpen reports whether an issued suspension is still inside its
+// continuation window.
+func holdWindowOpen(record *journalRecord) bool {
 	operation, issued := record.Pending, record.Timing.SuspendIssuedAt
-	return operation != nil && operation.SuspendIssued && operation.Continuations < maxSuspendContinuations &&
-		issued != nil && sharedNow().Before(issued.Add(suspendContinuationWindow))
+	return operation != nil && operation.SuspendIssued && issued != nil && sharedNow().Before(issued.Add(suspendContinuationWindow))
+}
+
+// suspendRetryError is a failure on the hold path that says nothing about
+// the suspension: a journal write that conflicted, was cancelled or ran out
+// of time. It is retried by rereading the journal, never doubt.
+type suspendRetryError struct{ err error }
+
+func (e *suspendRetryError) Error() string { return e.err.Error() }
+func (e *suspendRetryError) Unwrap() error { return e.err }
+
+// holdRetry reports an error on the hold path that must be retried rather
+// than start the strong path: a suspendRetryError, or any failure once this
+// request's own context has ended (a cancelled reconcile, a lost lease, a
+// shutdown). The strong path runs detached from the request, so taking it
+// there would delete the worker mid-continuation. Both are bounded by the
+// continuation window; past it, doubt applies as before.
+func holdRetry(ctx context.Context, err error, record *journalRecord) bool {
+	if !holdWindowOpen(record) {
+		return false
+	}
+	retry := (*suspendRetryError)(nil)
+	return errors.As(err, &retry) || ctx.Err() != nil
 }
 
 // suspensionPending reports whether err is a failure the continuation
@@ -996,10 +1023,14 @@ func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap,
 	}
 	record.Pending.Doubt = reason
 	if err := d.save(ctx, cm, record); err != nil {
-		// An unrecorded doubt is never held: a write conflict is retried by
-		// rereading the journal, as after a crash before the result was
-		// handled, and any other write failure takes the strong path at once.
+		// An unrecorded doubt is never held. A write that conflicted, was
+		// cancelled or ran out of time is retried by rereading the journal,
+		// as after a crash before the result was handled. Only a definite
+		// write failure takes the strong path at once.
 		record.Pending.Doubt = ""
+		if apierrors.IsConflict(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return &suspendRetryError{err: errors.Join(cause, err)}
+		}
 		return errors.Join(cause, err)
 	}
 	return pending

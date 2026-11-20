@@ -2858,6 +2858,103 @@ func TestSharedContinuationsOutliveTheHoldWindow(t *testing.T) {
 	}
 }
 
+// A doubt write that fails only because the request's own context ended (a
+// cancelled reconcile, a lost lease, a shutdown) is retried. It never starts
+// the strong path, whose detached deletion would crash the SUSPENDING Actor
+// mid-continuation.
+func TestSharedCancelledDoubtWriteNeverStartsTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failFinalizeOnce = true
+	var cancel context.CancelFunc
+	cancelling := &suspensionReviewControl{nativeFixture: native, submit: func(request *pb.SuspendActorRequest) (*pb.SuspendActorResponse, error) {
+		// The request is cancelled as the failed call returns.
+		defer cancel()
+		return native.SuspendActor(t.Context(), request)
+	}}
+	for range 8 {
+		tick()
+		ctx, cancelPass := context.WithCancel(t.Context())
+		cancel = cancelPass
+		d := sharedDriver(contextAwareClient(c), native)
+		d.control = cancelling
+		_, _ = d.SuspendInstance(ctx, first.Key, a.Identity)
+		cancelPass()
+		if cancelling.calls > 0 {
+			break
+		}
+	}
+	if cancelling.calls != 1 {
+		t.Fatalf("the suspend was issued %d times", cancelling.calls)
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong != "" || !podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatalf("a cancelled doubt write started the strong path: %q", record.SharedWorker.Strong)
+	}
+	// Live passes continue the suspension, then retire strongly.
+	for range 24 {
+		tick()
+		observed, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		deleteGoneWorker(t, c, native, recordA)
+		if err == nil && observed.State == sdk.AllocationStopped {
+			break
+		}
+	}
+	if _, record, err = sharedDriver(c, native).read(t.Context(), first.Key); err != nil {
+		t.Fatal(err)
+	}
+	if record.Failure != "" || record.Checkpoint == nil || native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil {
+		t.Fatalf("the suspension's data was lost: failure=%q", record.Failure)
+	}
+}
+
+// cancellingTemplateControl cancels the request inside GetActorTemplate and
+// fails the call as a real one would.
+type cancellingTemplateControl struct {
+	*nativeFixture
+	cancel context.CancelFunc
+}
+
+func (c *cancellingTemplateControl) GetActorTemplate(ctx context.Context, req *pb.GetActorTemplateRequest, opts ...grpc.CallOption) (*pb.ActorTemplate, error) {
+	c.cancel()
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+// The rest of the hold path follows the same rule: once the request's own
+// context has ended, a later read failing on it (here the template check of
+// a held continuation pass) is retried, not doubt.
+func TestSharedCancelledHoldPassNeverStartsTheStrongPath(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failFinalizeOnce = true
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Pending != nil && record.Pending.Doubt != "" {
+			break
+		}
+	}
+	tick()
+	ctx, cancel := context.WithCancel(t.Context())
+	d := sharedDriver(c, native)
+	d.control = &cancellingTemplateControl{nativeFixture: native, cancel: cancel}
+	_, _ = d.SuspendInstance(ctx, first.Key, a.Identity)
+	cancel()
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Pending == nil || record.Pending.Doubt == "" {
+		t.Fatal("the fixture recorded no held doubt")
+	}
+	if record.SharedWorker.Strong != "" || !podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatalf("a cancelled hold pass started the strong path: %q", record.SharedWorker.Strong)
+	}
+}
+
 // The held deletion is bounded: an Actor that cannot be read after a failed
 // suspend takes the strong path once the continuation window ends, and not
 // before.
@@ -4955,6 +5052,9 @@ func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
 		{name: "template listing stalls past the sweep deadline", break_: func(f *nativeFixture) { f.blockTemplateList = true }, bound: sharedProvenanceOutageBound},
 		{name: "the provider's own credentials are rejected", break_: func(f *nativeFixture) { f.credentialsRejected = true }, bound: sharedProvenanceOutageBound},
 		{name: "the control plane looks down from the provider", break_: func(f *nativeFixture) { f.nativeDown = true }, bound: sharedControlPlaneDownGrace},
+		// A rejection of the provider's own credentials never takes the
+		// control-plane-down grace, whatever the worker probe returns.
+		{name: "template listing rejects credentials while the worker probe looks down", break_: func(f *nativeFixture) { f.rejectTemplateList, f.nativeDown = true, true }, bound: sharedProvenanceOutageBound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 2)
@@ -4986,6 +5086,52 @@ func TestSharedNativeTemplateInventoryOutageRetiresPastItsBound(t *testing.T) {
 				t.Fatalf("a native template inventory outage did not retire the pool at %s", tc.bound)
 			}
 		})
+	}
+}
+
+// racingTemplateControl runs during inside each ActorTemplate List.
+type racingTemplateControl struct {
+	*nativeFixture
+	during func()
+}
+
+func (c *racingTemplateControl) ListActorTemplates(ctx context.Context, req *pb.ListActorTemplatesRequest, opts ...grpc.CallOption) (*pb.ListActorTemplatesResponse, error) {
+	c.during()
+	return c.nativeFixture.ListActorTemplates(ctx, req, opts...)
+}
+
+// A sweep's inventory that succeeds after a newer one failed does not clear
+// the pool's durable outage stamp: the tracked outage is still on.
+func TestSharedStaleInventorySuccessKeepsTheNativeOutageStamp(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	stamped := sharedNow().Add(-30 * time.Second).UTC().Format(time.RFC3339Nano)
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedNativeOutageAnnotation] = stamped
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	sharedNativeTemplateHealth.failed(sharedNow().Add(-30 * time.Second))
+	racing := &racingTemplateControl{nativeFixture: native, during: func() {
+		// An admission List starts after this one and fails first.
+		testClock.Add(int64(time.Second))
+		sharedNativeTemplateHealth.failed(sharedNow())
+	}}
+	_ = (&SpareWorkerReplenisher{Client: c, Control: racing, Config: sharedConfig()}).Sweep(t.Context())
+	if !sharedNativeTemplateHealth.failing() {
+		t.Fatal("the fixture's newer failure did not keep the tracked outage")
+	}
+	if current, found := getPool(t, c, record.SharedWorker.Pool); !found || current.GetAnnotations()[sharedNativeOutageAnnotation] != stamped {
+		t.Fatal("a stale inventory success cleared the native outage stamp")
+	}
+	// A success that starts after the newer failure clears the tracked
+	// outage, and with it the stamp.
+	testClock.Add(int64(time.Second))
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	if current, found := getPool(t, c, record.SharedWorker.Pool); !found || current.GetAnnotations()[sharedNativeOutageAnnotation] != "" {
+		t.Fatal("a success that cleared the outage left its stamp")
 	}
 }
 
@@ -5523,10 +5669,11 @@ func TestSharedFreshBudgetsEndOnCancellationAfterTheSweepDeadline(t *testing.T) 
 
 // stalledPoolDeletes stalls every WorkerPool delete until its context ends
 // and counts them; Pod deletes are recorded by UID with their time.
-func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(string) time.Time) {
+func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(string) time.Time, func() time.Time) {
 	var poolDeletes atomic.Int64
 	var mu sync.Mutex
 	podDeleted := map[string]time.Time{}
+	var firstStallEnded time.Time
 	wrapped := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
 		Delete: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			switch o := obj.(type) {
@@ -5534,6 +5681,11 @@ func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(str
 				if o.GetKind() == "WorkerPool" {
 					poolDeletes.Add(1)
 					<-ctx.Done()
+					mu.Lock()
+					if firstStallEnded.IsZero() {
+						firstStallEnded = time.Now()
+					}
+					mu.Unlock()
 					return ctx.Err()
 				}
 			case *corev1.Pod:
@@ -5547,10 +5699,14 @@ func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(str
 		},
 	}))
 	return wrapped, &poolDeletes, func(uid string) time.Time {
-		mu.Lock()
-		defer mu.Unlock()
-		return podDeleted[uid]
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			return podDeleted[uid]
+		}, func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return firstStallEnded
+		}
 }
 
 func TestSharedShutdownStopsIssuingNewRetirements(t *testing.T) {
@@ -5562,7 +5718,7 @@ func TestSharedShutdownStopsIssuingNewRetirements(t *testing.T) {
 	due := manySharedPools(t, c, native, first, binding, 12)
 	pool, ledger := poolLedger(t, c, due[0])
 	setNow(t, sharedRetireAt(pool, ledger).Add(time.Minute))
-	stalling, poolDeletes, _ := stalledPoolDeletes(c)
+	stalling, poolDeletes, _, _ := stalledPoolDeletes(c)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	started := time.Now()
@@ -5614,11 +5770,15 @@ func TestSharedDecidedRetirementsNeverDelayAQuarantine(t *testing.T) {
 		t.Fatal("the allocation joined a retiring pool")
 	}
 	native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})].Metadata.Uid = "foreign-template-uid"
-	stalling, _, podDeleted := stalledPoolDeletes(c)
-	started := time.Now()
+	stalling, _, podDeleted, stallEnded := stalledPoolDeletes(c)
 	_ = sharedReplenisher(stalling, native).Sweep(t.Context())
-	if at := podDeleted(record.Worker.PodUID); at.IsZero() || at.Sub(started) > time.Second {
-		t.Fatalf("decided retirements delayed a required quarantine: %v", at.Sub(started))
+	// Causal order, not wall time: a quarantine queued behind the stalled
+	// retirements could only start once one of their pool deletes gave up
+	// at its cleanup timeout, so its worker Pod delete must come before
+	// the first stall ended.
+	at, ended := podDeleted(record.Worker.PodUID), stallEnded()
+	if at.IsZero() || ended.IsZero() || !at.Before(ended) {
+		t.Fatalf("decided retirements delayed a required quarantine: quarantine Pod delete at %v, first stalled pool delete ended at %v", at, ended)
 	}
 }
 
