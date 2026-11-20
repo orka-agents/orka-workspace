@@ -363,6 +363,12 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 		}
 		if record.Operation == "suspend" {
 			if err := d.reserveSuspended(ctx, record); err != nil {
+				if record.SharedWorker != nil && record.BootRequested && record.Observation.State != sdk.AllocationStopped && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
+					// After the suspension intent, before or after capture,
+					// an unverifiable retained-data reservation is doubt
+					// like any other definite failure.
+					return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, "the suspension's retained-data reservation could not be verified: "+err.Error()))
+				}
 				return err
 			}
 		}

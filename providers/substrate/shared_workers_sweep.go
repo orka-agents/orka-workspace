@@ -217,12 +217,13 @@ func listSharedPools(ctx context.Context, c client.Client, provenance map[types.
 	all := &unstructured.UnstructuredList{}
 	all.SetAPIVersion(workerPoolAPIVersion())
 	all.SetKind("WorkerPoolList")
+	listed := sharedTrackerClock.Load()
 	if err := c.List(ctx, all); err != nil {
 		return nil, err
 	}
 	// Only a complete, successful List prunes the in-process per-pool
 	// trackers; a failed List returned above prunes nothing.
-	pruneSharedPoolTrackers(all.Items)
+	pruneSharedPoolTrackers(all.Items, listed)
 	var out []unstructured.Unstructured
 	for _, pool := range all.Items {
 		_, labeled := pool.GetLabels()[sharedPoolLabel]
@@ -758,7 +759,14 @@ func (d *Lifecycle) clearOutageMark(ctx context.Context, pool *unstructured.Unst
 type decidedStamps struct {
 	mu   sync.Mutex
 	keys map[types.UID]map[string]string
+	// touched is when each pool's entry last changed, by sharedTrackerClock.
+	touched map[types.UID]uint64
 }
+
+// sharedTrackerClock orders changes to the in-process per-pool trackers
+// against a WorkerPool List, so a prune never drops an entry recorded after
+// the List began (for a pool the List could not yet show).
+var sharedTrackerClock atomic.Uint64
 
 const (
 	decidedSet   = "set"
@@ -777,6 +785,10 @@ func (s *decidedStamps) record(uid types.UID, key, decision string) {
 		s.keys[uid] = map[string]string{}
 	}
 	s.keys[uid][key] = decision
+	if s.touched == nil {
+		s.touched = map[types.UID]uint64{}
+	}
+	s.touched[uid] = sharedTrackerClock.Add(1)
 }
 
 func (s *decidedStamps) last(uid types.UID, key string) string {
@@ -785,13 +797,15 @@ func (s *decidedStamps) last(uid types.UID, key string) string {
 	return s.keys[uid][key]
 }
 
-// retain drops the decisions of every pool UID not in live.
-func (s *decidedStamps) retain(live map[types.UID]bool) {
+// retain drops the decisions of every pool UID not in live that last
+// changed before the List began (listed).
+func (s *decidedStamps) retain(live map[types.UID]bool, listed uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for uid := range s.keys {
-		if !live[uid] {
+		if !live[uid] && s.touched[uid] <= listed {
 			delete(s.keys, uid)
+			delete(s.touched, uid)
 		}
 	}
 }
@@ -801,19 +815,22 @@ func (s *decidedStamps) retain(live map[types.UID]bool) {
 // are never reused, so a pool gone from such a List never needs its decision
 // again. A pool that is still deleting is still listed, so its in-flight
 // writes keep the decision that outranks them.
-func pruneSharedPoolTrackers(pools []unstructured.Unstructured) {
+//
+// listed is sharedTrackerClock before the List began: an entry changed since
+// may belong to a pool created after the List's snapshot, so it is kept.
+func pruneSharedPoolTrackers(pools []unstructured.Unstructured, listed uint64) {
 	live := make(map[types.UID]bool, len(pools))
 	for i := range pools {
 		live[pools[i].GetUID()] = true
 	}
-	sharedDecidedStamps.retain(live)
-	sharedUnverifiedPools.retain(live)
+	sharedDecidedStamps.retain(live, listed)
+	sharedUnverifiedPools.retain(live, listed)
 }
 
 func (s *decidedStamps) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.keys = nil
+	s.keys, s.touched = nil, nil
 }
 
 // outageMark is one durable outage annotation change: a value to set when
@@ -1098,6 +1115,8 @@ const sharedUnverifiedAnnotation = "substrate.workspace.orka.ai/unverified-since
 type poolRejections struct {
 	mu    sync.Mutex
 	since map[types.UID]time.Time
+	// touched is when each entry was recorded, by sharedTrackerClock.
+	touched map[types.UID]uint64
 }
 
 var sharedUnverifiedPools = &poolRejections{}
@@ -1108,6 +1127,10 @@ func (p *poolRejections) failed(uid types.UID, now time.Time) time.Time {
 	if p.since == nil {
 		p.since = map[types.UID]time.Time{}
 	}
+	if p.touched == nil {
+		p.touched = map[types.UID]uint64{}
+	}
+	p.touched[uid] = sharedTrackerClock.Add(1)
 	if start, ok := p.since[uid]; ok {
 		return start
 	}
@@ -1115,13 +1138,15 @@ func (p *poolRejections) failed(uid types.UID, now time.Time) time.Time {
 	return now
 }
 
-// retain drops the entries of every pool UID not in live.
-func (p *poolRejections) retain(live map[types.UID]bool) {
+// retain drops the entries of every pool UID not in live that were last
+// recorded before the List began (listed).
+func (p *poolRejections) retain(live map[types.UID]bool, listed uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for uid := range p.since {
-		if !live[uid] {
+		if !live[uid] && p.touched[uid] <= listed {
 			delete(p.since, uid)
+			delete(p.touched, uid)
 		}
 	}
 }
@@ -1130,6 +1155,7 @@ func (p *poolRejections) succeeded(uid types.UID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.since, uid)
+	delete(p.touched, uid)
 }
 
 func (p *poolRejections) pending(uid types.UID) bool {
@@ -1142,7 +1168,7 @@ func (p *poolRejections) pending(uid types.UID) bool {
 func (p *poolRejections) reset() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.since = nil
+	p.since, p.touched = nil, nil
 }
 
 // sharedPoolUnverified reports a pool whose isolation checks have not

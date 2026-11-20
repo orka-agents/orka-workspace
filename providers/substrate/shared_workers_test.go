@@ -1202,6 +1202,61 @@ func TestSharedFailedReplacementMarkerSaveStillRetires(t *testing.T) {
 	}
 }
 
+// After the suspension intent, every SuspendInstance pass rechecks the
+// retained-data reservation. A definite failure of that read, before or after
+// the capture, is doubt like any other: the pool's strong retirement starts.
+// A conflict or a cancellation is retried.
+func TestSharedSuspensionReservationFailureTakesTheStrongPath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    func() error
+		strong bool
+	}{
+		{"definite failure", func() error { return apierrors.NewInternalError(errors.New("reservation read refused")) }, true},
+		{"deadline", func() error { return fmt.Errorf("reservation read: %w", context.DeadlineExceeded) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 3)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			d := sharedDriver(c, native)
+			cm, record, err := d.read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := int32(5)
+			record.MaxSuspended = &limit
+			if err := d.save(t.Context(), cm, record); err != nil {
+				t.Fatal(err)
+			}
+			// The intent is persisted, and the reservation made.
+			if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+				t.Fatal(err)
+			}
+			if _, current, err := sharedDriver(c, native).read(t.Context(), first.Key); err != nil || current.Pending == nil {
+				t.Fatalf("the suspension intent was not persisted: %v", err)
+			}
+			retention := retentionKey(record)
+			failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok && key == retention {
+					return tc.err()
+				}
+				return w.Get(ctx, key, obj, opts...)
+			}})
+			for range 3 {
+				tick()
+				_, _ = sharedDriver(failing, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+			}
+			pool, found := getPool(t, c, recordA.SharedWorker.Pool)
+			retiring := !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool)
+			if retiring != tc.strong {
+				t.Fatalf("pool retirement = %v, want %v", retiring, tc.strong)
+			}
+		})
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture
@@ -5893,6 +5948,30 @@ func TestSharedPoolTrackersArePrunedOnlyFromACompleteList(t *testing.T) {
 	}
 	if sharedDecidedStamps.last(live, sharedUnverifiedAnnotation) != decidedClear || !sharedUnverifiedPools.pending(live) {
 		t.Fatal("a complete List pruned a live pool's trackers")
+	}
+	// A decision recorded while the List runs, for a pool created after its
+	// snapshot, is kept.
+	created := types.UID("created-during-list-uid")
+	racing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		err := w.List(ctx, list, opts...)
+		if u, ok := list.(*unstructured.UnstructuredList); ok && u.GetKind() == "WorkerPoolList" && sharedDecidedStamps.last(created, sharedUnverifiedAnnotation) == "" {
+			// A pool is created after this List's snapshot, and a decision
+			// is recorded for it before the prune runs; later Lists see it.
+			pool := poolObject()
+			pool.SetNamespace(record.Placement.Namespace)
+			pool.SetName("created-during-list")
+			pool.SetUID(created)
+			if err := w.Create(ctx, pool); err != nil {
+				return err
+			}
+			sharedDecidedStamps.record(created, sharedUnverifiedAnnotation, decidedSet)
+			sharedUnverifiedPools.failed(created, sharedNow())
+		}
+		return err
+	}})
+	_ = (&SpareWorkerReplenisher{Client: racing, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if sharedDecidedStamps.last(created, sharedUnverifiedAnnotation) != decidedSet || !sharedUnverifiedPools.pending(created) {
+		t.Fatal("a prune dropped a decision recorded while its List ran")
 	}
 	// The live pool's newer decision still outranks a stale write.
 	d := sharedDriver(c, native)
