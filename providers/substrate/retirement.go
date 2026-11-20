@@ -379,9 +379,10 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			return fmt.Errorf("native suspension is unsupported or already retired")
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
-			if record.SharedWorker != nil && record.Pending != nil && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
-				// After the suspension intent, an unverifiable journal
-				// requirement is doubt like any other error.
+			if record.SharedWorker != nil && record.BootRequested && record.Operation == "suspend" && record.Observation.State != sdk.AllocationStopped && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
+				// After the suspension intent, before or after the capture
+				// and until Stopped, an unverifiable journal requirement is
+				// doubt like any other error.
 				return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
 			}
 			return err

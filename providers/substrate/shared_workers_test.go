@@ -1437,6 +1437,52 @@ func TestSharedWarmCreationRefusesASupersededTemplateInventory(t *testing.T) {
 	}
 }
 
+// After the Tag is captured and before Stopped, a pass's journal
+// requirement check that fails definitively is doubt like any other post-
+// evidence failure: the pool's strong retirement starts.
+func TestSharedJournalRequirementFailureAfterCaptureTakesTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	// The Stop half after the capture keeps conflicting, so the suspension
+	// stays captured but not stopped.
+	conflicting := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if o, ok := obj.(*corev1.ConfigMap); ok {
+			if after, ok := decodeClaimRecord(o); ok && after.WorkloadAbsent {
+				return apierrors.NewConflict(corev1.Resource("configmaps"), o.GetName(), errors.New("raced"))
+			}
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	captured := false
+	for range 24 {
+		tick()
+		_, _ = sharedDriver(conflicting, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Checkpoint != nil && record.Pending == nil {
+			captured = true
+			break
+		}
+	}
+	if !captured {
+		t.Fatal("the fixture never captured the suspension")
+	}
+	if pool, found := getPool(t, c, recordA.SharedWorker.Pool); !found || pool.GetDeletionTimestamp() != nil || sharedRetireDecided(pool) {
+		t.Fatal("the fixture retired the pool before the injected failure")
+	}
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*api.ExecutionWorkspace); ok && key == clientKey(first.Key) {
+			return apierrors.NewInternalError(errors.New("workspace read refused"))
+		}
+		return w.Get(ctx, key, obj, opts...)
+	}})
+	tick()
+	_, _ = sharedDriver(failing, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	if pool, found := getPool(t, c, recordA.SharedWorker.Pool); found && pool.GetDeletionTimestamp() == nil && !sharedRetireDecided(pool) {
+		t.Fatal("a journal requirement failure after the capture skipped the strong path")
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture
