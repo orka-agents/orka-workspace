@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render an isolated Core/provider Task proof using the existing Core fixture."""
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -44,6 +45,19 @@ for obj in objects:
             "--substrate-api-key-file=/run/substrate-client/credential-bundle.pem",
             "--substrate-api-ca-file=/run/substrate-server/trust-bundle.pem",
             "--substrate-router-url=https://atenet-router.ate-system.svc:443"])
+        # Optional Core tuning for latency runs (core/latency.sh), recorded in
+        # the rendered Deployment: Task reconcile concurrency and log level.
+        if os.environ.get("ORKA_TASK_MAX_CONCURRENT_RECONCILES"):
+            manager["args"].append("--task-max-concurrent-reconciles=" + os.environ["ORKA_TASK_MAX_CONCURRENT_RECONCILES"])
+        if os.environ.get("ORKA_CORE_LOG_LEVEL"):
+            manager["args"].append("--zap-log-level=" + os.environ["ORKA_CORE_LOG_LEVEL"])
+        # A Claude-typed fixture profile runs the same deterministic runtime
+        # image: Core selects the provider through ORKA_ACP_PROVIDER, which
+        # overrides the image's default.
+        if os.environ.get("ORKA_CORE_CLAUDE_FIXTURE") == "1":
+            manager["args"].append("--acp-claude-runtime-image=" + runtime_image)
+        # Extra Core flags for a measured variant, space separated.
+        manager["args"].extend(os.environ.get("ORKA_CORE_EXTRA_ARGS", "").split())
         manager.setdefault("volumeMounts", []).extend([
             {"name": "substrate-client", "mountPath": "/run/substrate-client", "readOnly": True},
             {"name": "substrate-server", "mountPath": "/run/substrate-server", "readOnly": True}])
@@ -63,6 +77,17 @@ for obj in objects:
         manager["args"] = [arg.replace(".svc:8080", ".svc.cluster.local:8080")
                            if arg.startswith(("--acp-provider-proxy-base-url=", "--controller-url=")) else arg
                            for arg in manager["args"]]
+
+# Core's API authenticates ServiceAccount callers (such as core/cleanup.sh's
+# Session cleanup) by TokenReview, as the released chart grants through
+# config/rbac/metrics_auth_role.yaml.
+add_tokenreview = [
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": "external-substrate-core-tokenreview"},
+     "rules": [{"apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"]}]},
+    {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": "external-substrate-core-tokenreview"},
+     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "external-substrate-core-tokenreview"},
+     "subjects": [{"kind": "ServiceAccount", "name": "orka-controller-manager", "namespace": namespace}]}]
+objects.extend(add_tokenreview)
 
 role = json.loads(pathlib.Path(core_role).read_text())
 role["metadata"] = {"name": "external-substrate-core"}
@@ -149,6 +174,11 @@ for obj in provider_objects:
         # the provider may attest credential injection. Core keeps its provider
         # Secret in the workload namespace; no extra namespace is listed.
         container["args"].append("--egress-credential-provider=k8s.io")
+        # This kindctl cluster's Agent Substrate install serves only this run,
+        # which provider ADR 0008 requires before any profile shares workers.
+        # The gateway TTL flag keeps its default, the gateway's own default.
+        if os.environ.get("SUBSTRATE_DEDICATED_INSTALL") == "1":
+            container["args"].append("--substrate-dedicated-install")
     objects.append(obj)
 
 # Applying a List silently replaces an earlier object with a later same-identity

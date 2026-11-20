@@ -71,7 +71,8 @@ rules:
     verbs: [get, list, create]
   - apiGroups: [ate.dev]
     resources: [workerpools]
-    verbs: [get, list, create, delete]
+    # update claims a spare (ADR 0007) and writes a shared pool's ledger (ADR 0008).
+    verbs: [get, list, create, update, delete]
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, create, update, delete]
