@@ -660,6 +660,11 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 }
 
 func main() {
+	if os.Getenv("SESSION_CLEANUP") == "1" || os.Getenv("RESULT_FETCH") == "1" {
+		// Runs as a run-namespace identity without native credentials.
+		sessionCleanupMain()
+		return
+	}
 	namespace, image := os.Getenv("POD_NAMESPACE"), os.Getenv("RUNTIME_IMAGE")
 	if namespace == "" || image == "" {
 		fmt.Fprintln(os.Stderr, "POD_NAMESPACE and RUNTIME_IMAGE are required")
@@ -681,10 +686,23 @@ func main() {
 		err = dialErr
 		if err == nil {
 			defer conn.Close()
-			ctx, cancel := context.WithTimeout(context.Background(), 14*time.Minute)
+			timeout := 14 * time.Minute
+			if os.Getenv("LATENCY_MEASURE") == "1" {
+				// core/latency.sh bounds the Job; the windows and repetitions
+				// need more than one proof's budget.
+				timeout = 85 * time.Minute
+			}
+			if os.Getenv("NATIVE_WATCH") == "1" {
+				timeout = nativeWatchDuration()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			p := &proof{c: c, native: pb.NewControlClient(conn), namespace: namespace, image: image}
-			if os.Getenv("CORE_PROOF_CLEANUP") == "1" {
+			if os.Getenv("LATENCY_MEASURE") == "1" {
+				report, err = p.measure(ctx)
+			} else if os.Getenv("NATIVE_WATCH") == "1" {
+				report, err = p.nativeWatch(ctx)
+			} else if os.Getenv("CORE_PROOF_CLEANUP") == "1" {
 				report, err = p.cleanupNative(ctx)
 			} else if os.Getenv("RETIRED_TASK_UID") != "" {
 				report, err = p.verifyRetiredTask(ctx)
@@ -704,5 +722,37 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if os.Getenv("LATENCY_MEASURE") == "1" {
+		fmt.Println("NATIVE_CORE_LATENCY", string(encoded))
+		return
+	}
 	fmt.Println("NATIVE_CORE_PROOF", string(encoded))
+}
+
+func sessionCleanupMain() {
+	namespace, endpoint := os.Getenv("POD_NAMESPACE"), os.Getenv("CORE_API_URL")
+	if namespace == "" || endpoint == "" {
+		fmt.Fprintln(os.Stderr, "POD_NAMESPACE and CORE_API_URL are required")
+		os.Exit(2)
+	}
+	config, err := rest.InClusterConfig()
+	var report map[string]any
+	if err == nil {
+		var c client.Client
+		if c, err = client.New(config, client.Options{}); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			if os.Getenv("RESULT_FETCH") == "1" {
+				report, err = fetchPromptReceipts(ctx, c, namespace, endpoint)
+			} else {
+				report, err = cleanupSessions(ctx, c, namespace, endpoint)
+			}
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "native Core Session cleanup failed:", err)
+		os.Exit(1)
+	}
+	encoded, _ := json.Marshal(report)
+	fmt.Println("NATIVE_CORE_SESSIONS", string(encoded))
 }
