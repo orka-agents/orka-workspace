@@ -416,10 +416,22 @@ The ready and stopped timing logs report `workerSource: shared`. The stopped log
   - no non-`VOLUMES` Actors;
   - no profile without the field;
   - no lifetime over 24h.
-- **Live validation is still needed.** On a live Agent Substrate cluster it must show:
-  - label propagation;
-  - the capacity arithmetic for `N` Actors;
-  - `observed_epoch` behaviour;
-  - egress revocation and its settle window on a running Actor;
-  - the eviction path and one-second escalation on a strongly retired shared worker;
-  - a suspension continued after a `FinalizeSuspended` failure, with the strong path's deletion held until the continuation records the Actor `SUSPENDED`.
+- **Live validation.** Two rounds ran on kind with gVisor and Agent Substrate v1.0.0, with Core from the integration branch: round 1 on bfc87ab, round 2 on c0de5dd. The orka-workspace#25 thread summarizes them.
+  - **Shown:**
+    - Label propagation: the pool's random label reached the worker Pod, the native Worker and the derived template's selector, and nothing else.
+    - Capacity for `N = 4`: four concurrent Sessions shared one pool, and the fifth got a fresh pool.
+    - `observed_epoch`: stable through claims, suspends and a resume. Negative control: restarting the worker container moved the epochs and retired the pool.
+    - Egress revocation on a running Actor: requests were blocked about 10 s after deny-all was stored, and the suspend followed at about 16 s. Neighbours on the same worker kept their egress.
+    - Taint eviction: neighbours went through Core's eviction drain to `EvictionSuspended`, and their data was restored on resume.
+    - Lifetime-doubt eviction (round 2): all three neighbours were evicted and suspended, none failed, and their data matched after resume.
+    - The capped first grace (143–173 s) and the 1 s escalation (round 1).
+    - The suspension-continuation hold (round 2): after a failed checkpoint and a failed `FinalizeSuspended`, the strong path's deletion was held until the continuation succeeded, inside the 120 s window. It held across a provider restart too, and the data was intact.
+    - A 32-turn concurrent stress run on the orka-workspace#26 head stacked on this branch.
+  - **Not shown on kind:**
+    - A moment where `observed_epoch` differs from `registered_epoch`: 250 ms polling never caught one.
+    - An escalation and an eviction in the same run: the 3 h minimum lifetime prevents it.
+    - A continuation whose checkpoint was not yet committed.
+    - A node or kubelet failure, which is out of scope.
+  - **Later heads.** c0de5dd to dd3e74b changed only error classification and bookkeeping on these paths. No other validated behaviour depends on what they changed, except the continuation hold.
+    - Both injected failures surfaced as gRPC `Canceled`. Since 51cd4e1 a cancellation or deadline is a retry rather than held doubt. On these heads the same injections therefore continue the suspension and capture its data without starting the strong path at all, so the pool is not retired.
+    - The hold itself now applies only to definite failures, which are covered by unit tests but were not injected live.
