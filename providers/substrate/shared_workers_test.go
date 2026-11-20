@@ -771,7 +771,16 @@ func TestSharedCancelledPostProofFailureIsRetried(t *testing.T) {
 // while the request itself is still live.
 type deadlineControl struct {
 	*nativeFixture
-	getWorker, getActor, deleteActor func() error
+	getWorker, getActor, deleteActor, getEgress func() error
+}
+
+func (c *deadlineControl) GetActorEgressPolicy(ctx context.Context, req *pb.GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*pb.EgressPolicy, error) {
+	if c.getEgress != nil {
+		if err := c.getEgress(); err != nil {
+			return nil, err
+		}
+	}
+	return c.nativeFixture.GetActorEgressPolicy(ctx, req, opts...)
 }
 
 func (c *deadlineControl) GetWorker(ctx context.Context, req *pb.GetWorkerRequest, opts ...grpc.CallOption) (*pb.Worker, error) {
@@ -826,6 +835,9 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 		err   func() error
 	}{
 		{"GetWorker during the proof, gRPC deadline", "proof", grpcDeadline},
+		{"proof attempt save, child timeout", "proofAttemptSave", childTimeout},
+		{"egress read during the proof, gRPC deadline", "egressRead", grpcDeadline},
+		{"final Actor read of the proof, child timeout", "proofActorRead", childTimeout},
 		{"GetActor after the proof, gRPC canceled", "getActor", grpcCanceled},
 		{"DeleteActor, gRPC deadline", "delete", grpcDeadline},
 		{"DeleteActor, child timeout", "delete", childTimeout},
@@ -851,11 +863,23 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 				remaining.Add(-1)
 				return tc.err()
 			}
-			native.afterSuspend = func(*pb.Actor) { suspended.Store(true) }
+			native.afterSuspend = func(*pb.Actor) {
+				suspended.Store(true)
+				if tc.stage == "proofAttemptSave" {
+					// The worker's version keeps moving, so the proof records
+					// another attempt, until the injected failures run out.
+					native.churnWorker = recordA.Worker.Name
+				}
+			}
+			var passActorReads atomic.Int64
 			control := &deadlineControl{nativeFixture: native,
-				getWorker:   func() error { return fail(tc.stage == "proof" && suspended.Load()) },
-				getActor:    func() error { return fail(tc.stage == "getActor" && absent.Load()) },
+				getWorker: func() error { return fail(tc.stage == "proof" && suspended.Load()) },
+				getActor: func() error {
+					reads := passActorReads.Add(1)
+					return fail(tc.stage == "getActor" && absent.Load() || tc.stage == "proofActorRead" && suspended.Load() && !absent.Load() && reads == 2)
+				},
 				deleteActor: func() error { return fail(tc.stage == "delete") },
+				getEgress:   func() error { return fail(tc.stage == "egressRead" && suspended.Load()) },
 			}
 			faulty := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 				switch o := obj.(type) {
@@ -875,6 +899,15 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 									return err
 								}
 							}
+							if after.SharedWorker.ProofAttempts > before.SharedWorker.ProofAttempts && tc.stage == "proofAttemptSave" {
+								err := fail(true)
+								if remaining.Load() <= 0 {
+									native.churnWorker = ""
+								}
+								if err != nil {
+									return err
+								}
+							}
 						}
 					}
 				case *unstructured.Unstructured:
@@ -889,6 +922,7 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 			var observed sdk.AllocationObservation
 			for range 24 {
 				tick()
+				passActorReads.Store(0)
 				d := sharedDriver(faulty, native)
 				d.control = control
 				observed, _ = d.StopInstance(t.Context(), first.Key, a.Identity)
@@ -913,6 +947,111 @@ func TestSharedPostEvidenceCancellationsAndDeadlinesAreRetried(t *testing.T) {
 				t.Fatalf("the retried Stop did not finish: %s", observed.State)
 			}
 		})
+	}
+}
+
+// A one-shot finalization failure takes the strong path on the journal as
+// last persisted: finishStop's provisional Stopped state is never made
+// durable by the marker's write, and Stopped is reported only once the exact
+// worker Pod is proven absent, although the slot was already released.
+func TestSharedFinalizationFailureNeverPersistsAProvisionalStop(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	podKey := client.ObjectKey{Namespace: recordA.Worker.Namespace, Name: recordA.Worker.Pod}
+	pod := &corev1.Pod{}
+	if err := c.Get(t.Context(), podKey, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.SetFinalizers([]string{"test.invalid/hold"})
+	if err := c.Update(t.Context(), pod); err != nil {
+		t.Fatal(err)
+	}
+	var failed atomic.Bool
+	faulty := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if o, ok := obj.(*corev1.ConfigMap); ok && !failed.Load() {
+			if after, ok := decodeClaimRecord(o); ok && after.SharedWorker != nil && after.Observation.State == sdk.AllocationStopped && after.SharedWorker.Strong == "" {
+				failed.Store(true)
+				return apierrors.NewInternalError(errors.New("journal write refused once"))
+			}
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+	for range 24 {
+		tick()
+		_, _ = sharedDriver(faulty, native).StopInstance(t.Context(), first.Key, a.Identity)
+		if failed.Load() {
+			break
+		}
+	}
+	if !failed.Load() {
+		t.Fatal("the fixture never failed finalization")
+	}
+	for range 4 {
+		tick()
+		observed, _ := sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity)
+		if observed.State == sdk.AllocationStopped {
+			t.Fatal("Stopped was reported before the strongly retired worker Pod was proven absent")
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SharedWorker.Strong == "" || record.Observation.State == sdk.AllocationStopped || record.Timing.StoppedAt != nil {
+		t.Fatalf("the provisional finalization was persisted: strong=%q state=%s", record.SharedWorker.Strong, record.Observation.State)
+	}
+	if err := c.Get(t.Context(), podKey, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.SetFinalizers(nil)
+	if err := c.Update(t.Context(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if observed, _ := sharedRetired(t, c, native, first, a.Identity, false); observed.State != sdk.AllocationStopped {
+		t.Fatalf("the Stop did not finish once the Pod was absent: %s", observed.State)
+	}
+}
+
+// A ledger that becomes unreadable after a booted Actor's interim proof and
+// deletion is doubt during the slot release: the pool is retired strongly,
+// and Stopped needs exact Pod absence.
+func TestSharedUnreadableLedgerAtReleaseTakesTheStrongPath(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	for range 24 {
+		tick()
+		_, _ = sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.DeleteIssued {
+			break
+		}
+	}
+	pool, _ := poolLedger(t, c, recordA.SharedWorker.Pool)
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedLedgerAnnotation] = "{"
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	var observed sdk.AllocationObservation
+	for range 24 {
+		tick()
+		if observed, _ = sharedDriver(c, native).StopInstance(t.Context(), first.Key, a.Identity); observed.State == sdk.AllocationStopped {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.State != sdk.AllocationStopped || record.SharedWorker.Strong == "" {
+		t.Fatalf("an unreadable ledger at release did not take the strong path: %s %q", observed.State, record.SharedWorker.Strong)
+	}
+	if podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("Stopped was reported before exact Pod absence")
 	}
 }
 

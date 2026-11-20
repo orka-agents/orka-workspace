@@ -1444,8 +1444,9 @@ func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.Confi
 		}
 		shared.ProofAttempts++
 		if err := d.save(ctx, cm, record); err != nil {
-			if apierrors.IsConflict(err) {
-				// Ordinary journal contention: reread and retry the proof.
+			if apierrors.IsConflict(err) || requestCancelled(ctx, err) {
+				// Ordinary journal contention, or a cancellation or a
+				// deadline: reread and retry the proof.
 				return nil, "", err
 			}
 			return nil, "the proof attempt could not be recorded", nil
@@ -1454,9 +1455,15 @@ func (d *Lifecycle) proveSharedTermination(ctx context.Context, cm *corev1.Confi
 	}
 	// (3) Egress is still deny-all: no credential-injection effect remains.
 	if err := d.verifyEgressDenyAll(ctx, record); err != nil {
+		if requestCancelled(ctx, err) {
+			return nil, "", err
+		}
 		return nil, "the revoked egress could not be verified", nil
 	}
 	current, err := d.actor(ctx, record)
+	if err != nil && requestCancelled(ctx, err) {
+		return nil, "", err
+	}
 	if err != nil || current == nil || current.GetMetadata().GetVersion() != actor.GetMetadata().GetVersion() || current.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_SUSPENDED || current.GetStatus().GetWorkerAssignment() != nil {
 		return nil, "the suspended Actor changed during the proof", nil
 	}
@@ -1551,11 +1558,16 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		}
 		return nil
 	}
-	if shared.Strong != "" && !shared.Released {
+	if shared.Strong != "" {
 		// Finish a persisted strong retirement before the slot (and with it
-		// the marker the bounds loop reads) is released.
+		// the marker the bounds loop reads) is released, and before Stopped
+		// is reported, including for a strong path started after the release
+		// (for example when finalization failed).
 		gone, err := d.strongSharedAbsence(ctx, record)
 		if err != nil || !gone {
+			if err == nil {
+				err = fmt.Errorf("waiting for the strongly retired shared worker to be proven absent")
+			}
 			return err
 		}
 	}
@@ -1581,7 +1593,25 @@ func (d *Lifecycle) sharedStopDoubt(ctx context.Context, cm *corev1.ConfigMap, r
 	if err == nil || apierrors.IsConflict(err) || requestCancelled(ctx, err) || record.SharedWorker.Strong != "" {
 		return err
 	}
-	return errors.Join(err, d.sharedDoubt(ctx, cm, record, reason+": "+err.Error()))
+	return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, reason+": "+err.Error()))
+}
+
+// durableSharedDoubt is sharedDoubt on the journal as last persisted. A pass
+// that fails leaves provisional changes in memory (for example finishStop's
+// Stopped state, or a step recorded as issued whose save failed); persisting
+// the strong marker must never make those durable. The caller returns at
+// once: its in-memory record is replaced by the reread one. If the journal
+// cannot be reread, only the pool's deletion is started, which needs nothing
+// but the bound pool's identity.
+func (d *Lifecycle) durableSharedDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string) error {
+	readCtx, cancel := strongCleanupContext(ctx)
+	defer cancel()
+	durableCM, durable, err := d.read(readCtx, record.Request.Key)
+	if err != nil || durableCM.UID != cm.UID || durable.SharedWorker == nil || durable.Observation.Identity != record.Observation.Identity {
+		return errors.Join(err, d.initiateSharedStrongRetirement(ctx, record))
+	}
+	*cm, *record = *durableCM, *durable
+	return d.sharedDoubt(ctx, cm, record, reason)
 }
 
 // requestCancelled reports a failure that is only a cancellation or a
@@ -1849,9 +1879,11 @@ func (d *Lifecycle) releaseSharedSlot(ctx context.Context, cm *corev1.ConfigMap,
 			ledger.Entries = slices.DeleteFunc(ledger.Entries, func(entry sharedLedgerEntry) bool { return entry.Journal == marker })
 			return len(ledger.Entries) != before, nil
 		})
-		// An unreadable ledger admits nobody, so the Actor's already-deleted
-		// slot needs no release there; API errors and conflicts are retried.
-		if err != nil && !errors.Is(err, errSharedLedgerInvalid) {
+		// An unreadable ledger admits nobody, so a never-booted claim's slot
+		// needs no release there. A booted allocation's is doubt: its error
+		// reaches sharedStopDoubt, which retires the pool and requires exact
+		// Pod absence. API errors and conflicts are retried.
+		if err != nil && (record.BootRequested || !errors.Is(err, errSharedLedgerInvalid)) {
 			return err
 		}
 	}

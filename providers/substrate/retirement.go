@@ -376,7 +376,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			if record.SharedWorker != nil && record.Pending != nil && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) {
 				// After the suspension intent, an unverifiable journal
 				// requirement is doubt like any other error.
-				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
+				return errors.Join(err, d.durableSharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
 			}
 			return err
 		}
@@ -446,7 +446,7 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 				// A failure inside the issued suspension is recorded as doubt
 				// whose deletion waits, within a bounded window, for the
 				// continuation (suspensionPending).
-				return errors.Join(err, absenceErr, d.sharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
+				return errors.Join(err, absenceErr, d.durableSharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
 			}
 			if err != nil {
 				return errors.Join(err, absenceErr)
