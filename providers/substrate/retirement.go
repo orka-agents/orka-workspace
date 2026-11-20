@@ -1040,6 +1040,28 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 	return nil
 }
 
+// sharedHoldAnnotation durably records, on a shared pool, when the
+// suspension whose doubt holds its strong deletion was issued. From then on
+// the pool admits nobody: no claim and no Resume. The Kubernetes-only bounds
+// loop retires the pool once the hold has outlived its continuation window,
+// whether or not the held record is reconciled again. A hold always ends in
+// the strong path, so the stamp is never cleared.
+const sharedHoldAnnotation = "substrate.workspace.orka.ai/shared-hold-since"
+
+// stampSharedHold writes the hold stamp on the record's pool, best effort
+// and on its own bounded context. The bounds loop stamps it too, from the
+// journal's persisted doubt, so a failed write here closes admission within
+// one bounds pass.
+func (d *Lifecycle) stampSharedHold(ctx context.Context, record *journalRecord) {
+	shared, issued := record.SharedWorker, record.Timing.SuspendIssuedAt
+	if shared == nil || shared.UID == "" || issued == nil {
+		return
+	}
+	writeCtx, cancel := strongCleanupContext(ctx)
+	defer cancel()
+	d.writeOutageMarks(writeCtx, []outageMark{{namespace: record.Placement.Namespace, name: shared.Pool, uid: types.UID(shared.UID), key: sharedHoldAnnotation, value: issued.UTC().Format(time.RFC3339Nano)}})
+}
+
 // deferSuspendDoubt records reason as the issued suspension's doubt and
 // returns cause as a failure the continuation resolves. The strong path is
 // decided; its deletion is held while the Actor stays SUSPENDING, within the
@@ -1056,7 +1078,11 @@ func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap,
 		return pending
 	}
 	record.Pending.Doubt = reason
-	if err := d.save(ctx, cm, record); err != nil {
+	if err := d.save(ctx, cm, record); err == nil {
+		// The strong path is decided: the pool admits nobody from now on,
+		// although its deletion waits for the continuation.
+		d.stampSharedHold(ctx, record)
+	} else {
 		// An unrecorded doubt is never held. A write that conflicted, was
 		// cancelled or ran out of time is retried by rereading the journal,
 		// as after a crash before the result was handled. Only a definite

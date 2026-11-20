@@ -1325,6 +1325,118 @@ func TestSharedEveryPostCaptureFailureTakesTheStrongPath(t *testing.T) {
 	}
 }
 
+// A held suspension doubt closes admission at once, although the pool's
+// deletion waits for the continuation; the bounds loop restamps a missing
+// hold, and retires the pool once the hold outlives its continuation window
+// whether or not the held record is reconciled again.
+func TestSharedHeldDoubtClosesAdmissionAndIsBoundedByTheBoundsLoop(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failFinalizeOnce = true
+	var issued time.Time
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Pending != nil && record.Pending.Doubt != "" {
+			issued = record.Timing.SuspendIssuedAt.Time
+			break
+		}
+	}
+	if issued.IsZero() {
+		t.Fatal("the failed suspend recorded no doubt")
+	}
+	pool, _ := poolLedger(t, c, recordA.SharedWorker.Pool)
+	if !sharedPoolHeld(pool) || pool.GetDeletionTimestamp() != nil {
+		t.Fatal("a held doubt did not close admission, or did not hold the deletion")
+	}
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	if _, recordB := sharedReady(t, c, native, second); recordB.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("a pool whose strong retirement is held kept admitting")
+	}
+	// A hold stamp that was never written is restamped from the journal.
+	annotations := maps.Clone(pool.GetAnnotations())
+	delete(annotations, sharedHoldAnnotation)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	bounds := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
+	setNow(t, issued.Add(suspendContinuationWindow-time.Second))
+	if err := bounds.EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); !found || current.GetDeletionTimestamp() != nil || !sharedPoolHeld(current) {
+		t.Fatal("the bounds loop did not restamp the hold, or retired the pool inside its window")
+	}
+	// The held record is never reconciled again: the bounds loop retires
+	// the pool once the hold outlives its window.
+	setNow(t, issued.Add(suspendContinuationWindow))
+	if err := bounds.EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); found && current.GetDeletionTimestamp() == nil {
+		t.Fatal("a hold that outlived its continuation window left the pool alive")
+	}
+}
+
+// A shared worker's capacity, MaxActors times the Actor size, must itself be
+// a valid native capacity, and a worker runtime that books a per-Actor
+// overhead the sizing does not cover fails closed.
+func TestSharedWorkerCapacityFitsNativeLimits(t *testing.T) {
+	scope := sharedScope{Namespace: "tenant", Atespace: "native", ProfileUID: "p", ProfileHash: "h", SourceUID: "s", Shape: "x", CPUMillicores: 249999, MemoryBytes: 1 << 30, MaxActors: 4, Lifetime: metav1.Duration{Duration: 3 * time.Hour}}
+	if !scope.valid() {
+		t.Fatal("a scope whose capacity fits the native bound was refused")
+	}
+	scope.CPUMillicores = 250000
+	if scope.valid() {
+		t.Fatal("a scope whose aggregate CPU exceeds the native capacity bound was accepted")
+	}
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	cpu, memory := expectedWorkerCapacity(record)
+	worker := &pb.Worker{Status: &pb.WorkerStatus{
+		Capacity:       &pb.WorkerResources{CpuMillicores: cpu, MemoryBytes: memory, Actors: 2},
+		SandboxClasses: []*pb.WorkerSandboxClass{{SandboxClass: gvisorSandboxClass, DefaultRuntime: &pb.WorkerSandboxRuntime{}}},
+	}}
+	if err := verifySingleActorWorkerShape(record, worker, false); err != nil {
+		t.Fatalf("a worker sized exactly with no overhead was refused: %v", err)
+	}
+	worker.Status.SandboxClasses[0].DefaultRuntime.ActorOverhead = &pb.RuntimeOverhead{MemoryBytesPerGib: 1 << 20}
+	if err := verifySingleActorWorkerShape(record, worker, false); err == nil {
+		t.Fatal("a worker runtime booking a per-Actor overhead was accepted")
+	}
+}
+
+// A warm shared pool, like every other pool creation, is never authorized by
+// a template inventory that a newer failed read superseded.
+func TestSharedWarmCreationRefusesASupersededTemplateInventory(t *testing.T) {
+	c, native, _, _ := sharedFixture(t, 2)
+	item := &profile.SubstrateWorkspaceProfile{}
+	if err := c.Get(t.Context(), client.ObjectKey{Namespace: "tenant", Name: "shared"}, item); err != nil {
+		t.Fatal(err)
+	}
+	item.Annotations = map[string]string{spareWorkersAnnotation: "1"}
+	if err := c.Update(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	racing := &racingTemplateControl{nativeFixture: native, during: func() {
+		// A newer List starts and fails while the sweep's own is in flight.
+		testClock.Add(int64(time.Second))
+		sharedNativeTemplateHealth.failed(sharedNow())
+	}}
+	_ = (&SpareWorkerReplenisher{Client: c, Control: racing, Config: sharedConfig()}).Sweep(t.Context())
+	if len(sharedPools(t, c)) != 0 {
+		t.Fatal("a warm shared pool was created from a superseded template inventory")
+	}
+	testClock.Add(int64(time.Second))
+	if err := sharedReplenisher(c, native).Sweep(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sharedPools(t, c)) != 1 {
+		t.Fatal("a fresh inventory did not allow the warm pool")
+	}
+}
+
 // sharedStepFault injects one lasting failure into a shared Stop.
 type sharedStepFault struct {
 	native       *nativeFixture

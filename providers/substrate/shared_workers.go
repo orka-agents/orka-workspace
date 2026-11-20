@@ -145,8 +145,11 @@ func (s sharedScope) valid() bool {
 			return false
 		}
 	}
+	// The worker's capacity, MaxActors times the Actor size, must itself be
+	// a valid native capacity, which bounds CPU below 1000 cores.
 	return s.Namespace != "" && s.Atespace != "" && s.ProfileUID != "" && s.ProfileHash != "" && s.SourceUID != "" && s.Shape != "" &&
 		s.CPUMillicores > 0 && s.MemoryBytes > 0 && s.MaxActors >= profile.MinSharedActorsPerWorker && s.MaxActors <= profile.MaxSharedActorsPerWorker &&
+		s.CPUMillicores <= maxNativeCPUMillicores/int64(s.MaxActors) &&
 		s.Lifetime.Duration >= profile.MinSharedWorkerLifetime && s.Lifetime.Duration <= profile.MaxSharedWorkerLifetime
 }
 
@@ -563,7 +566,7 @@ func sharedAdmissionEnds(pool *unstructured.Unstructured, ledger *sharedLedger) 
 }
 
 func sharedAdmits(pool *unstructured.Unstructured, ledger *sharedLedger, now time.Time) bool {
-	return pool.GetDeletionTimestamp() == nil && !sharedRetireDecided(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
+	return pool.GetDeletionTimestamp() == nil && !sharedRetireDecided(pool) && !sharedPoolHeld(pool) && !sharedPoolUnverified(pool) && ledger.State == sharedAdmitting && now.Before(sharedAdmissionEnds(pool, ledger)) && len(ledger.Entries) < int(ledger.Scope.MaxActors)
 }
 
 func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
@@ -1043,6 +1046,11 @@ func (d *Lifecycle) prepareSharedWorker(ctx context.Context, cm *corev1.ConfigMa
 		// isolation checks failed included: the Resume waits until they
 		// complete, or the pool retires at its bound.
 		return false, errors.New("the shared worker's isolation checks have not completed since they last failed, so its Resume waits")
+	}
+	if sharedPoolHeld(pool) {
+		// A neighbour's held suspension doubt has decided the pool's strong
+		// retirement; nothing new starts on it.
+		return false, fmt.Errorf("the shared worker's strong retirement is decided and held for a neighbour's suspension: %w", sdk.ErrStaleIdentity)
 	}
 	// Re-checked immediately before Resume, never only when the allocation was
 	// prepared: the template already selects this pool, so suspicion here
@@ -2595,6 +2603,12 @@ func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructur
 var sharedLedgerWriteTimeout = 5 * time.Second
 
 // sharedRetireIntended reports a decided strong retirement not yet deleted.
+// sharedPoolHeld reports a pool stamped by a held suspension doubt.
+func sharedPoolHeld(pool *unstructured.Unstructured) bool {
+	_, held := pool.GetAnnotations()[sharedHoldAnnotation]
+	return held
+}
+
 // sharedRetireDecided reports a pool whose strong retirement is decided:
 // durably, by its retirement-intent annotation, or in this process when
 // neither its Delete nor that annotation could be written.

@@ -171,6 +171,16 @@ func verifySingleActorWorkerShape(record *journalRecord, worker *pb.Worker, allo
 	if !registering && (len(classes) != 1 || classes[0].GetSandboxClass() != gvisorSandboxClass) {
 		return fmt.Errorf("native worker must run only the gVisor sandbox class")
 	}
+	// The sizing assumes gVisor books no per-Actor overhead (as in Agent
+	// Substrate v1.0.0). A runtime that books one would let fewer Actors fit
+	// than were sized for, so it fails closed.
+	for _, class := range classes {
+		for _, runtime := range append([]*pb.WorkerSandboxRuntime{class.GetDefaultRuntime()}, class.GetRestorableRuntimes()...) {
+			if overhead := runtime.GetActorOverhead(); overhead.GetMemoryBytes() != 0 || overhead.GetMemoryBytesPerGib() != 0 {
+				return fmt.Errorf("native worker runtime books a per-Actor overhead its sizing does not cover")
+			}
+		}
+	}
 	cpu, memory := expectedWorkerCapacity(record)
 	capacity := worker.GetStatus().GetCapacity()
 	if cpu <= 0 || memory <= 0 || capacity.GetCpuMillicores() != cpu || capacity.GetMemoryBytes() != memory || capacity.GetActors() < 1 {

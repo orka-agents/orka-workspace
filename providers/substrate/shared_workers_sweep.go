@@ -116,6 +116,11 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		retire := func(state, reason string) {
 			retirements = append(retirements, retirement{pool: pool, state: state, reason: reason, escalateAt: escalateAt})
 		}
+		if !recorded.heldSince.IsZero() && !sharedPoolHeld(pool) {
+			// A persisted held doubt closes admission even when its record's
+			// own stamp write failed, or after a restart.
+			d.startOutageMark(ctx, pool, sharedHoldAnnotation, recorded.heldSince.UTC().Format(time.RFC3339Nano))
+		}
 		switch {
 		case outage:
 			retire(sharedRetiring, "the shared worker's journal provenance stayed unavailable past its bound")
@@ -133,6 +138,10 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			// Native control could not be set up at startup, so no native
 			// sweep verifies the pool's templates or assignments.
 			retire(sharedRetiring, "native control has been unavailable to this provider since startup, past its bound: "+NativeDegradedReason())
+		case !recorded.heldSince.IsZero() && !now.Before(recorded.heldSince.Add(suspendContinuationWindow)):
+			// A held suspension doubt outlived its continuation window,
+			// whether or not its record is reconciled again.
+			retire(sharedRetiring, "a suspension's held strong retirement outlived its continuation window")
 		case recorded.strong:
 			// A journal that recorded this pool's UID holds an unreleased
 			// strong marker or failure, whatever the mutable entry list now
@@ -252,6 +261,9 @@ type sharedProvenance struct {
 	scopes   []sharedScope
 	// strong is an unreleased recorded Strong marker or instance failure.
 	strong bool
+	// heldSince is when the earliest suspension whose doubt holds the
+	// strong deletion was issued, or zero.
+	heldSince time.Time
 	// podUIDs are the worker Pod UIDs journals fenced on this pool.
 	podUIDs map[string]bool
 	// workspaces are the workspaces of the unreleased journals that recorded
@@ -332,6 +344,9 @@ func (d *Lifecycle) sharedJournalProvenance(ctx context.Context) (map[types.UID]
 		// ordinary recorded failure counts only while the slot is held.
 		if record.SharedWorker.Strong != "" || !record.SharedWorker.Released && record.Failure != "" {
 			entry.strong = true
+		}
+		if operation, issued := record.Pending, record.Timing.SuspendIssuedAt; operation != nil && operation.Doubt != "" && record.SharedWorker.Strong == "" && issued != nil && (entry.heldSince.IsZero() || issued.Time.Before(entry.heldSince)) {
+			entry.heldSince = issued.Time
 		}
 		if !record.SharedWorker.Released {
 			entry.workspaces = append(entry.workspaces, record.Request.Key)
@@ -2066,6 +2081,11 @@ func (d *Lifecycle) createWarmSharedPool(ctx context.Context, shape *sharedProfi
 	// generated label satisfies, still fails closed.
 	if templatesReach(templates, shape.scope.Atespace, sharedLabels(label), ours) {
 		return errForeignTemplate
+	}
+	// Like every other pool creation, a warm one is never authorized by an
+	// inventory a newer failed read superseded.
+	if err := errSupersededTemplateInventory(); err != nil {
+		return err
 	}
 	spec, err := buildSharedPoolSpec(shape.source, shape.scope, label)
 	if err != nil {
