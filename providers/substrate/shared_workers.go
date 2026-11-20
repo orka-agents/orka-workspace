@@ -575,9 +575,31 @@ func ledgerEntry(ledger *sharedLedger, marker string) *sharedLedgerEntry {
 	return nil
 }
 
-// sharedPoolMatches checks a pool's identity against the record's binding:
-// labels, specification digest, no owner, and a ledger of the same scope.
+// sharedPoolMatches checks a pool's identity against the record's binding
+// and its lifetime evidence. Admission, claims and boots require both.
 func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (*sharedLedger, error) {
+	ledger, err := sharedPoolIdentity(pool, record)
+	if err != nil {
+		return nil, err
+	}
+	if !sharedLifetimeConsistent(pool, ledger) {
+		return nil, fmt.Errorf("shared worker lifetime evidence is missing or inconsistent: %w", sdk.ErrStaleIdentity)
+	}
+	return ledger, nil
+}
+
+// sharedLifetimeConsistent reports whether the creation-time deadline
+// annotation agrees with the ledger. Disagreement is lifetime doubt, which
+// retires the pool strongly; it is not doubt about who the pool hosts.
+func sharedLifetimeConsistent(pool *unstructured.Unstructured, ledger *sharedLedger) bool {
+	recorded, ok := sharedRecordedDeadline(pool)
+	return ok && recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration))
+}
+
+// sharedPoolIdentity checks a pool's identity against the record's binding:
+// labels, specification digest, no owner, and a readable ledger of the same
+// scope whose name commits to it.
+func sharedPoolIdentity(pool *unstructured.Unstructured, record *journalRecord) (*sharedLedger, error) {
 	shared := record.SharedWorker
 	actual, ok := poolSpecDigest(pool)
 	if pool.GetUID() == "" || !ok || actual != shared.SpecDigest || !maps.Equal(pool.GetLabels(), record.RuntimePoolLabels) || len(pool.GetOwnerReferences()) != 0 {
@@ -592,9 +614,6 @@ func sharedPoolMatches(pool *unstructured.Unstructured, record *journalRecord) (
 	}
 	if committed, bound := sharedNameBinding(pool, ledger.Scope); committed && !bound {
 		return nil, fmt.Errorf("shared worker name does not commit to its ledger scope: %w", sdk.ErrStaleIdentity)
-	}
-	if recorded, ok := sharedRecordedDeadline(pool); !ok || !recorded.Equal(ledger.BornAt.Add(ledger.Scope.Lifetime.Duration)) {
-		return nil, fmt.Errorf("shared worker lifetime evidence is missing or inconsistent: %w", sdk.ErrStaleIdentity)
 	}
 	return ledger, nil
 }
@@ -821,11 +840,15 @@ func (d *Lifecycle) verifySharedRuntimePool(ctx context.Context, cm *corev1.Conf
 	if string(pool.GetUID()) != shared.UID {
 		return nil, sdk.ErrStaleIdentity
 	}
-	ledger, err := sharedPoolMatches(pool, record)
+	// Only identity is required here. Inconsistent lifetime evidence makes
+	// the pool retiring, never stale: its exact neighbours stay observable
+	// so Orka core drains and suspends them inside the eviction window, as
+	// for any other strong retirement.
+	ledger, err := sharedPoolIdentity(pool, record)
 	if err != nil {
 		return nil, err
 	}
-	retiring := pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || ledger.State == sharedRetiring || ledger.State == sharedQuarantined
+	retiring := pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) || ledger.State == sharedRetiring || ledger.State == sharedQuarantined || !sharedLifetimeConsistent(pool, ledger)
 	if retiring && !allowRetiring {
 		return nil, fmt.Errorf("shared worker is retiring: %w", sdk.ErrStaleIdentity)
 	}
@@ -1174,9 +1197,12 @@ func (d *Lifecycle) sharedStrongReason(ctx context.Context, cm *corev1.ConfigMap
 	case sharedRetireIntended(pool):
 		return "the shared worker's strong retirement was decided but its deletion has not completed", nil
 	}
-	ledger, err := sharedPoolMatches(pool, record)
+	ledger, err := sharedPoolIdentity(pool, record)
 	if err != nil {
 		return "the shared worker ledger is in doubt", nil
+	}
+	if !sharedLifetimeConsistent(pool, ledger) {
+		return "the shared worker's lifetime evidence is missing or inconsistent", nil
 	}
 	if ledger.State == sharedRetiring || ledger.State == sharedQuarantined {
 		return "the shared worker is " + strings.ToLower(ledger.State), nil
@@ -1693,7 +1719,7 @@ func (d *Lifecycle) resolveRetiringSharedClaim(ctx context.Context, cm *corev1.C
 			return err
 		}
 		if err == nil {
-			if ledger, matchErr := sharedPoolMatches(pool, record); matchErr == nil && ledgerEntry(ledger, claimMarker(cm, record)) != nil {
+			if ledger, matchErr := sharedPoolIdentity(pool, record); matchErr == nil && ledgerEntry(ledger, claimMarker(cm, record)) != nil {
 				shared.UID = string(pool.GetUID())
 				record.RuntimePool.UID = shared.UID
 				return d.save(ctx, cm, record)

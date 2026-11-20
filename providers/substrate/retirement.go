@@ -425,10 +425,12 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 				observed, err = d.fail(ctx, cm, record, lost.reason)
 				return err
 			}
-			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) {
+			if err != nil && record.SharedWorker != nil && !apierrors.IsConflict(err) && !suspensionPending(err, record) {
 				// After the suspension intent is persisted, every error on a
-				// shared worker is doubt: the strong path never waits on the
-				// checkpoint, and the suspend is never replayed.
+				// shared worker is doubt, and the suspend is never replayed.
+				// A failure inside the issued suspension is recorded as doubt
+				// whose deletion waits, within a bounded window, for the
+				// continuation (suspensionPending).
 				return errors.Join(err, absenceErr, d.sharedDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error()))
 			}
 			if err != nil {
@@ -453,11 +455,18 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 	return observed, err
 }
 
-func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (captureErr error) {
 	operation := record.Pending
 	actor, err := d.actor(ctx, record)
 	if err != nil {
 		if record.SharedWorker != nil {
+			if suspendContinuationOpen(record) {
+				// The suspension is in flight: the doubt is recorded and the
+				// read retried within the continuation window, rather than
+				// starting a deletion that would reclaim the snapshot's node
+				// state.
+				return d.deferSuspendDoubt(ctx, cm, record, "the Actor could not be read during suspension", err)
+			}
 			// On a shared worker an unreadable Actor is doubt: retire the
 			// whole worker rather than wait on evidence that may never come.
 			return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read during suspension"))
@@ -506,6 +515,12 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 		// Synchronous durability returns only after the snapshot is uploaded,
 		// so CreateTag copies it without changing the Actor.
 		_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
+		if err != nil && record.SharedWorker != nil {
+			// The doubt is recorded, and the next read decides when its
+			// deletion starts: SUSPENDING is continued first, SUSPENDED
+			// starts it before the capture, and any other state at once.
+			err = d.deferSuspendDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error(), err)
+		}
 		return errors.Join(err, retireErr)
 	}
 	state := actor.GetStatus().GetState()
@@ -530,6 +545,14 @@ func (d *Lifecycle) capture(ctx context.Context, cm *corev1.ConfigMap, record *j
 			return lostInstance(record, nativeActorStopped)
 		}
 		return fmt.Errorf("native suspension outcome is unresolved for Actor state %s after request issuance; refusing replay", state)
+	}
+	if record.SharedWorker != nil && operation.Doubt != "" && record.SharedWorker.Strong == "" {
+		// SUSPENDED: upstream released the Actor from the worker with its
+		// snapshot recorded, so the held strong path starts now. A failing
+		// retirement never stops the capture; its error is returned with it.
+		if retireErr := d.sharedDoubt(ctx, cm, record, operation.Doubt); retireErr != nil {
+			defer func() { captureErr = errors.Join(captureErr, retireErr) }()
+		}
 	}
 	snapshot := latestSnapshot(actor)
 	hash := snapshotDigest(snapshot)
@@ -872,11 +895,39 @@ func captureUnrecoverable(err error) bool {
 }
 
 // suspendContinuationInterval spaces re-issues of a stalled suspension, and
-// maxSuspendContinuations bounds them.
+// maxSuspendContinuations bounds them. suspendContinuationWindow, from the
+// suspend's issue, bounds how long a failure the continuation resolves is
+// retried before it is doubt.
 const (
 	suspendContinuationInterval = 10 * time.Second
 	maxSuspendContinuations     = 10
+	suspendContinuationWindow   = (maxSuspendContinuations + 2) * suspendContinuationInterval
 )
+
+// suspendPendingError is a failure inside an issued data-keeping suspension
+// on a shared worker that the continuation resolves: the suspend call or a
+// continuation returned an error, or the Actor could not be read. Its doubt is
+// recorded (checkpointIntent.Doubt), and within the continuation window the
+// strong path's deletion waits for the Actor to leave SUSPENDING.
+type suspendPendingError struct{ err error }
+
+func (e *suspendPendingError) Error() string { return e.err.Error() }
+func (e *suspendPendingError) Unwrap() error { return e.err }
+
+// suspendContinuationOpen reports whether an issued suspension is still
+// inside its continuation window.
+func suspendContinuationOpen(record *journalRecord) bool {
+	operation, issued := record.Pending, record.Timing.SuspendIssuedAt
+	return operation != nil && operation.SuspendIssued && operation.Continuations < maxSuspendContinuations &&
+		issued != nil && sharedNow().Before(issued.Add(suspendContinuationWindow))
+}
+
+// suspensionPending reports whether err is a failure the continuation
+// resolves, inside its window.
+func suspensionPending(err error, record *journalRecord) bool {
+	pending := (*suspendPendingError)(nil)
+	return errors.As(err, &pending) && suspendContinuationOpen(record)
+}
 
 // continueSuspend resumes the same upstream suspension when a SuspendActor
 // call failed after the Actor was marked SUSPENDING, for example a transient
@@ -890,10 +941,14 @@ const (
 // is never suspended again. The workflow holds the Actor lease
 // (acquireActorLease), so a continuation issued while the original call is
 // still running is refused with Aborted and has no effect. It must finish
-// before the worker Pod is gone, because the worker-delete workflow crashes a
-// SUSPENDING Actor and reclaims its node state. Only shared workers continue:
-// their strong path deletes the pool, so waiting loses the data, while a
-// private worker keeps observing without resubmitting.
+// before the worker Pod is gone, because the worker-delete workflow that runs
+// then crashes a SUSPENDING Actor and reclaims its node state, and a worker
+// with no running sandbox exits within seconds of its delete. So a failure
+// inside this suspension records its doubt and holds the strong path's
+// deletion until the Actor leaves SUSPENDING, within the continuation window
+// (deferSuspendDoubt). Only shared workers continue: their strong path deletes
+// the pool, so waiting loses the data, while a private worker keeps observing
+// without resubmitting.
 func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, operation *checkpointIntent) error {
 	last := record.Timing.SuspendIssuedAt
 	if operation.ContinuedAt != nil {
@@ -906,6 +961,11 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 		// rather than wait for the lifetime bound.
 		return fmt.Errorf("the suspension stayed SUSPENDING after %d continuations", operation.Continuations)
 	}
+	if operation.Doubt != "" && !suspendContinuationOpen(record) {
+		// A recorded doubt holds the strong path's deletion only inside the
+		// continuation window.
+		return fmt.Errorf("the suspension stayed SUSPENDING past its continuation window: %s", operation.Doubt)
+	}
 	if last != nil && now.Sub(last.Time) < suspendContinuationInterval {
 		return nil
 	}
@@ -916,5 +976,29 @@ func (d *Lifecycle) continueSuspend(ctx context.Context, cm *corev1.ConfigMap, r
 		return err
 	}
 	_, err := d.control.SuspendActor(ctx, &pb.SuspendActorRequest{Actor: actorRef(record), Options: &pb.SuspendOptions{Mode: pb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS}})
-	return err
+	if err != nil {
+		return d.deferSuspendDoubt(ctx, cm, record, "the suspension could not complete: "+err.Error(), err)
+	}
+	return nil
+}
+
+// deferSuspendDoubt records reason as the issued suspension's doubt and
+// returns cause as a failure the continuation resolves. The strong path is
+// decided; its deletion is held while the Actor stays SUSPENDING, within the
+// continuation window, and starts once it is SUSPENDED, in any other state,
+// or when the window or the continuations run out.
+func (d *Lifecycle) deferSuspendDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, cause error) error {
+	pending := &suspendPendingError{err: cause}
+	if record.Pending.Doubt != "" {
+		return pending
+	}
+	record.Pending.Doubt = reason
+	if err := d.save(ctx, cm, record); err != nil {
+		// An unrecorded doubt is never held: a write conflict is retried by
+		// rereading the journal, as after a crash before the result was
+		// handled, and any other write failure takes the strong path at once.
+		record.Pending.Doubt = ""
+		return errors.Join(cause, err)
+	}
+	return pending
 }

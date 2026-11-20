@@ -422,7 +422,6 @@ func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRe
 	f.suspends++
 	v.Metadata.Version++
 	v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDED
-	f.releaseWorker(v)
 	generation := v.Status.LastAssignedGeneration + 1
 	v.Status.LastAssignedGeneration = generation
 	uuid := fmt.Sprintf("snap-%s-%d", v.Metadata.Uid, generation)
@@ -438,8 +437,10 @@ func (f *nativeFixture) SuspendActor(ctx context.Context, req *pb.SuspendActorRe
 		f.suspends--
 		v.Status.State = pb.ActorState_ACTOR_STATE_SUSPENDING
 		v.Status.Snapshots[len(v.Status.Snapshots)-1].DurableSnapshot.State = pb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING
+		// Only a FinalizeSuspended that succeeds releases the worker.
 		return nil, status.Error(codes.Unavailable, "workflow failed at step FinalizeSuspended: timeout")
 	}
+	f.releaseWorker(v)
 	return &pb.SuspendActorResponse{Actor: proto.Clone(v).(*pb.Actor)}, f.effect("suspend")
 }
 func (f *nativeFixture) DeleteActor(_ context.Context, req *pb.DeleteActorRequest, _ ...grpc.CallOption) (*pb.Actor, error) {

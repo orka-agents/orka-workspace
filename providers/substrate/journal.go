@@ -77,6 +77,11 @@ type checkpointIntent struct {
 	// ContinuedAt is the last one. Both are saved before each re-issue.
 	Continuations int               `json:"continuations,omitempty"`
 	ContinuedAt   *metav1.MicroTime `json:"continuedAt,omitempty"`
+	// Doubt is the strong-path reason of a failure inside this issued
+	// suspension on a shared worker. The strong path is decided but its
+	// deletion is held until the Actor leaves SUSPENDING, so upstream's
+	// worker-delete cannot reclaim the node state the continuation needs.
+	Doubt string `json:"doubt,omitempty"`
 }
 type checkpointRecord struct {
 	Tag        nativeReference `json:"tag"`

@@ -1386,6 +1386,80 @@ func TestSharedUnreadableLifetimeEvidenceRetiresAtOnce(t *testing.T) {
 	}
 }
 
+// Inconsistent lifetime evidence is lifetime doubt, not identity doubt: the
+// pool retires strongly, but its exact neighbours stay observable and are
+// suspended through Orka core's eviction drain, as on the taint path, instead
+// of being rejected as stale and lost.
+func TestSharedInconsistentLifetimeEvidenceKeepsNeighboursObservableForEviction(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	b, recordB := sharedReady(t, c, native, second)
+	if recordB.SharedWorker.Pool != recordA.SharedWorker.Pool {
+		t.Fatal("the neighbours do not share a pool")
+	}
+	// The worker Pod drains and the pool waits on it, as on a live cluster.
+	hold := func(key client.ObjectKey, object client.Object, finalizers []string) {
+		t.Helper()
+		if err := c.Get(t.Context(), key, object); err != nil {
+			t.Fatal(err)
+		}
+		object.SetFinalizers(finalizers)
+		if err := c.Update(t.Context(), object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	podKey := client.ObjectKey{Namespace: recordA.Worker.Namespace, Name: recordA.Worker.Pod}
+	poolKey := client.ObjectKey{Namespace: recordA.Placement.Namespace, Name: recordA.SharedWorker.Pool}
+	hold(podKey, &corev1.Pod{}, []string{"test.invalid/hold"})
+	hold(poolKey, poolObject(), []string{"test.invalid/hold"})
+	// The deadline annotation moves earlier than the ledger's, with grace left.
+	pool, _ := poolLedger(t, c, recordA.SharedWorker.Pool)
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedDeadlineAnnotation] = sharedNow().Add(2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	observe := func(when string) {
+		t.Helper()
+		for _, request := range []sdk.WorkloadRequest{first, second} {
+			if _, err := sharedDriver(c, native).Observe(t.Context(), request.Key); err != nil {
+				t.Fatalf("%s: a neighbour of a pool with inconsistent lifetime evidence was rejected: %v", when, err)
+			}
+		}
+	}
+	observe("before retirement")
+	if err := (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if current, found := getPool(t, c, recordA.SharedWorker.Pool); !found || current.GetDeletionTimestamp() == nil {
+		t.Fatal("a pool with inconsistent lifetime evidence was not strongly retired")
+	}
+	observe("while the pool retires")
+	// Admission and boots still require consistent evidence.
+	third := sharedWorkspace(t, c, first, "tenant", "third", "third-uid", binding)
+	if _, recordC := sharedReady(t, c, native, third); recordC.SharedWorker.Pool == recordA.SharedWorker.Pool {
+		t.Fatal("an allocation joined a pool with inconsistent lifetime evidence")
+	}
+	// Core's eviction drain suspends each neighbour through the strong path.
+	tick()
+	if _, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity); err != nil {
+		t.Fatalf("the eviction suspend of a neighbour was rejected: %v", err)
+	}
+	hold(podKey, &corev1.Pod{}, nil)
+	hold(poolKey, poolObject(), nil)
+	for _, retired := range []struct {
+		request  sdk.WorkloadRequest
+		identity sdk.InstanceIdentity
+	}{{first, a.Identity}, {second, b.Identity}} {
+		out, record := sharedRetired(t, c, native, retired.request, retired.identity, true)
+		if record.SharedWorker.Strong == "" || out.RetainedData == nil || record.Failure != "" {
+			t.Fatalf("a neighbour was not suspended through the strong path: strong=%q retained=%v failure=%q", record.SharedWorker.Strong, out.RetainedData, record.Failure)
+		}
+	}
+}
+
 func TestSharedWarmCreationRequiresACleanTemplateInventory(t *testing.T) {
 	c, native, _, _ := sharedFixture(t, 2)
 	item := &profile.SubstrateWorkspaceProfile{}
@@ -2670,6 +2744,104 @@ func TestSharedFinalizeFailureKeepsTheDataThroughTheStrongPath(t *testing.T) {
 	}
 	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
 		t.Fatal("the strong deletion was skipped")
+	}
+}
+
+// deleteGoneWorker models upstream's worker-delete workflow, which runs once
+// a worker Pod is gone: every Actor still bound to that worker, SUSPENDING
+// included, is crashed and its node state reclaimed.
+func deleteGoneWorker(t *testing.T, c client.Client, native *nativeFixture, record *journalRecord) {
+	t.Helper()
+	if podExists(t, c, record.Worker.Namespace, record.Worker.Pod, record.Worker.PodUID) {
+		return
+	}
+	for key, actor := range native.actors {
+		state := actor.Status.State
+		if actor.Status.GetWorkerAssignment().GetWorker().GetName() != record.Worker.Name || (state != pb.ActorState_ACTOR_STATE_RUNNING && state != pb.ActorState_ACTOR_STATE_SUSPENDING) {
+			continue
+		}
+		if native.finalizePending == key {
+			native.finalizePending = ""
+		}
+		actor.Status.State = pb.ActorState_ACTOR_STATE_CRASHED
+		actor.Metadata.Version++
+		native.releaseWorker(actor)
+	}
+}
+
+// A worker Pod hosting no running sandbox exits within seconds of its delete,
+// whatever its grace, and upstream's worker-delete then crashes a SUSPENDING
+// Actor. A suspension that failed in FinalizeSuspended therefore holds the
+// strong path's deletion until its continuation finishes, then retires the
+// worker strongly.
+func TestSharedSuspensionDoubtHoldsTheDeletionUntilTheContinuationFinishes(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failFinalizeOnce = true
+	for range 24 {
+		tick()
+		observed, err := sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		deleteGoneWorker(t, c, native, recordA)
+		if err == nil && observed.State == sdk.AllocationStopped {
+			break
+		}
+		if _, current, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && current.Failure != "" {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Failure != "" || record.Checkpoint == nil || native.tags[record.Checkpoint.Atespace+"/"+record.Checkpoint.Tag.Name] == nil || record.Observation.RetainedData == nil {
+		t.Fatalf("the strong path's deletion let upstream crash the suspension before its continuation: failure=%q", record.Failure)
+	}
+	if record.SharedWorker.Strong == "" {
+		t.Fatal("the held doubt never took the strong path")
+	}
+	if native.suspendCalls != 2 {
+		t.Fatalf("SuspendActor calls = %d, want the original and one continuation", native.suspendCalls)
+	}
+	if _, found := getPool(t, c, recordA.SharedWorker.Pool); found || podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the strong deletion did not follow the continuation")
+	}
+}
+
+// The held deletion is bounded: an Actor that cannot be read after a failed
+// suspend takes the strong path once the continuation window ends, and not
+// before.
+func TestSharedHeldSuspensionDoubtIsBoundedByTheContinuationWindow(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	a, recordA := sharedReady(t, c, native, first)
+	native.failFinalizeOnce = true
+	var issued time.Time
+	for range 8 {
+		tick()
+		_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+		if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err == nil && record.Pending != nil && record.Pending.Doubt != "" {
+			issued = record.Timing.SuspendIssuedAt.Time
+			break
+		}
+	}
+	if issued.IsZero() {
+		t.Fatal("the failed suspend recorded no doubt")
+	}
+	native.failGetActor = 1 << 20
+	setNow(t, issued.Add(suspendContinuationWindow-time.Second))
+	_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err != nil || record.SharedWorker.Strong != "" {
+		t.Fatalf("the strong path started inside the continuation window: %v", err)
+	}
+	if !podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the worker Pod was deleted inside the continuation window")
+	}
+	setNow(t, issued.Add(suspendContinuationWindow))
+	_, _ = sharedDriver(c, native).SuspendInstance(t.Context(), first.Key, a.Identity)
+	if _, record, err := sharedDriver(c, native).read(t.Context(), first.Key); err != nil || record.SharedWorker.Strong == "" {
+		t.Fatalf("the held doubt outlived its continuation window: %v", err)
+	}
+	if podExists(t, c, recordA.Worker.Namespace, recordA.Worker.Pod, recordA.Worker.PodUID) {
+		t.Fatal("the strong deletion did not start when the window ended")
 	}
 }
 
