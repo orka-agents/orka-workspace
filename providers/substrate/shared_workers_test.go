@@ -5897,3 +5897,49 @@ func TestSharedProofAttemptSaveConflictIsRetriedNotDoubt(t *testing.T) {
 		t.Fatal("ordinary journal contention disturbed the neighbour")
 	}
 }
+
+func TestSharedUnknownUIDTemplateMustMatchItsFrozenDigest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*pb.ActorTemplate)
+		foreign bool
+	}{
+		{name: "a foreign same-name template with an empty selector", mutate: func(template *pb.ActorTemplate) {
+			template.Metadata.Uid = "foreign-template-uid"
+			template.WorkerSelector = nil
+		}, foreign: true},
+		{name: "the provider's own template, its UID not yet recorded", mutate: func(*pb.ActorTemplate) {}, foreign: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, _ := sharedFixture(t, 2)
+			_, record := sharedReady(t, c, native, first)
+			// The journal records the template's name and frozen digest, but
+			// not yet its UID.
+			cm, current, err := sharedDriver(c, native).read(t.Context(), first.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.Template.Digest == "" {
+				t.Fatal("the fixture journal records no template digest")
+			}
+			current.Template.UID, current.CreateTemplate.UID = "", ""
+			data, err := json.Marshal(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cm.Data[journalDataKey] = string(data)
+			if err := c.Update(t.Context(), cm); err != nil {
+				t.Fatal(err)
+			}
+			recordedTemplates.replace(nil, recordedTemplates.begin())
+			tc.mutate(native.templates[refKey(&pb.ObjectRef{Atespace: record.Atespace, Name: record.Template.Name})])
+			foreign, err := sharedDriver(c, native).foreignTemplateMatches(t.Context(), record.Atespace, sharedLabels(record.SharedWorker.Label))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if foreign != tc.foreign {
+				t.Fatalf("foreign = %v, want %v", foreign, tc.foreign)
+			}
+		})
+	}
+}

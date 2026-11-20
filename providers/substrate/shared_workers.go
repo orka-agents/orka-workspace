@@ -2040,8 +2040,14 @@ func (d *Lifecycle) providerTemplates(ctx context.Context) (all, shared map[stri
 			return
 		}
 		key := atespace + "/" + ref.Name
-		if existing, found := out[key]; !found || existing == "" {
-			out[key] = ref.UID
+		value := ref.UID
+		if value == "" && ref.Digest != "" {
+			// The template's UID is not yet recorded: its frozen spec digest
+			// stands in, and only a template with that exact spec counts.
+			value = unknownUIDDigestPrefix + ref.Digest
+		}
+		if existing, found := out[key]; !found || recordedRank(value) > recordedRank(existing) {
+			out[key] = value
 		}
 	}
 	journals := &corev1.ConfigMapList{}
@@ -2116,7 +2122,9 @@ func (d *Lifecycle) listAllActorTemplates(ctx context.Context) (out []*pb.ActorT
 // templatesReach reports a foreign template whose worker selector, empty or
 // not, a worker with these labels satisfies. Outside the pool's Atespace
 // every such template is foreign. Inside it, so is any that is not a derived
-// template this provider recorded (ours), with the recorded UID once known.
+// template this provider recorded (ours): with its recorded UID once known,
+// or, while its UID is not yet recorded, only if its specification matches
+// the recorded frozen digest. A recorded name with neither fails closed.
 func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels map[string]string, ours map[string]string) bool {
 	return slices.ContainsFunc(templates, func(template *pb.ActorTemplate) bool {
 		if !selectorMatches(template.GetWorkerSelector().GetMatchLabels(), poolLabels) {
@@ -2127,8 +2135,39 @@ func templatesReach(templates []*pb.ActorTemplate, atespace string, poolLabels m
 			return true
 		}
 		uid, recorded := ours[meta.GetAtespace()+"/"+meta.GetName()]
-		return !recorded || uid != "" && uid != meta.GetUid()
+		return !recordedTemplateMatches(template, uid, recorded)
 	})
+}
+
+// unknownUIDDigestPrefix marks a recorded template whose UID is not yet
+// known; the rest of the value is its frozen spec digest.
+const unknownUIDDigestPrefix = "digest:"
+
+// recordedTemplateMatches reports whether a template is the provider's
+// recorded one: by exact UID once known, or by its frozen spec digest while
+// the UID is not yet recorded. Anything else is not ours.
+func recordedTemplateMatches(template *pb.ActorTemplate, recordedValue string, recorded bool) bool {
+	switch {
+	case !recorded || recordedValue == "":
+		return false
+	case strings.HasPrefix(recordedValue, unknownUIDDigestPrefix):
+		digest, err := templateDigest(template)
+		return err == nil && digest == strings.TrimPrefix(recordedValue, unknownUIDDigestPrefix)
+	default:
+		return recordedValue == template.GetMetadata().GetUid()
+	}
+}
+
+// recordedRank orders a name's recorded values: a known UID over a frozen
+// digest over nothing.
+func recordedRank(value string) int {
+	switch {
+	case value == "":
+		return 0
+	case strings.HasPrefix(value, unknownUIDDigestPrefix):
+		return 1
+	}
+	return 2
 }
 
 // selectorMatches reports whether a label selector, including an empty one,
