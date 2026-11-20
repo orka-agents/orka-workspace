@@ -5552,3 +5552,93 @@ func TestSharedPoolDeleteHasItsOwnBudgetAfterASlowPodCleanup(t *testing.T) {
 		t.Fatal("a slow Pod cleanup left the pool's Delete an expired budget")
 	}
 }
+
+func TestSharedOutsideAtespaceQuarantineNeverWaitsOnProviderRecords(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.templates["other/foreign"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "other", Name: "foreign", Uid: "foreign-uid", Version: 1}}
+	// The provider's records (the checkpoint catalogs) stall until their
+	// context ends.
+	stalling := contextAwareClient(interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.ConfigMapList); ok {
+				options := &client.ListOptions{}
+				options.ApplyOptions(opts)
+				if options.LabelSelector != nil && strings.Contains(options.LabelSelector.String(), catalogLabel) {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+			}
+			return w.List(ctx, list, opts...)
+		},
+	}))
+	recording, deletes := recordingDeletes(t, stalling)
+	var podDeleted time.Time
+	started := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sharedReplenisher(recording, native).Sweep(t.Context())
+	}()
+	for podDeleted.IsZero() && time.Since(started) < 5*time.Second {
+		if slices.ContainsFunc(deletes(), func(d deleteRecord) bool { return d.kind == "Pod" && d.uid == record.Worker.PodUID }) {
+			podDeleted = time.Now()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if podDeleted.IsZero() || podDeleted.Sub(started) > 2*time.Second {
+		t.Fatalf("an outside-Atespace quarantine waited on the provider's records: %v", podDeleted.Sub(started))
+	}
+	<-done
+}
+
+func TestSharedUnverifiedPoolRetiresAtItsBoundDuringALongScan(t *testing.T) {
+	previous := sharedIsolationCheckTimeout
+	sharedIsolationCheckTimeout = 2 * time.Second
+	t.Cleanup(func() { sharedIsolationCheckTimeout = previous })
+	c, native, first, binding := sharedFixture(t, 2)
+	names := manySharedPools(t, c, native, first, binding, 24)
+	// Every pool's assignment List uses up its whole budget, so the scan
+	// takes several rounds.
+	native.blockAssignments = true
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = sharedReplenisher(c, native).Sweep(t.Context())
+	}()
+	// The first stamped pools are durable as soon as they are decided, long
+	// before the scan ends.
+	var stamped string
+	deadline := time.Now().Add(5 * time.Second)
+	for stamped == "" {
+		for _, name := range names {
+			if pool, found := getPool(t, c, name); found && pool.GetAnnotations()[sharedUnverifiedAnnotation] != "" {
+				stamped = name
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no unverified stamp was written while the scan ran")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("the scan finished before the test could interleave")
+	default:
+	}
+	// A restart loses every in-process record; the durable stamp keeps the
+	// age, and the independent bounds loop enforces it mid-scan.
+	sharedUnverifiedPools.reset()
+	setNow(t, sharedNow().Add(sharedProvenanceOutageBound))
+	_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, stamped); found {
+		t.Fatal("an unverified pool outlived its bound while a long scan ran")
+	}
+	select {
+	case <-done:
+		t.Fatal("the retirement waited for the scan to end")
+	default:
+	}
+	<-done
+}

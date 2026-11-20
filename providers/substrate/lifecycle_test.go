@@ -103,8 +103,8 @@ type nativeFixture struct {
 	// blockAssignments stalls every assignment List until its context ends.
 	blockAssignments bool
 	// hiddenWorkers omits these workers from ListWorkers.
-	hiddenWorkers map[string]bool
-	assignmentLists  int
+	hiddenWorkers   map[string]bool
+	assignmentLists int
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
 	// failEgressUpdate fails the next UpdateActorEgressPolicy calls.
