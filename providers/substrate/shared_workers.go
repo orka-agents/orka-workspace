@@ -2337,7 +2337,7 @@ func (d *Lifecycle) recordSharedRetirement(ctx context.Context, pool *unstructur
 
 // sharedLedgerWriteTimeout bounds the best-effort retirement state write that
 // follows a strong retirement's Delete.
-const sharedLedgerWriteTimeout = 5 * time.Second
+var sharedLedgerWriteTimeout = 5 * time.Second
 
 // sharedRetireIntended reports a decided strong retirement not yet deleted.
 func sharedRetireIntended(pool *unstructured.Unstructured) bool {

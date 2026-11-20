@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,7 +104,9 @@ type nativeFixture struct {
 	// blockAssignments stalls every assignment List until its context ends.
 	blockAssignments bool
 	// hiddenWorkers omits these workers from ListWorkers.
-	hiddenWorkers   map[string]bool
+	hiddenWorkers map[string]bool
+	// workersMu guards workers against concurrent per-pool listings.
+	workersMu       sync.Mutex
 	assignmentLists int
 	// failGetActor fails the next GetActor calls.
 	failGetActor int
@@ -551,6 +554,9 @@ func (f *nativeFixture) ListWorkers(ctx context.Context, _ *pb.ListWorkersReques
 	if err := f.client.List(ctx, pools); err != nil {
 		return nil, err
 	}
+	// The provider lists workers from concurrent per-pool checks.
+	f.workersMu.Lock()
+	defer f.workersMu.Unlock()
 	for _, pool := range pools.Items {
 		if pool.GetLabels()[workerInstanceLabel] == "" && pool.GetLabels()[sharedPoolLabel] == "" || pool.GetDeletionTimestamp() != nil {
 			continue
@@ -609,6 +615,8 @@ func (f *nativeFixture) ListWorkerActorAssignments(ctx context.Context, req *pb.
 		f.failAfter = ""
 		return nil, status.Error(codes.Unavailable, "assignment listing unavailable")
 	}
+	f.workersMu.Lock()
+	defer f.workersMu.Unlock()
 	out := &pb.ListWorkerActorAssignmentsResponse{}
 	for _, v := range f.actors {
 		if v.Status.GetWorkerAssignment().GetWorker().GetName() == req.Worker.Name {

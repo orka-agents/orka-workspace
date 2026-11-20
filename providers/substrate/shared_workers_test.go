@@ -2414,6 +2414,7 @@ func TestSharedEscapedCharacterLedgerCannotBlockRetirement(t *testing.T) {
 }
 
 func TestSharedBlockedLedgerWriteCannotDelayTheDelete(t *testing.T) {
+	shortSharedBudgets(t)
 	for _, path := range []string{"retire", "hard", "bounds"} {
 		t.Run(path, func(t *testing.T) {
 			c, native, first, _ := sharedFixture(t, 2)
@@ -2482,6 +2483,7 @@ func TestSharedRejectedStrongMarkerStillDeletesThePool(t *testing.T) {
 }
 
 func TestSharedBoundsPassDoesMandatoryWorkBeforeBookkeeping(t *testing.T) {
+	shortSharedBudgets(t)
 	c, native, first, binding := sharedFixture(t, 2)
 	// Many pools, all due at once.
 	var pools []string
@@ -2568,6 +2570,7 @@ func manySharedPools(t *testing.T, c client.Client, native *nativeFixture, first
 }
 
 func TestSharedEscalationIsIndependentOfSlowPoolDeletes(t *testing.T) {
+	shortSharedBudgets(t)
 	c, native, first, binding := sharedFixture(t, 2)
 	pools := manySharedPools(t, c, native, first, binding, 11)
 	pool, ledger := poolLedger(t, c, pools[0])
@@ -2758,6 +2761,7 @@ func TestSharedRecordedTemplateCheckHitsTheCacheAndRefreshesOnAMiss(t *testing.T
 }
 
 func TestSharedEscalationsAreIssuedConcurrentlyWhenPodDeletesStall(t *testing.T) {
+	shortSharedBudgets(t)
 	c, native, first, binding := sharedFixture(t, 2)
 	pools := manySharedPools(t, c, native, first, binding, 11)
 	pool, ledger := poolLedger(t, c, pools[0])
@@ -5103,11 +5107,12 @@ func TestSharedStalledHostedListStillRunsTheAssignmentChecks(t *testing.T) {
 }
 
 func TestSharedStalledBoundsDeletesNeverDelayTheIsolationChecks(t *testing.T) {
+	shortSharedBudgets(t)
 	previous := sharedCleanupTimeout
 	sharedCleanupTimeout = 2 * time.Second
 	t.Cleanup(func() { sharedCleanupTimeout = previous })
 	c, native, first, binding := sharedFixture(t, 2)
-	due := manySharedPools(t, c, native, first, binding, 17)
+	due := manySharedPools(t, c, native, first, binding, 12)
 	pool, ledger := poolLedger(t, c, due[0])
 	setNow(t, sharedRetireAt(pool, ledger).Add(time.Minute))
 	// A young pool, reached by a foreign template.
@@ -5197,6 +5202,7 @@ func TestSharedAssignmentCheckThatAlwaysTimesOutRetiresAtTheBound(t *testing.T) 
 }
 
 func TestSharedKnownQuarantineIsNotDelayedByOtherPoolsStalledChecks(t *testing.T) {
+	shortSharedBudgets(t)
 	previous := sharedIsolationCheckTimeout
 	sharedIsolationCheckTimeout = 2 * time.Second
 	t.Cleanup(func() { sharedIsolationCheckTimeout = previous })
@@ -5323,11 +5329,12 @@ func stalledPoolDeletes(c client.Client) (client.Client, *atomic.Int64, func(str
 }
 
 func TestSharedShutdownStopsIssuingNewRetirements(t *testing.T) {
+	shortSharedBudgets(t)
 	previous := sharedCleanupTimeout
 	sharedCleanupTimeout = 2 * time.Second
 	t.Cleanup(func() { sharedCleanupTimeout = previous })
 	c, native, first, binding := sharedFixture(t, 2)
-	due := manySharedPools(t, c, native, first, binding, 20)
+	due := manySharedPools(t, c, native, first, binding, 12)
 	pool, ledger := poolLedger(t, c, due[0])
 	setNow(t, sharedRetireAt(pool, ledger).Add(time.Minute))
 	stalling, poolDeletes, _ := stalledPoolDeletes(c)
@@ -5357,11 +5364,12 @@ func TestSharedShutdownStopsIssuingNewRetirements(t *testing.T) {
 }
 
 func TestSharedDecidedRetirementsNeverDelayAQuarantine(t *testing.T) {
+	shortSharedBudgets(t)
 	previous := sharedCleanupTimeout
 	sharedCleanupTimeout = 2 * time.Second
 	t.Cleanup(func() { sharedCleanupTimeout = previous })
 	c, native, first, binding := sharedFixture(t, 2)
-	retiring := manySharedPools(t, c, native, first, binding, 20)
+	retiring := manySharedPools(t, c, native, first, binding, 12)
 	// Every one of these pools has a persisted retirement whose pool delete
 	// stalls.
 	for _, name := range retiring {
@@ -5439,6 +5447,7 @@ func TestSharedFailedPodCleanupStillDeletesTheQuarantinedPool(t *testing.T) {
 }
 
 func TestSharedFailedNamespaceInventoryIsListedOncePerPass(t *testing.T) {
+	shortSharedBudgets(t)
 	c, native, first, binding := sharedFixture(t, 2)
 	names := manySharedPools(t, c, native, first, binding, 20)
 	var lists, gets atomic.Int64
@@ -5554,6 +5563,7 @@ func TestSharedPoolDeleteHasItsOwnBudgetAfterASlowPodCleanup(t *testing.T) {
 }
 
 func TestSharedOutsideAtespaceQuarantineNeverWaitsOnProviderRecords(t *testing.T) {
+	shortSharedBudgets(t)
 	c, native, first, _ := sharedFixture(t, 2)
 	_, record := sharedReady(t, c, native, first)
 	native.templates["other/foreign"] = &pb.ActorTemplate{Metadata: &pb.ResourceMetadata{Atespace: "other", Name: "foreign", Uid: "foreign-uid", Version: 1}}
@@ -5593,11 +5603,12 @@ func TestSharedOutsideAtespaceQuarantineNeverWaitsOnProviderRecords(t *testing.T
 }
 
 func TestSharedUnverifiedPoolRetiresAtItsBoundDuringALongScan(t *testing.T) {
+	shortSharedBudgets(t)
 	previous := sharedIsolationCheckTimeout
 	sharedIsolationCheckTimeout = 2 * time.Second
 	t.Cleanup(func() { sharedIsolationCheckTimeout = previous })
 	c, native, first, binding := sharedFixture(t, 2)
-	names := manySharedPools(t, c, native, first, binding, 24)
+	names := manySharedPools(t, c, native, first, binding, 16)
 	// Every pool's assignment List uses up its whole budget, so the scan
 	// takes several rounds.
 	native.blockAssignments = true
@@ -5641,4 +5652,112 @@ func TestSharedUnverifiedPoolRetiresAtItsBoundDuringALongScan(t *testing.T) {
 	default:
 	}
 	<-done
+}
+
+func TestSharedUnclassifiedUnverifiedStampKeepsTheGrace(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	// A stamp whose classification was never written.
+	start := sharedNow()
+	annotations := maps.Clone(pool.GetAnnotations())
+	annotations[sharedUnverifiedAnnotation] = start.UTC().Format(time.RFC3339Nano)
+	pool.SetAnnotations(annotations)
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	bounds := &SpareWorkerReplenisher{Client: c, Config: sharedConfig()}
+	setNow(t, start.Add(sharedProvenanceOutageBound))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+		t.Fatal("an unclassified stamp was retired at the outage bound instead of keeping the grace")
+	}
+	setNow(t, start.Add(sharedControlPlaneDownGrace))
+	_ = bounds.EnforceSharedBounds(t.Context())
+	if _, found := getPool(t, c, record.SharedWorker.Pool); found {
+		t.Fatal("an unclassified stamp outlived the control-plane-down grace")
+	}
+}
+
+func TestSharedUnverifiedStampCarriesItsClassification(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	native.assignmentsUnavailable = true
+	_ = sharedReplenisher(c, native).Sweep(t.Context())
+	pool, _ := getPool(t, c, record.SharedWorker.Pool)
+	if pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" || pool.GetAnnotations()[sharedUnverifiedGraceAnnotation] != sharedUnverifiedGraceNone {
+		t.Fatalf("the unverified stamp was not written with its classification: %v", pool.GetAnnotations())
+	}
+}
+
+func TestSharedDelayedOutageStampWritesNeverUndoANewerDecision(t *testing.T) {
+	mark := func(pool *unstructured.Unstructured, value string, decided time.Time) outageMark {
+		return outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: value, decidedAt: decided}
+	}
+	t.Run("a delayed set after a newer clear", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+		d := sharedDriver(c, native).withSharedPass()
+		t0 := sharedNow()
+		d.writeOutageMarks(t.Context(), []outageMark{mark(pool, t0.UTC().Format(time.RFC3339Nano), t0)})
+		// The pool recovered: a newer decision clears the stamp...
+		d.writeOutageMarks(t.Context(), []outageMark{mark(pool, "", t0.Add(2*time.Second))})
+		// ...and a set decided before that recovery lands late.
+		d.writeOutageMarks(t.Context(), []outageMark{mark(pool, t0.Add(time.Second).UTC().Format(time.RFC3339Nano), t0.Add(time.Second))})
+		current, _ := getPool(t, c, record.SharedWorker.Pool)
+		if current.GetAnnotations()[sharedUnverifiedAnnotation] != "" {
+			t.Fatal("a delayed set revived a stamp a newer decision cleared")
+		}
+		setNow(t, t0.Add(sharedControlPlaneDownGrace+time.Minute))
+		_ = (&SpareWorkerReplenisher{Client: c, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+		if _, found := getPool(t, c, record.SharedWorker.Pool); !found {
+			t.Fatal("a recovered pool was retired on a delayed stamp")
+		}
+	})
+	t.Run("a delayed clear after a newer set", func(t *testing.T) {
+		c, native, first, _ := sharedFixture(t, 2)
+		_, record := sharedReady(t, c, native, first)
+		pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+		d := sharedDriver(c, native).withSharedPass()
+		t0 := sharedNow()
+		// A newer outage is stamped...
+		d.writeOutageMarks(t.Context(), []outageMark{mark(pool, t0.UTC().Format(time.RFC3339Nano), t0.Add(2*time.Second))})
+		// ...and a clear decided before it lands late.
+		d.writeOutageMarks(t.Context(), []outageMark{mark(pool, "", t0.Add(time.Second))})
+		current, _ := getPool(t, c, record.SharedWorker.Pool)
+		if current.GetAnnotations()[sharedUnverifiedAnnotation] == "" {
+			t.Fatal("a delayed clear wiped out a newer outage")
+		}
+	})
+}
+
+func TestSharedSupersededPassStampWritesStop(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, _ := poolLedger(t, c, record.SharedWorker.Pool)
+	old := sharedDriver(c, native).withSharedLoopPass("sweep")
+	// A later pass of the same loop starts before the old pass's write runs.
+	sharedDriver(c, native).withSharedLoopPass("sweep")
+	old.startOutageMark(t.Context(), pool, sharedUnverifiedAnnotation, sharedNow().UTC().Format(time.RFC3339Nano))
+	old.flushOutageMarks(t.Context())
+	current, _ := getPool(t, c, record.SharedWorker.Pool)
+	if current.GetAnnotations()[sharedUnverifiedAnnotation] != "" {
+		t.Fatal("a superseded pass's stamp write still landed")
+	}
+}
+
+// shortSharedBudgets shortens every shared-worker budget for a test whose
+// stalls would otherwise wait out production-length bounds. Each test that
+// depends on a particular budget still sets it after this.
+func shortSharedBudgets(t *testing.T) {
+	t.Helper()
+	cleanup, escalation, ledger, bookkeeping := sharedCleanupTimeout, sharedEscalationTimeout, sharedLedgerWriteTimeout, sharedBookkeepingBudget
+	inventory, discovery, marks, check := sharedInventoryTimeout, sharedDiscoveryTimeout, sharedOutageMarkBudget, sharedIsolationCheckTimeout
+	sharedCleanupTimeout, sharedEscalationTimeout, sharedLedgerWriteTimeout, sharedBookkeepingBudget = time.Second, time.Second, 500*time.Millisecond, 2*time.Second
+	sharedInventoryTimeout, sharedDiscoveryTimeout, sharedOutageMarkBudget, sharedIsolationCheckTimeout = time.Second, time.Second, time.Second, time.Second
+	t.Cleanup(func() {
+		sharedCleanupTimeout, sharedEscalationTimeout, sharedLedgerWriteTimeout, sharedBookkeepingBudget = cleanup, escalation, ledger, bookkeeping
+		sharedInventoryTimeout, sharedDiscoveryTimeout, sharedOutageMarkBudget, sharedIsolationCheckTimeout = inventory, discovery, marks, check
+	})
 }

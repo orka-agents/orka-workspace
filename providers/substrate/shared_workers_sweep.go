@@ -46,7 +46,7 @@ type sharedProfileShape struct {
 // dedicated, and a worker Pod still present when the hard bound nears is
 // re-deleted with a one-second grace.
 func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lifecycle) error {
-	d = d.withSharedPass()
+	d = d.withSharedLoopPass("bounds")
 	defer d.flushOutageMarks(ctx)
 	// Escalations due by the latest bound any provenance could give go out
 	// first, while discovery runs alongside under its own deadline.
@@ -697,7 +697,17 @@ type outageMark struct {
 	namespace, name string
 	uid             types.UID
 	key, value      string
+	// overwrite replaces a present value instead of keeping it.
+	overwrite bool
+	// decidedAt is when the decision this write represents was made. A
+	// write is applied only if the pool's record for its key was not
+	// decided later, so a delayed write never undoes a newer decision.
+	decidedAt time.Time
 }
+
+// outageDecidedKey is the annotation recording when a stamp key's current
+// state was decided.
+func outageDecidedKey(key string) string { return key + "-decided" }
 
 // sharedOutageMarkConcurrency caps a pass's concurrent outage annotation
 // writes, and sharedOutageMarkBudget bounds how long the pass's end waits for
@@ -710,7 +720,21 @@ var sharedOutageMarkBudget = 30 * time.Second
 // most sharedOutageMarkConcurrency at a time, each pool read fresh and
 // written only if it still has the same UID, on its own short bound.
 func (d *Lifecycle) startOutageMark(ctx context.Context, pool *unstructured.Unstructured, key, value string) {
-	mark := outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: key, value: value}
+	d.startOutageMarks(ctx, outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: key, value: value})
+}
+
+// startOutageMarks writes one pool's annotation changes together, in one
+// Update, in the background.
+func (d *Lifecycle) startOutageMarks(ctx context.Context, marks ...outageMark) {
+	if len(marks) == 0 {
+		return
+	}
+	decided := sharedNow()
+	for i := range marks {
+		if marks[i].decidedAt.IsZero() {
+			marks[i].decidedAt = decided
+		}
+	}
 	p := d.sharedPass
 	if p == nil {
 		return
@@ -730,9 +754,13 @@ func (d *Lifecycle) startOutageMark(ctx context.Context, pool *unstructured.Unst
 			return
 		}
 		defer func() { <-slots }()
+		if p.superseded() {
+			// A later pass of the same loop decides afresh.
+			return
+		}
 		writeCtx, cancel := freshBudget(ctx, sharedLedgerWriteTimeout)
 		defer cancel()
-		d.writeOutageMarks(writeCtx, []outageMark{mark})
+		d.writeOutageMarks(writeCtx, marks)
 	}()
 }
 
@@ -775,13 +803,22 @@ func (d *Lifecycle) writeOutageMarksRetry(ctx context.Context, marks []outageMar
 	}
 	changed := false
 	for _, mark := range marks {
+		decidedKey := outageDecidedKey(mark.key)
+		if recorded, err := time.Parse(time.RFC3339Nano, annotations[decidedKey]); err == nil && !mark.decidedAt.IsZero() && recorded.After(mark.decidedAt) {
+			// A newer decision already wrote this key.
+			continue
+		}
 		_, present := annotations[mark.key]
 		switch {
 		case mark.value == "" && present:
 			delete(annotations, mark.key)
 			changed = true
-		case mark.value != "" && !present:
+		case mark.value != "" && (!present || mark.overwrite && annotations[mark.key] != mark.value):
 			annotations[mark.key] = mark.value
+			changed = true
+		}
+		if decided := mark.decidedAt.UTC().Format(time.RFC3339Nano); !mark.decidedAt.IsZero() && annotations[decidedKey] != decided {
+			annotations[decidedKey] = decided
 			changed = true
 		}
 	}
@@ -861,14 +898,28 @@ func noteNativeCredentials(ctx context.Context, err error) {
 	}
 }
 
-// sharedUnverifiedGraceAnnotation, set to sharedUnverifiedGraceDown, records
-// that a pool's checks last failed while native looked down from the
-// provider, so the control-plane-down grace applies instead of the outage
-// bound.
+// sharedUnverifiedGraceAnnotation classifies a pool's unverified stamp,
+// written in the same Update as the stamp: sharedUnverifiedGraceDown when
+// its checks last failed while native looked down from the provider (the
+// control-plane-down grace applies), sharedUnverifiedGraceNone otherwise (the
+// outage bound applies). A stamp whose classification is missing is treated
+// as under the grace until the sweep classifies it, so the bounds loop never
+// retires early.
 const (
 	sharedUnverifiedGraceAnnotation = "substrate.workspace.orka.ai/unverified-grace"
 	sharedUnverifiedGraceDown       = "control-plane-down"
+	sharedUnverifiedGraceNone       = "none"
 )
+
+// stampedTime parses a pool's durable outage annotation key.
+func stampedTime(pool *unstructured.Unstructured, key string) (time.Time, bool) {
+	raw, ok := pool.GetAnnotations()[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	stamped, err := time.Parse(time.RFC3339Nano, raw)
+	return stamped, err == nil
+}
 
 // sharedStampedOutagePast reports, from the pool's durable stamps alone (so
 // the Kubernetes-only bounds loop can enforce them whatever the sweep's
@@ -879,9 +930,11 @@ func sharedStampedOutagePast(pool *unstructured.Unstructured, now time.Time) str
 	annotations := pool.GetAnnotations()
 	if raw, ok := annotations[sharedUnverifiedAnnotation]; ok {
 		if since, err := time.Parse(time.RFC3339Nano, raw); err == nil {
-			bound := sharedProvenanceOutageBound
-			if annotations[sharedUnverifiedGraceAnnotation] == sharedUnverifiedGraceDown {
-				bound = sharedControlPlaneDownGrace
+			// Only a stamp classified as outside the grace takes the outage
+			// bound; a missing classification keeps the grace.
+			bound := sharedControlPlaneDownGrace
+			if annotations[sharedUnverifiedGraceAnnotation] == sharedUnverifiedGraceNone {
+				bound = sharedProvenanceOutageBound
 			}
 			if !now.Before(since.Add(bound)) {
 				return "the shared worker's isolation checks have not completed since its durable stamp, past their bound"
@@ -963,19 +1016,26 @@ func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.U
 	if native {
 		noteNativeCredentials(ctx, err)
 	}
-	start := d.recordOutageSince(ctx, pool, sharedUnverifiedAnnotation, sharedUnverifiedPools.failed(pool.GetUID(), sharedNow()))
-	elapsed := sharedNow().Sub(start)
-	bound := sharedProvenanceOutageBound
 	grace := native && nativeUnavailable(err) && !nativeCredentialsRejected(err) && d.sharedPass.nativeDown(ctx, d)
-	// The class is stamped durably beside the age, so the Kubernetes-only
-	// bounds loop, which cannot probe native, applies the same bound.
+	bound, class := sharedProvenanceOutageBound, sharedUnverifiedGraceNone
 	if grace {
-		bound = sharedControlPlaneDownGrace
-		d.startOutageMark(ctx, pool, sharedUnverifiedGraceAnnotation, sharedUnverifiedGraceDown)
-	} else {
-		d.clearOutageMark(ctx, pool, sharedUnverifiedGraceAnnotation)
+		bound, class = sharedControlPlaneDownGrace, sharedUnverifiedGraceDown
 	}
-	if elapsed < bound {
+	start := sharedUnverifiedPools.failed(pool.GetUID(), sharedNow())
+	if recorded, ok := stampedTime(pool, sharedUnverifiedAnnotation); ok && recorded.Before(start) {
+		start = recorded
+	}
+	// The class is stamped durably beside the age, in the same write, so the
+	// Kubernetes-only bounds loop, which cannot probe native, applies the
+	// same bound.
+	marks := []outageMark{{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation, value: start.UTC().Format(time.RFC3339Nano)}}
+	if pool.GetAnnotations()[sharedUnverifiedGraceAnnotation] != class || pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" {
+		marks = append(marks, outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedGraceAnnotation, value: class, overwrite: true})
+	}
+	if pool.GetAnnotations()[sharedUnverifiedAnnotation] == "" || len(marks) > 1 {
+		d.startOutageMarks(ctx, marks...)
+	}
+	if sharedNow().Sub(start) < bound {
 		return err
 	}
 	reason := "the shared worker's isolation checks did not complete past their bound"
@@ -989,8 +1049,11 @@ func (d *Lifecycle) verificationFailed(ctx context.Context, pool *unstructured.U
 // own isolation checks completed.
 func (d *Lifecycle) verificationSucceeded(ctx context.Context, pool *unstructured.Unstructured) {
 	sharedUnverifiedPools.succeeded(pool.GetUID())
-	d.clearOutageMark(ctx, pool, sharedUnverifiedAnnotation)
-	d.clearOutageMark(ctx, pool, sharedUnverifiedGraceAnnotation)
+	if annotations := pool.GetAnnotations(); annotations[sharedUnverifiedAnnotation] != "" || annotations[sharedUnverifiedGraceAnnotation] != "" {
+		d.startOutageMarks(ctx,
+			outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedAnnotation},
+			outageMark{namespace: pool.GetNamespace(), name: pool.GetName(), uid: pool.GetUID(), key: sharedUnverifiedGraceAnnotation})
+	}
 }
 
 // nativeDown probes, once per pass, whether the native control plane looks
@@ -999,6 +1062,9 @@ func (p *sharedPassReads) nativeDown(ctx context.Context, d *Lifecycle) bool {
 	if p == nil {
 		return d.nativeControlDown(ctx)
 	}
+	// Single flight: concurrent checks wait for the pass's one probe.
+	p.probeMu.Lock()
+	defer p.probeMu.Unlock()
 	p.mu.Lock()
 	probed, down := p.probed, p.down
 	p.mu.Unlock()
@@ -1220,7 +1286,7 @@ const sharedEscalationPeriod = 10 * time.Second
 // shared pool past its escalation time has its worker Pods re-deleted with a
 // one-second grace. It never issues or waits on a pool Delete.
 func (r *SpareWorkerReplenisher) EnforceSharedEscalation(ctx context.Context) error {
-	d := New(r.Client, nil, r.Config).withSharedPass()
+	d := New(r.Client, nil, r.Config).withSharedLoopPass("escalation")
 	discovered := make(chan sharedDiscovery, 1)
 	go func() { discovered <- d.discoverShared(ctx, false) }()
 	escalatedEarly, earlyErr := d.escalateDueByAnnotations(ctx)
@@ -1361,7 +1427,7 @@ func (r *SpareWorkerReplenisher) RunSharedEscalation(ctx context.Context, period
 
 // sharedBookkeepingBudget bounds the total time one bounds pass spends on
 // best-effort retirement bookkeeping, after all mandatory work.
-const sharedBookkeepingBudget = 30 * time.Second
+var sharedBookkeepingBudget = 30 * time.Second
 
 // sharedBoundsOf returns when a pool's strong retirement starts and when its
 // worker Pods are escalated, and whether its lifetime evidence is consistent.
@@ -1506,7 +1572,7 @@ func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructur
 // changed scope, collection, ledger writes and warm creation) is skipped.
 func (r *SpareWorkerReplenisher) sweepShared(ctx context.Context, d *Lifecycle, profiles []profile.SubstrateWorkspaceProfile, workers *spareWorkerCache, profilesKnown bool) error {
 	// One snapshot of journals and workspaces is shared by every pool.
-	d = d.withSharedPass()
+	d = d.withSharedLoopPass("sweep")
 	// Durable outage stamps are written after every safety action.
 	defer d.flushOutageMarks(ctx)
 	listCtx, cancelList := isolationContext(ctx)
@@ -2388,8 +2454,14 @@ type sharedPassReads struct {
 	// annotation writes.
 	markWrites sync.WaitGroup
 	markSlots  chan struct{}
-	// probed and down cache the pass's native control-plane probe.
+	// loop and generation identify the pass among its loop's passes; a
+	// writer of a superseded pass stops.
+	loop       *atomic.Uint64
+	generation uint64
+	// probed and down cache the pass's native control-plane probe, and
+	// probeMu makes it a single flight.
 	probed, down bool
+	probeMu      sync.Mutex
 	// namespaces serializes each namespace's first List across concurrent
 	// per-pool checks, so a namespace is still listed once per pass.
 	namespaces keyedMutex
@@ -2455,6 +2527,24 @@ func (d *Lifecycle) withSharedPass() *Lifecycle {
 	pass := *d
 	pass.sharedPass = newSharedPassReads()
 	return &pass
+}
+
+// sharedLoopPasses counts each loop's passes, so a pass's background writes
+// stop once a later pass of the same loop has started.
+var sharedLoopPasses = map[string]*atomic.Uint64{"sweep": {}, "bounds": {}, "escalation": {}}
+
+// withSharedLoopPass is withSharedPass for a pass of the named loop.
+func (d *Lifecycle) withSharedLoopPass(loop string) *Lifecycle {
+	pass := d.withSharedPass()
+	if counter := sharedLoopPasses[loop]; counter != nil {
+		pass.sharedPass.loop, pass.sharedPass.generation = counter, counter.Add(1)
+	}
+	return pass
+}
+
+// superseded reports a later pass of the same loop.
+func (p *sharedPassReads) superseded() bool {
+	return p != nil && p.loop != nil && p.loop.Load() != p.generation
 }
 
 // noteJournals records the pass's labeled journal inventory.
