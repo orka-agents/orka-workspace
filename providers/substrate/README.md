@@ -255,6 +255,20 @@ ownerReference to collect. Each spare costs one idle worker Pod, the Actor size
 plus 64Mi of requests, so `N` spares per profile reserve `N` such Pods. Spares
 need `update` on `workerpools`.
 
+Spares also serve private DataOnly profiles (`spec.suspend.mode: DataOnly`) on
+resume. Every sequence resolves its profile again, so a resume selects a spare
+exactly as a cold allocation does. The data-only resume check compares the
+pool and template specifications without their birth labels, so a spare built
+from the current operator pool is a compatible resume target. The Actor is
+still created from the Tag on its checkpoint template, rotated onto the derived
+template that selects the spare's birth labels, and resumed only after every
+pre-Resume check. Suspension tears the claimed spare down like any private pool
+and proves its worker Pod absent before the Actor is deleted, so no worker
+survives a suspension. A resume consumes one spare, and the replenisher
+replaces it within 10 seconds. To use spares for a suspend-enabled private
+class, set the annotation on that class's profile. On a shared profile the
+annotation instead counts warm shared slots, as described below.
+
 **Shared workers (interim).** A profile may opt in to sharing one gVisor
 worker among up to `N` data-only Actors of one namespace, profile and Actor
 size ([ADR 0008](../../docs/adr/0008-substrate-shared-workers.md), Orka ADR
@@ -460,6 +474,21 @@ before it creates another. A pending workspace is polled after 200 ms, then
 do not trigger a reconcile. Each pass re-verifies everything it acts on, and
 continues in the same pass after a write whose result it can verify, such as a
 restored Actor's bootstrap template rotation or a shared ledger's Actor UID.
+
+A pass waiting for its worker before Resume does not rely on that poll alone.
+The workspace reconciler also watches worker Pods (narrowed to Pods labelled
+`ate.dev/worker-pool`) and `ate.dev` WorkerPools. Before it reads its worker, a
+pass records the pool it waits on. An event on that pool's WorkerPool or worker
+Pod then wakes the workspace at once and restarts its poll backoff. When
+Kubernetes already shows the worker's exact Pod Ready, the remaining wait is
+native state that no Kubernetes object shows: the Worker turning `ACTIVE`,
+reporting its epoch and runtimes, or receiving a claimed spare's labels. Such a
+pass polls every 100 ms for at most 20 passes, then the ordinary backoff resumes.
+The watches only decide when the next pass runs. Every decision still reads the
+journal, pool, Pod and native Worker uncached and repeats every fence, and a
+missed event costs only the poll it would have replaced. The watches need
+`watch` on `pods` and `workerpools`, and the Agent Substrate CRDs installed
+before the provider starts.
 
 Infrastructure readiness reports the native Actor identity, exact worker Pod,
 request sequence, the public sealed-bootstrap challenge hash, the router
