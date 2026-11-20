@@ -2254,14 +2254,17 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 		return err
 	}
 	if !issued {
-		// Already deleting: logged once, when this provider issued it.
-		return nil
+		// Already deleting: logged once, when this provider issued it. A
+		// capped Pod delete that failed is still reported.
+		return err
 	}
 	ctrl.LoggerFrom(ctx).Info("Substrate shared worker retired", "state", state, "reason", reason)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedLedgerWriteTimeout)
 	defer cancel()
 	d.recordSharedRetirement(writeCtx, pool, state, reason)
-	return nil
+	// The pool's Delete was issued; a direct Pod cleanup that failed is
+	// returned, so its capped delete is retried.
+	return err
 }
 
 // deleteSharedPool is the mandatory step of every strong retirement, on its
@@ -2278,20 +2281,24 @@ func (d *Lifecycle) hardRetireSharedPool(ctx context.Context, pool *unstructured
 // right one; the API server never lengthens an in-progress grace, so the
 // Deployment's later cascade cannot either.
 func (d *Lifecycle) deleteSharedPool(ctx context.Context, pool *unstructured.Unstructured, escalateAt time.Time) (bool, error) {
-	if pool.GetDeletionTimestamp() != nil {
-		return false, nil
-	}
 	podCtx, cancelPods := strongCleanupContext(ctx)
 	defer cancelPods()
 	if escalateAt.IsZero() {
 		escalateAt = sharedLatestEscalateAt(pool)
+	}
+	if pool.GetDeletionTimestamp() != nil {
+		// Already deleting: only the capped worker Pod delete is retried,
+		// so a Pod the cascade gave its default grace is capped before the
+		// hard bound's escalation. A Pod already carrying a grace no longer
+		// than the cap is skipped.
+		return false, d.deleteSharedWorkerPods(podCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring", false)
 	}
 	// Isolation wins over the grace cap: if the direct Pod cleanup fails, the
 	// pool's Delete is still issued, and the Pod error is returned with it.
 	// The cascade may then give the worker Pod its default grace; the
 	// escalation loop keeps re-deleting it, and later passes retry the
 	// capped Pod delete.
-	podErr := d.deleteSharedWorkerPods(podCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring")
+	podErr := d.deleteSharedWorkerPods(podCtx, pool, nil, sharedWorkerGrace(escalateAt, sharedNow()), "the shared worker is retiring", false)
 	// The pool's Delete has a cleanup budget of its own, so a slow Pod
 	// cleanup can never leave it an expired context.
 	deleteCtx, cancel := strongCleanupContext(ctx)

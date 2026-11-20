@@ -97,6 +97,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		escalateAt time.Time
 	}
 	var retirements []retirement
+	var deleting []poolDeadline
 	var escalations []*unstructured.Unstructured
 	for i := range pools {
 		pool := &pools[i]
@@ -107,6 +108,9 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 			escalations = append(escalations, pool)
 		}
 		if pool.GetDeletionTimestamp() != nil {
+			// A deleting pool's worker Pods still get the capped delete
+			// retried every pass, before the hard bound's escalation.
+			deleting = append(deleting, poolDeadline{pool: pool, escalateAt: escalateAt})
 			continue
 		}
 		retire := func(state, reason string) {
@@ -157,6 +161,7 @@ func (r *SpareWorkerReplenisher) enforceSharedBounds(ctx context.Context, d *Lif
 		}
 	}
 	errs = append(errs, d.escalateSharedPools(ctx, escalations, provenance))
+	errs = append(errs, d.retryCappedPodDeletes(ctx, deleting)...)
 	var mu sync.Mutex
 	var deleted []retirement
 	work := make(chan retirement)
@@ -1321,7 +1326,7 @@ func (d *Lifecycle) escalateSharedPools(ctx context.Context, pools []*unstructur
 		go func() {
 			defer group.Done()
 			for pool := range work {
-				if err := d.deleteSharedWorkerPods(ctx, pool, provenance[pool.GetUID()].podUIDs, sharedEscalationGrace, "the worker Pod outlived its strong retirement"); err != nil {
+				if err := d.deleteSharedWorkerPods(ctx, pool, provenance[pool.GetUID()].podUIDs, sharedEscalationGrace, "the worker Pod outlived its strong retirement", true); err != nil {
 					mu.Lock()
 					errs = append(errs, err)
 					mu.Unlock()
@@ -1560,7 +1565,11 @@ func sharedBoundsOf(pool *unstructured.Unstructured, provenance sharedProvenance
 //
 // Retirement uses the same deletion, first, with the grace the time left
 // allows (deleteSharedPool).
-func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured, recorded map[string]bool, grace int64, reason string) error {
+//
+// escalation marks the hard bound's best-effort re-delete, which always
+// re-deletes; a retirement's capped delete skips a Pod whose deletion already
+// ends by its own deadline.
+func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructured.Unstructured, recorded map[string]bool, grace int64, reason string, escalation bool) error {
 	pods := &corev1.PodList{}
 	listCtx, cancelList := context.WithTimeout(context.WithoutCancel(ctx), sharedEscalationTimeout)
 	err := d.client.List(listCtx, pods, client.InNamespace(pool.GetNamespace()), client.MatchingLabels{workerPoolLabel: pool.GetName()})
@@ -1597,6 +1606,13 @@ func (d *Lifecycle) deleteSharedWorkerPods(ctx context.Context, pool *unstructur
 			continue
 		}
 		if pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds <= grace {
+			continue
+		}
+		// A graceful delete sets the Pod's deletionTimestamp to when its
+		// grace ends. A Pod whose deletion already ends by this delete's
+		// deadline needs no re-delete, so retries never shorten a grace pass
+		// by pass.
+		if !escalation && pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.Time.After(sharedNow().Add(time.Duration(grace)*time.Second)) {
 			continue
 		}
 		if grace == sharedEscalationGrace {
@@ -2020,6 +2036,38 @@ func feed[T any](ctx context.Context, work chan<- T, items []T) {
 			work <- item
 		}
 	}
+}
+
+// poolDeadline is a pool with the escalation time its worker Pods' grace is
+// capped by.
+type poolDeadline struct {
+	pool       *unstructured.Unstructured
+	escalateAt time.Time
+}
+
+// retryCappedPodDeletes retries the capped worker Pod delete of deleting
+// pools, concurrently and capped, each on its own short bound.
+func (d *Lifecycle) retryCappedPodDeletes(ctx context.Context, pools []poolDeadline) []error {
+	errs := make([]error, len(pools))
+	work := make(chan int)
+	var group sync.WaitGroup
+	for range min(sharedRetireConcurrency, len(pools)) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := range work {
+				_, errs[i] = d.deleteSharedPool(ctx, pools[i].pool, pools[i].escalateAt)
+			}
+		}()
+	}
+	indexes := make([]int, len(pools))
+	for i := range indexes {
+		indexes[i] = i
+	}
+	feed(ctx, work, indexes)
+	close(work)
+	group.Wait()
+	return errs
 }
 
 // sharedRetireConcurrency caps a pass's concurrent decided retirements.

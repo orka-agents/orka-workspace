@@ -5819,3 +5819,41 @@ func TestSharedNewFailureOutranksAnInFlightRecoveryClear(t *testing.T) {
 		t.Fatal("an in-flight recovery clear erased a newer failure's stamp")
 	}
 }
+
+func TestSharedDeletingPoolStillGetsItsCappedPodDelete(t *testing.T) {
+	c, native, first, _ := sharedFixture(t, 2)
+	_, record := sharedReady(t, c, native, first)
+	pool, ledger := poolLedger(t, c, record.SharedWorker.Pool)
+	// The pool stays deleting (as a foreground cascade would).
+	pool.SetFinalizers([]string{"foregroundDeletion"})
+	if err := c.Update(t.Context(), pool); err != nil {
+		t.Fatal(err)
+	}
+	setNow(t, sharedRetireAt(pool, ledger))
+	// The first retirement's direct Pod cleanup fails: the pool Delete is
+	// still issued, and the Pod error returned.
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, w client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return apierrors.NewInternalError(errors.New("pod list refused"))
+			}
+			return w.List(ctx, list, opts...)
+		},
+	})
+	if err := sharedDriver(failing, native).hardRetireSharedPool(t.Context(), pool, sharedRetiring, "lifetime"); err == nil {
+		t.Fatal("a failed Pod cleanup was dropped once the pool Delete succeeded")
+	}
+	current, _ := getPool(t, c, record.SharedWorker.Pool)
+	if current.GetDeletionTimestamp() == nil {
+		t.Fatal("the pool Delete was not issued")
+	}
+	// The next bounds pass, well before the hard bound's escalation, retries
+	// the capped Pod delete for the deleting pool.
+	recording, deletes := recordingDeletes(t, c)
+	_ = (&SpareWorkerReplenisher{Client: recording, Config: sharedConfig()}).EnforceSharedBounds(t.Context())
+	if !slices.ContainsFunc(deletes(), func(d deleteRecord) bool {
+		return d.kind == "Pod" && d.uid == record.Worker.PodUID && d.grace != nil && *d.grace == int64(workerPodTerminationGrace/time.Second)
+	}) {
+		t.Fatalf("a deleting pool's worker Pod never got its capped delete retried: %+v", deletes())
+	}
+}
