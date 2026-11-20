@@ -147,10 +147,20 @@ func (d *Lifecycle) captureRetirementWorker(ctx context.Context, cm *corev1.Conf
 }
 
 func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
+	if record.SharedWorker != nil && record.BootRequested {
+		// Every pass of a booted shared retirement, before and after its
+		// proof through deletion, slot release and journal finalization,
+		// follows one rule (sharedStopDoubt).
+		return d.sharedStopDoubt(ctx, cm, record, "the shared retirement could not complete", d.stopBooted(ctx, cm, record))
+	}
+	return d.stopBooted(ctx, cm, record)
+}
+
+func (d *Lifecycle) stopBooted(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) error {
 	actor, err := d.actor(ctx, record)
 	if err != nil {
-		if record.SharedWorker != nil && record.BootRequested && !record.WorkloadAbsent {
-			return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor could not be read during retirement"))
+		if record.SharedWorker != nil && record.BootRequested {
+			return d.sharedStopDoubt(ctx, cm, record, "the Actor could not be read during retirement", err)
 		}
 		return err
 	}
@@ -363,6 +373,11 @@ func (d *Lifecycle) SuspendInstance(ctx context.Context, key sdk.AllocationKey, 
 			return fmt.Errorf("native suspension is unsupported or already retired")
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
+			if record.SharedWorker != nil && record.Pending != nil && !apierrors.IsConflict(err) && !holdRetry(ctx, err, record) && ctx.Err() == nil {
+				// After the suspension intent, an unverifiable journal
+				// requirement is doubt like any other error.
+				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the workspace's journal requirement could not be verified during suspension: "+err.Error()))
+			}
 			return err
 		}
 		if record.Operation != "suspend" {

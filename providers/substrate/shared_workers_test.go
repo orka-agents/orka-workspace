@@ -641,6 +641,183 @@ func TestSharedFailureAfterTheInterimProofTakesTheStrongPath(t *testing.T) {
 	}
 }
 
+// Every step of a shared Stop from its evidence suspend through deletion,
+// slot release and journal finalization follows one rule: a persistent
+// failure there persists the strong marker and starts the pool's retirement
+// before the pass returns. Each case injects a lasting failure at one step.
+func TestSharedEveryPostEvidenceFailureTakesTheStrongPath(t *testing.T) {
+	// journalTransition fails journal writes that newly set a field.
+	journalTransition := func(changed func(before, after *journalRecord) bool) func(*sharedStepFault) {
+		return func(f *sharedStepFault) {
+			f.journal = changed
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		inject func(*sharedStepFault)
+	}{
+		{"evidence SuspendActor", func(f *sharedStepFault) { f.native.failSuspendBeforeEffect = true }},
+		{"GetWorker during the proof", func(f *sharedStepFault) { f.afterSuspend = func(n *nativeFixture) { n.failGetWorker = 1 << 20 } }},
+		{"assignment List during the proof", func(f *sharedStepFault) { f.afterSuspend = func(n *nativeFixture) { n.assignmentsRejected = true } }},
+		{"suspend observation save", journalTransition(func(before, after *journalRecord) bool {
+			return before.SharedWorker.Suspend != nil && before.SharedWorker.Suspend.SnapshotDigest == "" && after.SharedWorker.Suspend != nil && after.SharedWorker.Suspend.SnapshotDigest != ""
+		})},
+		{"proof save", journalTransition(func(before, after *journalRecord) bool {
+			return before.SharedWorker.Proof == nil && after.SharedWorker.Proof != nil
+		})},
+		{"workload absence save", journalTransition(func(before, after *journalRecord) bool { return !before.WorkloadAbsent && after.WorkloadAbsent })},
+		{"Actor deletion save", journalTransition(func(before, after *journalRecord) bool { return !before.DeleteIssued && after.DeleteIssued })},
+		{"GetActor after the proof", func(f *sharedStepFault) { f.afterAbsent = func(n *nativeFixture) { n.failGetActor = 1 << 20 } }},
+		{"DeleteActor", func(f *sharedStepFault) { f.native.failDelete = true }},
+		{"slot release ledger write", func(f *sharedStepFault) { f.failLedger = true }},
+		{"slot release save", journalTransition(func(before, after *journalRecord) bool {
+			return !before.SharedWorker.Released && after.SharedWorker.Released
+		})},
+		{"journal finalization save", journalTransition(func(before, after *journalRecord) bool {
+			return before.Observation.State != sdk.AllocationStopped && after.Observation.State == sdk.AllocationStopped
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, native, first, binding := sharedFixture(t, 3)
+			second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+			a, recordA := sharedReady(t, c, native, first)
+			sharedReady(t, c, native, second)
+			fault := &sharedStepFault{native: native}
+			tc.inject(fault)
+			native.afterSuspend = func(*pb.Actor) {
+				if fault.afterSuspend != nil {
+					fault.fired.Store(true)
+					fault.afterSuspend(native)
+				}
+			}
+			faulty := fault.client(t, c)
+			started := func() bool {
+				pool, found := getPool(t, c, recordA.SharedWorker.Pool)
+				return !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool)
+			}
+			for range 24 {
+				tick()
+				_, _ = sharedDriver(faulty, native).StopInstance(t.Context(), first.Key, a.Identity)
+				if started() {
+					break
+				}
+			}
+			if !fault.fired.Load() {
+				t.Fatal("the fixture never injected its failure")
+			}
+			if !started() {
+				t.Fatal("a lasting failure at this step never started the pool's strong retirement")
+			}
+		})
+	}
+}
+
+// cancellingDeleteControl cancels the request inside DeleteActor and fails
+// the call as a real one would.
+type cancellingDeleteControl struct {
+	*nativeFixture
+	cancel context.CancelFunc
+}
+
+func (c *cancellingDeleteControl) DeleteActor(ctx context.Context, req *pb.DeleteActorRequest, opts ...grpc.CallOption) (*pb.Actor, error) {
+	c.cancel()
+	return nil, status.FromContextError(ctx.Err()).Err()
+}
+
+// The retry half of the same rule: a failure after the proof that comes only
+// from the request's own context ending never starts the strong path, and a
+// live pass then finishes the Stop on its interim proof.
+func TestSharedCancelledPostProofFailureIsRetried(t *testing.T) {
+	c, native, first, binding := sharedFixture(t, 3)
+	second := sharedWorkspace(t, c, first, "tenant", "second", "second-uid", binding)
+	a, recordA := sharedReady(t, c, native, first)
+	sharedReady(t, c, native, second)
+	cancelled := false
+	for range 24 {
+		tick()
+		_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := sharedDriver(c, native)
+		ctx, cancel := context.WithCancel(t.Context())
+		if record.WorkloadAbsent || record.SharedWorker.Proof != nil {
+			d.control = &cancellingDeleteControl{nativeFixture: native, cancel: cancel}
+			cancelled = true
+		}
+		_, _ = d.StopInstance(ctx, first.Key, a.Identity)
+		cancel()
+		if cancelled {
+			break
+		}
+	}
+	_, record, err := sharedDriver(c, native).read(t.Context(), first.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cancelled || !record.DeleteIssued {
+		t.Fatal("the fixture never cancelled the Actor's deletion")
+	}
+	if pool, found := getPool(t, c, recordA.SharedWorker.Pool); record.SharedWorker.Strong != "" || !found || pool.GetDeletionTimestamp() != nil || sharedRetireIntended(pool) {
+		t.Fatalf("a cancelled request started the strong path: %q", record.SharedWorker.Strong)
+	}
+	observed, record := sharedRetired(t, c, native, first, a.Identity, false)
+	if observed.State != sdk.AllocationStopped || record.SharedWorker.Strong != "" {
+		t.Fatalf("the retried Stop did not finish on its interim proof: %s %q", observed.State, record.SharedWorker.Strong)
+	}
+}
+
+// sharedStepFault injects one lasting failure into a shared Stop.
+type sharedStepFault struct {
+	native       *nativeFixture
+	afterSuspend func(*nativeFixture)
+	afterAbsent  func(*nativeFixture)
+	journal      func(before, after *journalRecord) bool
+	failLedger   bool
+	fired        atomic.Bool
+}
+
+func (f *sharedStepFault) client(t *testing.T, c client.Client) client.Client {
+	t.Helper()
+	absent := false
+	if f.native.failSuspendBeforeEffect || f.native.failDelete {
+		f.fired.Store(true)
+	}
+	return interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{Update: func(ctx context.Context, w client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		switch o := obj.(type) {
+		case *corev1.ConfigMap:
+			after, ok := decodeClaimRecord(o)
+			stored := &corev1.ConfigMap{}
+			if !ok || w.Get(ctx, client.ObjectKeyFromObject(o), stored) != nil {
+				break
+			}
+			before, ok := decodeClaimRecord(stored)
+			if !ok || before.SharedWorker == nil || after.SharedWorker == nil {
+				break
+			}
+			if f.journal != nil && f.journal(before, after) {
+				f.fired.Store(true)
+				return apierrors.NewInternalError(errors.New("journal write refused"))
+			}
+			if !before.WorkloadAbsent && after.WorkloadAbsent {
+				absent = true
+				if f.afterAbsent != nil {
+					defer func() {
+						f.fired.Store(true)
+						f.afterAbsent(f.native)
+					}()
+				}
+			}
+		case *unstructured.Unstructured:
+			if o.GetKind() == "WorkerPool" && f.failLedger && absent {
+				f.fired.Store(true)
+				return apierrors.NewInternalError(errors.New("ledger write refused"))
+			}
+		}
+		return w.Update(ctx, obj, opts...)
+	}})
+}
+
 func TestSharedTaintOrQuarantineRetiresThroughTheStrongPath(t *testing.T) {
 	for _, quarantine := range []bool{false, true} {
 		t.Run(map[bool]string{false: "taint", true: "quarantine"}[quarantine], func(t *testing.T) {

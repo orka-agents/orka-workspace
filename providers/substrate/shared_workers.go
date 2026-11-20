@@ -1472,10 +1472,7 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 	if record.BootRequested && !record.WorkloadAbsent {
 		if actor != nil && actor.GetStatus().GetWorkerAssignment() != nil && (record.Worker == nil || !sharedAssignmentMatches(actor.GetStatus().GetWorkerAssignment(), record.Worker)) {
 			if err := d.captureSharedReplacement(ctx, cm, record, actor); err != nil {
-				if apierrors.IsConflict(err) {
-					return err
-				}
-				return errors.Join(err, d.sharedDoubt(ctx, cm, record, "the Actor's replacement worker could not be recorded"))
+				return d.sharedStopDoubt(ctx, cm, record, "the Actor's replacement worker could not be recorded", err)
 			}
 		}
 		// A persisted strong marker always wins, even over a journaled interim
@@ -1486,6 +1483,10 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		if reason == "" && shared.Proof == nil {
 			var err error
 			if reason, err = d.sharedStrongReason(ctx, cm, record); err != nil {
+				if ctx.Err() != nil {
+					// The request's own context ended: retried, never doubt.
+					return err
+				}
 				// Unverifiable before the proof is doubt: persist it and start
 				// the pool's deletion (under the detached cleanup context)
 				// rather than leave no intent for the bounds loop to recover.
@@ -1494,16 +1495,22 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 		}
 		if reason == "" && shared.Proof == nil {
 			proven, doubt, err := d.advanceSharedInterim(ctx, cm, record, actor)
-			if err != nil && !apierrors.IsConflict(err) {
+			if err != nil && !apierrors.IsConflict(err) && ctx.Err() == nil {
 				// Any failure after the evidence suspend's intent (including
 				// a journal write after the suspend took effect) is doubt; a
-				// write conflict is retried.
+				// write conflict, or a failure once the request's own context
+				// has ended, is retried.
 				doubt, err = "the evidence-only retirement could not be recorded: "+err.Error(), nil
 			}
 			if err != nil || (!proven && doubt == "") {
 				return err
 			}
 			reason = doubt
+		}
+		if reason != "" && shared.Strong == "" && ctx.Err() != nil {
+			// A doubt this pass found may come from a read cut short by the
+			// request's own context ending; the next pass decides again.
+			return ctx.Err()
 		}
 		if reason != "" {
 			// Deletion is driven even if the marker cannot be saved; the
@@ -1556,11 +1563,24 @@ func (d *Lifecycle) stopShared(ctx context.Context, cm *corev1.ConfigMap, record
 // admitting. A write conflict is retried, and so is any failure once the
 // request's own context has ended (a cancelled reconcile, a lost lease, a
 // shutdown), since the strong path runs detached from it.
+//
+// The strong path already under way (a marker set this pass or persisted
+// before) is driven by strongSharedAbsence and the bounds loop, so its own
+// waits and retries return as they are.
 func (d *Lifecycle) sharedStopDoubt(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, err error) error {
-	if apierrors.IsConflict(err) || ctx.Err() != nil {
+	if err == nil || apierrors.IsConflict(err) || ctx.Err() != nil || record.SharedWorker.Strong != "" {
 		return err
 	}
 	return errors.Join(err, d.sharedDoubt(ctx, cm, record, reason+": "+err.Error()))
+}
+
+// sharedStopFailure applies sharedStopDoubt to a booted shared record and
+// returns err unchanged for any other.
+func (d *Lifecycle) sharedStopFailure(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord, reason string, err error) error {
+	if record.SharedWorker == nil || !record.BootRequested {
+		return err
+	}
+	return d.sharedStopDoubt(ctx, cm, record, reason, err)
 }
 
 // advanceSharedInterim moves the interim path forward by one step. It

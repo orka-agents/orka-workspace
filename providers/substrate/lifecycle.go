@@ -580,14 +580,14 @@ func (d *Lifecycle) StopInstance(ctx context.Context, key sdk.AllocationKey, ide
 			return nil
 		}
 		if err := d.requireJournal(ctx, cm, record); err != nil {
-			return err
+			return d.sharedStopFailure(ctx, cm, record, "the workspace's journal requirement could not be verified during retirement", err)
 		}
 		if record.Operation != "stop" {
 			record.Operation = "stop"
 			stamp(&record.Timing.RetirementStartedAt)
 			record.Observation = pendingObservation(record)
 			if err := d.save(ctx, cm, record); err != nil {
-				return err
+				return d.sharedStopFailure(ctx, cm, record, "the retirement could not be recorded", err)
 			}
 		}
 		if err := d.stop(ctx, cm, record); err != nil {
