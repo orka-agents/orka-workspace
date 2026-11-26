@@ -419,6 +419,46 @@ before core may release the workspace. Retained in-tree MCP actor pools remain a
 migration boundary: the shared workload contract currently has no MCP
 service/pool request. Existing resources retire under their original owner.
 
+## Lifecycle timing
+
+Each sequence's journal (and its `substrate-history-*` archive) records
+microsecond milestone times under `timing`. Each time comes from this
+provider's clock and is written by the journal save that already persists its
+step, so timing adds no API writes. Native timestamps are never used because
+their clock may differ. Each lifecycle emits one Info line, on the pass that
+first persists its final milestone; repeated reconciles and restarts do not log
+again. The lines carry no credentials, bootstrap material, snapshot locations,
+or provider-native names and UIDs. A phase is omitted when either bound is
+missing, for example in journals written before timing existed.
+
+`Substrate runtime ready` carries `workspaceNamespace`, `workspaceName`,
+`runtimePool` (the Orka RuntimePool binding), `sequence`, `path` (`cold`, or
+`resume` from a Tag), and these durations in milliseconds:
+
+| Field | From | To |
+| --- | --- | --- |
+| `workerPoolMs` | allocation start | private WorkerPool UID saved |
+| `workerActiveMs` | WorkerPool created | active, empty worker fenced (overlaps the next three) |
+| `templateCreateMs` | WorkerPool created | bootstrap template UID saved |
+| `actorCreateMs` | template created | Actor UID saved |
+| `templateUpdateMs` | Actor created | restored Actor first seen on its rotated template (`resume` only; observed by the next save) |
+| `workerToResumeMs` | worker fenced | Resume issued |
+| `resumeToChallengeMs` | Resume issued | bootstrap challenge saved |
+| `challengeToReadyMs` | challenge saved | Ready saved |
+| `totalMs` | allocation start | Ready saved |
+
+`Substrate runtime stopped` carries `workspaceNamespace`, `workspaceName`,
+`runtimePool`, `sequence`, `operation` (`stop` or `suspend`), and these
+durations in milliseconds:
+
+| Field | From | To |
+| --- | --- | --- |
+| `suspendMs` | Suspend issued | `SUSPENDED` with a new data snapshot observed |
+| `tagMs` | suspension observed | data Tag verified and recorded |
+| `workerTeardownMs` | Tag recorded (suspend) or retirement start (stop) | worker Pods and private WorkerPool proven absent |
+| `actorDeleteMs` | Actor delete issued | Actor absence observed and Stopped saved |
+| `totalMs` | retirement start | Stopped saved |
+
 ## Checkpoints
 
 `ExecutionWorkspaceCheckpoint` exports an existing verified Data artifact from

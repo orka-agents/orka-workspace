@@ -367,6 +367,7 @@ func (d *Lifecycle) ensureRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 	}
 	if record.RuntimePool.UID == "" {
 		record.RuntimePool.UID = string(pool.GetUID())
+		stamp(&record.Timing.WorkerPoolCreatedAt)
 		return d.save(ctx, cm, record)
 	}
 	return nil
@@ -468,6 +469,7 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	}
 	if record.Worker == nil {
 		record.Worker = fence
+		stamp(&record.Timing.WorkerActiveAt)
 		if err := d.save(ctx, cm, record); err != nil {
 			return false, err
 		}

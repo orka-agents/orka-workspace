@@ -143,6 +143,9 @@ type journalRecord struct {
 	DeleteIssued      bool                 `json:"deleteIssued,omitempty"`
 	// StartedAt bounds creation and boot until first process evidence.
 	StartedAt metav1.Time `json:"startedAt,omitempty"`
+	// Timing holds this sequence's lifecycle milestones for latency logs.
+	// It is diagnostic only and never gates a lifecycle decision.
+	Timing lifecycleTiming `json:"timing,omitzero"`
 	// Failure records an exact-instance loss. The instance never restarts;
 	// Core authorizes its cleanup, and retained checkpoints stay recoverable.
 	Failure string `json:"failure,omitempty"`
