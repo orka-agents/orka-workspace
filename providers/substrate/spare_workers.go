@@ -519,6 +519,21 @@ func (r *SpareWorkerReplenisher) wanted(ctx context.Context, item *profile.Subst
 	return want
 }
 
+// spareSpecMatches reports whether pool's live spec equals the expected spare
+// spec with its own birth labels, catching spec drift (for example a changed
+// workerImage) even when the creation-time shape annotation was left intact.
+func spareSpecMatches(pool *unstructured.Unstructured, shape *spareShape) bool {
+	if pool == nil || shape == nil {
+		return false
+	}
+	expected, err := buildPrivatePoolSpec(shape.source, shape.cpu, shape.memory, spareBirth(pool.GetName()))
+	if err != nil {
+		return false
+	}
+	actual, ok := poolSpecDigest(pool)
+	return ok && actual == digest(expected)
+}
+
 func (r *SpareWorkerReplenisher) replenish(ctx context.Context, d *Lifecycle, workers *spareWorkerCache, item *profile.SubstrateWorkspaceProfile, want int, spares []*unstructured.Unstructured) error {
 	var shape *spareShape
 	if want > 0 {
@@ -537,7 +552,10 @@ func (r *SpareWorkerReplenisher) replenish(ctx context.Context, d *Lifecycle, wo
 		if !unclaimedSpare(pool, string(item.UID)) {
 			continue
 		}
-		fresh := shape != nil && pool.GetNamespace() == shape.source.GetNamespace() && pool.GetAnnotations()[spareSourceAnnotation] == string(shape.source.GetUID()) && pool.GetAnnotations()[spareShapeAnnotation] == shape.digest
+		fresh := shape != nil && pool.GetNamespace() == shape.source.GetNamespace() &&
+			pool.GetAnnotations()[spareSourceAnnotation] == string(shape.source.GetUID()) &&
+			pool.GetAnnotations()[spareShapeAnnotation] == shape.digest &&
+			spareSpecMatches(pool, shape)
 		if fresh {
 			current = append(current, pool)
 			continue
