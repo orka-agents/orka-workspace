@@ -64,7 +64,14 @@ func TestCodexProviderRequiresTheLoopbackSessionProxy(t *testing.T) {
 	if err != nil || model != "gpt-5.4" || base != "http://127.0.0.1:4567/_orka/provider/r/v1" {
 		t.Fatalf("codexProvider = %q %q %v", model, base, err)
 	}
-	for _, config := range []string{``, `{}`, `{"model":"m","model_provider":"orka","model_providers":{"orka":{"base_url":"http://example.com"}}}`, `{"model_provider":"orka","model_providers":{"orka":{"base_url":"http://127.0.0.1:1"}}}`} {
+	for _, config := range []string{
+		``,
+		`{}`,
+		`{"model":"m","model_provider":"orka","model_providers":{"orka":{"base_url":"http://example.com"}}}`,
+		`{"model_provider":"orka","model_providers":{"orka":{"base_url":"http://127.0.0.1:1"}}}`,
+		`{"model":"m","model_provider":"orka","model_providers":{"orka":{"base_url":"http://127.0.0.1:4567@external.example/proxy"}}}`,
+		`{"model":"m","model_provider":"orka","model_providers":{"orka":{"base_url":"http://127.0.0.1:/proxy"}}}`,
+	} {
 		if _, _, err := codexProvider(config); err == nil {
 			t.Fatalf("config %q must be refused", config)
 		}

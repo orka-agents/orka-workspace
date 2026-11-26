@@ -178,6 +178,7 @@ func clonePrivateWorkspace(t *testing.T, c client.Client, base sdk.WorkloadReque
 // private pool ownership.
 func TestConcurrentPrivateWorkspacesClaimSparesSafely(t *testing.T) {
 	c, inner, base := fixture(t, true)
+	base = cappedRequest(t, c, base, 6)
 	setSpareAnnotation(t, c, "3")
 	native := &lockedNative{nativeFixture: inner}
 	repl := &SpareWorkerReplenisher{Client: c, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
