@@ -91,7 +91,7 @@ func retiredWith(t *testing.T, ctx context.Context, c client.Client, native *nat
 		var out sdk.AllocationObservation
 		var err error
 		if suspend {
-			out, err = driver(c, native).SuspendInstance(ctx, request.Key, identity)
+			out, err = driver(c, native).SuspendInstance(ctx, request.Key, identity, nil)
 		} else {
 			out, err = driver(c, native).StopInstance(ctx, request.Key, identity)
 		}
@@ -466,7 +466,7 @@ func TestLifecycleTimingRecoveredCheckpointKeepsCatalogCompletion(t *testing.T) 
 		return inner.Update(ctx, obj, opts...)
 	}})
 	for range 12 {
-		if _, err := driver(wrapped, native).SuspendInstance(ctx, request.Key, first.Identity); err != nil {
+		if _, err := driver(wrapped, native).SuspendInstance(ctx, request.Key, first.Identity, nil); err != nil {
 			break
 		}
 	}
