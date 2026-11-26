@@ -89,6 +89,10 @@ type turn struct {
 	SettledMs  int64             `json:"settledMs,omitempty"`
 	Identity   map[string]string `json:"identity"`
 	Workspace  string            `json:"workspace"`
+	// liveStartup preserves the Actor/worker startup identity observed before
+	// detach so a fast zero-window suspension clearing Allocation.Startup
+	// cannot erase it.
+	liveStartup *api.NativeProcessEvidence
 }
 
 var acceptedOrLater = map[string]bool{"Accepted": true, "Running": true, "Settling": true, "Succeeded": true}
@@ -147,6 +151,10 @@ func (l *latency) createTurn(ctx context.Context, name, session, class string, c
 	}
 	if t.Workspace == "" || t.Identity["runtimeInstanceID"] == "" || t.Identity["runtimeSessionUID"] == "" {
 		return nil, fmt.Errorf("successful Task %s omitted its workspace or runtime identity", name)
+	}
+	if current, err := l.workspace(ctx, t.Workspace); err == nil && current.Status.Allocation != nil &&
+		current.Status.Allocation.Startup != nil && current.Status.Allocation.Startup.Process != nil {
+		t.liveStartup = current.Status.Allocation.Startup.Process.DeepCopy()
 	}
 	return t, nil
 }
@@ -364,9 +372,21 @@ func (l *latency) logTurn(scenario string, rep int, ordinal string, t *turn, bef
 	l.emit("turn", map[string]any{"scenario": scenario, "rep": rep, "turn": ordinal, "task": t, "workspaceBefore": before, "workspaceAfter": after})
 }
 
+// applyLiveStartup backfills Actor/worker identity captured before detach when
+// a fast zero-window suspension has already cleared Allocation.Startup.
+func applyLiveStartup(s *snapshot, p *api.NativeProcessEvidence) {
+	if s == nil || p == nil || s.ActorUID != "" {
+		return
+	}
+	s.ActorUID = p.UID
+	s.ActorVersion = p.Version
+	s.WorkerPodUID = string(p.Worker.UID)
+	s.WorkerPod = p.Worker.Namespace + "/" + p.Worker.Name
+}
+
 // detachScenario: the profile has no warm window, so every detach suspends.
-func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, error) {
-	session := fmt.Sprintf("lat-detach-%d", rep)
+func (l *latency) detachScenario(ctx context.Context, sessionPrefix string, rep int) (map[string]any, error) {
+	session := fmt.Sprintf("%s-detach-%d", sessionPrefix, rep)
 	tagsBeforeT1, err := l.listTagUIDs(ctx)
 	if err != nil {
 		return nil, err
@@ -384,12 +404,14 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
+	applyLiveStartup(afterT1, t1.liveStartup)
 	l.logTurn("detach", rep, "t1", t1, nil, afterT1)
-	suspended, waited, err := l.waitSuspended(ctx, t1.Workspace, pool, afterT1, 5*time.Minute)
+	suspended, _, err := l.waitSuspended(ctx, t1.Workspace, pool, afterT1, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}
-	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t1", "workspace": t1.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": suspended})
+	observedAfterSettleT1 := ms(time.Since(t1.CreatedAt)) - t1.SettledMs
+	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t1", "workspace": t1.Workspace, "observedAfterSettleMs": observedAfterSettleT1, "snapshot": suspended})
 	if _, present := suspended.Annotations["suspend-at"]; present {
 		l.violate("window-unset workspace carries a suspend-at deadline")
 	}
@@ -407,24 +429,27 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
+	applyLiveStartup(afterT2, t2.liveStartup)
 	l.logTurn("detach", rep, "t2", t2, suspended, afterT2)
-	if t2.Workspace != t1.Workspace || afterT2.Sequence != afterT1.Sequence+1 || !afterT2.ResumePath || afterT2.ActorUID == afterT1.ActorUID ||
+	if t2.Workspace != t1.Workspace || afterT2.Sequence != afterT1.Sequence+1 || !afterT2.ResumePath ||
+		afterT1.ActorUID == "" || afterT2.ActorUID == "" || afterT2.ActorUID == afterT1.ActorUID ||
 		t2.Identity["runtimeInstanceID"] == t1.Identity["runtimeInstanceID"] {
 		l.violate("continuation %s did not resume the same workspace from its Tag on a new sequence and Actor", t2.Name)
 	}
-	final, waited, err := l.waitSuspended(ctx, t2.Workspace, t2.Identity["runtimePoolName"], afterT2, 5*time.Minute)
+	final, _, err := l.waitSuspended(ctx, t2.Workspace, t2.Identity["runtimePoolName"], afterT2, 5*time.Minute)
 	if err != nil {
 		return nil, err
 	}
-	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t2", "workspace": t2.Workspace, "observedAfterSettleMs": ms(waited), "snapshot": final})
+	observedAfterSettleT2 := ms(time.Since(t2.CreatedAt)) - t2.SettledMs
+	l.emit("suspended", map[string]any{"scenario": "detach", "rep": rep, "after": "t2", "workspace": t2.Workspace, "observedAfterSettleMs": observedAfterSettleT2, "snapshot": final})
 	return map[string]any{"session": session, "workspace": t1.Workspace, "t1": t1, "t2": t2, "resumedSequence": afterT2.Sequence}, nil
 }
 
 // warmScenario: the profile freezes a warm window. Turn 2 arrives inside it
 // and must attach the running instance; then the window expires, retention
 // suspends, and turn 3 resumes from the Tag.
-func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, error) {
-	session := fmt.Sprintf("lat-warm-%d", rep)
+func (l *latency) warmScenario(ctx context.Context, sessionPrefix string, rep int) (map[string]any, error) {
+	session := fmt.Sprintf("%s-warm-%d", sessionPrefix, rep)
 	t1, err := l.createTurn(ctx, session+"-t1", session, "lat-warm", true)
 	if err != nil {
 		return nil, err
@@ -520,6 +545,9 @@ func (l *latency) warmScenario(ctx context.Context, rep int) (map[string]any, er
 	expiryLateness := time.Since(deadline)
 	l.emit("suspended", map[string]any{"scenario": "warm", "rep": rep, "after": "window", "workspace": t2.Workspace,
 		"observedAfterDeadlineMs": ms(expiryLateness), "snapshot": suspended})
+	if expiryLateness < 0 {
+		l.violate("workspace %s suspended %s before its warm deadline", t2.Workspace, -expiryLateness)
+	}
 	// Idle retention can collect older workspaces' Tags meanwhile, so the
 	// expiry is checked for a Tag UID that did not exist before.
 	if len(newTags(warm2, suspended)) == 0 {
@@ -639,19 +667,19 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 		default:
 			return nil, fmt.Errorf("unknown latency scenario %q", scenario)
 		}
+		sessionPrefix := "lat"
+		if suffix != "" {
+			// A later run in the same namespace uses a distinct run component
+			// so Session and Task names never collide regardless of LATENCY_REPEATS.
+			sessionPrefix = "lat-r" + suffix
+		}
 		for rep := 1; rep <= repeats; rep++ {
-			id := rep
-			if suffix != "" {
-				// A later run in the same namespace uses fresh Session and Task names.
-				n, _ := strconv.Atoi(suffix)
-				id = n*100 + rep
-			}
 			var result map[string]any
 			var err error
 			if scenario == "detach" {
-				result, err = l.detachScenario(ctx, id)
+				result, err = l.detachScenario(ctx, sessionPrefix, rep)
 			} else {
-				result, err = l.warmScenario(ctx, id)
+				result, err = l.warmScenario(ctx, sessionPrefix, rep)
 			}
 			if err != nil {
 				report["events"] = l.events

@@ -148,15 +148,11 @@ def turn_sample(event):
     before = event.get('workspaceBefore') or {}
     started_new = before.get('sequence') != sequence or event['turn'] == 't1'
     evidence = {'sequence': sequence, 'newSequence': started_new}
+    admission = find(core, 'ACP workspace runtime admission timings', runtimePool=pool, sequence=sequence)
     if started_new:
-        admission = find(core, 'ACP workspace runtime admission timings', runtimePool=pool, sequence=sequence)
-        if admission:
-            initial = [a for a in admission if str(a.get('readmission')).lower() != 'true']
-            readmit = [a for a in admission if str(a.get('readmission')).lower() == 'true']
-            if initial:
-                sample.update(ms_fields(initial[0], 'admit.'))
-            if readmit:
-                sample.update(ms_fields(readmit[-1], 'readmit.'))
+        initial = [a for a in admission if str(a.get('readmission')).lower() != 'true']
+        if initial:
+            sample.update(ms_fields(initial[0], 'admit.'))
         started = find(core, 'ACP workspace runtime started', runtimePool=pool, sequence=sequence)
         if started:
             sample.update(ms_fields(started[-1], 'coreStart.'))
@@ -165,6 +161,13 @@ def turn_sample(event):
         if ready:
             sample.update(ms_fields(ready[-1], 'providerReady.'))
             evidence['providerPath'] = ready[-1].get('path')
+    begin = when(task.get('createdAt'))
+    if begin is not None:
+        end = begin + (task.get('settledMs') or task['doneMs']) / 1000.0
+        readmit = [a for a in admission if str(a.get('readmission')).lower() == 'true' and
+                   begin <= (when(a.get('time')) or 0) <= end]
+        if readmit:
+            sample.update(ms_fields(readmit[-1], 'readmit.'))
     # The supervisor names each RuntimeSession generation
     # runtime-<RuntimeSession UID>-g<generation>; a Session keeps its UID
     # across turns. Without a recorded generation, the turn's own time window
@@ -282,7 +285,7 @@ if checks:
     out.append('')
 held = [event for event in evidence if event.get('event') == 'windowHeld']
 for event in held:
-    replicas = sorted({sample['pool'].get('desiredReplicas') for sample in event['samples']})
+    replicas = sorted({(sample.get('pool') or {}).get('desiredReplicas') for sample in event['samples']})
     out.append('- window %s: %d samples, pool desiredReplicas %s, Actor and worker present in all: %s' % (
         event['rep'], len(event['samples']), replicas, all(s['actorExists'] and s['workerPodExists'] for s in event['samples'])))
 (run / 'summary.md').write_text('\n'.join(out) + '\n')

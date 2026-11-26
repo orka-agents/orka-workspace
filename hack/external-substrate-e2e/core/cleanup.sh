@@ -126,8 +126,8 @@ job="$(proof_job_json)"
 session_job="$(proof_job_json "${session_job_name}")"
 [[ -z "${session_job}" ]] || require_finished "${session_job}"
 # A latency measurement (core/latency.sh) still creating Tasks must finish first.
-if kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o json |
-  jq -e 'any(.items[]; all(.status.conditions[]?; .status != "True" or (.type != "Complete" and .type != "Failed")))' >/dev/null; then
+latency_jobs="$(kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o json)"
+if jq -e 'any(.items[]; all(.status.conditions[]?; .status != "True" or (.type != "Complete" and .type != "Failed")))' <<<"${latency_jobs}" >/dev/null; then
   printf 'A Core latency Job has not finished; refusing to retire a running measurement.\n' >&2
   exit 1
 fi

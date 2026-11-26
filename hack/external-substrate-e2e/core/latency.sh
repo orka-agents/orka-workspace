@@ -27,8 +27,8 @@ namespace_uid="$(jq -r '.metadata.annotations["orka.workspace.e2e/namespace-uid"
   printf 'Namespace %s is not the lifetime the proof Job recorded.\n' "${namespace}" >&2
   exit 1
 }
-if kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o json |
-  jq -e 'any(.items[]; all(.status.conditions[]?; .status != "True" or (.type != "Complete" and .type != "Failed")))' >/dev/null; then
+latency_jobs="$(kubectl -n "${client_namespace}" get jobs -l orka.workspace.e2e/latency=native-core -o json)"
+if jq -e 'any(.items[]; all(.status.conditions[]?; .status != "True" or (.type != "Complete" and .type != "Failed")))' <<<"${latency_jobs}" >/dev/null; then
   printf 'Another latency Job is still running.\n' >&2
   exit 1
 fi
