@@ -72,9 +72,10 @@ func allocationStart(record *journalRecord) *metav1.MicroTime {
 	return &metav1.MicroTime{Time: record.StartedAt.Time}
 }
 
-// phase appends a duration in milliseconds when both bounds were recorded.
+// phase appends a duration in milliseconds when both bounds were recorded and
+// to does not precede from (a backward wall-clock jump omits the field).
 func phase(values []any, key string, from, to *metav1.MicroTime) []any {
-	if from == nil || to == nil {
+	if from == nil || to == nil || to.Before(from) {
 		return values
 	}
 	return append(values, key, to.Sub(from.Time).Milliseconds())

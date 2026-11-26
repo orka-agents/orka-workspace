@@ -275,6 +275,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 		return err
 	}
 	if first {
+		// Best-effort structured timing log; a crash after save commits may omit it.
 		logRuntimeStopped(ctx, record)
 	}
 	return nil
