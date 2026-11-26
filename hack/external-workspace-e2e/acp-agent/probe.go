@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -79,7 +80,11 @@ func codexProvider(config string) (model, baseURL string, err error) {
 		return "", "", fmt.Errorf("CODEX_CONFIG is not JSON")
 	}
 	provider, ok := parsed.ModelProviders[parsed.ModelProvider]
-	if parsed.Model == "" || !ok || !strings.HasPrefix(provider.BaseURL, "http://127.0.0.1:") {
+	if parsed.Model == "" || !ok {
+		return "", "", fmt.Errorf("CODEX_CONFIG names no loopback session provider proxy")
+	}
+	parsedURL, err := url.Parse(provider.BaseURL)
+	if err != nil || parsedURL.Scheme != "http" || parsedURL.User != nil || parsedURL.Hostname() != "127.0.0.1" || parsedURL.Port() == "" {
 		return "", "", fmt.Errorf("CODEX_CONFIG names no loopback session provider proxy")
 	}
 	return parsed.Model, strings.TrimRight(provider.BaseURL, "/"), nil
