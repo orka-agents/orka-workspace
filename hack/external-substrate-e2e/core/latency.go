@@ -252,28 +252,38 @@ func (l *latency) snapshot(ctx context.Context, w *api.ExecutionWorkspace, poolN
 			s.Pool = map[string]any{"uid": string(pool.GetUID()), "specDesiredReplicas": specReplicas, "desiredReplicas": desired, "currentReplicas": current,
 				"lifecycle": str(pool, "status", "lifecycle"), "admissionState": str(pool, "status", "admissionState"),
 				"activeInstance": str(pool, "status", "activeInstance", "runtimeInstanceID"), "bootID": str(pool, "status", "activeInstance", "bootID")}
-			var secrets corev1.SecretList
+			var secrets metav1.PartialObjectMetadataList
+			secrets.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("SecretList"))
 			if err := l.c.List(ctx, &secrets, client.InNamespace(l.namespace), client.MatchingLabels{runtimePoolUIDLabel: string(pool.GetUID())}); err != nil {
 				return nil, err
 			}
 			s.PoolSecrets = map[string]string{}
 			for _, secret := range secrets.Items {
-				// Identity and version only; Secret data is never read into the report.
+				// Metadata-only list: Secret data never enters this process.
 				s.PoolSecrets[secret.Name] = string(secret.UID) + "@" + secret.ResourceVersion
 			}
 		} else if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
 	}
+	tags, err := l.listTagUIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.Tags = tags
+	return s, nil
+}
+
+func (l *latency) listTagUIDs(ctx context.Context) ([]string, error) {
 	tags, err := l.native.ListTags(ctx, &pb.ListTagsRequest{Atespace: l.namespace, Options: &pb.ListOptions{PageSize: 1000}})
 	if err != nil {
 		return nil, err
 	}
-	s.Tags = []string{}
+	uids := make([]string, 0, len(tags.GetTags()))
 	for _, tag := range tags.GetTags() {
-		s.Tags = append(s.Tags, tag.GetMetadata().GetUid())
+		uids = append(uids, tag.GetMetadata().GetUid())
 	}
-	return s, nil
+	return uids, nil
 }
 
 // waitSuspended waits for the exact suspension of the instance snapshot
@@ -357,6 +367,10 @@ func (l *latency) logTurn(scenario string, rep int, ordinal string, t *turn, bef
 // detachScenario: the profile has no warm window, so every detach suspends.
 func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, error) {
 	session := fmt.Sprintf("lat-detach-%d", rep)
+	tagsBeforeT1, err := l.listTagUIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
 	t1, err := l.createTurn(ctx, session+"-t1", session, "lat-detach", true)
 	if err != nil {
 		return nil, err
@@ -379,7 +393,7 @@ func (l *latency) detachScenario(ctx context.Context, rep int) (map[string]any, 
 	if _, present := suspended.Annotations["suspend-at"]; present {
 		l.violate("window-unset workspace carries a suspend-at deadline")
 	}
-	if len(newTags(afterT1, suspended)) == 0 {
+	if len(newTags(&snapshot{Tags: tagsBeforeT1}, suspended)) == 0 {
 		l.violate("suspension of %s produced no native Tag", t1.Workspace)
 	}
 	t2, err := l.createTurn(ctx, session+"-t2", session, "lat-detach", false)
@@ -660,13 +674,39 @@ func (p *proof) measure(ctx context.Context) (map[string]any, error) {
 }
 
 // ensureClassOnce creates the profile/class pair unless an earlier run in
-// this namespace already did; an existing pair must already be Ready.
+// this namespace already created an identical Ready pair. If the existing
+// profile has a different suspendAfterDetach window, it returns an error
+// rather than silently measuring the wrong window.
 func (l *latency) ensureClassOnce(ctx context.Context, name string, window *metav1.Duration) error {
 	existing := &api.ExecutionWorkspaceClass{}
-	if err := l.c.Get(ctx, client.ObjectKey{Namespace: l.namespace, Name: name}, existing); err == nil {
-		return nil
-	} else if !apierrors.IsNotFound(err) {
+	err := l.c.Get(ctx, client.ObjectKey{Namespace: l.namespace, Name: name}, existing)
+	if apierrors.IsNotFound(err) {
+		return l.ensureClass(ctx, name, window)
+	}
+	if err != nil {
 		return err
 	}
-	return l.ensureClass(ctx, name, window)
+	existingProfile := &profile.SubstrateWorkspaceProfile{}
+	if err := l.c.Get(ctx, client.ObjectKey{Namespace: l.namespace, Name: name}, existingProfile); err != nil {
+		return fmt.Errorf("read existing profile %s: %w", name, err)
+	}
+	var gotWindow *time.Duration
+	if existingProfile.Spec.Retention != nil && existingProfile.Spec.Retention.SuspendAfterDetach != nil {
+		d := existingProfile.Spec.Retention.SuspendAfterDetach.Duration
+		gotWindow = &d
+	}
+	var wantWindow *time.Duration
+	if window != nil {
+		d := window.Duration
+		wantWindow = &d
+	}
+	if (gotWindow == nil) != (wantWindow == nil) || (gotWindow != nil && *gotWindow != *wantWindow) {
+		return fmt.Errorf("existing profile %s has suspendAfterDetach=%v, want %v; clean up or use matching LATENCY_WINDOW", name, gotWindow, wantWindow)
+	}
+	for _, condition := range existing.Status.Conditions {
+		if condition.Type == "Ready" && condition.ObservedGeneration == existing.Generation && condition.Status == metav1.ConditionTrue {
+			return nil
+		}
+	}
+	return fmt.Errorf("existing class %s is not Ready at generation %d", name, existing.Generation)
 }

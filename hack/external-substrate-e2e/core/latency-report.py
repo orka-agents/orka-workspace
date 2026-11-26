@@ -149,6 +149,14 @@ def turn_sample(event):
     started_new = before.get('sequence') != sequence or event['turn'] == 't1'
     evidence = {'sequence': sequence, 'newSequence': started_new}
     if started_new:
+        admission = find(core, 'ACP workspace runtime admission timings', runtimePool=pool, sequence=sequence)
+        if admission:
+            initial = [a for a in admission if str(a.get('readmission')).lower() != 'true']
+            readmit = [a for a in admission if str(a.get('readmission')).lower() == 'true']
+            if initial:
+                sample.update(ms_fields(initial[0], 'admit.'))
+            if readmit:
+                sample.update(ms_fields(readmit[-1], 'readmit.'))
         started = find(core, 'ACP workspace runtime started', runtimePool=pool, sequence=sequence)
         if started:
             sample.update(ms_fields(started[-1], 'coreStart.'))
@@ -182,17 +190,17 @@ def turn_sample(event):
     return {key: value for key, value in sample.items() if value is not None}, evidence
 
 
-def stop_sample(event, sequence):
-    snapshot = event['snapshot']
+def stop_sample(event, sequence, pool_name):
     sample = {}
-    pool = (snapshot.get('runtimePool') or {})
-    stopped = [entry for entry in find(core, 'ACP workspace runtime stopped', sequence=sequence) if entry.get('action') == 'suspend']
-    stopped = [entry for entry in stopped if not pool or entry.get('runtimePool', '').startswith('acp-ws')]
     workspace_stopped = find(provider, 'Substrate runtime stopped', workspaceName=event['workspace'], sequence=sequence)
     pools = {entry.get('runtimePool') for entry in workspace_stopped if entry.get('runtimePool')}
-    stopped = [entry for entry in stopped if not pools or entry.get('runtimePool') in pools]
-    if stopped:
-        sample.update(ms_fields(stopped[-1], 'coreStop.'))
+    if pool_name:
+        pools.add(pool_name)
+    if pools:
+        stopped = [entry for entry in find(core, 'ACP workspace runtime stopped', sequence=sequence)
+                   if entry.get('action') == 'suspend' and entry.get('runtimePool') in pools]
+        if stopped:
+            sample.update(ms_fields(stopped[-1], 'coreStop.'))
     if workspace_stopped:
         sample.update(ms_fields(workspace_stopped[-1], 'providerStop.'))
     for key in ('observedAfterSettleMs', 'observedAfterDeadlineMs'):
@@ -206,6 +214,7 @@ groups = {'cold (turn 1)': [], 'resume from Tag, window unset (turn 2)': [], 'wa
 stops = {'suspend on detach, window unset': [], 'suspend at window expiry': []}
 evidence = []
 last_sequence = {}
+last_pool = {}
 for event in events:
     if event['event'] == 'turn':
         sample, info = turn_sample(event)
@@ -215,11 +224,13 @@ for event in events:
         evidence.append({'scenario': event['scenario'], 'rep': event['rep'], 'turn': event['turn'], 'task': event['task']['name'], **info,
                          'runtimeInstanceID': event['task']['identity']['runtimeInstanceID'], 'actorUID': event['workspaceAfter'].get('actorUID')})
         last_sequence[event['task']['workspace']] = event['workspaceAfter']['sequence']
+        last_pool[event['task']['workspace']] = event['task']['identity'].get('runtimePoolName', '')
     elif event['event'] == 'suspended':
         sequence = last_sequence.get(event['workspace'])
+        pool_name = last_pool.get(event['workspace'], '')
         key = 'suspend at window expiry' if event['scenario'] == 'warm' else 'suspend on detach, window unset'
         if event.get('after') in ('t1', 't2', 'window'):
-            stops[key].append(stop_sample(event, sequence))
+            stops[key].append(stop_sample(event, sequence, pool_name))
     elif event['event'] in ('warmAttach', 'windowHeld', 'violation'):
         evidence.append(event)
 

@@ -97,6 +97,7 @@ jq --arg name "${job_name}" --arg repeats "${LATENCY_REPEATS:-3}" --arg window "
 start="$(date +%s)"
 status=0
 while true; do
+  (( $(date +%s) - start < 5520 )) || { status=1; break; }
   current="$(kubectl -n "${client_namespace}" --request-timeout=15s get job "${job_name}" -o json)" || { sleep 2; continue; }
   if jq -e 'any(.status.conditions[]?; (.type == "Failed" or .type == "FailureTarget") and .status == "True")' <<<"${current}" >/dev/null; then
     status=1
@@ -105,7 +106,6 @@ while true; do
   if jq -e 'any(.status.conditions[]?; .type == "Complete" and .status == "True")' <<<"${current}" >/dev/null; then
     break
   fi
-  (( $(date +%s) - start < 5520 )) || { status=1; break; }
   sleep 5
 done
 kubectl -n "${client_namespace}" logs "job/${job_name}" >"${run_dir}/latency.log" || true
@@ -114,7 +114,7 @@ touch "${run_dir}/.done"
 sleep 2
 # Timing lines only; everything else stays in the cluster.
 kubectl -n "${namespace}" logs deployment/external-substrate-core --since-time="${since}" |
-  grep -E 'ACP workspace runtime (started|stopped)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
+  grep -E 'ACP workspace runtime (started|stopped|admission timings)|ACP turn timings|WarmDetachWindow|warm-detach' >"${run_dir}/core-timings.log" || true
 # Every provider replica: only the elected leader reconciles and logs.
 kubectl -n "${provider_namespace}" logs -l app=orka-workspace-substrate --tail=-1 --max-log-requests=10 --since-time="${since}" |
   grep -E 'Substrate runtime (ready|stopped)' >"${run_dir}/provider-timings.log" || true
