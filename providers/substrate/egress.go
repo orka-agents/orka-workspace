@@ -265,7 +265,7 @@ func (d *Lifecycle) revokeWithdrawnEgressCredentials(ctx context.Context, key sd
 // and for a retiring Actor an applied deny-all is not an error.
 func (d *Lifecycle) revokeLiveEgressCredentials(ctx context.Context, key sdk.AllocationKey) error {
 	_, record, err := d.readForEgressRevocation(ctx, key)
-	if err != nil || record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
+	if err != nil || !d.egressRevocationNeeded(record) {
 		return nil
 	}
 	actor, err := d.actor(ctx, record)
@@ -279,6 +279,20 @@ func (d *Lifecycle) revokeLiveEgressCredentials(ctx context.Context, key sdk.All
 		return nil
 	}
 	return err
+}
+
+// egressRevocationNeeded reports a journaled credential-bearing allowlist
+// that the current configuration no longer admits or compiles: exactly when
+// revokeWithdrawnEgressCredentials would install deny-all.
+func (d *Lifecycle) egressRevocationNeeded(record *journalRecord) bool {
+	if record.Request.Runtime == nil || !record.Request.Runtime.Egress.HasCredentialInjection() || record.EgressPolicy.UID == "" || record.EgressDenyAll {
+		return false
+	}
+	if d.config.admitEgressCredentials(record.Request) != nil {
+		return true
+	}
+	_, err := compileEgressPolicy(record.Atespace, record.Request.Key.Namespace, record.Request.Runtime.Egress, d.config)
+	return err != nil
 }
 
 // verifyEgressPolicy read-only checks the exact applied allowlist.

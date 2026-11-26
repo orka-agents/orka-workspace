@@ -216,7 +216,7 @@ func (d *Lifecycle) stop(ctx context.Context, cm *corev1.ConfigMap, record *jour
 				}
 			}
 			if pod.DeletionTimestamp == nil {
-				if err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
+				if err := d.client.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}, client.GracePeriodSeconds(10)); err != nil && !apierrors.IsNotFound(err) {
 					return err
 				}
 			}
