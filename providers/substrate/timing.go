@@ -98,10 +98,19 @@ func allocationPath(record *journalRecord) string {
 	return "cold"
 }
 
+// workerSource is spare when the private WorkerPool was a claimed spare, so
+// workerPoolMs and workerActiveMs measure the claim instead of worker birth.
+func workerSource(record *journalRecord) string {
+	if spare := record.SpareWorker; spare != nil && !spare.Released && record.RuntimePool.UID != "" {
+		return "spare"
+	}
+	return "fresh"
+}
+
 func readyTimingValues(record *journalRecord) []any {
 	t := &record.Timing
 	start := allocationStart(record)
-	values := append(timingSubject(record), "path", allocationPath(record))
+	values := append(timingSubject(record), "path", allocationPath(record), "workerSource", workerSource(record))
 	values = phase(values, "workerPoolMs", start, t.WorkerPoolCreatedAt)
 	values = phase(values, "workerActiveMs", t.WorkerPoolCreatedAt, t.WorkerActiveAt)
 	values = phase(values, "templateCreateMs", t.WorkerPoolCreatedAt, t.TemplateCreatedAt)

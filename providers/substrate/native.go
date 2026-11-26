@@ -132,7 +132,12 @@ func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *jo
 	return d.verifyRuntimePool(ctx, record)
 }
 
+// workerLabels are the birth labels of the record's private workers: its own
+// identity, or a claimed spare's labels, which were fixed before the claim.
 func workerLabels(record *journalRecord) map[string]string {
+	if record.SpareWorker != nil {
+		return spareBirth(record.SpareWorker.Birth)
+	}
 	return map[string]string{workerAllocationLabel: record.Observation.Identity.AllocationID, workerInstanceLabel: record.Observation.Identity.InstanceID}
 }
 

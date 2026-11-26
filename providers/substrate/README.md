@@ -203,6 +203,62 @@ this Actor, and the applied egress policy. Native worker and router ingress
 remain operator-owned. Operators must avoid concurrent mutation of
 adapter-owned resources.
 
+**Spare workers.** A profile may keep pre-created private workers so worker
+Pod scheduling, image pull and registration leave the allocation critical path
+([ADR 0007](../../docs/adr/0007-substrate-spare-workers.md)). Set the mutable
+annotation `substrate.workspace.orka.ai/spare-workers: "N"` on the
+`SubstrateWorkspaceProfile`, with `N` a single digit from `0` to `8`. Absent or
+`0` keeps the behavior above. Any other value counts as `0` and is logged once
+per value. The annotation is not part of the profile hash, so changing it never
+invalidates admitted workspaces. A leader-only replenisher, run every 10
+seconds, keeps `N` unclaimed spares per profile. Each spare is a private
+single-replica WorkerPool, named `ate-spare-<random>`, in the operator pool's
+namespace. It is built by the same copy logic as a per-instance pool: worker
+image, sandbox class with the pinned resolved SandboxConfig, scheduling, and
+the Actor size from the infrastructure template's limits. Orka core sends
+native requests without container resources, so that is the size every
+allocation computes. The spare's labels are only
+`substrate.workspace.orka.ai/spare-profile-uid` and unique allocation/instance
+birth labels. Agent Substrate copies WorkerPool labels onto the Worker, and no
+Orka-managed selector matches these labels, so no provider-managed Actor can be
+placed on an unclaimed spare (clusters enabling spares should not schedule
+unrestricted foreign ActorTemplates without a `workerSelector`). Spares hold no
+credentials and have no owner. The replenisher deletes
+spares that are stale: the profile was deleted, the annotation was lowered or
+became invalid, the operator pool UID changed, or its specification drifted.
+It deletes nothing while the current shape cannot be computed, for example
+while the operator pool's SandboxConfig resolves. Each delete first proves no
+Actor is assigned and carries UID and resourceVersion preconditions, so a
+concurrent claim wins.
+
+An allocation, cold or resumed from a Tag, then tries to claim a spare before
+creating its own pool. It takes one whose spec equals byte for byte the pool it
+would create, except for the birth labels, whose single worker is `ACTIVE`,
+registered, gVisor, exactly sized, allocated nothing, and lists no assignments,
+and whose Pod is exact and not terminating. The journal records the selection
+and `claimIssued` before the claim. The claim is one Update with the read
+resourceVersion that replaces the spare's labels with the ordinary private-pool
+labels, owns it by the anchor, and adds a
+`substrate.workspace.orka.ai/spare-claim` marker naming the exact journal
+lifetime and sequence. The pool UID is saved, in the save that already binds a
+fresh pool, only after that marker is observed. A conflict, a lost response
+that does not show the marker, a vanished or changed spare, or a worker that is
+no longer active and empty falls back to the fresh pool the allocation would
+have created, before any template or Actor exists. The claim changes only
+WorkerPool metadata, never the worker Pod, and Startup waits until Agent
+Substrate has copied the new labels to the empty Worker. Every check before
+Resume still applies unchanged. After the claim the spare is the allocation's
+ordinary private pool, retired exactly as above, and it never returns to the
+spare set. The journal is authoritative. Retirement with an unbound claim binds the pool
+when it finds the exact pool carrying the journal's own marker and matching the
+record so normal deletion removes it, and otherwise releases the claim in the
+journal. The replenisher collects a claimed pool only when
+the exact journal's record for that sequence does not hold it and no Actor is
+assigned. A pool whose journal is missing or replaced stays for its anchor
+ownerReference to collect. Each spare costs one idle worker Pod, the Actor size
+plus 64Mi of requests, so `N` spares per profile reserve `N` such Pods. Spares
+need `update` on `workerpools`.
+
 ## Workload translation
 
 Orka supplies the immutable public supervisor request. The provider compiles it
@@ -433,11 +489,14 @@ missing, for example in journals written before timing existed.
 
 `Substrate runtime ready` carries `workspaceNamespace`, `workspaceName`,
 `runtimePool` (the Orka RuntimePool binding), `sequence`, `path` (`cold`, or
-`resume` from a Tag), and these durations in milliseconds:
+`resume` from a Tag), `workerSource` (`spare` when the private WorkerPool was a
+claimed spare, otherwise `fresh`), and these durations in milliseconds. For a
+spare, `workerPoolMs` ends when the claim is saved and `workerActiveMs` measures
+only the post-claim checks, not worker birth:
 
 | Field | From | To |
 | --- | --- | --- |
-| `workerPoolMs` | allocation start | private WorkerPool UID saved |
+| `workerPoolMs` | allocation start | private WorkerPool UID saved (created or claimed) |
 | `workerActiveMs` | WorkerPool created | active, empty worker fenced (overlaps the next three) |
 | `templateCreateMs` | WorkerPool created | bootstrap template UID saved |
 | `actorCreateMs` | template created | Actor UID saved |

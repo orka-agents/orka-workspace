@@ -14,3 +14,5 @@ These records preserve the baseline decisions. See [implementation status](../im
 [ADR 0005](0005-persisted-workload-sequences.md) records numbered runtime requests, retained lineage, and exact-instance retirement authorization.
 
 [ADR 0006](0006-agent-substrate-v1.md) records the Agent Substrate v1.0.0 contract: host-name egress allowlists, router-targeted startup evidence, single-Actor worker sizing, and retire-first handling of v0.1.0 state.
+
+[ADR 0007](0007-substrate-spare-workers.md) records opt-in spare private Substrate workers that allocations claim with an optimistic-lock write, keeping one Actor per proven-empty worker.
