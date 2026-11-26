@@ -342,6 +342,16 @@ An issued suspension is never replayed because of a transport error. Known nativ
 `SUSPENDING` progress stays pending; a still-running or failed Actor reports an
 unresolved outcome until exact snapshot evidence or authorized retirement settles it.
 
+`--max-concurrent-reconciles` (default 8, from 1 to 32) sets how many
+ExecutionWorkspaces are reconciled in parallel; one workspace is never
+reconciled twice at once. Parallel reconciles share only thread-safe clients and
+resourceVersion-preconditioned writes: spare claims and the suspended-occupancy
+ledger. A pending workspace is polled after 200 ms, then 400 ms and 800 ms, then
+every second, because the provider's own status writes do not trigger a
+reconcile. Each pass re-verifies everything it acts on, and continues in the
+same pass after a write whose result it can verify, such as a restored Actor's
+bootstrap template rotation.
+
 Infrastructure readiness reports the native Actor identity, exact worker Pod,
 request sequence, the public sealed-bootstrap challenge hash, the router
 endpoint, and `routerTarget` `<atespace>/<actor>`. The provider reads the

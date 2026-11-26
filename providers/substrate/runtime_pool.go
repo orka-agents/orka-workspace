@@ -416,6 +416,16 @@ func (d *Lifecycle) ensureRuntimePool(ctx context.Context, cm *corev1.ConfigMap,
 }
 
 func (d *Lifecycle) verifyRuntimePool(ctx context.Context, record *journalRecord) error {
+	return d.verifyPrivateRuntimePool(ctx, record)
+}
+
+// verifyRuntimePoolWith is verifyRuntimePool against the journal this pass
+// already read.
+func (d *Lifecycle) verifyRuntimePoolWith(ctx context.Context, _ *corev1.ConfigMap, record *journalRecord) error {
+	return d.verifyPrivateRuntimePool(ctx, record)
+}
+
+func (d *Lifecycle) verifyPrivateRuntimePool(ctx context.Context, record *journalRecord) error {
 	pool := poolObject()
 	if err := d.client.Get(ctx, client.ObjectKey{Namespace: record.Placement.Namespace, Name: record.RuntimePool.Name}, pool); err != nil {
 		return err
