@@ -27,7 +27,12 @@ func (r *ExecutionWorkspaceReconciler) reconcileLifecycle(ctx context.Context, w
 func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, workspace *workspacev1alpha1.ExecutionWorkspace, read *workspacev1alpha1.ExecutionWorkspaceProvider) (ctrl.Result, error) {
 	pending := false
 	var operationErr error
+	key := client.ObjectKeyFromObject(workspace)
+	// This pass registers again whatever worker pool it still waits on.
+	r.wakes.forget(key)
+	wait := &workerWait{register: func(pool types.NamespacedName) { r.wakes.await(key, pool) }}
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		wait.begin()
 		current := &workspacev1alpha1.ExecutionWorkspace{}
 		provider := &workspacev1alpha1.ExecutionWorkspaceProvider{}
 		if read != nil {
@@ -84,6 +89,11 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 		}
 		before = current.DeepCopy()
 		driver := r.lifecycle()
+		driver.wait = wait
+		// The pass's two challenge reads share one router connection; the
+		// next pass dials again with freshly loaded TLS material.
+		driver.router = &routerChallengeGetter{config: driver.config}
+		defer driver.release()
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation
 		// snap is this pass's verified journal and observation, while nothing
@@ -289,7 +299,6 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 		setLifecycleMilestoneConditions(current, observed, missing, operationErr, failure)
 		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 	})
-	key := client.ObjectKeyFromObject(workspace)
 	if err != nil {
 		r.polls.reset(key)
 		return ctrl.Result{}, err
@@ -299,9 +308,13 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 		return ctrl.Result{}, operationErr
 	}
 	if pending {
+		if wait.lagging() {
+			return ctrl.Result{RequeueAfter: r.polls.lag(key)}, nil
+		}
 		return ctrl.Result{RequeueAfter: r.polls.next(key)}, nil
 	}
 	r.polls.reset(key)
+	r.wakes.forget(key)
 	return ctrl.Result{RequeueAfter: providerHeartbeatPeriod}, nil
 }
 
@@ -317,17 +330,24 @@ const (
 )
 
 // pendingPolls holds, per workspace, the next poll interval of an unbroken
-// run of pending passes. The workqueue never reconciles one workspace twice at
-// once, but reconciles of different workspaces share this map, so it is
-// guarded. A run ends, and its entry is dropped, on any non-pending result.
+// run of pending passes, and how many native-lag polls that run has used.
+// The workqueue never reconciles one workspace twice at once, but reconciles
+// of different workspaces and watch events share this map, so it is guarded.
+// A run ends, and its entry is dropped, on any non-pending result or on an
+// event that wakes the workspace.
 type pendingPolls struct {
 	mu        sync.Mutex
 	intervals map[types.NamespacedName]time.Duration
+	lags      map[types.NamespacedName]int
 }
 
 func (p *pendingPolls) next(key types.NamespacedName) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.nextLocked(key)
+}
+
+func (p *pendingPolls) nextLocked(key types.NamespacedName) time.Duration {
 	if p.intervals == nil {
 		p.intervals = map[types.NamespacedName]time.Duration{}
 	}
@@ -339,7 +359,32 @@ func (p *pendingPolls) next(key types.NamespacedName) time.Duration {
 	return interval
 }
 
+// lag is the next poll of a pass that waits only on native state Kubernetes
+// already shows: nativeLagPoll for at most nativeLagPolls passes of a run,
+// then the ordinary backoff.
+func (p *pendingPolls) lag(key types.NamespacedName) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lags == nil {
+		p.lags = map[types.NamespacedName]int{}
+	}
+	if p.lags[key] >= nativeLagPolls {
+		return p.nextLocked(key)
+	}
+	p.lags[key]++
+	return nativeLagPoll
+}
+
 func (p *pendingPolls) reset(key types.NamespacedName) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.intervals, key)
+	delete(p.lags, key)
+}
+
+// restart returns the backoff of key's run to pendingPollInitial. It keeps
+// the run's native-lag count, so events cannot extend the fast polls.
+func (p *pendingPolls) restart(key types.NamespacedName) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.intervals, key)

@@ -81,7 +81,11 @@ func run(leader bool, leaderNamespace string, config provider.Config, maxConcurr
 			return err
 		}
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme, LeaderElection: leader, LeaderElectionID: "orka-workspace-substrate.workspace.orka.ai", LeaderElectionNamespace: leaderNamespace, HealthProbeBindAddress: ":8081", Metrics: metricsserver.Options{BindAddress: "0"}})
+	cacheOptions, err := provider.ManagerCacheOptions()
+	if err != nil {
+		return err
+	}
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme, Cache: cacheOptions, LeaderElection: leader, LeaderElectionID: "orka-workspace-substrate.workspace.orka.ai", LeaderElectionNamespace: leaderNamespace, HealthProbeBindAddress: ":8081", Metrics: metricsserver.Options{BindAddress: "0"}})
 	if err != nil {
 		return err
 	}
