@@ -165,13 +165,34 @@ type Lifecycle struct {
 	control         pb.ControlClient
 	config          Config
 	challengeClient challengeGetter
+	// router reads the router challenge when challengeClient is unset. New
+	// creates it, so the driver's reads, and copies of the driver, share one
+	// connection.
+	router *routerChallengeGetter
 }
 
 var _ sdk.Lifecycle = (*Lifecycle)(nil)
 var _ sdk.SuspensionController = (*Lifecycle)(nil)
 
 func New(c client.Client, control pb.ControlClient, config Config) *Lifecycle {
-	return &Lifecycle{client: c, control: control, config: config}
+	return &Lifecycle{client: c, control: control, config: config, router: &routerChallengeGetter{config: config}}
+}
+
+// routerChallenges returns this driver's router challenge reader. A driver
+// not made by New reads through a getter of its own for each call.
+func (d *Lifecycle) routerChallenges() *routerChallengeGetter {
+	if d.router == nil {
+		return &routerChallengeGetter{config: d.config}
+	}
+	return d.router
+}
+
+// release closes the idle router connection this driver's challenge reads
+// kept open. The driver stays usable; a later read dials again.
+func (d *Lifecycle) release() {
+	if d.router != nil {
+		d.router.closeIdle()
+	}
 }
 
 func digest(data []byte) string {
