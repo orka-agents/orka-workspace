@@ -457,6 +457,9 @@ func (d *Lifecycle) privatePoolWorker(ctx context.Context, record *journalRecord
 }
 
 func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (bool, error) {
+	// Registered before any read below, so an event on this pool while they
+	// run wakes the workspace again.
+	d.awaitWorker(record)
 	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
 		return false, err
 	}
@@ -470,6 +473,7 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	allocated := selected.GetStatus().GetAllocated()
 	if selected.GetStatus().GetState() == pb.WorkerState_WORKER_STATE_UNAVAILABLE || len(selected.GetStatus().GetSandboxClasses()) == 0 || selected.GetStatus().GetRegisteredEpoch() <= 0 {
 		// Registration and readiness are still in progress.
+		d.noteNativeLag(ctx, selected)
 		return false, nil
 	}
 	if selected.GetMetadata().GetUid() == "" || selected.GetStatus().GetState() != pb.WorkerState_WORKER_STATE_ACTIVE || allocated.GetActors() != 0 || allocated.GetCpuMillicores() != 0 || allocated.GetMemoryBytes() != 0 {
@@ -481,6 +485,9 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 	for key, value := range record.TemplateSpec.GetWorkerSelector().GetMatchLabels() {
 		if selected.GetLabels()[key] != value {
 			if spareWorkerLabelsPending(record, selected) {
+				// The claimed WorkerPool already carries the labels; only
+				// their native copy onto the Worker is outstanding.
+				d.noteNativeLag(ctx, nil)
 				return false, nil
 			}
 			return false, sdk.ErrStaleIdentity
