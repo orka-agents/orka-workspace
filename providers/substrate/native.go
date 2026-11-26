@@ -398,7 +398,13 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor 
 	}
 	getter := d.challengeClient
 	if getter == nil {
-		getter = d.routerChallenges()
+		if d.router != nil {
+			getter = d.router
+		} else {
+			ephemeral := &routerChallengeGetter{config: d.config}
+			defer ephemeral.closeIdle()
+			getter = ephemeral
+		}
 	}
 	endpoint := d.endpoint()
 	if endpoint == "" {
