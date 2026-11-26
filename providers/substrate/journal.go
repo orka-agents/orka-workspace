@@ -179,7 +179,7 @@ var _ sdk.Lifecycle = (*Lifecycle)(nil)
 var _ sdk.SuspensionController = (*Lifecycle)(nil)
 
 func New(c client.Client, control pb.ControlClient, config Config) *Lifecycle {
-	return &Lifecycle{client: c, control: control, config: config, router: &routerChallengeGetter{config: config}}
+	return &Lifecycle{client: c, control: control, config: config}
 }
 
 // routerChallenges returns this driver's router challenge reader. A driver
