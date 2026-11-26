@@ -92,6 +92,7 @@ func (r *ExecutionWorkspaceReconciler) reconcileRead(ctx context.Context, worksp
 		driver.wait = wait
 		// The pass's two challenge reads share one router connection; the
 		// next pass dials again with freshly loaded TLS material.
+		driver.router = &routerChallengeGetter{config: driver.config}
 		defer driver.release()
 		key := workspaceprovider.AllocationKey{Namespace: current.Namespace, Name: current.Name, WorkspaceUID: current.UID, ProviderUID: current.Spec.ProviderBinding.UID}
 		var observed workspaceprovider.AllocationObservation

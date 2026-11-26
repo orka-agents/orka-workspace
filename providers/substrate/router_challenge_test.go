@@ -108,6 +108,7 @@ func (s *routerChallengeServer) accepted() int {
 func TestRouterChallengeReusesOneConnectionPerPass(t *testing.T) {
 	server, config := newRouterChallengeServer(t)
 	d := New(nil, nil, config)
+	d.router = &routerChallengeGetter{config: config}
 	for range 2 {
 		challenge, err := d.routerChallenges().Get(t.Context(), config.RouterEndpoint, "native/actor")
 		if err != nil {

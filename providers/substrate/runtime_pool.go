@@ -487,7 +487,7 @@ func (d *Lifecycle) prepareWorker(ctx context.Context, cm *corev1.ConfigMap, rec
 			if spareWorkerLabelsPending(record, selected) {
 				// The claimed WorkerPool already carries the labels; only
 				// their native copy onto the Worker is outstanding.
-				d.noteNativeLag(ctx, nil)
+				d.noteNativeLag(ctx, selected)
 				return false, nil
 			}
 			return false, sdk.ErrStaleIdentity
