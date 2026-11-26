@@ -169,6 +169,10 @@ type Lifecycle struct {
 	// creates it, so the driver's reads, and copies of the driver, share one
 	// connection.
 	router *routerChallengeGetter
+	// wait, set only by a workspace reconcile pass, learns the worker pool
+	// that pass waits on, so a watch event on it wakes the workspace
+	// (worker_wakes.go).
+	wait *workerWait
 }
 
 var _ sdk.Lifecycle = (*Lifecycle)(nil)
