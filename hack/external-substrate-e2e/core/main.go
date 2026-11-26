@@ -698,11 +698,6 @@ func (p *proof) cleanupNative(ctx context.Context) (map[string]any, error) {
 }
 
 func main() {
-	if os.Getenv("SESSION_CLEANUP") == "1" {
-		// Runs as a run-namespace identity without native credentials.
-		sessionCleanupMain()
-		return
-	}
 	namespace, image := os.Getenv("POD_NAMESPACE"), os.Getenv("RUNTIME_IMAGE")
 	if namespace == "" || image == "" {
 		fmt.Fprintln(os.Stderr, "POD_NAMESPACE and RUNTIME_IMAGE are required")
@@ -767,28 +762,4 @@ func main() {
 		return
 	}
 	fmt.Println("NATIVE_CORE_PROOF", string(encoded))
-}
-
-func sessionCleanupMain() {
-	namespace, endpoint := os.Getenv("POD_NAMESPACE"), os.Getenv("CORE_API_URL")
-	if namespace == "" || endpoint == "" {
-		fmt.Fprintln(os.Stderr, "POD_NAMESPACE and CORE_API_URL are required")
-		os.Exit(2)
-	}
-	config, err := rest.InClusterConfig()
-	var report map[string]any
-	if err == nil {
-		var c client.Client
-		if c, err = client.New(config, client.Options{}); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-			report, err = cleanupSessions(ctx, c, namespace, endpoint)
-		}
-	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "native Core Session cleanup failed:", err)
-		os.Exit(1)
-	}
-	encoded, _ := json.Marshal(report)
-	fmt.Println("NATIVE_CORE_SESSIONS", string(encoded))
 }
