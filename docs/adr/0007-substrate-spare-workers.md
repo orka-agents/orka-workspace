@@ -31,8 +31,10 @@ which is what every allocation computes because core sends native requests
 without container resources. A spare differs from the pool an allocation
 would create only in its birth label values. Agent Substrate copies WorkerPool
 labels onto Workers, so an unclaimed spare's WorkerPool carries only a
-spare-profile label and its unique birth labels. No selector matches them, so
-no Actor can be placed on it. A leader-only replenisher keeps `N` unclaimed
+spare-profile label and its unique birth labels. No Orka-managed selector
+matches them, so no provider-managed Actor can be placed on an unclaimed spare
+(clusters enabling spares should not run unrestricted foreign ActorTemplates
+without a `workerSelector`). A leader-only replenisher keeps `N` unclaimed
 spares per profile and deletes stale ones. A spare is stale when its profile is
 gone, the count was lowered, the operator pool UID changed, or the
 specification drifted. Deletion proves no Actor is assigned and carries UID

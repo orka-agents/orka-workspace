@@ -294,7 +294,10 @@ func (d *Lifecycle) ensureSpareRuntimePool(ctx context.Context, cm *corev1.Confi
 		return d.abandonSpare(ctx, cm, record, "the spare disappeared")
 	}
 	if err != nil {
-		return err
+		if spare.ClaimIssued {
+			return err
+		}
+		return d.abandonSpare(ctx, cm, record, "the spare could not be read")
 	}
 	marker := claimMarker(cm, record)
 	if string(pool.GetUID()) != spare.UID || pool.GetDeletionTimestamp() != nil {
@@ -349,8 +352,11 @@ func (d *Lifecycle) ensureSpareRuntimePool(ctx context.Context, cm *corev1.Confi
 			pool = current
 		}
 	}
-	if pool.GetDeletionTimestamp() != nil || !runtimePoolMatches(pool, record) {
+	if pool.GetDeletionTimestamp() != nil {
 		return sdk.ErrStaleIdentity
+	}
+	if !runtimePoolMatches(pool, record) {
+		return d.abandonSpare(ctx, cm, record, "the spare changed after the claim")
 	}
 	record.RuntimePool.UID = string(pool.GetUID())
 	stamp(&record.Timing.WorkerPoolCreatedAt)

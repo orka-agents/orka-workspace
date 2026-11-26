@@ -220,8 +220,10 @@ native requests without container resources, so that is the size every
 allocation computes. The spare's labels are only
 `substrate.workspace.orka.ai/spare-profile-uid` and unique allocation/instance
 birth labels. Agent Substrate copies WorkerPool labels onto the Worker, and no
-selector matches these labels, so nothing can place an Actor on an unclaimed
-spare. Spares hold no credentials and have no owner. The replenisher deletes
+Orka-managed selector matches these labels, so no provider-managed Actor can be
+placed on an unclaimed spare (clusters enabling spares should not schedule
+unrestricted foreign ActorTemplates without a `workerSelector`). Spares hold no
+credentials and have no owner. The replenisher deletes
 spares that are stale: the profile was deleted, the annotation was lowered or
 became invalid, the operator pool UID changed, or its specification drifted.
 It deletes nothing while the current shape cannot be computed, for example
@@ -247,8 +249,10 @@ WorkerPool metadata, never the worker Pod, and Startup waits until Agent
 Substrate has copied the new labels to the empty Worker. Every check before
 Resume still applies unchanged. After the claim the spare is the allocation's
 ordinary private pool, retired exactly as above, and it never returns to the
-spare set. The journal is authoritative. Retirement with an unbound claim
-releases it in the journal. The replenisher collects a claimed pool only when
+spare set. The journal is authoritative. Retirement with an unbound claim binds the pool
+when it finds the exact pool carrying the journal's own marker and matching the
+record so normal deletion removes it, and otherwise releases the claim in the
+journal. The replenisher collects a claimed pool only when
 the exact journal's record for that sequence does not hold it and no Actor is
 assigned. A pool whose journal is missing or replaced stays for its anchor
 ownerReference to collect. Each spare costs one idle worker Pod, the Actor size
