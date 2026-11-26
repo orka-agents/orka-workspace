@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -163,7 +164,10 @@ func TestRouterChallengeReuseKeepsFailClosedDecoding(t *testing.T) {
 		"status":   func() { server.status, server.body = http.StatusServiceUnavailable, valid },
 		"unknown":  func() { server.status, server.body = http.StatusOK, `{"schema":"x","extra":true}` },
 		"trailing": func() { server.status, server.body = http.StatusOK, valid+"{}" },
-		"oversize": func() { server.status, server.body = http.StatusOK, `"`+string(make([]byte, 65537))+`"` },
+		"oversize": func() {
+			server.status = http.StatusOK
+			server.body = strings.Repeat(" ", 65537) + valid
+		},
 	} {
 		server.mu.Lock()
 		change()
