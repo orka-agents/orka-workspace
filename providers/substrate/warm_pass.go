@@ -40,7 +40,7 @@ func (d *Lifecycle) steadyReady(ctx context.Context, snap *passSnapshot, workspa
 	if validateRequest(request) != nil || d.config.admitEgressCredentials(request) != nil || d.control == nil || d.endpoint() == "" {
 		return false
 	}
-	if admittedWorkspace(workspace, request) != nil || admittedProvider(provider, request) != nil {
+	if admittedWorkspace(workspace, request) != nil || admittedProvider(provider, request) != nil || d.admitted(ctx, request) != nil {
 		return false
 	}
 	if record.Request.Sequence != request.Sequence || record.Request.Revision != request.Revision || record.Operation != "ensure" || record.Failure != "" {

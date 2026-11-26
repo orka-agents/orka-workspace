@@ -312,6 +312,37 @@ func TestWarmAttachFallsBackToTheFullPassOnAnyChange(t *testing.T) {
 			t.Fatal("an unadmitted generation was acknowledged")
 		}
 	})
+	t.Run("provider disabled during observation", func(t *testing.T) {
+		r, c, native, request, _ := warmAttach(t, "private")
+		disabled := false
+		r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+			Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := w.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				// Disable the provider once the pass has read the journal during observation.
+				if !disabled && key.Name == journalKey(request.Key).Name {
+					disabled = true
+					p := &api.ExecutionWorkspaceProvider{}
+					if err := c.Get(ctx, client.ObjectKey{Name: "substrate"}, p); err != nil {
+						return err
+					}
+					p.Spec.LifecycleState = api.ExecutionWorkspaceProviderDisabled
+					if err := c.Update(ctx, p); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+		_ = native
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil {
+			t.Fatal("a workspace whose provider was disabled during observation must fail admission")
+		}
+		if workspace := bindingWorkspace(t, c, request.Key); workspace.Status.Allocation.State == sdk.AllocationReady || sdk.ConditionIsTrue(workspace.Status.Conditions, string(api.ConditionWorkspaceDataPlaneReady)) {
+			t.Fatal("a workspace whose provider was disabled during observation was published Ready")
+		}
+	})
 }
 
 // warmAttachBudget bounds the simulated warm-attach pass, and
