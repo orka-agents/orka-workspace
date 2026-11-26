@@ -364,7 +364,9 @@ func TestActiveAttachmentNeverHidesFailedStateFromAnUnreadableJournal(t *testing
 	if err := c.Update(t.Context(), workspace); err != nil {
 		t.Fatal(err)
 	}
-	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key), skip: 1}
+	// The pass takes the failure record from the journal its observation
+	// read, so that read is the one that fails.
+	flaky := &journalReadFailsOnce{Client: c, journal: journalKey(request.Key)}
 	r := &ExecutionWorkspaceReconciler{Client: flaky, Control: native, Config: Config{RouterEndpoint: fixtureRouter}}
 	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: clientKey(request.Key)}); err == nil || !flaky.fired {
 		t.Fatalf("unreadable failure record was hidden: fired=%v err=%v", flaky.fired, err)

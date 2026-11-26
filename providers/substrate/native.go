@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"sync"
 	"time"
 
 	api "github.com/orka-agents/orka-workspace/api/v1alpha1"
@@ -117,19 +118,25 @@ func (d *Lifecycle) ensureInfrastructure(ctx context.Context, cm *corev1.ConfigM
 }
 
 func (d *Lifecycle) verifyInfrastructureReadOnly(ctx context.Context, record *journalRecord) error {
+	journal := &corev1.ConfigMap{}
+	if err := d.client.Get(ctx, journalKey(record.Request.Key), journal); err != nil {
+		return err
+	}
+	return d.verifyInfrastructureWith(ctx, journal, record)
+}
+
+// verifyInfrastructureWith is verifyInfrastructureReadOnly against the
+// journal this pass already read, which is the only writer's own record.
+func (d *Lifecycle) verifyInfrastructureWith(ctx context.Context, journal *corev1.ConfigMap, record *journalRecord) error {
 	anchor := &corev1.ConfigMap{}
 	key := types.NamespacedName{Namespace: record.Placement.Namespace, Name: record.Anchor.Name}
 	if err := d.client.Get(ctx, key, anchor); err != nil {
 		return err
 	}
-	journal := &corev1.ConfigMap{}
-	if err := d.client.Get(ctx, journalKey(record.Request.Key), journal); err != nil {
-		return err
-	}
 	if record.Anchor.UID == "" || string(anchor.UID) != record.Anchor.UID || anchor.DeletionTimestamp != nil || !reflect.DeepEqual(anchor.Labels, labels(record)) || anchor.Data["journalName"] != journal.Name || anchor.Data["journalNamespace"] != journal.Namespace || anchor.Data["journalUID"] != string(journal.UID) {
 		return sdk.ErrStaleIdentity
 	}
-	return d.verifyRuntimePool(ctx, record)
+	return d.verifyRuntimePoolWith(ctx, journal, record)
 }
 
 // workerLabels are the birth labels of the record's private workers: its own
@@ -400,13 +407,30 @@ func (d *Lifecycle) challenge(ctx context.Context, record *journalRecord, actor 
 	return hash, nil
 }
 
+// verifyAll runs independent read-only checks concurrently and returns the
+// first failure in argument order, as the checks would report one by one.
+func verifyAll(checks ...func() error) error {
+	errs := make([]error, len(checks))
+	var wg sync.WaitGroup
+	for i, check := range checks {
+		wg.Go(func() { errs[i] = check() })
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func pendingObservation(record *journalRecord) sdk.AllocationObservation {
 	observed := record.Observation
 	observed.State = sdk.AllocationPending
 	observed.Startup = nil
 	return observed
 }
-func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sdk.AllocationObservation, error) {
+func (d *Lifecycle) observeReady(ctx context.Context, cm *corev1.ConfigMap, record *journalRecord) (sdk.AllocationObservation, error) {
 	if record.Template.UID == "" || record.Worker == nil || record.ChallengeSHA256 == "" {
 		return pendingObservation(record), nil
 	}
@@ -422,37 +446,34 @@ func (d *Lifecycle) observeReady(ctx context.Context, record *journalRecord) (sd
 	if actor.GetStatus().GetState() != pb.ActorState_ACTOR_STATE_RUNNING {
 		return sdk.AllocationObservation{}, lostInstance(record, nativeActorStopped)
 	}
-	if err := d.verifyInheritedCheckpoint(ctx, record); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if err := d.verifyPlacement(ctx, record); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if err := d.verifyInfrastructureReadOnly(ctx, record); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
 	// The Actor names its template; the immutable template UID is pinned by
 	// re-reading it, since v1 reports no running template UID on the Actor.
 	if actor.GetActorTemplate().GetName() != record.Template.Name {
 		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
 	}
-	if err := d.verifyTemplate(ctx, record.Atespace, record.Template); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if err := d.verifyEgressPolicy(ctx, record); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	worker, err := d.worker(ctx, record, actor)
+	// The remaining checks only read and are independent, so they run at once;
+	// every one must pass, and the first failure in this order is reported.
+	var worker *workerFence
+	err = verifyAll(
+		func() error { return d.verifyInheritedCheckpoint(ctx, record) },
+		func() error { return d.verifyPlacement(ctx, record) },
+		func() error { return d.verifyInfrastructureWith(ctx, cm, record) },
+		func() error { return d.verifyTemplate(ctx, record.Atespace, record.Template) },
+		func() error { return d.verifyEgressPolicy(ctx, record) },
+		func() error {
+			// worker reads the fenced Pod and checks its UID, pool and birth
+			// labels against the fence, which is all bindWorker checks.
+			var err error
+			if worker, err = d.worker(ctx, record, actor); err != nil {
+				return err
+			}
+			if *worker != *record.Worker {
+				return sdk.ErrStaleIdentity
+			}
+			return d.verifyWorkerExclusive(ctx, record, worker.Name, true)
+		},
+	)
 	if err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if record.Worker == nil || *worker != *record.Worker {
-		return sdk.AllocationObservation{}, sdk.ErrStaleIdentity
-	}
-	if err := d.bindWorker(ctx, record); err != nil {
-		return sdk.AllocationObservation{}, err
-	}
-	if err := d.verifyWorkerExclusive(ctx, record, worker.Name, true); err != nil {
 		return sdk.AllocationObservation{}, err
 	}
 	hash, err := d.challenge(ctx, record, actor)

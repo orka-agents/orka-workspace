@@ -24,6 +24,7 @@ func main() {
 	var leader bool
 	var leaderNamespace string
 	var config provider.Config
+	var maxConcurrentReconciles int
 	flag.BoolVar(&leader, "leader-elect", true, "elect one active provider")
 	flag.StringVar(&leaderNamespace, "leader-election-namespace", "orka-workspace-system", "namespace of provider leader Lease")
 	flag.StringVar(&config.APIEndpoint, "native-api-endpoint", "api.ate-system.svc:443", "pinned Substrate control TLS endpoint")
@@ -38,6 +39,7 @@ func main() {
 	flag.StringVar(&config.RouterServerName, "native-router-server-name", "", "router TLS server name; defaults to the endpoint host")
 	flag.DurationVar(&config.BootTimeout, "native-boot-timeout", 6*time.Minute, "fail a native allocation that has no process evidence after this long")
 	flag.StringVar(&config.EgressCredentialProvider, "egress-credential-provider", "", "credential provider class the Substrate egress gateway was installed with (only k8s.io); empty disables egress credential injection")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", provider.DefaultMaxConcurrentReconciles, fmt.Sprintf("ExecutionWorkspaces reconciled in parallel, from 1 to %d; one workspace is never reconciled twice at once", provider.MaxMaxConcurrentReconciles))
 	flag.Func("egress-credential-namespace", "namespace, besides each workload's own, whose Secrets egress credential rules may name; repeatable (Orka core needs its runtime namespace)", func(value string) error {
 		config.EgressCredentialNamespaces = append(config.EgressCredentialNamespaces, strings.TrimSpace(value))
 		return nil
@@ -50,12 +52,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if err := run(leader, leaderNamespace, config); err != nil {
+	if err := provider.ValidateMaxConcurrentReconciles(maxConcurrentReconciles); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if err := run(leader, leaderNamespace, config, maxConcurrentReconciles); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
-func run(leader bool, leaderNamespace string, config provider.Config) error {
+func run(leader bool, leaderNamespace string, config provider.Config, maxConcurrentReconciles int) error {
 	// Without acknowledged native control, run only the provider reconciler so
 	// it withdraws any stale advertisement instead of crash-looping.
 	var native pb.ControlClient
@@ -83,7 +89,7 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 	if err != nil {
 		return err
 	}
-	for _, setup := range controllerSetups(c, config, native) {
+	for _, setup := range controllerSetups(c, config, native, maxConcurrentReconciles) {
 		if err := setup(mgr); err != nil {
 			return err
 		}
@@ -98,10 +104,10 @@ func run(leader bool, leaderNamespace string, config provider.Config) error {
 }
 
 // controllerSetups registers lifecycle controllers only with native control.
-func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient) []func(ctrl.Manager) error {
+func controllerSetups(c client.Client, config provider.Config, native pb.ControlClient, maxConcurrentReconciles int) []func(ctrl.Manager) error {
 	setups := []func(ctrl.Manager) error{(&provider.ProviderReconciler{Client: c, Config: config}).SetupWithManager}
 	if native == nil {
 		return setups
 	}
-	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
+	return append(setups, (&provider.ExecutionWorkspaceReconciler{Client: c, Control: native, Config: config, MaxConcurrentReconciles: maxConcurrentReconciles}).SetupWithManager, (&provider.CheckpointReconciler{Client: c, Control: native, Config: config}).SetupWithManager, (&provider.SpareWorkerReplenisher{Client: c, Control: native, Config: config}).SetupWithManager)
 }

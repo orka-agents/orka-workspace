@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -157,9 +158,13 @@ func TestResetRetentionLedgerKeepsUnfinishedResumeReservation(t *testing.T) {
 	if err := admit(c)(t.Context(), next); err != nil {
 		t.Fatal(err)
 	}
+	// The successor's fresh worker is still registering, so the resume is
+	// unfinished.
+	native.registering = true
 	if observed, err := driver(c, native).EnsureAllocation(t.Context(), next); err != nil || observed.State == sdk.AllocationReady {
 		t.Fatalf("resume unexpectedly finished in one step: state=%q err=%v", observed.State, err)
 	}
+	native.registering = false
 	_, record, err := driver(c, native).read(t.Context(), request.Key)
 	if err != nil {
 		t.Fatal(err)
@@ -179,6 +184,9 @@ func TestResetRetentionLedgerKeepsUnfinishedResumeReservation(t *testing.T) {
 	}
 	if _, err := driver(c, native).SuspendInstance(t.Context(), second.Key, secondReady.Identity, nil); err == nil || !strings.Contains(err.Error(), "missing retained workspace") {
 		t.Fatalf("reset ledger ignored an unfinished resume reservation: %v", err)
+	}
+	for _, worker := range native.workers {
+		worker.Status.State = pb.WorkerState_WORKER_STATE_ACTIVE
 	}
 	ready(t, c, native, next)
 	_, record, err = driver(c, native).read(t.Context(), request.Key)
