@@ -8,12 +8,16 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	profile "github.com/orka-agents/orka-workspace/providers/substrate/api/v1alpha1"
 	pb "github.com/orka-agents/orka-workspace/providers/substrate/nativepb"
 	sdk "github.com/orka-agents/orka-workspace/sdk"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
@@ -679,5 +683,34 @@ func TestSpareWorkerJournalValidation(t *testing.T) {
 			t.Fatal(err)
 		}
 		cm = restored
+	}
+}
+
+func TestSpareWorkerEmptyAnnotationLoggedOnce(t *testing.T) {
+	var logs []string
+	logger := funcr.New(func(prefix, args string) {
+		logs = append(logs, prefix+args)
+	}, funcr.Options{})
+	ctx := ctrl.LoggerInto(t.Context(), logr.Logger(logger))
+	r := &SpareWorkerReplenisher{}
+	item := &profile.SubstrateWorkspaceProfile{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "tenant",
+			Name:        "native",
+			UID:         "profile-empty-uid",
+			Annotations: map[string]string{spareWorkersAnnotation: ""},
+		},
+	}
+	if got := r.wanted(ctx, item); got != 0 {
+		t.Fatalf("wanted = %d, want 0", got)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("first sweep logged %d diagnostics, want 1", len(logs))
+	}
+	if got := r.wanted(ctx, item); got != 0 {
+		t.Fatalf("second wanted = %d, want 0", got)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("second sweep logged %d diagnostics, want 1", len(logs))
 	}
 }

@@ -505,7 +505,8 @@ func (r *SpareWorkerReplenisher) wanted(ctx context.Context, item *profile.Subst
 		r.invalid = map[types.UID]string{}
 	}
 	if err != nil {
-		if raw := item.Annotations[spareWorkersAnnotation]; r.invalid[item.UID] != raw {
+		raw := item.Annotations[spareWorkersAnnotation]
+		if prev, seen := r.invalid[item.UID]; !seen || prev != raw {
 			r.invalid[item.UID] = raw
 			ctrl.LoggerFrom(ctx).Error(err, "Substrate spare workers disabled for profile with an invalid annotation", "profileNamespace", item.Namespace, "profileName", item.Name)
 		}
